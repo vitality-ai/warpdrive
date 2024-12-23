@@ -1,3 +1,6 @@
 [submodule "client/python-sdk"]
 	path = client/python-sdk
 	url = https://github.com/vitality-ai/python-sdk.git
+[submodule "client/go-sdk"]
+	path = client/go-sdk
+	url = https://github.com/vitality-ai/go-sdk.git
