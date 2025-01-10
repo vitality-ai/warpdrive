@@ -1,4 +1,7 @@
-# CIAOS - CIA's Object Store
+# CIAOS - Next Generation Object Storage Engine
+
+<img src="https://github.com/user-attachments/assets/654f3add-74ab-4c34-8b73-234852ea11c7" alt="Example Image" width="800"  height="250">
+
 
 ## About
 CIAOS is a general purpose KV/Object store focused on workloads that require high throughput. Practical Applications which drives our developemt is to support Storage Disaggregation Architectures and AI/ML Workloads . 
