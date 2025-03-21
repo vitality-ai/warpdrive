@@ -14,6 +14,7 @@
 12. https://t.co/tEAygOhPyU [12] - TUM's High performance object storage for analytics. 
 13. https://jamesbornholt.com/papers/shardstore-sosp21.pdf [13] - Amazon S3's formal verification and Technical Details. 
 14. https://storage.googleapis.com/pub-tools-public-publication-data/pdf/36971.pdf [14] - Google's Megastore.
-15. https://static.usenix.org/events/osdi04/tech/full_papers/renesse/renesse.pdf - Chain Replication for High Availability and Throughput in Storage Services. 
-16. https://www.usenix.org/conference/fast23/presentation/zhong - Per-File Virtualization for Userspace Persistent Memory Filesystems
-17. https://dl.acm.org/doi/10.1145/3568429 - ML to improve storage I/O throughput for ML. 
+15. https://static.usenix.org/events/osdi04/tech/full_papers/renesse/renesse.pdf - Chain Replication for High Availability and Throughput in Storage Services. [15]
+16. https://www.usenix.org/conference/fast23/presentation/zhong - Per-File Virtualization for Userspace Persistent Memory Filesystems [16]
+17. https://dl.acm.org/doi/10.1145/3568429 - ML to improve storage I/O throughput for ML. [17]
+18. https://github.com/deepseek-ai/3FS/blob/main/docs/design_notes.md - Deepseek's 3FS Design [18]
