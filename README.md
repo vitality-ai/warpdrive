@@ -9,7 +9,7 @@ CIAOS is a general purpose KV/Object store focused on workloads that require hig
 ## System Offerings that are currently being built. 
 1. Storage - Key/Value, Files and Blobs. 
 2. Fault Tolerance - Uses Erasure Coding to Optimise Data replication - Seeks contribution for design - [Discussion](https://github.com/cia-labs/Storage-service/issues/72)
-3. User Access Management - Seeks contribution for design. [Discussion](https://github.com/cia-labs/Storage-service/issues/36)
+3. User Access Management - [Discussion](https://github.com/cia-labs/Storage-service/issues/36)
 4. Search - Seeks contribution for design. -   [Discussion](https://github.com/cia-labs/Storage-service/issues/35)
 5. Availability - Seeks contribution for design. [Discussion]()
 6. Client Library - Client package is currently available for Python only.
