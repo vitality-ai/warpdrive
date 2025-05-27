@@ -18,3 +18,4 @@
 16. https://www.usenix.org/conference/fast23/presentation/zhong - Per-File Virtualization for Userspace Persistent Memory Filesystems [16]
 17. https://dl.acm.org/doi/10.1145/3568429 - ML to improve storage I/O throughput for ML. [17]
 18. https://github.com/deepseek-ai/3FS/blob/main/docs/design_notes.md - Deepseek's 3FS Design [18]
+19. https://www.usenix.org/system/files/atc22-yang-tzu-wei.pdf - Google's Cachestack. to determine file placement in SSD/HDD via knapsack [19] 
