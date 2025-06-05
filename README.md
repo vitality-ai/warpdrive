@@ -12,7 +12,6 @@
 [![License](https://img.shields.io/github/license/vitality-ai/Storage-service?style=for-the-badge&logo=law&color=32CD32&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/blob/main/LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-98.6%25-CE422B?style=for-the-badge&logo=rust&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service) 
 [![Last Commit](https://img.shields.io/github/last-commit/vitality-ai/Storage-service?style=for-the-badge&logo=clock&color=9966CC&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/commits/main)
-![Visitors](https://api.visitorbadge.io/api/visitors?path=vitality-ai%2FStorage-service&label=Visitors&labelColor=%23000000&countColor=%23FFD700&style=for-the-badge)
 
 </div>
 
