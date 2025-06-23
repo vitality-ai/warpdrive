@@ -25,7 +25,8 @@ CIAOS is a general purpose KV/Object store focused on workloads that require hig
 3. User Access Management and S3 middleware - [Repo](https://github.com/vitality-ai/Vitality-console)
 4. Search - Seeks contribution for design. -   [Discussion](https://github.com/cia-labs/Storage-service/issues/35)
 5. Availability - Seeks contribution for design. [Discussion]()
-6. Client Library - Client package is currently available for Python only.
+6. Client Library - Client package is currently available for Python only. [Repo](https://github.com/vitality-ai/python-sdk).
+7. Compute and Storage Infrastructure Research - [Repo](https://github.com/vitality-ai/NexCSAD).
 
 ---
 
