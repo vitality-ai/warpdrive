@@ -17,7 +17,7 @@
 
 
 ## About
-CIAOS is a general purpose KV/Object store focused on workloads that require high throughput. Practical Applications which drives our developemt is to support Storage Disaggregated Architectures and AI/ML Workloads . Our current implementation of the object store is based on Facebook's 2008 haystack paper and our road map([Technical Roadmap](https://github.com/vitality-ai/Storage-service/blob/main/Technical-Architecture.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems. [ v0.0.0 Technical Architecture](https://github.com/vitality-ai/Storage-service/blob/main/Technical-Architecture.md). 
+CIAOS is a general purpose KV/Object store focused on workloads that require high throughput. Practical Applications which drives our developemt is to support Storage Disaggregated Architectures and AI/ML Workloads . Our current implementation of the object store is based on Facebook's 2008 haystack paper and our road map([Technical Roadmap](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Roadmap.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems. [ v0.0.0 Technical Architecture](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Architecture.md). 
 
 ## System Offerings that are currently being built. 
 1. Storage - Key/Value, Files and Blobs. 
