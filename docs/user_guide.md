@@ -2,7 +2,7 @@
 
 > **Note:**  
 > These instructions assume you have installed and are running the Storage Service locally.  
-> For setup instructions, see the [Developer's Documentation](../docs.md).  
+> For setup instructions, see the [Developer's Documentation](../docs/setup.md).  
 > Once our cloud offering is available, we will update this guide with details for connecting to the managed service.
 
 ## Getting Started
@@ -78,4 +78,4 @@ ciaos_client.append(key="your_key", data_list=[b"additional_data"])
 
 ---
 
-For advanced usage and development details, see the [Developer's Documentation](../docs.md).
+For advanced usage and development details, see the [Developer's Documentation](../docs/setup.md).
