@@ -37,4 +37,4 @@ See the [User Guide](docs/user_guide.md) for installation, configuration, and AP
 ---
 
 ## Developer's Corner
-For more advanced usage and development details, visit the [Developer's Documentation](https://github.com/cia-labs/Storage-service/blob/main/docs.md).
+For more advanced usage and development details, visit the [Developer's Documentation](https://github.com/cia-labs/Storage-service/blob/main/docs/setup.md).
