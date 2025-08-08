@@ -3,11 +3,8 @@
 
 // @generated
 
-use core::mem;
-use core::cmp::Ordering;
 
 extern crate flatbuffers;
-use self::flatbuffers::{EndianScalar, Follow};
 
 #[allow(unused_imports, dead_code)]
 pub mod store {
@@ -219,8 +216,8 @@ impl core::fmt::Debug for FileDataList<'_> {
 /// catch every error, or be maximally performant. For the
 /// previous, unchecked, behavior use
 /// `root_as_file_data_list_unchecked`.
-pub fn root_as_file_data_list(buf: &[u8]) -> Result<FileDataList, flatbuffers::InvalidFlatbuffer> {
-  flatbuffers::root::<FileDataList>(buf)
+pub fn root_as_file_data_list(buf: &[u8]) -> Result<FileDataList<'_>, flatbuffers::InvalidFlatbuffer> {
+  flatbuffers::root::<FileDataList<'_>>(buf)
 }
 #[inline]
 /// Verifies that a buffer of bytes contains a size prefixed
@@ -229,8 +226,8 @@ pub fn root_as_file_data_list(buf: &[u8]) -> Result<FileDataList, flatbuffers::I
 /// catch every error, or be maximally performant. For the
 /// previous, unchecked, behavior use
 /// `size_prefixed_root_as_file_data_list_unchecked`.
-pub fn size_prefixed_root_as_file_data_list(buf: &[u8]) -> Result<FileDataList, flatbuffers::InvalidFlatbuffer> {
-  flatbuffers::size_prefixed_root::<FileDataList>(buf)
+pub fn size_prefixed_root_as_file_data_list(buf: &[u8]) -> Result<FileDataList<'_>, flatbuffers::InvalidFlatbuffer> {
+  flatbuffers::size_prefixed_root::<FileDataList<'_>>(buf)
 }
 #[inline]
 /// Verifies, with the given options, that a buffer of bytes
@@ -262,15 +259,15 @@ pub fn size_prefixed_root_as_file_data_list_with_opts<'b, 'o>(
 /// Assumes, without verification, that a buffer of bytes contains a FileDataList and returns it.
 /// # Safety
 /// Callers must trust the given bytes do indeed contain a valid `FileDataList`.
-pub unsafe fn root_as_file_data_list_unchecked(buf: &[u8]) -> FileDataList {
-  flatbuffers::root_unchecked::<FileDataList>(buf)
+pub unsafe fn root_as_file_data_list_unchecked(buf: &[u8]) -> FileDataList<'_> {
+  flatbuffers::root_unchecked::<FileDataList<'_>>(buf)
 }
 #[inline]
 /// Assumes, without verification, that a buffer of bytes contains a size prefixed FileDataList and returns it.
 /// # Safety
 /// Callers must trust the given bytes do indeed contain a valid size prefixed `FileDataList`.
-pub unsafe fn size_prefixed_root_as_file_data_list_unchecked(buf: &[u8]) -> FileDataList {
-  flatbuffers::size_prefixed_root_unchecked::<FileDataList>(buf)
+pub unsafe fn size_prefixed_root_as_file_data_list_unchecked(buf: &[u8]) -> FileDataList<'_> {
+  flatbuffers::size_prefixed_root_unchecked::<FileDataList<'_>>(buf)
 }
 #[inline]
 pub fn finish_file_data_list_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(

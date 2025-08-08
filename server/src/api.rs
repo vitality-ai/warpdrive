@@ -1,5 +1,5 @@
 //api.rs
-use actix_web::{web, post, HttpRequest, HttpResponse,Error };
+use actix_web::{web, HttpRequest, HttpResponse,Error };
 use log::info;
 
 use crate::service::{get_service, put_service ,append_service , delete_service, update_key_service,update_service};
