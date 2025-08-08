@@ -14,7 +14,7 @@ To install the FlatBuffers compiler (`flatc`), execute the following commands:
 ```bash
 git clone https://github.com/google/flatbuffers.git
 cd flatbuffers
-cmake
+cmake .
 make
 ./flattests # Quick test; should print "ALL TESTS PASSED"
 sudo make install # Install FlatBuffers
