@@ -28,7 +28,7 @@ flatc --version # Verify FlatBuffers installation
 
 ```bash
 git clone https://github.com/cia-labs/Storage-service.git
-cd Storage-service/server
+cd ciaos/server
 ```  
 
 ---
