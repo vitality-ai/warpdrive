@@ -44,7 +44,7 @@ Install the required dependencies first:
 ### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/cia-labs/ciaos.git
+git clone https://github.com/vitality-ai/ciaos.git
 cd ciaos/server
 ```
 
