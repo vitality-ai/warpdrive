@@ -88,7 +88,7 @@ You can verify your setup by running a demo client. Currently, a demo client is 
 
 4. **Navigate to the demo directory:**
    ```bash
-   cd /home/nash/cj/CIAOS/ciaos/demo
+   cd ciaos/demo
    ```
 
 5. **Run the test client:**
