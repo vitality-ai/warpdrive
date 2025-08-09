@@ -44,7 +44,7 @@ Install the required dependencies first:
 ### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/vitality-ai/ciaos.git
+git clone --recurse-submodules https://github.com/vitality-ai/ciaos.git
 cd ciaos/server
 ```
 
@@ -63,6 +63,41 @@ cargo build
 ```bash
 cargo run
 ```
+
+---
+ 
+### 5. Test the Application Locally with the Demo Client App
+
+You can verify your setup by running a demo client. Currently, a demo client is available for Python. In order to the run the demo client you need to install our client package by following the below steps.
+
+1. **Navigate to the Python SDK directory:**  
+   (Use your local path)
+   ```bash
+   cd ciaos/client/python-sdk
+   ```
+
+2. **Clone and initialize submodules (if not already done):**
+   ```bash
+   git submodule update --init --recursive
+   ```
+
+3. **Install the SDK in editable mode:**
+   ```bash
+   pip install -e .
+   ```
+
+4. **Navigate to the demo directory:**
+   ```bash
+   cd /home/nash/cj/CIAOS/ciaos/demo
+   ```
+
+5. **Run the test client:**
+   ```bash
+   python3 pythonTestClient.py
+   ```
+
+   This script will interact with your running server and perform basic upload, download, update, and delete operations.
+   Check the outputs to confirm all functionalities are working as expected.
 
 ---
 
