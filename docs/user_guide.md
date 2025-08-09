@@ -3,7 +3,7 @@
 > **Note:**  
 > These instructions assume you have installed and are running the Storage Service locally.  
 > For setup instructions, see the [Developer's Documentation](../docs/setup.md).  
-> Once our cloud offering is available, we will update this guide with details for connecting to the managed service.
+> Once our cloud offering is available, we will update this guide with details for connecting to the managed service. However if you are a developer we suggest you follow our [Developer's Documentation](../docs/setup.md) which is self contained to get you started.  
 
 ## Getting Started
 
