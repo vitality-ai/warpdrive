@@ -9,8 +9,24 @@ use log::info;
  */ 
 mod storage;
 
-// Handles management of keys and offset/size lists
+// Metadata storage abstraction layer
+mod metadata;
+
+// Configuration for metadata storage
+mod config;
+
+// SQLite implementation of metadata storage
+mod sqlite_store;
+
+// Mock implementation for testing
+mod mock_store;
+
+// Legacy database module for backward compatibility
 mod database;
+
+// Integration tests
+#[cfg(test)]
+mod integration_tests;
 
 // Handles serialization and deserialization of file offsets and sizes into binary format for SQL blob storage
 mod util;
