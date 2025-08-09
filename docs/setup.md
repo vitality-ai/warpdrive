@@ -1,87 +1,96 @@
 # Developer's Guide
 
-## Local Setup  
-**Follow these steps to set up and run the storage server locally.**  
+## 🚀 Local Setup
 
-### Prerequisites  
+Follow these steps to set up and run the storage server locally:
+
+---
+
+### 1. Prerequisites
+
+Install the required dependencies first:
 
 - **Rust**  
-- **libsqlite3-dev**  
-- **FlatBuffers Compiler (`flatc`)**  
+  [Install Rust](https://rustup.rs/) with:
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
 
-To install the FlatBuffers compiler (`flatc`), execute the following commands:  
+- **libsqlite3-dev** & **FlatBuffers Compiler (`flatc`)**
 
-```bash
-git clone https://github.com/google/flatbuffers.git
-cd flatbuffers
-cmake .
-make
-./flattests # Quick test; should print "ALL TESTS PASSED"
-sudo make install # Install FlatBuffers
-sudo ldconfig # Configure the dynamic linker
-flatc --version # Verify FlatBuffers installation
-```  
+  **For Ubuntu/Debian:**
+  ```bash
+  sudo apt-get update && sudo apt-get install -y libsqlite3-dev flatbuffers-compiler
+  ```
+
+  **For macOS (with Homebrew):**
+  ```bash
+  brew install sqlite3 flatbuffers
+  ```
+
+  **Manual FlatBuffers install (if needed):**
+  ```bash
+  git clone https://github.com/google/flatbuffers.git
+  cd flatbuffers
+  cmake .
+  make
+  sudo make install
+  sudo ldconfig
+  flatc --version
+  ```
 
 ---
 
-### Clone the Repository  
+### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/cia-labs/Storage-service.git
+git clone https://github.com/cia-labs/ciaos.git
 cd ciaos/server
-```  
+```
 
 ---
 
-### Building the Rust Server  
+### 3. Build the Rust Server
 
 ```bash
 cargo build
-```  
+```
 
 ---
 
-### Running the Application  
+### 4. Run the Application
 
 ```bash
 cargo run
-```  
+```
 
 ---
 
-# Deploying the Storage Service as a Docker Container  
+## 🐳 Docker (Optional)
 
-To deploy the storage service as a container, follow these steps:  
+Deploy the storage service in a Docker container:
 
-### Build the Docker Image  
-
-Use the provided [Dockerfile](https://github.com/cia-labs/Storage-service/blob/main/Dockerfile) in the GitHub repository to build the image:  
-
+**Build the Docker image:**
 ```bash
 docker build -t ciaos .
-```  
----
-### (Optional) Modifying the Exposed Port   
+```
 
-If you wish to change the exposed port:  
+**(Optional) Change the exposed port:**
+- Update the port in `server/src/main.rs` (e.g., `9710`)
+- Update the `EXPOSE` line in the Dockerfile (e.g., `EXPOSE 9710`)
 
-1. Update the **bind address** in `Storage-service/server/src/main.rs`:  
-
-```rust
-.bind(("0.0.0.0", 9710))? // Default is port 9710
-```  
-
-2. Modify the `EXPOSE` directive in the Dockerfile to reflect the new port:  
-
-```dockerfile
-# Change the exposed port
-EXPOSE 9710
-```  
-
-### Run the Docker Container  
-
+**Run the Docker container:**
 ```bash
 docker run -p 9710:9710 ciaos
-```  
+```
 
-The storage service should now be accessible on the specified port.
+---
+
+## 💡 Troubleshooting
+
+- Ensure all prerequisites are installed and available in your PATH.
+- For advanced help, see [Rust docs](https://doc.rust-lang.org/book/) or [FlatBuffers docs](https://google.github.io/flatbuffers/).
+
+---
+
+Happy Hacking! 🚀
