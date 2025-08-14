@@ -223,3 +223,62 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
 
 }
 
+
+// All unit tests will currently be here. 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_functionality() {
+        let test_string = "test_user".to_string();
+        assert_eq!(test_string, "test_user");
+        println!("Basic test passed!");
+    }
+
+    #[test]
+    fn test_header_handler_with_valid_user() {
+        use actix_web::test;
+        
+        // Create a test request with the User header
+        let req = test::TestRequest::default()
+            .insert_header(("User", "test_user"))
+            .to_http_request();
+        
+        // Call header_handler function
+        let result = header_handler(req);
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test_user");
+        println!("Header handler with valid user test passed!");
+    }
+
+    #[test]
+    fn test_header_handler_missing_user_header() {
+        use actix_web::test;
+        
+        let req = test::TestRequest::default()
+            .to_http_request();
+        
+        let result = header_handler(req);
+        
+        assert!(result.is_err());
+        println!("Header handler missing user header test passed!");
+    }
+
+    #[test]
+    fn test_header_handler_with_empty_user() {
+        use actix_web::test;
+        
+        let req = test::TestRequest::default()
+            .insert_header(("User", ""))
+            .to_http_request();
+        
+        let result = header_handler(req);
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+        println!("Header handler with empty user test passed!");
+    }
+}
