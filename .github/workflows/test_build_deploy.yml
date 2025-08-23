@@ -25,6 +25,14 @@ jobs:
         override: true
         components: clippy
 
+    - name: Build project
+      working-directory: server
+      run: cargo build
+
+    - name: Run unit tests
+      working-directory: server
+      run: cargo test
+
     - name: Lint with Clippy (Errors Only)
       working-directory: server
       run: |
