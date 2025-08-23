@@ -44,8 +44,8 @@ Install the required dependencies first:
 ### 2. Clone the Repository
 
 ```bash
-git clone --recurse-submodules https://github.com/vitality-ai/ciaos.git
-cd ciaos/server
+git clone --recurse-submodules https://github.com/vitality-ai/warpdrive.git
+cd warpdrive/server
 ```
 
 ---
@@ -73,7 +73,7 @@ You can verify your setup by running a demo client. Currently, a demo client is 
 1. **Navigate to the Python SDK directory:**  
    (Use your local path)
    ```bash
-   cd ciaos/client/python-sdk
+   cd warpdrive/client/python-sdk
    ```
 
 2. **Clone and initialize submodules (if not already done):**
@@ -88,7 +88,7 @@ You can verify your setup by running a demo client. Currently, a demo client is 
 
 4. **Navigate to the demo directory:**
    ```bash
-   cd ciaos/demo
+   cd warpdrive/demo
    ```
 
 5. **Run the test client:**
@@ -107,7 +107,7 @@ Deploy the storage service in a Docker container:
 
 **Build the Docker image:**
 ```bash
-docker build -t ciaos .
+docker build -t warpdrive .
 ```
 
 **(Optional) Change the exposed port:**
@@ -116,7 +116,7 @@ docker build -t ciaos .
 
 **Run the Docker container:**
 ```bash
-docker run -p 9710:9710 ciaos
+docker run -p 9710:9710 warpdrive
 ```
 
 ---
