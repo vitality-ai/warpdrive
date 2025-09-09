@@ -8,7 +8,7 @@ use log_mdc;
 
 
 use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
-use crate::database::Database;
+use crate::metadata_service::MetadataService;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 
 
@@ -28,7 +28,7 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     let user = header_handler(req)?;
 
-    let db = Database::new(&user)?;
+    let db = MetadataService::new(&user)?;
     if db.check_key(&key).map_err(ErrorInternalServerError)? {
         warn!("Key already exists: {}", key);
         return Ok(HttpResponse::BadRequest().body("Key already exists"));
@@ -71,7 +71,7 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
 
     let user = header_handler(req)?;
 
-    let db = Database::new(&user)?;
+    let db = MetadataService::new(&user)?;
     db.check_key_nonexistance(&key)?;
     info!("Retrieving data for key: {}", key);
 
@@ -98,7 +98,7 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
 pub async fn append_service(key: String, mut payload: web::Payload, req: HttpRequest ) -> Result<HttpResponse, Error> {
     let user = header_handler(req)?;
 
-    let db = Database::new(&user)?;
+    let db = MetadataService::new(&user)?;
     db.check_key_nonexistance(&key)?;
     info!("Starting chunk load");
     let mut bytes = BytesMut::new();
@@ -151,7 +151,7 @@ pub async fn delete_service(key: String, req: HttpRequest)-> Result<HttpResponse
 
     let user = header_handler(req)?;
 
-    let db = Database::new(&user)?;
+    let db = MetadataService::new(&user)?;
     db.check_key_nonexistance(&key)?;
     let offset_size_bytes = match db.get_offset_size_lists(&key) {
         Ok(offset_size_bytes) => offset_size_bytes,
@@ -175,7 +175,7 @@ pub async fn update_key_service(old_key: String, new_key: String, req: HttpReque
     
     let user = header_handler(req)?;
 
-    let db = Database::new(&user)?;
+    let db = MetadataService::new(&user)?;
     db.check_key_nonexistance(&old_key)?;
     // Update the key in the database
     match db.update_key_from_db(&old_key, &new_key) {
@@ -187,7 +187,7 @@ pub async fn update_key_service(old_key: String, new_key: String, req: HttpReque
 pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRequest ) ->  Result<HttpResponse, Error>{
     let user = header_handler(req)?;
 
-    let db = Database::new(&user)?;
+    let db = MetadataService::new(&user)?;
     db.check_key_nonexistance(&key)?;
 
     info!("Starting chunk load");
