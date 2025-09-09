@@ -13,6 +13,19 @@ use std::env;
 
 use crate::util::flatbuffer_store_generated::store::{FileDataList, FileData, FileDataArgs, FileDataListArgs};
 
+/// Binary Storage abstraction layer
+/// Allows swapping between different storage backends (local filesystem, distributed systems, etc.)
+pub trait BinaryStorage {
+    /// Write flatbuffer data and return offset/size pairs for stored files
+    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<Vec<(u64, u64)>, Error>;
+    
+    /// Read data using offset/size pairs and return flatbuffer data
+    fn read_data(&self, user_id: &str, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error>;
+    
+    /// Log deletion of data identified by key and offset/size pairs
+    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: Vec<(u64, u64)>) -> Result<(), Error>;
+}
+
 
 fn get_storage_directory() -> PathBuf {
     // Try to get the storage directory from environment variable
@@ -215,4 +228,133 @@ pub fn delete_and_log(user : &str,key: &str, offset_size_list: Vec<(u64, u64)>) 
     
         info!("Deleted and logged data for key: {}", key);
         Ok(())
+}
+
+/// Local XFS Binary Storage implementation
+/// Uses the existing file-per-user approach with XFS filesystem
+pub struct LocalXFSBinaryStore;
+
+impl LocalXFSBinaryStore {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl BinaryStorage for LocalXFSBinaryStore {
+    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
+        write_files_to_storage(user_id, data)
+    }
+
+    fn read_data(&self, user_id: &str, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
+        get_files_from_storage(user_id, offset_size_list)
+    }
+
+    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: Vec<(u64, u64)>) -> Result<(), Error> {
+        delete_and_log(user_id, key, offset_size_list)
+    }
+}
+
+/// Storage configuration enum for backend selection
+#[derive(Debug, Clone)]
+pub enum StorageBackend {
+    LocalXFS,
+    #[cfg(test)]
+    Mock,
+}
+
+/// Storage manager that provides the configured storage backend
+pub struct StorageManager;
+
+impl StorageManager {
+    /// Get the configured storage backend based on environment variables
+    pub fn get_storage() -> Box<dyn BinaryStorage> {
+        let backend = match env::var("STORAGE_BACKEND") {
+            Ok(backend_str) => match backend_str.to_lowercase().as_str() {
+                #[cfg(test)]
+                "mock" => StorageBackend::Mock,
+                _ => StorageBackend::LocalXFS,
+            }
+            Err(_) => StorageBackend::LocalXFS,
+        };
+
+        match backend {
+            StorageBackend::LocalXFS => Box::new(LocalXFSBinaryStore::new()),
+            #[cfg(test)]
+            StorageBackend::Mock => Box::new(MockBinaryStorage::new()),
+        }
+    }
+}
+
+/// Mock Binary Storage implementation for testing
+/// Stores data in memory without any disk I/O operations
+#[cfg(test)]
+pub struct MockBinaryStorage {
+    next_offset: u64,
+}
+
+#[cfg(test)]
+impl MockBinaryStorage {
+    pub fn new() -> Self {
+        Self {
+            next_offset: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl BinaryStorage for MockBinaryStorage {
+    fn write_data(&self, _user_id: &str, data: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
+        // Simulate the flatbuffer parsing and return mock offset/size pairs
+        let file_data_list = match root::<FileDataList>(data) {
+            Ok(data) => data,
+            Err(e) => return Err(ErrorBadRequest(format!("Failed to parse FlatBuffers data: {:?}", e))),
+        };
+        
+        let files = match file_data_list.files() {
+            Some(files) => files,
+            None => return Err(ErrorBadRequest("No files found in FlatBuffers data")),
+        };
+
+        let mut offset_size_list = Vec::new();
+        let mut current_offset = self.next_offset;
+        
+        for file_data in files.iter() {
+            let data = match file_data.data() {
+                Some(data) => data,
+                None => continue,
+            };
+            
+            let size = data.bytes().len() as u64;
+            offset_size_list.push((current_offset, size));
+            current_offset += size;
+        }
+        
+        Ok(offset_size_list)
+    }
+
+    fn read_data(&self, _user_id: &str, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
+        // Create a mock flatbuffer response
+        let mut builder = FlatBufferBuilder::new();
+        let mut file_data_vec = Vec::new();
+        
+        for &(_offset, size) in offset_size_list.iter() {
+            // Create mock data
+            let mock_data = vec![0u8; size as usize];
+            let data_vector = builder.create_vector(&mock_data);
+            let file_data = FileData::create(&mut builder, &FileDataArgs { data: Some(data_vector) });
+            file_data_vec.push(file_data);
+        }
+        
+        let files = builder.create_vector(&file_data_vec);
+        let file_data_list = FileDataList::create(&mut builder, &FileDataListArgs { files: Some(files) });
+        builder.finish(file_data_list, None);
+        
+        Ok(builder.finished_data().to_vec())
+    }
+
+    fn log_deletion(&self, _user_id: &str, key: &str, _offset_size_list: Vec<(u64, u64)>) -> Result<(), Error> {
+        // Mock implementation - just log the deletion
+        info!("Mock: Deleted and logged data for key: {}", key);
+        Ok(())
+    }
 }

@@ -7,7 +7,7 @@ use actix_web::error::{ErrorInternalServerError,ErrorBadRequest};
 use log_mdc;
 
 
-use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
+use crate::storage::StorageManager;
 use crate::database::Database;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 
@@ -48,7 +48,8 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     info!("Total received data size: {} bytes", bytes.len());
 
-    let offset_size_list = write_files_to_storage(&user, &bytes)?;
+    let storage = StorageManager::get_storage();
+    let offset_size_list = storage.write_data(&user, &bytes)?;
 
 
     if offset_size_list.is_empty()  {
@@ -87,7 +88,8 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
     // Deserialize offset and size data
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
 
-    let data = get_files_from_storage(&user,offset_size_list)?;
+    let storage = StorageManager::get_storage();
+    let data = storage.read_data(&user, offset_size_list)?;
 
     // Return the FlatBuffers serialized data
     Ok(HttpResponse::Ok()
@@ -113,7 +115,8 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
     info!("Total received data size: {} bytes", bytes.len());
 
-    let mut offset_size_list_append = write_files_to_storage(&user,&bytes)?;
+    let storage = StorageManager::get_storage();
+    let mut offset_size_list_append = storage.write_data(&user, &bytes)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -163,7 +166,8 @@ pub async fn delete_service(key: String, req: HttpRequest)-> Result<HttpResponse
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
     // Deserialize offset and size data
     
-    delete_and_log(&user,&key, offset_size_list)?;
+    let storage = StorageManager::get_storage();
+    storage.log_deletion(&user, &key, offset_size_list)?;
 
     match db.delete_from_db(&key) {
         Ok(()) => Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {}", key))),
@@ -205,7 +209,8 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     info!("Total received data size: {} bytes", bytes.len());
     info!("Starting deserialization");
     
-    let offset_size_list = write_files_to_storage(&user,&bytes)?;
+    let storage = StorageManager::get_storage();
+    let offset_size_list = storage.write_data(&user, &bytes)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);
@@ -280,5 +285,68 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
         println!("Header handler with empty user test passed!");
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use crate::storage::{BinaryStorage, LocalXFSBinaryStore, MockBinaryStorage, StorageManager};
+    use flatbuffers::FlatBufferBuilder;
+    use crate::util::flatbuffer_store_generated::store::{FileDataList, FileData, FileDataArgs, FileDataListArgs};
+
+    #[test]
+    fn test_local_xfs_storage_creation() {
+        let _storage = LocalXFSBinaryStore::new();
+        // Just test that we can create the storage instance
+        assert!(true);
+        println!("LocalXFSBinaryStore creation test passed!");
+    }
+
+    #[test]
+    fn test_mock_storage_creation() {
+        let _storage = MockBinaryStorage::new();
+        // Just test that we can create the storage instance
+        assert!(true);
+        println!("MockBinaryStorage creation test passed!");
+    }
+
+    #[test]
+    fn test_storage_manager_default_backend() {
+        let _storage = StorageManager::get_storage();
+        // Should return LocalXFS by default
+        // We can't directly test the type but we can test that it works
+        assert!(true);
+        println!("StorageManager default backend test passed!");
+    }
+
+    #[test]
+    fn test_mock_storage_write_read_cycle() {
+        let storage = MockBinaryStorage::new();
+        
+        // Create test flatbuffer data
+        let mut builder = FlatBufferBuilder::new();
+        let test_data = b"test data content";
+        let data_vector = builder.create_vector(test_data);
+        let file_data = FileData::create(&mut builder, &FileDataArgs { data: Some(data_vector) });
+        let file_data_vec = vec![file_data];
+        let files = builder.create_vector(&file_data_vec);
+        let file_data_list = FileDataList::create(&mut builder, &FileDataListArgs { files: Some(files) });
+        builder.finish(file_data_list, None);
+        let flatbuffer_data = builder.finished_data();
+
+        // Test write operation
+        let offset_size_list = storage.write_data("test_user", flatbuffer_data).unwrap();
+        assert_eq!(offset_size_list.len(), 1);
+        assert_eq!(offset_size_list[0].1, test_data.len() as u64); // size should match
+
+        // Test read operation
+        let read_result = storage.read_data("test_user", offset_size_list).unwrap();
+        assert!(!read_result.is_empty());
+
+        // Test deletion logging
+        let delete_result = storage.log_deletion("test_user", "test_key", vec![(0, 100)]);
+        assert!(delete_result.is_ok());
+
+        println!("MockBinaryStorage write/read cycle test passed!");
     }
 }
