@@ -164,3 +164,10 @@ server/app/crud/db_name.db
 server/storage
 server/metadata
 server/Cargo.lock
+
+
+#tla
+tla/*TTrace*
+tla/*.jar
+tla/states
+
