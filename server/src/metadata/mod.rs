@@ -8,6 +8,9 @@ pub mod sqlite_store;
 pub mod mock_store;
 pub mod config;
 
+#[cfg(test)]
+mod comprehensive_test;
+
 use actix_web::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

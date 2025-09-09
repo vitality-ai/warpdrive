@@ -1,4 +1,9 @@
 //database.rs
+//
+// DEPRECATED: This module is deprecated in favor of the metadata storage abstraction.
+// Please use `MetadataService` from the `metadata_service` module instead.
+// This module is kept for backward compatibility but will be removed in a future version.
+
 use std::sync::Mutex;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::sync::Arc;
