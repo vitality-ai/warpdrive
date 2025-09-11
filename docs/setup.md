@@ -58,7 +58,39 @@ cargo build
 
 ---
 
-### 4. Run the Application
+### 4. Configuration
+
+#### Storage Backend Configuration
+
+The server supports different storage backends through the `STORAGE_BACKEND` environment variable:
+
+- **LocalXFS** (default): Uses local filesystem with XFS-optimized binary storage
+- **Mock** (testing only): In-memory storage for testing without disk I/O
+
+**Example:**
+```bash
+# Use default LocalXFS backend
+cargo run
+
+# Use mock backend for testing (only available in test builds)
+STORAGE_BACKEND=mock cargo test
+```
+
+#### Storage Directory Configuration
+
+Configure the storage directory using the `STORAGE_DIRECTORY` environment variable:
+
+```bash
+# Set custom storage directory
+export STORAGE_DIRECTORY=/path/to/storage
+cargo run
+```
+
+If not set, the server uses `./storage` as the default directory.
+
+---
+
+### 5. Run the Application
 
 ```bash
 cargo run
@@ -66,7 +98,7 @@ cargo run
 
 ---
  
-### 5. Test the Application Locally with the Demo Client App
+### 6. Test the Application Locally with the Demo Client App
 
 You can verify your setup by running a demo client. Currently, a demo client is available for Python. In order to the run the demo client you need to install our client package by following the below steps.
 
