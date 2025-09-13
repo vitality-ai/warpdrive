@@ -164,6 +164,8 @@ server/app/crud/db_name.db
 server/storage
 server/metadata
 server/Cargo.lock
+# Test files generated during storage testing
+server/*.json
 
 
 #tla
