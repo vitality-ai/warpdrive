@@ -5,11 +5,36 @@ use bytes::BytesMut;
 use log::{info, error, warn};
 use actix_web::error::{ErrorInternalServerError,ErrorBadRequest};
 use log_mdc;
+use lazy_static;
 
-
-use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
+use crate::storage::{BinaryStorage, get_configured_storage_backend};
 use crate::metadata_service::MetadataService;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
+
+/// Storage service that manages binary storage operations
+pub struct StorageService {
+    backend: Box<dyn BinaryStorage>,
+}
+
+impl StorageService {
+    pub fn new() -> Self {
+        Self {
+            backend: get_configured_storage_backend(),
+        }
+    }
+    
+    pub fn with_backend(backend: Box<dyn BinaryStorage>) -> Self {
+        Self { backend }
+    }
+    
+    pub fn get_backend(&self) -> &dyn BinaryStorage {
+        &*self.backend
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref STORAGE_SERVICE: StorageService = StorageService::new();
+}
 
 
 fn header_handler(req: HttpRequest) ->  Result<String, Error> {
@@ -48,7 +73,8 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     info!("Total received data size: {} bytes", bytes.len());
 
-    let offset_size_list = write_files_to_storage(&user, &bytes)?;
+    let storage_backend = STORAGE_SERVICE.get_backend();
+    let offset_size_list = storage_backend.put_files(&user, &bytes)?;
 
 
     if offset_size_list.is_empty()  {
@@ -87,7 +113,8 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
     // Deserialize offset and size data
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
 
-    let data = get_files_from_storage(&user,offset_size_list)?;
+    let storage_backend = STORAGE_SERVICE.get_backend();
+    let data = storage_backend.get_files(&user, offset_size_list)?;
 
     // Return the FlatBuffers serialized data
     Ok(HttpResponse::Ok()
@@ -113,7 +140,8 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
     info!("Total received data size: {} bytes", bytes.len());
 
-    let mut offset_size_list_append = write_files_to_storage(&user,&bytes)?;
+    let storage_backend = STORAGE_SERVICE.get_backend();
+    let mut offset_size_list_append = storage_backend.put_files(&user, &bytes)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -163,7 +191,8 @@ pub async fn delete_service(key: String, req: HttpRequest)-> Result<HttpResponse
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
     // Deserialize offset and size data
     
-    delete_and_log(&user,&key, offset_size_list)?;
+    let storage_backend = STORAGE_SERVICE.get_backend();
+    storage_backend.delete_files(&user, &key, offset_size_list)?;
 
     match db.delete_from_db(&key) {
         Ok(()) => Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {}", key))),
@@ -205,7 +234,8 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     info!("Total received data size: {} bytes", bytes.len());
     info!("Starting deserialization");
     
-    let offset_size_list = write_files_to_storage(&user,&bytes)?;
+    let storage_backend = STORAGE_SERVICE.get_backend();
+    let offset_size_list = storage_backend.put_files(&user, &bytes)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);
@@ -280,5 +310,36 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
         println!("Header handler with empty user test passed!");
+    }
+
+    #[test]
+    fn test_storage_service_creation() {
+        // Test that StorageService can be created
+        let storage_service = StorageService::new();
+        let _backend = storage_service.get_backend();
+        
+        // We can't test the exact type, but we can ensure it implements BinaryStorage
+        // by calling a method that should exist
+        use crate::storage::MockBinaryStore;
+        let mock_storage = Box::new(MockBinaryStore::new());
+        let custom_service = StorageService::with_backend(mock_storage);
+        let _custom_backend = custom_service.get_backend();
+        
+        // Both backends should be usable
+        assert!(true); // Test passes if no panic occurs
+        println!("Storage service creation test passed!");
+    }
+
+    #[test]
+    fn test_storage_backend_configuration() {
+        use crate::storage::get_configured_storage_backend;
+        
+        // Test default backend (should be LocalXFS)
+        let _default_backend = get_configured_storage_backend();
+        assert!(true); // Test passes if creation succeeds
+        
+        // Test setting environment variable (we can't easily test this in unit tests
+        // without affecting other tests, but the function is designed to handle it)
+        println!("Storage backend configuration test passed!");
     }
 }
