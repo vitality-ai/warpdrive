@@ -11,7 +11,6 @@ use actix_web::error::{ErrorInternalServerError, ErrorNotFound};
 use log::{warn, info};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use std::hash::{Hash, Hasher};
 
 fn get_storage_directory() -> PathBuf {
     // Try to get the storage directory from environment variable
@@ -87,9 +86,33 @@ impl LocalXFSBinaryStore {
         file.read_exact(&mut buffer)?;
         Ok(buffer)
     }
+}
+
+impl Storage for LocalXFSBinaryStore {
+    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+        // Write data to the binary file and return real offset/size (matches original behavior)
+        let (offset, size) = self.append_to_file(user_id, data)
+            .map_err(ErrorInternalServerError)?;
+        
+        info!("Wrote data for user {} at offset {} with size {}", 
+              user_id, offset, size);
+        
+        Ok((offset, size))
+    }
     
-    /// Log deletion of an object to a JSON file
-    fn log_deletion(&self, user_id: &str, object_id: &str, offset: u64, size: u64) -> Result<(), Error> {
+    fn read_data(&self, user_id: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        // Read data from the binary file at specific offset/size (matches original behavior)
+        let data = self.read_from_file(user_id, offset, size)
+            .map_err(ErrorInternalServerError)?;
+        
+        info!("Read data for user {} from offset {} with size {}", 
+              user_id, offset, size);
+        
+        Ok(data)
+    }
+    
+    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        // Log deletion to JSON file (matches original behavior)
         let log_path = format!("{}.json", user_id);
         let mut log_file = OpenOptions::new()
             .create(true)
@@ -98,8 +121,8 @@ impl LocalXFSBinaryStore {
             .map_err(ErrorInternalServerError)?;
             
         let log_entry = json!({
-            object_id: {
-                "offset_size": [(offset, size)]
+            key: {
+                "offset_size": offset_size_list
             }
         });
         
@@ -108,11 +131,12 @@ impl LocalXFSBinaryStore {
         writeln!(log_file, "{}", log_entry.to_string())
             .map_err(ErrorInternalServerError)?;
             
+        info!("Logged deletion for user {} key {} with {} chunks", 
+              user_id, key, offset_size_list.len());
+        
         Ok(())
     }
-}
-
-impl Storage for LocalXFSBinaryStore {
+    
     fn put_object(&self, user_id: &str, object_id: &str, data: &[u8]) -> Result<(), Error> {
         // Write data to the binary file
         let (offset, size) = self.append_to_file(user_id, data)
@@ -158,9 +182,9 @@ impl Storage for LocalXFSBinaryStore {
         
         if let Some(user_objects) = index.get_mut(user_id) {
             if let Some((offset, size)) = user_objects.remove(object_id) {
-                // Log the deletion
+                // Log the deletion using the low-level interface
                 drop(index); // Release the lock before calling log_deletion
-                self.log_deletion(user_id, object_id, offset, size)?;
+                self.log_deletion(user_id, object_id, &[(offset, size)])?;
                 
                 info!("Deleted object {} for user {} (was at offset {} with size {})", 
                       object_id, user_id, offset, size);
@@ -217,7 +241,9 @@ mod tests {
         assert_eq!(retrieved_data, test_data);
         
         // Test verify_object (basic implementation)
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
         test_data.hash(&mut hasher);
         let checksum = hasher.finish().to_be_bytes();
         assert!(store.verify_object(user_id, object_id, &checksum).unwrap());

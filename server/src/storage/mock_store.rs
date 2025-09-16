@@ -60,6 +60,53 @@ impl Default for MockBinaryStore {
 }
 
 impl Storage for MockBinaryStore {
+    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+        // Simulate append behavior with virtual offset/size
+        let mut store = self.data.lock().unwrap();
+        let user_objects = store.entry(user_id.to_string()).or_insert_with(HashMap::new);
+        
+        // Calculate a virtual offset based on existing data size
+        let offset = user_objects.values().map(|data| data.len() as u64).sum::<u64>();
+        let size = data.len() as u64;
+        
+        // Store with a unique key based on offset
+        let key = format!("chunk_{}", offset);
+        user_objects.insert(key, data.to_vec());
+        
+        info!("Mock: Wrote data for user {} at virtual offset {} with size {}", 
+              user_id, offset, size);
+        
+        Ok((offset, size))
+    }
+    
+    fn read_data(&self, user_id: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        // For mock, try to find data by virtual offset
+        let store = self.data.lock().unwrap();
+        
+        if let Some(user_objects) = store.get(user_id) {
+            let key = format!("chunk_{}", offset);
+            if let Some(data) = user_objects.get(&key) {
+                if data.len() as u64 == size {
+                    info!("Mock: Read data for user {} from virtual offset {} with size {}", 
+                          user_id, offset, size);
+                    return Ok(data.clone());
+                }
+            }
+        }
+        
+        Err(ErrorNotFound(format!(
+            "Data not found for user {} at offset {} with size {}", 
+            user_id, offset, size
+        )))
+    }
+    
+    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        // Mock implementation - just log the deletion
+        info!("Mock: Logged deletion for user {} key {} with {} chunks", 
+              user_id, key, offset_size_list.len());
+        Ok(())
+    }
+    
     fn put_object(&self, user_id: &str, object_id: &str, data: &[u8]) -> Result<(), Error> {
         let mut store = self.data.lock().unwrap();
         let user_objects = store.entry(user_id.to_string()).or_insert_with(HashMap::new);

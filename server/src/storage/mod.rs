@@ -22,13 +22,22 @@ use crate::util::flatbuffer_store_generated::store::{FileDataList, FileData, Fil
 
 /// Trait defining the binary storage interface
 pub trait Storage: Send + Sync {
-    /// Store binary data for an object
+    /// Write data for a user and return (offset, size) - simulates the original append behavior
+    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<(u64, u64), Error>;
+    
+    /// Read data for a user from specific offset and size
+    fn read_data(&self, user_id: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error>;
+    
+    /// Log deletion for a user with key and offset/size information
+    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
+    
+    /// Store binary data for an object (higher-level interface)
     fn put_object(&self, user_id: &str, object_id: &str, data: &[u8]) -> Result<(), Error>;
     
-    /// Retrieve binary data for an object
+    /// Retrieve binary data for an object (higher-level interface)
     fn get_object(&self, user_id: &str, object_id: &str) -> Result<Vec<u8>, Error>;
     
-    /// Delete binary data for an object
+    /// Delete binary data for an object (higher-level interface)
     fn delete_object(&self, user_id: &str, object_id: &str) -> Result<(), Error>;
     
     /// Verify object integrity using checksum
@@ -73,16 +82,10 @@ pub fn write_files_to_storage(user: &str, body: &[u8]) -> Result<Vec<(u64, u64)>
             }
         };
 
-        let object_id = format!("file_{}", index);
-        match STORAGE_INSTANCE.put_object(user, &object_id, data.bytes()) {
-            Ok(()) => {
-                // For compatibility, we need to simulate offset/size
-                // In the new abstraction, we don't expose internal offset/size details
-                // But we return dummy values for now to maintain API compatibility
-                let offset = index as u64 * 1000; // Dummy offset
-                let size = data.bytes().len() as u64;
+        match STORAGE_INSTANCE.write_data(user, data.bytes()) {
+            Ok((offset, size)) => {
                 offset_size_list.push((offset, size));
-                info!("Written file {} as object {} with size {}", index, object_id, size);
+                info!("Written file {} at offset {} with size {}", index, offset, size);
             }
             Err(e) => {
                 error!("Failed to write file {} to storage: {}", index, e);
@@ -101,9 +104,8 @@ pub fn get_files_from_storage(user: &str, offset_size_list: Vec<(u64, u64)>) -> 
     let mut file_data_vec = Vec::new();
     info!("Building the flatbuffer to share");
     
-    for (index, &(_offset, _size)) in offset_size_list.iter().enumerate() {
-        let object_id = format!("file_{}", index);
-        let data = STORAGE_INSTANCE.get_object(user, &object_id)
+    for &(offset, size) in offset_size_list.iter() {
+        let data = STORAGE_INSTANCE.read_data(user, offset, size)
             .map_err(ErrorInternalServerError)?;
         
         let data_vector = builder.create_vector(&data);
@@ -121,11 +123,7 @@ pub fn get_files_from_storage(user: &str, offset_size_list: Vec<(u64, u64)>) -> 
 
 /// Legacy API compatibility: Handles the deletion process and logs the deletion details
 pub fn delete_and_log(user: &str, key: &str, offset_size_list: Vec<(u64, u64)>) -> Result<(), Error> {
-    for (index, &(_offset, _size)) in offset_size_list.iter().enumerate() {
-        let object_id = format!("file_{}", index);
-        STORAGE_INSTANCE.delete_object(user, &object_id)?;
-    }
-    
+    STORAGE_INSTANCE.log_deletion(user, key, &offset_size_list)?;
     info!("Deleted and logged data for key: {}", key);
     Ok(())
 }
