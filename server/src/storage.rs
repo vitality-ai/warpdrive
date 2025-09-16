@@ -1,5 +1,6 @@
 // storage.rs
 
+// Legacy imports - still needed for potential backwards compatibility
 use std::fs::{OpenOptions, File};
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use actix_web::Error;
@@ -10,8 +11,16 @@ use serde_json::json;
 use std::path::{ PathBuf};
 use std::env;
 
-
 use crate::util::flatbuffer_store_generated::store::{FileDataList, FileData, FileDataArgs, FileDataListArgs};
+use crate::binary::{BinaryStorage, config::BinaryConfig};
+
+// Global binary storage instance - initialized once for the application
+lazy_static::lazy_static! {
+    static ref BINARY_STORAGE: std::sync::Arc<dyn BinaryStorage> = {
+        let config = BinaryConfig::from_env();
+        config.create_store()
+    };
+}
 
 
 fn get_storage_directory() -> PathBuf {
@@ -35,17 +44,23 @@ fn get_storage_directory() -> PathBuf {
     }
 }
 
+//////////////////////////////////////////
+/// Legacy implementation - now replaced by binary storage abstraction ///
+/// Kept for reference and potential backwards compatibility ///
+//////////////////////////////////////////
+
 /* OpenFile provides operations for interacting with binary (.bin) files:
  * - Creating new files
  * - Reading existing files
  * - Writing data to files
  * - Managing file seek operations
- */struct OpenFile {
+ */
+#[allow(dead_code)]
+struct OpenFile {
     file: File,
 }
 
-
-
+#[allow(dead_code)]
 impl OpenFile {
     /* Creates a new file handler for the given user
      * Returns a Result containing either the file handle or an IO error
@@ -91,12 +106,8 @@ Returns a vector of (offset, size) pairs for each written file
 */
 pub fn write_files_to_storage(user : &str,body: &[u8])
     -> Result<Vec<(u64, u64)>, Error> {
-    // Open the storage file in append mode
-    let mut haystack = OpenFile::new(&user)?;
-
-    let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
-
-   // Deserialize binary data into FileDataList using flatbuffer
+    
+    // Deserialize binary data into FileDataList using flatbuffer
     let file_data_list = match root::<FileDataList>(&body) {
         Ok(data) => data,
         Err(e) => return Err(ErrorBadRequest(format!("Failed to parse FlatBuffers data: {:?}", e))),
@@ -107,6 +118,8 @@ pub fn write_files_to_storage(user : &str,body: &[u8])
     };
     info!("Deserialized {} files", files.len());
 
+    // Extract data from flatbuffer for batch processing
+    let mut data_list = Vec::new();
     for (index, file_data) in files.iter().enumerate() {
         let data = match file_data.data() {
             Some(data) => data,
@@ -115,20 +128,11 @@ pub fn write_files_to_storage(user : &str,body: &[u8])
                 continue;
             }
         };
-
-        match haystack.write(data.bytes()) {
-            Ok((offset, size)) => {
-                offset_size_list.push((offset, size));
-                info!("Written file {} at offset {} with size {}", index, offset, size);
-            }
-            Err(e) => {
-                error!("Failed to write file {} to haystack: {}", index, e);
-                return Err(ErrorInternalServerError(e));
-            }
-        }
+        data_list.push(data.bytes());
     }
 
-    Ok(offset_size_list)
+    // Use binary storage abstraction for batch write
+    BINARY_STORAGE.put_objects_batch(user, data_list)
 }
 
 /* Retrieves and combines files from storage into a FlatBuffer
@@ -142,36 +146,41 @@ pub fn write_files_to_storage(user : &str,body: &[u8])
  *   Error: On file access or buffer creation failure
  */
 pub fn get_files_from_storage(user : &str, offset_size_list: Vec<(u64, u64)>)-> Result<Vec<u8>, Error> {
-    info!("connecting to .bin and gettting files");
-    let mut haystack = OpenFile::new(&user).map_err(ErrorInternalServerError)?;
-    info!("connected to .bin");
+    info!("Getting files from binary storage");
+    
+    // Use binary storage abstraction for batch read
+    let data_list = BINARY_STORAGE.get_objects_batch(user, &offset_size_list)?;
+    
+    info!("Retrieved {} files, building the flatbuffer to share", data_list.len());
     let mut builder = FlatBufferBuilder::new();
     let mut file_data_vec = Vec::new();
-    info!("building the flatbuffer to share");
-    for &(offset, size) in offset_size_list.iter() {
-        let data = haystack.read(offset, size).map_err(ErrorInternalServerError)?;
+    
+    for data in data_list {
         let data_vector = builder.create_vector(&data);
         let file_data = FileData::create(&mut builder, &FileDataArgs { data: Some(data_vector) });
         file_data_vec.push(file_data);
     }
-    info!("successfully built the buffer");
+    
+    info!("Successfully built the buffer");
     let files = builder.create_vector(&file_data_vec);
     let file_data_list = FileDataList::create(&mut builder, &FileDataListArgs { files: Some(files) });
     builder.finish(file_data_list, None);
-    info!("sending buffer");
+    info!("Sending buffer");
     Ok(builder.finished_data().to_vec())
-    }
+}
 
-/*//////////////////////////////////////
-/// here starts delete functionality ///
-////////////////////////////////////////
+//////////////////////////////////////////
+/// Legacy delete functionality - now handled by binary storage abstraction ///
+//////////////////////////////////////////
 
-Handles file deletion and logging of deleted files */
+// Handles file deletion and logging of deleted files
 
+#[allow(dead_code)]
 struct DeleteFile {
         file: File,
     }
     
+#[allow(dead_code)]
 impl DeleteFile {
      /* Creates a new delete file handler for the given user
      * The handler manages a JSON file for tracking deletions
@@ -210,9 +219,6 @@ impl DeleteFile {
  * - offset_size_list: List of offset/size pairs for the deleted content
  */
 pub fn delete_and_log(user : &str,key: &str, offset_size_list: Vec<(u64, u64)>) -> Result<(), Error> {
-        let mut delete_file = DeleteFile::new(&user)?;
-        delete_file.delete(key, &offset_size_list)?;
-    
-        info!("Deleted and logged data for key: {}", key);
-        Ok(())
+    // Use binary storage abstraction for deletion
+    BINARY_STORAGE.delete_object(user, key, &offset_size_list)
 }
