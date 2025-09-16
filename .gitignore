@@ -165,6 +165,10 @@ server/storage
 server/metadata
 server/Cargo.lock
 
+# binary storage test files
+*.bin
+*.json
+
 
 #tla
 tla/*TTrace*
