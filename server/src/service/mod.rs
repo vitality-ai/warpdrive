@@ -1,4 +1,6 @@
-//service.rs
+//service/mod.rs
+pub mod metadata_service;
+
 use actix_web::{ web, HttpResponse,Error, HttpRequest};
 use futures::StreamExt;
 use bytes::BytesMut;
@@ -8,7 +10,7 @@ use log_mdc;
 
 
 use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
-use crate::metadata_service::MetadataService;
+use crate::service::metadata_service::MetadataService;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 
 

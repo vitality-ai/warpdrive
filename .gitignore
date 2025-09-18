@@ -165,6 +165,10 @@ server/storage
 server/metadata
 server/Cargo.lock
 
+# Test data files
+server/*.json
+server/logs/
+
 
 #tla
 tla/*TTrace*

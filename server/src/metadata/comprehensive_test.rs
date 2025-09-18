@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::metadata::{Metadata, config::{MetadataConfig, MetadataBackend}};
-    use crate::metadata_service::MetadataService;
+    use crate::service::metadata_service::MetadataService;
     use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
     use std::env;
 

@@ -224,7 +224,6 @@ impl Storage for LocalXFSBinaryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::hash::{Hash, Hasher};
 
     #[test]
     fn test_local_xfs_binary_store_basic_operations() {
