@@ -5,7 +5,7 @@ use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 use std::sync::Mutex;
 use rusqlite::{params, Connection};
 use std::sync::Arc;
-use log::{warn, info};
+use log::{warn, info, error};
 use actix_web::Error;
 use lazy_static::lazy_static;
 use std::env;
@@ -41,13 +41,21 @@ lazy_static! {
             "CREATE TABLE IF NOT EXISTS haystack (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user TEXT NOT NULL,
+                bucket TEXT NOT NULL DEFAULT 'default',
                 key TEXT NOT NULL,
                 offset_size_list BLOB,
-                UNIQUE(user, key)
+                UNIQUE(user, bucket, key)
             )",
             [],
         )
         .expect("Failed to create table");
+        
+        // Add migration for existing data
+        conn.execute(
+            "ALTER TABLE haystack ADD COLUMN bucket TEXT DEFAULT 'default'",
+            [],
+        ).ok(); // Ignore error if column already exists
+        
         Arc::new(Mutex::new(conn))
     };
 }
@@ -63,52 +71,65 @@ impl SQLiteMetadataStore {
 }
 
 impl MetadataStorage for SQLiteMetadataStore {
-    fn put_metadata(&self, user_id: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
+    fn put_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
+        info!("SQLite put_metadata called for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
         let offset_size_list = metadata.to_offset_size_list();
         let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
+        info!("Serialized metadata, size: {} bytes", offset_size_bytes.len());
         
         let conn = DB_CONN.lock().unwrap();
-        conn.execute(
-            "INSERT INTO haystack (user, key, offset_size_list) VALUES (?1, ?2, ?3)",
-            params![user_id, object_id, offset_size_bytes],
-        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        info!("Acquired database connection lock");
         
-        Ok(())
+        let result = conn.execute(
+            "INSERT INTO haystack (user, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, bucket, object_id, offset_size_bytes],
+        );
+        
+        match result {
+            Ok(_) => {
+                info!("Successfully inserted metadata for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
+                Ok(())
+            },
+            Err(e) => {
+                error!("Failed to insert metadata for user: {}, bucket: {}, object_id: {}: {}", user_id, bucket, object_id, e);
+                Err(actix_web::error::ErrorInternalServerError(e))
+            }
+        }
     }
     
-    fn get_metadata(&self, user_id: &str, object_id: &str) -> Result<Metadata, Error> {
+    fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
         let conn = DB_CONN.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT offset_size_list FROM haystack WHERE user = ?1 AND key = ?2")
+        let mut stmt = conn.prepare("SELECT offset_size_list FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
-        let offset_size_bytes = stmt.query_row(params![user_id, object_id], |row| {
+        let offset_size_bytes = stmt.query_row(params![user_id, bucket, object_id], |row| {
             let offset_size_list: Vec<u8> = row.get(0)?;
             Ok(offset_size_list)
         }).map_err(|e| {
             warn!("Key does not exist or database error: {}", e);
-            actix_web::error::ErrorNotFound(format!("No data found for key: {}, The key does not exist", object_id))
+            actix_web::error::ErrorNotFound(format!("No data found for key: {} in bucket: {}, The key does not exist", object_id, bucket))
         })?;
         
         let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
         Ok(Metadata::from_offset_size_list(offset_size_list))
     }
     
-    fn delete_metadata(&self, user_id: &str, object_id: &str) -> Result<(), Error> {
+    fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "DELETE FROM haystack WHERE user = ?1 AND key = ?2",
-            params![user_id, object_id],
+            "DELETE FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3",
+            params![user_id, bucket, object_id],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         
         Ok(())
     }
     
-    fn list_objects(&self, user_id: &str) -> Result<Vec<ObjectId>, Error> {
+    fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error> {
         let conn = DB_CONN.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT key FROM haystack WHERE user = ?1")
+        let mut stmt = conn.prepare("SELECT key FROM haystack WHERE user = ?1 AND bucket = ?2")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
-        let rows = stmt.query_map(params![user_id], |row| {
+        let rows = stmt.query_map(params![user_id, bucket], |row| {
             let key: String = row.get(0)?;
             Ok(key)
         }).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -121,35 +142,38 @@ impl MetadataStorage for SQLiteMetadataStore {
         Ok(objects)
     }
     
-    fn object_exists(&self, user_id: &str, object_id: &str) -> Result<bool, Error> {
+    fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
+        info!("SQLite object_exists called for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
         let conn = DB_CONN.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM haystack WHERE user = ?1 AND key = ?2")
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
-        let count: i64 = stmt.query_row(params![user_id, object_id], |row| row.get(0))
+        let count: i64 = stmt.query_row(params![user_id, bucket, object_id], |row| row.get(0))
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
-        Ok(count > 0)
+        let exists = count > 0;
+        info!("SQLite object_exists result: {} for user: {}, bucket: {}, object_id: {}", exists, user_id, bucket, object_id);
+        Ok(exists)
     }
     
-    fn update_metadata(&self, user_id: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
+    fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
         let offset_size_list = metadata.to_offset_size_list();
         let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
         
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "UPDATE haystack SET offset_size_list = ?1 WHERE user = ?2 AND key = ?3",
-            params![offset_size_bytes, user_id, object_id],
+            "UPDATE haystack SET offset_size_list = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
+            params![offset_size_bytes, user_id, bucket, object_id],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         
         Ok(())
     }
     
-    fn update_object_id(&self, user_id: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error> {
+    fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "UPDATE haystack SET key = ?1 WHERE user = ?2 AND key = ?3",
-            params![new_object_id, user_id, old_object_id],
+            "UPDATE haystack SET key = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
+            params![new_object_id, user_id, bucket, old_object_id],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         
         Ok(())
@@ -172,37 +196,37 @@ mod tests {
         let object_id = "test_object_sqlite";
         
         // Test put_metadata
-        store.put_metadata(user_id, object_id, &metadata).unwrap();
+        store.put_metadata(user_id, "default", object_id, &metadata).unwrap();
         
         // Test object_exists
-        assert!(store.object_exists(user_id, object_id).unwrap());
-        assert!(!store.object_exists(user_id, "nonexistent").unwrap());
+        assert!(store.object_exists(user_id, "default", object_id).unwrap());
+        assert!(!store.object_exists(user_id, "default", "nonexistent").unwrap());
         
         // Test get_metadata
-        let retrieved = store.get_metadata(user_id, object_id).unwrap();
+        let retrieved = store.get_metadata(user_id, "default", object_id).unwrap();
         assert_eq!(retrieved.chunks.len(), 2);
         assert_eq!(retrieved.to_offset_size_list(), vec![(100, 200), (300, 400)]);
         
         // Test list_objects
-        let objects = store.list_objects(user_id).unwrap();
+        let objects = store.list_objects(user_id, "default").unwrap();
         assert!(objects.contains(&object_id.to_string()));
         
         // Test update_metadata
         let new_metadata = Metadata::from_offset_size_list(vec![(500, 600)]);
-        store.update_metadata(user_id, object_id, &new_metadata).unwrap();
+        store.update_metadata(user_id, "default", object_id, &new_metadata).unwrap();
         
-        let updated = store.get_metadata(user_id, object_id).unwrap();
+        let updated = store.get_metadata(user_id, "default", object_id).unwrap();
         assert_eq!(updated.to_offset_size_list(), vec![(500, 600)]);
         
         // Test update_object_id
         let new_object_id = "new_test_object_sqlite";
-        store.update_object_id(user_id, object_id, new_object_id).unwrap();
+        store.update_object_id(user_id, "default", object_id, new_object_id).unwrap();
         
-        assert!(!store.object_exists(user_id, object_id).unwrap());
-        assert!(store.object_exists(user_id, new_object_id).unwrap());
+        assert!(!store.object_exists(user_id, "default", object_id).unwrap());
+        assert!(store.object_exists(user_id, "default", new_object_id).unwrap());
         
         // Test delete_metadata
-        store.delete_metadata(user_id, new_object_id).unwrap();
-        assert!(!store.object_exists(user_id, new_object_id).unwrap());
+        store.delete_metadata(user_id, "default", new_object_id).unwrap();
+        assert!(!store.object_exists(user_id, "default", new_object_id).unwrap());
     }
 }

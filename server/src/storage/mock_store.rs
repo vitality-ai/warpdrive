@@ -60,7 +60,7 @@ impl Default for MockBinaryStore {
 }
 
 impl Storage for MockBinaryStore {
-    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+    fn write_data(&self, user_id: &str, _bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
         // Simulate append behavior with virtual offset/size
         let mut store = self.data.lock().unwrap();
         let user_objects = store.entry(user_id.to_string()).or_insert_with(HashMap::new);
@@ -79,7 +79,7 @@ impl Storage for MockBinaryStore {
         Ok((offset, size))
     }
     
-    fn read_data(&self, user_id: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+    fn read_data(&self, user_id: &str, _bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
         // For mock, try to find data by virtual offset
         let store = self.data.lock().unwrap();
         
@@ -100,7 +100,7 @@ impl Storage for MockBinaryStore {
         )))
     }
     
-    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+    fn log_deletion(&self, user_id: &str, _bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         // Mock implementation - just log the deletion
         info!("Mock: Logged deletion for user {} key {} with {} chunks", 
               user_id, key, offset_size_list.len());

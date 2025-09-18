@@ -590,3 +590,159 @@ async fn test_error_cases() {
     println!("APPEND to non-existent key Status: {:?}", append_resp.status());
     assert_eq!(append_resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[actix_web::test]
+async fn test_bucket_feature() {
+    // Test the bucket functionality - verify user/bucket.bin file structure
+    let mut builder = FlatBufferBuilder::new();
+    let data_bytes = builder.create_vector(&[1u8, 2, 3, 4, 5]);
+    let file = FileData::create(&mut builder, &FileDataArgs {
+        data: Some(data_bytes),
+    });
+    let files = builder.create_vector(&[file]);
+    let file_list = FileDataList::create(&mut builder, &FileDataListArgs {
+        files: Some(files),
+    });
+    builder.finish(file_list, None);
+    let buf = builder.finished_data();
+
+    let app = test::init_service(
+        App::new()
+            .service(put)
+            .service(get)
+            .service(append)
+            .service(delete)
+            .service(update_key)
+            .service(update)
+    ).await;
+
+    let test_user = "bucket_test_user";
+    let test_bucket = "test_bucket";
+    let test_key = format!("bucket_test_key_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    
+    println!("Testing bucket feature with user: {}, bucket: {}, key: {}", test_user, test_bucket, test_key);
+
+    // 1. PUT data with bucket header
+    let put_req = test::TestRequest::post()
+        .uri(&format!("/put/{}", test_key))
+        .insert_header(("content-type", "application/octet-stream"))
+        .insert_header(("user", test_user))
+        .insert_header(("bucket", test_bucket))
+        .set_payload(buf.to_vec())
+        .to_request();
+
+    let put_resp = test::call_service(&app, put_req).await;
+    println!("PUT with bucket Status: {:?}", put_resp.status());
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    // 2. Verify the bucket file was created
+    let expected_bucket_file = format!("storage/{}/{}.bin", test_user, test_bucket);
+    println!("Checking for bucket file: {}", expected_bucket_file);
+    
+    // Check if the bucket file exists
+    let bucket_file_exists = std::path::Path::new(&expected_bucket_file).exists();
+    println!("Bucket file exists: {}", bucket_file_exists);
+    assert!(bucket_file_exists, "Bucket file should be created at: {}", expected_bucket_file);
+
+    // 3. GET data with bucket header
+    let get_req = test::TestRequest::get()
+        .uri(&format!("/get/{}", test_key))
+        .insert_header(("user", test_user))
+        .insert_header(("bucket", test_bucket))
+        .to_request();
+
+    let get_resp = test::call_service(&app, get_req).await;
+    println!("GET with bucket Status: {:?}", get_resp.status());
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let get_body = test::read_body(get_resp).await;
+    println!("GET with bucket Body Length: {} bytes", get_body.len());
+    assert!(!get_body.is_empty(), "GET should return data");
+
+    // 4. Test default bucket behavior (no bucket header)
+    let default_key = format!("default_bucket_key_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    
+    let put_default_req = test::TestRequest::post()
+        .uri(&format!("/put/{}", default_key))
+        .insert_header(("content-type", "application/octet-stream"))
+        .insert_header(("user", test_user))
+        // No bucket header - should use default
+        .set_payload(buf.to_vec())
+        .to_request();
+
+    let put_default_resp = test::call_service(&app, put_default_req).await;
+    println!("PUT with default bucket Status: {:?}", put_default_resp.status());
+    assert_eq!(put_default_resp.status(), StatusCode::OK);
+
+    // 5. Verify default bucket file was created
+    let expected_default_file = format!("storage/{}/default.bin", test_user);
+    println!("Checking for default bucket file: {}", expected_default_file);
+    
+    let default_file_exists = std::path::Path::new(&expected_default_file).exists();
+    println!("Default bucket file exists: {}", default_file_exists);
+    assert!(default_file_exists, "Default bucket file should be created at: {}", expected_default_file);
+
+    // 6. Test bucket isolation - same key in different buckets
+    let isolated_key = format!("isolated_key_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let bucket1 = "bucket1";
+    let bucket2 = "bucket2";
+
+    // PUT to bucket1
+    let put_bucket1_req = test::TestRequest::post()
+        .uri(&format!("/put/{}", isolated_key))
+        .insert_header(("content-type", "application/octet-stream"))
+        .insert_header(("user", test_user))
+        .insert_header(("bucket", bucket1))
+        .set_payload(buf.to_vec())
+        .to_request();
+
+    let put_bucket1_resp = test::call_service(&app, put_bucket1_req).await;
+    println!("PUT to bucket1 Status: {:?}", put_bucket1_resp.status());
+    assert_eq!(put_bucket1_resp.status(), StatusCode::OK);
+
+    // PUT to bucket2 (same key, different bucket)
+    let put_bucket2_req = test::TestRequest::post()
+        .uri(&format!("/put/{}", isolated_key))
+        .insert_header(("content-type", "application/octet-stream"))
+        .insert_header(("user", test_user))
+        .insert_header(("bucket", bucket2))
+        .set_payload(buf.to_vec())
+        .to_request();
+
+    let put_bucket2_resp = test::call_service(&app, put_bucket2_req).await;
+    println!("PUT to bucket2 Status: {:?}", put_bucket2_resp.status());
+    assert_eq!(put_bucket2_resp.status(), StatusCode::OK);
+
+    // 7. Verify both bucket files exist
+    let bucket1_file = format!("storage/{}/{}.bin", test_user, bucket1);
+    let bucket2_file = format!("storage/{}/{}.bin", test_user, bucket2);
+    
+    assert!(std::path::Path::new(&bucket1_file).exists(), "Bucket1 file should exist: {}", bucket1_file);
+    assert!(std::path::Path::new(&bucket2_file).exists(), "Bucket2 file should exist: {}", bucket2_file);
+
+    // 8. Test GET from specific buckets
+    let get_bucket1_req = test::TestRequest::get()
+        .uri(&format!("/get/{}", isolated_key))
+        .insert_header(("user", test_user))
+        .insert_header(("bucket", bucket1))
+        .to_request();
+
+    let get_bucket1_resp = test::call_service(&app, get_bucket1_req).await;
+    println!("GET from bucket1 Status: {:?}", get_bucket1_resp.status());
+    assert_eq!(get_bucket1_resp.status(), StatusCode::OK);
+
+    let get_bucket2_req = test::TestRequest::get()
+        .uri(&format!("/get/{}", isolated_key))
+        .insert_header(("user", test_user))
+        .insert_header(("bucket", bucket2))
+        .to_request();
+
+    let get_bucket2_resp = test::call_service(&app, get_bucket2_req).await;
+    println!("GET from bucket2 Status: {:?}", get_bucket2_resp.status());
+    assert_eq!(get_bucket2_resp.status(), StatusCode::OK);
+
+    println!("✅ All bucket feature tests passed!");
+    println!("✅ Verified user/bucket.bin file structure");
+    println!("✅ Verified bucket isolation");
+    println!("✅ Verified default bucket behavior");
+}

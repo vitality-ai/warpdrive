@@ -129,14 +129,14 @@ mod tests {
         let config = MetadataConfig { backend: MetadataBackend::SQLite };
         let store = config.create_store();
         // Verify store creation succeeds and we can call methods on it
-        let result = store.list_objects("test_user");
+        let result = store.list_objects("test_user", "default");
         assert!(result.is_ok());
         
         // Test Mock store creation
         let config = MetadataConfig { backend: MetadataBackend::Mock };
         let store = config.create_store();
         // Verify store creation succeeds and we can call methods on it
-        let result = store.list_objects("test_user");
+        let result = store.list_objects("test_user", "default");
         assert!(result.is_ok());
     }
 }

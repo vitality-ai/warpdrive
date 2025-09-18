@@ -22,14 +22,14 @@ use crate::util::flatbuffer_store_generated::store::{FileDataList, FileData, Fil
 
 /// Trait defining the binary storage interface
 pub trait Storage: Send + Sync {
-    /// Write data for a user and return (offset, size) - simulates the original append behavior
-    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<(u64, u64), Error>;
+    /// Write data for a user, bucket and return (offset, size) - simulates the original append behavior
+    fn write_data(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error>;
     
-    /// Read data for a user from specific offset and size
-    fn read_data(&self, user_id: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error>;
+    /// Read data for a user, bucket from specific offset and size
+    fn read_data(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error>;
     
-    /// Log deletion for a user with key and offset/size information
-    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
+    /// Log deletion for a user, bucket with key and offset/size information
+    fn log_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
     
     /// Store binary data for an object (higher-level interface)
     fn put_object(&self, user_id: &str, object_id: &str, data: &[u8]) -> Result<(), Error>;
@@ -59,19 +59,32 @@ lazy_static! {
 
 /// Legacy API compatibility: Processes incoming flatbuffer data and writes files to storage
 /// Returns a vector of (offset, size) pairs for each written file
-pub fn write_files_to_storage(user: &str, body: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
+pub fn write_files_to_storage(context: &crate::service::user_context::UserContext, body: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
+    info!("write_files_to_storage called for user: {}, bucket: {}, body size: {}", context.user_id, context.bucket, body.len());
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
 
     // Deserialize binary data into FileDataList using flatbuffer
     let file_data_list = match root::<FileDataList>(&body) {
-        Ok(data) => data,
-        Err(e) => return Err(ErrorBadRequest(format!("Failed to parse FlatBuffers data: {:?}", e))),
+        Ok(data) => {
+            info!("Successfully parsed FlatBuffers data");
+            data
+        },
+        Err(e) => {
+            error!("Failed to parse FlatBuffers data: {:?}", e);
+            return Err(ErrorBadRequest(format!("Failed to parse FlatBuffers data: {:?}", e)));
+        },
     };
     let files = match file_data_list.files() {
-        Some(files) => files,
-        None => return Err(ErrorBadRequest("No files found in FlatBuffers data")),
+        Some(files) => {
+            info!("Found {} files in FlatBuffers data", files.len());
+            files
+        },
+        None => {
+            error!("No files found in FlatBuffers data");
+            return Err(ErrorBadRequest("No files found in FlatBuffers data"));
+        },
     };
-    info!("Deserialized {} files", files.len());
+    info!("Deserialized {} files for user: {}, bucket: {}", files.len(), context.user_id, context.bucket);
 
     for (index, file_data) in files.iter().enumerate() {
         let data = match file_data.data() {
@@ -82,13 +95,15 @@ pub fn write_files_to_storage(user: &str, body: &[u8]) -> Result<Vec<(u64, u64)>
             }
         };
 
-        match STORAGE_INSTANCE.write_data(user, data.bytes()) {
+        info!("Attempting to write file {} to storage for user: {}, bucket: {}", index, context.user_id, context.bucket);
+        match STORAGE_INSTANCE.write_data(&context.user_id, &context.bucket, data.bytes()) {
             Ok((offset, size)) => {
                 offset_size_list.push((offset, size));
-                info!("Written file {} at offset {} with size {}", index, offset, size);
+                info!("Successfully written file {} at offset {} with size {} for user: {}, bucket: {}", 
+                      index, offset, size, context.user_id, context.bucket);
             }
             Err(e) => {
-                error!("Failed to write file {} to storage: {}", index, e);
+                error!("Failed to write file {} to storage for user: {}, bucket: {}: {}", index, context.user_id, context.bucket, e);
                 return Err(ErrorInternalServerError(e));
             }
         }
@@ -98,14 +113,14 @@ pub fn write_files_to_storage(user: &str, body: &[u8]) -> Result<Vec<(u64, u64)>
 }
 
 /// Legacy API compatibility: Retrieves and combines files from storage into a FlatBuffer
-pub fn get_files_from_storage(user: &str, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
+pub fn get_files_from_storage(context: &crate::service::user_context::UserContext, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
     info!("Getting files from storage using new abstraction");
     let mut builder = FlatBufferBuilder::new();
     let mut file_data_vec = Vec::new();
     info!("Building the flatbuffer to share");
     
     for &(offset, size) in offset_size_list.iter() {
-        let data = STORAGE_INSTANCE.read_data(user, offset, size)
+        let data = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
             .map_err(ErrorInternalServerError)?;
         
         let data_vector = builder.create_vector(&data);
@@ -122,9 +137,9 @@ pub fn get_files_from_storage(user: &str, offset_size_list: Vec<(u64, u64)>) -> 
 }
 
 /// Legacy API compatibility: Handles the deletion process and logs the deletion details
-pub fn delete_and_log(user: &str, key: &str, offset_size_list: Vec<(u64, u64)>) -> Result<(), Error> {
-    STORAGE_INSTANCE.log_deletion(user, key, &offset_size_list)?;
-    info!("Deleted and logged data for key: {}", key);
+pub fn delete_and_log(context: &crate::service::user_context::UserContext, key: &str, offset_size_list: Vec<(u64, u64)>) -> Result<(), Error> {
+    STORAGE_INSTANCE.log_deletion(&context.user_id, &context.bucket, key, &offset_size_list)?;
+    info!("Deleted and logged data for key: {} in bucket: {}", key, context.bucket);
     Ok(())
 }
 

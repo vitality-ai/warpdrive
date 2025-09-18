@@ -52,6 +52,21 @@ impl LocalXFSBinaryStore {
         storage_dir.join(format!("{}.bin", user_id))
     }
     
+    /// Get the file path for a user's bucket binary file
+    fn get_bucket_file_path(&self, user_id: &str, bucket: &str) -> PathBuf {
+        let storage_dir = get_storage_directory();
+        let user_dir = storage_dir.join(user_id);
+        
+        // Create user directory if it doesn't exist
+        if !user_dir.exists() {
+            std::fs::create_dir_all(&user_dir)
+                .expect("Failed to create user directory");
+        }
+        
+        // Return path as user/bucket-name.bin
+        user_dir.join(format!("{}.bin", bucket))
+    }
+    
     /// Open or create a user's binary file for writing
     fn open_user_file_for_write(&self, user_id: &str) -> io::Result<File> {
         let file_path = self.get_user_file_path(user_id);
@@ -65,6 +80,24 @@ impl LocalXFSBinaryStore {
     /// Open a user's binary file for reading
     fn open_user_file_for_read(&self, user_id: &str) -> io::Result<File> {
         let file_path = self.get_user_file_path(user_id);
+        OpenOptions::new()
+            .read(true)
+            .open(&file_path)
+    }
+    
+    /// Open or create a user's bucket binary file for writing
+    fn open_bucket_file_for_write(&self, user_id: &str, bucket: &str) -> io::Result<File> {
+        let file_path = self.get_bucket_file_path(user_id, bucket);
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+    }
+
+    /// Open a user's bucket binary file for reading
+    fn open_bucket_file_for_read(&self, user_id: &str, bucket: &str) -> io::Result<File> {
+        let file_path = self.get_bucket_file_path(user_id, bucket);
         OpenOptions::new()
             .read(true)
             .open(&file_path)
@@ -89,31 +122,46 @@ impl LocalXFSBinaryStore {
 }
 
 impl Storage for LocalXFSBinaryStore {
-    fn write_data(&self, user_id: &str, data: &[u8]) -> Result<(u64, u64), Error> {
-        // Write data to the binary file and return real offset/size (matches original behavior)
-        let (offset, size) = self.append_to_file(user_id, data)
+    fn write_data(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+        // Write data to the bucket binary file and return real offset/size
+        let mut file = self.open_bucket_file_for_write(user_id, bucket)
             .map_err(ErrorInternalServerError)?;
         
-        info!("Wrote data for user {} at offset {} with size {}", 
-              user_id, offset, size);
+        let offset = file.seek(SeekFrom::End(0))
+            .map_err(ErrorInternalServerError)?;
+        
+        file.write_all(data)
+            .map_err(ErrorInternalServerError)?;
+        
+        let size = data.len() as u64;
+        
+        info!("Wrote data for user {} bucket {} at offset {} with size {}", 
+              user_id, bucket, offset, size);
         
         Ok((offset, size))
     }
     
-    fn read_data(&self, user_id: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
-        // Read data from the binary file at specific offset/size (matches original behavior)
-        let data = self.read_from_file(user_id, offset, size)
+    fn read_data(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        // Read data from the bucket binary file at specific offset/size
+        let mut file = self.open_bucket_file_for_read(user_id, bucket)
             .map_err(ErrorInternalServerError)?;
         
-        info!("Read data for user {} from offset {} with size {}", 
-              user_id, offset, size);
+        file.seek(SeekFrom::Start(offset))
+            .map_err(ErrorInternalServerError)?;
         
-        Ok(data)
+        let mut buffer = vec![0u8; size as usize];
+        file.read_exact(&mut buffer)
+            .map_err(ErrorInternalServerError)?;
+        
+        info!("Read data for user {} bucket {} from offset {} with size {}", 
+              user_id, bucket, offset, size);
+        
+        Ok(buffer)
     }
     
-    fn log_deletion(&self, user_id: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+    fn log_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         // Log deletion to JSON file (matches original behavior)
-        let log_path = format!("{}.json", user_id);
+        let log_path = format!("{}_{}.json", user_id, bucket);
         let mut log_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -184,7 +232,7 @@ impl Storage for LocalXFSBinaryStore {
             if let Some((offset, size)) = user_objects.remove(object_id) {
                 // Log the deletion using the low-level interface
                 drop(index); // Release the lock before calling log_deletion
-                self.log_deletion(user_id, object_id, &[(offset, size)])?;
+                self.log_deletion(user_id, "default", object_id, &[(offset, size)])?;
                 
                 info!("Deleted object {} for user {} (was at offset {} with size {})", 
                       object_id, user_id, offset, size);

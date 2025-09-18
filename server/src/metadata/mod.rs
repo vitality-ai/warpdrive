@@ -65,25 +65,25 @@ pub type UserId = String;
 /// Trait defining the metadata storage interface
 pub trait MetadataStorage: Send + Sync {
     /// Store metadata for an object
-    fn put_metadata(&self, user_id: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error>;
+    fn put_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error>;
     
     /// Retrieve metadata for an object
-    fn get_metadata(&self, user_id: &str, object_id: &str) -> Result<Metadata, Error>;
+    fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error>;
     
     /// Delete metadata for an object
-    fn delete_metadata(&self, user_id: &str, object_id: &str) -> Result<(), Error>;
+    fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error>;
     
-    /// List all objects for a user
-    fn list_objects(&self, user_id: &str) -> Result<Vec<ObjectId>, Error>;
+    /// List all objects for a user, bucket
+    fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error>;
     
     /// Check if an object exists
-    fn object_exists(&self, user_id: &str, object_id: &str) -> Result<bool, Error>;
+    fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error>;
     
     /// Update metadata for an existing object
-    fn update_metadata(&self, user_id: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error>;
+    fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error>;
     
     /// Update the key (object_id) for an existing object
-    fn update_object_id(&self, user_id: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error>;
+    fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error>;
 }
 
 #[cfg(test)]

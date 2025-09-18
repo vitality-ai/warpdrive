@@ -26,58 +26,58 @@ impl MetadataService {
     }
     
     /// Check if a key exists
-    pub fn check_key(&self, key: &str) -> Result<bool, Error> {
-        METADATA_STORE.object_exists(&self.user, key)
+    pub fn check_key(&self, bucket: &str, key: &str) -> Result<bool, Error> {
+        METADATA_STORE.object_exists(&self.user, bucket, key)
     }
     
     /// Check key non-existence and return error if it doesn't exist
-    pub fn check_key_nonexistance(&self, key: &str) -> Result<(), Error> {
-        if !self.check_key(key)? {
+    pub fn check_key_nonexistance(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        if !self.check_key(bucket, key)? {
             return Err(actix_web::error::ErrorNotFound(format!(
-                "No data found for key: {}, The key does not exist", 
-                key
+                "No data found for key: {} in bucket: {}, The key does not exist", 
+                key, bucket
             )));
         }
         Ok(())
     }
     
-    /// Upload/store metadata for a key with offset-size list
-    pub fn upload_sql(&self, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
+    /// Write metadata for a key with offset-size list
+    pub fn write_metadata(&self, bucket: &str, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
         use crate::util::serializer::deserialize_offset_size;
         let offset_size_list = deserialize_offset_size(offset_size_bytes)?;
         let metadata = Metadata::from_offset_size_list(offset_size_list);
-        METADATA_STORE.put_metadata(&self.user, key, &metadata)
+        METADATA_STORE.put_metadata(&self.user, bucket, key, &metadata)
     }
     
-    /// Get offset-size list for a key
-    pub fn get_offset_size_lists(&self, key: &str) -> Result<Vec<u8>, Error> {
+    /// Read metadata for a key
+    pub fn read_metadata(&self, bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
         use crate::util::serializer::serialize_offset_size;
-        let metadata = METADATA_STORE.get_metadata(&self.user, key)?;
+        let metadata = METADATA_STORE.get_metadata(&self.user, bucket, key)?;
         let offset_size_list = metadata.to_offset_size_list();
         serialize_offset_size(&offset_size_list)
     }
     
     /// Delete metadata for a key
-    pub fn delete_from_db(&self, key: &str) -> Result<(), Error> {
-        METADATA_STORE.delete_metadata(&self.user, key)
+    pub fn delete_metadata(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        METADATA_STORE.delete_metadata(&self.user, bucket, key)
     }
     
-    /// Update/rename a key
-    pub fn update_key_from_db(&self, old_key: &str, new_key: &str) -> Result<(), Error> {
-        METADATA_STORE.update_object_id(&self.user, old_key, new_key)
+    /// Rename a key
+    pub fn rename_key(&self, bucket: &str, old_key: &str, new_key: &str) -> Result<(), Error> {
+        METADATA_STORE.update_object_id(&self.user, bucket, old_key, new_key)
     }
     
     /// Update metadata for an existing key
-    pub fn update_file_db(&self, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
+    pub fn update_metadata(&self, bucket: &str, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
         use crate::util::serializer::deserialize_offset_size;
         let offset_size_list = deserialize_offset_size(offset_size_bytes)?;
         let metadata = Metadata::from_offset_size_list(offset_size_list);
-        METADATA_STORE.update_metadata(&self.user, key, &metadata)
+        METADATA_STORE.update_metadata(&self.user, bucket, key, &metadata)
     }
     
     /// Append data (same as update for now)
-    pub fn append_sql(&self, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
-        self.update_file_db(key, offset_size_bytes)
+    pub fn append_metadata(&self, bucket: &str, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
+        self.update_metadata(bucket, key, offset_size_bytes)
     }
 }
 
@@ -96,42 +96,42 @@ mod tests {
         let key = "test_key_service";
         
         // Initially key should not exist
-        assert!(!service.check_key(key).unwrap());
-        assert!(service.check_key_nonexistance(key).is_err());
+        assert!(!service.check_key("default", key).unwrap());
+        assert!(service.check_key_nonexistance("default", key).is_err());
         
         // Create test data
         let offset_size_list = vec![(100, 200), (300, 400)];
         let offset_size_bytes = serialize_offset_size(&offset_size_list).unwrap();
         
         // Upload data
-        service.upload_sql(key, &offset_size_bytes).unwrap();
+        service.write_metadata("default", key, &offset_size_bytes).unwrap();
         
         // Key should now exist
-        assert!(service.check_key(key).unwrap());
-        assert!(service.check_key_nonexistance(key).is_ok());
+        assert!(service.check_key("default", key).unwrap());
+        assert!(service.check_key_nonexistance("default", key).is_ok());
         
         // Retrieve data
-        let retrieved_bytes = service.get_offset_size_lists(key).unwrap();
+        let retrieved_bytes = service.read_metadata("default", key).unwrap();
         assert_eq!(retrieved_bytes, offset_size_bytes);
         
         // Update data
         let new_offset_size_list = vec![(500, 600)];
         let new_offset_size_bytes = serialize_offset_size(&new_offset_size_list).unwrap();
-        service.update_file_db(key, &new_offset_size_bytes).unwrap();
+        service.update_metadata("default", key, &new_offset_size_bytes).unwrap();
         
-        let updated_bytes = service.get_offset_size_lists(key).unwrap();
+        let updated_bytes = service.read_metadata("default", key).unwrap();
         assert_eq!(updated_bytes, new_offset_size_bytes);
         
         // Update key name
         let new_key = "new_test_key_service";
-        service.update_key_from_db(key, new_key).unwrap();
+        service.rename_key("default", key, new_key).unwrap();
         
-        assert!(!service.check_key(key).unwrap());
-        assert!(service.check_key(new_key).unwrap());
+        assert!(!service.check_key("default", key).unwrap());
+        assert!(service.check_key("default", new_key).unwrap());
         
         // Delete data
-        service.delete_from_db(new_key).unwrap();
-        assert!(!service.check_key(new_key).unwrap());
+        service.delete_metadata("default", new_key).unwrap();
+        assert!(!service.check_key("default", new_key).unwrap());
         
         // Clean up
         env::remove_var("METADATA_BACKEND");
