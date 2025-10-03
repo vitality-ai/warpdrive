@@ -13,7 +13,7 @@ mod comprehensive_test;
 
 use actix_web::Error;
 use actix_web::error::{ErrorInternalServerError, ErrorBadRequest};
-use log::{info, error};
+use log::{info, error, warn};
 use flatbuffers::{root, FlatBufferBuilder};
 use lazy_static::lazy_static;
 use std::sync::Arc;
@@ -141,6 +141,55 @@ pub fn delete_and_log(context: &crate::service::user_context::UserContext, key: 
     STORAGE_INSTANCE.log_deletion(&context.user_id, &context.bucket, key, &offset_size_list)?;
     info!("Deleted and logged data for key: {} in bucket: {}", key, context.bucket);
     Ok(())
+}
+
+/// S3-compatible function: Writes raw binary data to storage (not FlatBuffers)
+/// Returns a vector of (offset, size) pairs for metadata storage
+pub fn write_s3_data_to_storage(context: &crate::service::user_context::UserContext, data: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
+    info!("write_s3_data_to_storage called for user: {}, bucket: {}, data size: {}", context.user_id, context.bucket, data.len());
+    
+    // For S3 compatibility, we treat the raw data as a single file
+    // This is different from the FlatBuffers approach which expects multiple files
+    match STORAGE_INSTANCE.write_data(&context.user_id, &context.bucket, data) {
+        Ok((offset, size)) => {
+            info!("Successfully written S3 data at offset {} with size {} for user: {}, bucket: {}", 
+                  offset, size, context.user_id, context.bucket);
+            Ok(vec![(offset, size)])
+        }
+        Err(e) => {
+            error!("Failed to write S3 data to storage for user: {}, bucket: {}: {}", context.user_id, context.bucket, e);
+            Err(ErrorInternalServerError(e))
+        }
+    }
+}
+
+/// S3-compatible function: Retrieves raw binary data from storage (not FlatBuffers)
+/// Takes offset_size_list and returns the raw data
+pub fn get_s3_data_from_storage(context: &crate::service::user_context::UserContext, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
+    info!("Getting S3 data from storage using new abstraction");
+    
+    // For S3 compatibility, we expect a single file (unlike FlatBuffers which can have multiple)
+    if offset_size_list.is_empty() {
+        return Err(ErrorBadRequest("No data found"));
+    }
+    
+    if offset_size_list.len() > 1 {
+        // If we have multiple chunks, concatenate them (this shouldn't happen for S3)
+        warn!("S3 data has multiple chunks, concatenating them");
+        let mut combined_data = Vec::new();
+        for &(offset, size) in &offset_size_list {
+            let chunk = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
+                .map_err(ErrorInternalServerError)?;
+            combined_data.extend_from_slice(&chunk);
+        }
+        Ok(combined_data)
+    } else {
+        // Single chunk (normal case for S3)
+        let (offset, size) = offset_size_list[0];
+        let data = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
+            .map_err(ErrorInternalServerError)?;
+        Ok(data)
+    }
 }
 
 #[cfg(test)]

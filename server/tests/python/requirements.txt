@@ -1,0 +1,4 @@
+# Requirements for S3 API testing
+boto3>=1.26.0
+botocore>=1.29.0
+requests>=2.25.0
