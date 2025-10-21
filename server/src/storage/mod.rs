@@ -7,6 +7,7 @@
 pub mod local_store;
 pub mod mock_store;
 pub mod config;
+pub mod deletion_worker;
 
 #[cfg(test)]
 mod comprehensive_test;

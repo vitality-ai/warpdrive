@@ -50,6 +50,21 @@ lazy_static! {
         )
         .expect("Failed to create table");
         
+        // Create deletion queue table for WAL
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS deletion_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                key TEXT NOT NULL,
+                offset_size_list BLOB NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                processed BOOLEAN DEFAULT FALSE
+            )",
+            [],
+        )
+        .expect("Failed to create deletion_queue table");
+        
         // Add migration for existing data
         conn.execute(
             "ALTER TABLE haystack ADD COLUMN bucket TEXT DEFAULT 'default'",
@@ -178,6 +193,156 @@ impl MetadataStorage for SQLiteMetadataStore {
         
         Ok(())
     }
+}
+
+/// Deletion queue operations for WAL functionality
+impl SQLiteMetadataStore {
+    /// Add a deletion event to the queue
+    pub fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        let offset_size_bytes = serialize_offset_size(&offset_size_list.to_vec())?;
+        
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, bucket, key, offset_size_bytes],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        info!("Queued deletion for user {} bucket {} key {} with {} chunks", 
+              user_id, bucket, key, offset_size_list.len());
+        Ok(())
+    }
+    
+    /// Get pending deletion events (for worker processing)
+    pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, bucket, key, offset_size_list, created_at 
+             FROM deletion_queue 
+             WHERE processed = FALSE 
+             ORDER BY created_at ASC 
+             LIMIT ?1"
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let rows = stmt.query_map(params![limit], |row| {
+            let offset_size_bytes: Vec<u8> = row.get(4)?;
+            let offset_size_list = deserialize_offset_size(&offset_size_bytes)
+                .map_err(|_e| rusqlite::Error::InvalidColumnType(4, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
+            
+            Ok(DeletionEvent {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                bucket: row.get(2)?,
+                key: row.get(3)?,
+                offset_size_list,
+                created_at: row.get(5)?,
+            })
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        
+        Ok(events)
+    }
+    
+    /// Mark deletion event as processed
+    pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE deletion_queue SET processed = TRUE WHERE id = ?1",
+            params![id],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        Ok(())
+    }
+    
+    /// Clean up old processed deletion events (older than 7 days)
+    pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let count = conn.execute(
+            "DELETE FROM deletion_queue WHERE processed = TRUE AND created_at < datetime('now', '-7 days')",
+            [],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        info!("Cleaned up {} old deletion events", count);
+        Ok(count)
+    }
+    
+    /// Get all used chunks for a user/bucket (for compaction)
+    pub fn get_used_chunks(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT offset_size_list FROM haystack WHERE user = ?1 AND bucket = ?2"
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let rows = stmt.query_map(params![user_id, bucket], |row| {
+            let offset_size_bytes: Vec<u8> = row.get(0)?;
+            let offset_size_list = deserialize_offset_size(&offset_size_bytes)
+                .map_err(|_e| rusqlite::Error::InvalidColumnType(0, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
+            Ok(offset_size_list)
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let mut all_chunks = Vec::new();
+        for row in rows {
+            let chunks: Vec<(u64, u64)> = row.map_err(actix_web::error::ErrorInternalServerError)?;
+            all_chunks.extend(chunks);
+        }
+        
+        Ok(all_chunks)
+    }
+    
+    /// Update chunk metadata for all objects in a bucket (for compaction)
+    pub fn update_bucket_chunks(&self, user_id: &str, bucket: &str, chunk_mapping: &[(u64, u64)]) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        
+        // Get all objects in this bucket
+        let mut stmt = conn.prepare(
+            "SELECT key, offset_size_list FROM haystack WHERE user = ?1 AND bucket = ?2"
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let rows = stmt.query_map(params![user_id, bucket], |row| {
+            let key: String = row.get(0)?;
+            let offset_size_bytes: Vec<u8> = row.get(1)?;
+            let offset_size_list = deserialize_offset_size(&offset_size_bytes)
+                .map_err(|_e| rusqlite::Error::InvalidColumnType(1, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
+            Ok((key, offset_size_list))
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        // Update each object's chunks
+        for row in rows {
+            let (key, old_chunks): (String, Vec<(u64, u64)>) = row.map_err(actix_web::error::ErrorInternalServerError)?;
+            
+            // Map old chunks to new chunks (simplified - assumes 1:1 mapping)
+            let new_chunks = old_chunks.iter().map(|(_, size)| {
+                // Find a chunk of the same size in the new mapping
+                chunk_mapping.iter().find(|(_, s)| s == size)
+                    .map(|(offset, size)| (*offset, *size))
+                    .unwrap_or((0, *size)) // Fallback
+            }).collect::<Vec<_>>();
+            
+            let new_offset_size_bytes = serialize_offset_size(&new_chunks)?;
+            
+            conn.execute(
+                "UPDATE haystack SET offset_size_list = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
+                params![new_offset_size_bytes, user_id, bucket, key],
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+        }
+        
+        info!("Updated chunk metadata for {}/{} with {} new chunks", user_id, bucket, chunk_mapping.len());
+        Ok(())
+    }
+}
+
+/// Deletion event structure
+#[derive(Debug, Clone)]
+pub struct DeletionEvent {
+    pub id: i64,
+    pub user_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub offset_size_list: Vec<(u64, u64)>,
+    pub created_at: String,
 }
 
 #[cfg(test)]

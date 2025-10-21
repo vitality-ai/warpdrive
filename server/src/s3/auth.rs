@@ -3,7 +3,6 @@ use actix_web::{HttpRequest, Error, error::ErrorUnauthorized};
 use log::{info, warn};
 
 /// Hardcoded credentials for S3 authentication
-/// TODO: Replace with proper credential management system
 const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 // const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
@@ -65,11 +64,11 @@ pub fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error>
     let path = req.path();
     let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     
-    if path_parts.len() < 2 {
+    if path_parts.is_empty() {
         return Err(ErrorUnauthorized("Invalid S3 path format"));
     }
     
-    // For S3 requests, the bucket is the first part after /s3/
+    // For S3 requests, the bucket is the first part after /s3/ or the first part for direct routes
     let bucket = if path_parts[0] == "s3" && path_parts.len() >= 3 {
         path_parts[1].to_string()
     } else {

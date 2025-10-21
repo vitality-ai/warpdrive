@@ -175,3 +175,6 @@ tla/*TTrace*
 tla/*.jar
 tla/states
 
+# Demo download folders (output from tests)
+demo/downloaded_files/
+

@@ -13,14 +13,14 @@ This module provides S3-compatible API endpoints for the CIAOS system, allowing 
 
 ### Object Operations
 
-- `PUT /s3/{bucket}/{key}` - Upload an object
-- `GET /s3/{bucket}/{key}` - Download an object  
-- `DELETE /s3/{bucket}/{key}` - Delete an object
-- `HEAD /s3/{bucket}/{key}` - Get object metadata
+- `PUT /{bucket}/{key}` - Upload an object
+- `GET /{bucket}/{key}` - Download an object  
+- `DELETE /{bucket}/{key}` - Delete an object
+- `HEAD /{bucket}/{key}` - Get object metadata
 
 ### Bucket Operations
 
-- `GET /s3/{bucket}?list-type=2` - List objects in a bucket
+- `GET /{bucket}?list-type=2` - List objects in a bucket
 
 ## Authentication
 
@@ -45,17 +45,17 @@ curl -X PUT \
   -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature" \
   -H "Content-Type: application/octet-stream" \
   --data "Hello, World!" \
-  http://localhost:9710/s3/my-bucket/my-object
+  http://localhost:9710/my-bucket/my-object
 
 # GET an object
 curl -X GET \
   -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature" \
-  http://localhost:9710/s3/my-bucket/my-object
+  http://localhost:9710/my-bucket/my-object
 
 # DELETE an object
 curl -X DELETE \
   -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature" \
-  http://localhost:9710/s3/my-bucket/my-object
+  http://localhost:9710/my-bucket/my-object
 ```
 
 ### Using Python

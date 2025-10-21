@@ -1,0 +1,14 @@
+{
+  "name": "CIAOS S3 Test",
+  "version": "1.0.0",
+  "features": ["PUT", "GET", "DELETE", "HEAD", "LIST", "COPY"],
+  "file_types": ["text", "binary", "image", "pdf"],
+  "timestamp": 1697896500,
+  "test_data": {
+    "strings": ["hello", "world", "ciaos"],
+    "numbers": [1, 2, 3, 42, 3.14],
+    "booleans": [true, false],
+    "null": null
+  },
+  "description": "This JSON file tests the S3 API's ability to handle structured data with various data types including strings, numbers, booleans, and null values."
+}
