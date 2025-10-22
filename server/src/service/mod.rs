@@ -78,7 +78,7 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     info!("Total received data size: {} bytes", bytes.len());
 
-    let offset_size_list = write_files_to_storage(&context, &bytes)?;
+    let offset_size_list = write_files_to_storage(&context, &bytes, false)?;
 
 
     if offset_size_list.is_empty()  {
@@ -124,7 +124,7 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
     // Deserialize offset and size data
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
 
-    let data = get_files_from_storage(&context, offset_size_list)?;
+    let data = get_files_from_storage(&context, offset_size_list, false)?;
 
     // Return the FlatBuffers serialized data
     Ok(HttpResponse::Ok()
@@ -150,7 +150,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
     info!("Total received data size: {} bytes", bytes.len());
 
-    let mut offset_size_list_append = write_files_to_storage(&context, &bytes)?;
+    let mut offset_size_list_append = write_files_to_storage(&context, &bytes, false)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -242,7 +242,7 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     info!("Total received data size: {} bytes", bytes.len());
     info!("Starting deserialization");
     
-    let offset_size_list = write_files_to_storage(&context, &bytes)?;
+    let offset_size_list = write_files_to_storage(&context, &bytes, false)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);

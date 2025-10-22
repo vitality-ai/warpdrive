@@ -11,6 +11,7 @@ use warp_drive::s3::handlers::{
     s3_list_objects_handler,
     s3_multipart_router
 };
+use warp_drive::storage::deletion_worker::start_deletion_worker;
 // ^ use the name from your Cargo.toml [package].name
 // e.g., if Cargo.toml says name = "warp_drive"
  
@@ -18,6 +19,10 @@ use warp_drive::s3::handlers::{
 async fn main() -> std::io::Result<()> {
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
     info!("Starting server on 127.0.0.1:8080");
+    
+    // Start the deletion worker as a background task (non-blocking)
+    let _deletion_worker_handle = start_deletion_worker();
+    info!("Deletion worker started in background");
     
         HttpServer::new(|| {
             App::new()

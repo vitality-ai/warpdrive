@@ -269,69 +269,6 @@ impl SQLiteMetadataStore {
         Ok(count)
     }
     
-    /// Get all used chunks for a user/bucket (for compaction)
-    pub fn get_used_chunks(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT offset_size_list FROM haystack WHERE user = ?1 AND bucket = ?2"
-        ).map_err(actix_web::error::ErrorInternalServerError)?;
-        
-        let rows = stmt.query_map(params![user_id, bucket], |row| {
-            let offset_size_bytes: Vec<u8> = row.get(0)?;
-            let offset_size_list = deserialize_offset_size(&offset_size_bytes)
-                .map_err(|_e| rusqlite::Error::InvalidColumnType(0, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
-            Ok(offset_size_list)
-        }).map_err(actix_web::error::ErrorInternalServerError)?;
-        
-        let mut all_chunks = Vec::new();
-        for row in rows {
-            let chunks: Vec<(u64, u64)> = row.map_err(actix_web::error::ErrorInternalServerError)?;
-            all_chunks.extend(chunks);
-        }
-        
-        Ok(all_chunks)
-    }
-    
-    /// Update chunk metadata for all objects in a bucket (for compaction)
-    pub fn update_bucket_chunks(&self, user_id: &str, bucket: &str, chunk_mapping: &[(u64, u64)]) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
-        
-        // Get all objects in this bucket
-        let mut stmt = conn.prepare(
-            "SELECT key, offset_size_list FROM haystack WHERE user = ?1 AND bucket = ?2"
-        ).map_err(actix_web::error::ErrorInternalServerError)?;
-        
-        let rows = stmt.query_map(params![user_id, bucket], |row| {
-            let key: String = row.get(0)?;
-            let offset_size_bytes: Vec<u8> = row.get(1)?;
-            let offset_size_list = deserialize_offset_size(&offset_size_bytes)
-                .map_err(|_e| rusqlite::Error::InvalidColumnType(1, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
-            Ok((key, offset_size_list))
-        }).map_err(actix_web::error::ErrorInternalServerError)?;
-        
-        // Update each object's chunks
-        for row in rows {
-            let (key, old_chunks): (String, Vec<(u64, u64)>) = row.map_err(actix_web::error::ErrorInternalServerError)?;
-            
-            // Map old chunks to new chunks (simplified - assumes 1:1 mapping)
-            let new_chunks = old_chunks.iter().map(|(_, size)| {
-                // Find a chunk of the same size in the new mapping
-                chunk_mapping.iter().find(|(_, s)| s == size)
-                    .map(|(offset, size)| (*offset, *size))
-                    .unwrap_or((0, *size)) // Fallback
-            }).collect::<Vec<_>>();
-            
-            let new_offset_size_bytes = serialize_offset_size(&new_chunks)?;
-            
-            conn.execute(
-                "UPDATE haystack SET offset_size_list = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
-                params![new_offset_size_bytes, user_id, bucket, key],
-            ).map_err(actix_web::error::ErrorInternalServerError)?;
-        }
-        
-        info!("Updated chunk metadata for {}/{} with {} new chunks", user_id, bucket, chunk_mapping.len());
-        Ok(())
-    }
 }
 
 /// Deletion event structure
@@ -394,4 +331,5 @@ mod tests {
         store.delete_metadata(user_id, "default", new_object_id).unwrap();
         assert!(!store.object_exists(user_id, "default", new_object_id).unwrap());
     }
+
 }

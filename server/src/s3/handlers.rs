@@ -84,7 +84,7 @@ pub async fn s3_put_object_handler(
     }
     
     // Use S3-compatible storage system for raw binary data
-    let offset_size_list = crate::storage::write_s3_data_to_storage(&context, &bytes)?;
+    let offset_size_list = crate::storage::write_files_to_storage(&context, &bytes, true)?;
     
     if offset_size_list.is_empty() {
         return Ok(HttpResponse::BadRequest().body("No data to store"));
@@ -135,7 +135,7 @@ pub async fn s3_get_object_handler(
     // Use S3-compatible storage system for raw binary data
     let offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-    let data = crate::storage::get_s3_data_from_storage(&context, offset_size_list)?;
+    let data = crate::storage::get_files_from_storage(&context, offset_size_list, true)?;
     
     
     // Return the actual data directly without conversion
@@ -344,10 +344,10 @@ pub async fn s3_copy_object_handler(
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
     
     // Get source data using S3-compatible function
-    let source_data = crate::storage::get_s3_data_from_storage(&context, offset_size_list)?;
+    let source_data = crate::storage::get_files_from_storage(&context, offset_size_list, true)?;
     
     // Write to new location using S3-compatible function
-    let new_offset_size_list = crate::storage::write_s3_data_to_storage(&context, &source_data)?;
+    let new_offset_size_list = crate::storage::write_files_to_storage(&context, &source_data, true)?;
     let new_offset_size_bytes = crate::util::serializer::serialize_offset_size(&new_offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &new_offset_size_bytes)?;
     
@@ -445,7 +445,7 @@ pub async fn s3_upload_part_handler(
     let db = MetadataService::new(&context.user_id)?;
     
     // Store the part data
-    let offset_size_list = crate::storage::write_s3_data_to_storage(&context, &bytes)?;
+    let offset_size_list = crate::storage::write_files_to_storage(&context, &bytes, true)?;
     let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     
     // Use a special key format for parts: {original_key}.part.{part_number}.{upload_id}
@@ -520,14 +520,14 @@ pub async fn s3_complete_multipart_upload_handler(
     for (_part_num, part_key) in &parts {
         let offset_size_bytes = db.read_metadata(&context.bucket, part_key)?;
         let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-        let part_data = crate::storage::get_s3_data_from_storage(&context, offset_size_list)?;
+        let part_data = crate::storage::get_files_from_storage(&context, offset_size_list, true)?;
         
         combined_data.extend_from_slice(&part_data);
     }
     
     
     // Store combined data
-    let final_offset_size_list = crate::storage::write_s3_data_to_storage(&context, &combined_data)?;
+    let final_offset_size_list = crate::storage::write_files_to_storage(&context, &combined_data, true)?;
     let final_offset_size_bytes = crate::util::serializer::serialize_offset_size(&final_offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &final_offset_size_bytes)?;
     

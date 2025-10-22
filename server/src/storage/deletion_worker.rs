@@ -24,19 +24,21 @@ impl DeletionWorker {
         }
     }
     
-    /// Start the deletion worker (runs in background)
-    pub async fn start(&self) {
+    /// Start the deletion worker as a background task (non-blocking)
+    pub fn start_background(self) -> tokio::task::JoinHandle<()> {
         info!("Starting deletion worker with {}s interval", self.cleanup_interval.as_secs());
         
-        let mut interval = time::interval(self.cleanup_interval);
-        
-        loop {
-            interval.tick().await;
+        tokio::spawn(async move {
+            let mut interval = time::interval(self.cleanup_interval);
             
-            if let Err(e) = self.process_deletions().await {
-                error!("Error processing deletions: {}", e);
+            loop {
+                interval.tick().await;
+                
+                if let Err(e) = self.process_deletions().await {
+                    error!("Error processing deletions: {}", e);
+                }
             }
-        }
+        })
     }
     
     /// Process pending deletion events
@@ -121,10 +123,10 @@ impl DeletionWorker {
     }
 }
 
-/// Start the deletion worker in the background
-pub async fn start_deletion_worker() {
+/// Start the deletion worker as a background task (non-blocking)
+pub fn start_deletion_worker() -> tokio::task::JoinHandle<()> {
     let worker = DeletionWorker::new();
-    worker.start().await;
+    worker.start_background()
 }
 
 #[cfg(test)]
