@@ -18,7 +18,7 @@ import boto3
 
 s3 = boto3.client(
     's3',
-    endpoint_url='http://localhost:9710',
+    endpoint_url='http://localhost:9710/s3',
     aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
     aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
     region_name='us-east-1'
@@ -42,13 +42,13 @@ export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 export AWS_DEFAULT_REGION=us-east-1
 
 # Upload
-aws s3 cp local_file.txt s3://my-bucket/remote_file.txt --endpoint-url http://localhost:9710
+aws s3 cp local_file.txt s3://my-bucket/remote_file.txt --endpoint-url http://localhost:9710/s3
 
 # Download
-aws s3 cp s3://my-bucket/remote_file.txt downloaded_file.txt --endpoint-url http://localhost:9710
+aws s3 cp s3://my-bucket/remote_file.txt downloaded_file.txt --endpoint-url http://localhost:9710/s3
 
 # List
-aws s3 ls s3://my-bucket/ --endpoint-url http://localhost:9710
+aws s3 ls s3://my-bucket/ --endpoint-url http://localhost:9710/s3
 ```
 
 ## 🧪 **Testing**

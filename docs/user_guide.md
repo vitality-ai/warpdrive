@@ -102,7 +102,7 @@ import boto3
 # Configure S3 client to use CIAOS
 s3_client = boto3.client(
     's3',
-    endpoint_url='http://localhost:9710',
+    endpoint_url='http://localhost:9710/s3',
     aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
     aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
     region_name='us-east-1'

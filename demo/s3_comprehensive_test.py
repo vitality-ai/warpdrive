@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 # Configuration
-SERVER_URL = "http://localhost:9710"
+SERVER_URL = "http://localhost:9710/s3"
 BUCKET_NAME = "ciaos-test-bucket"
 TEST_FILES_DIR = "test_files"
 DOWNLOAD_DIR = "downloaded_files"

@@ -68,11 +68,11 @@ pub fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error>
         return Err(ErrorUnauthorized("Invalid S3 path format"));
     }
     
-    // For S3 requests, the bucket is the first part after /s3/ or the first part for direct routes
-    let bucket = if path_parts[0] == "s3" && path_parts.len() >= 3 {
+    // For S3 requests, the bucket is the first part after /s3/
+    let bucket = if path_parts[0] == "s3" && path_parts.len() >= 2 {
         path_parts[1].to_string()
     } else {
-        path_parts[0].to_string()
+        return Err(ErrorUnauthorized("Invalid S3 path format - must start with /s3/"));
     };
     let user_id = format!("s3_user_{}", access_key);
     
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     async fn test_authenticate_s3_request() {
         let req = test::TestRequest::default()
-            .uri("/test-bucket/test-key")
+            .uri("/s3/test-bucket/test-key")
             .insert_header(("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature"))
             .to_http_request();
         
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     async fn test_authenticate_s3_request_invalid_key() {
         let req = test::TestRequest::default()
-            .uri("/test-bucket/test-key")
+            .uri("/s3/test-bucket/test-key")
             .insert_header(("Authorization", "AWS4-HMAC-SHA256 Credential=INVALID_KEY/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature"))
             .to_http_request();
         
