@@ -1,0 +1,22 @@
+CIAOS S3 API Test Document
+========================
+
+This is a comprehensive test of the S3-compatible API.
+Features tested:
+• Text file upload/download
+• JSON data handling
+• Binary data integrity
+• Image file processing
+• PDF document handling
+• Large file support
+• S3 operations (PUT, GET, DELETE, HEAD, LIST, COPY)
+
+Generated: 2025-10-21 14:15:00
+File size: This file contains multiple lines of text to test
+the S3 API's ability to handle text files with various content.
+
+Special characters: !@#$%^&*()_+-=[]{}|;:,.<>?/~`
+Unicode: 🚀 🌟 💻 🔧 ⚡
+
+This document tests the complete S3 workflow.
+All operations should work seamlessly with boto3.

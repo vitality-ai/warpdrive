@@ -50,6 +50,21 @@ lazy_static! {
         )
         .expect("Failed to create table");
         
+        // Create deletion queue table for WAL
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS deletion_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                key TEXT NOT NULL,
+                offset_size_list BLOB NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                processed BOOLEAN DEFAULT FALSE
+            )",
+            [],
+        )
+        .expect("Failed to create deletion_queue table");
+        
         // Add migration for existing data
         conn.execute(
             "ALTER TABLE haystack ADD COLUMN bucket TEXT DEFAULT 'default'",
@@ -180,6 +195,93 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 }
 
+/// Deletion queue operations for WAL functionality
+impl SQLiteMetadataStore {
+    /// Add a deletion event to the queue
+    pub fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        let offset_size_bytes = serialize_offset_size(&offset_size_list.to_vec())?;
+        
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, bucket, key, offset_size_bytes],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        info!("Queued deletion for user {} bucket {} key {} with {} chunks", 
+              user_id, bucket, key, offset_size_list.len());
+        Ok(())
+    }
+    
+    /// Get pending deletion events (for worker processing)
+    pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, bucket, key, offset_size_list, created_at 
+             FROM deletion_queue 
+             WHERE processed = FALSE 
+             ORDER BY created_at ASC 
+             LIMIT ?1"
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let rows = stmt.query_map(params![limit], |row| {
+            let offset_size_bytes: Vec<u8> = row.get(4)?;
+            let offset_size_list = deserialize_offset_size(&offset_size_bytes)
+                .map_err(|_e| rusqlite::Error::InvalidColumnType(4, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
+            
+            Ok(DeletionEvent {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                bucket: row.get(2)?,
+                key: row.get(3)?,
+                offset_size_list,
+                created_at: row.get(5)?,
+            })
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        
+        Ok(events)
+    }
+    
+    /// Mark deletion event as processed
+    pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE deletion_queue SET processed = TRUE WHERE id = ?1",
+            params![id],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        Ok(())
+    }
+    
+    /// Clean up old processed deletion events (older than 7 days)
+    pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let count = conn.execute(
+            "DELETE FROM deletion_queue WHERE processed = TRUE AND created_at < datetime('now', '-7 days')",
+            [],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        
+        info!("Cleaned up {} old deletion events", count);
+        Ok(count)
+    }
+    
+}
+
+/// Deletion event structure
+#[derive(Debug, Clone)]
+pub struct DeletionEvent {
+    pub id: i64,
+    pub user_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub offset_size_list: Vec<(u64, u64)>,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,4 +331,5 @@ mod tests {
         store.delete_metadata(user_id, "default", new_object_id).unwrap();
         assert!(!store.object_exists(user_id, "default", new_object_id).unwrap());
     }
+
 }

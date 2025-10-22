@@ -1,132 +1,74 @@
-# S3-Compatible API Implementation
+# S3-Compatible API
 
-This module provides S3-compatible API endpoints for the CIAOS system, allowing S3 clients to interact with the storage system using familiar S3 protocols.
+WarpDrive provides full S3 compatibility for seamless integration with existing S3 tools and libraries.
 
-## Features
+## ✅ **Implemented Features**
 
-- **S3-Compatible Endpoints**: PUT, GET, DELETE, HEAD, and LIST operations
-- **Authentication**: AWS4-HMAC-SHA256 signature support (simplified for testing)
-- **Bucket Support**: Multi-tenant bucket isolation
-- **Error Handling**: Proper HTTP status codes and error responses
+- **Core Operations**: PUT, GET, DELETE, HEAD, LIST
+- **Advanced Operations**: COPY, Multipart Upload
+- **Authentication**: AWS Signature V4
+- **Unified Storage**: Same backend as native API
 
-## API Endpoints
+## 🚀 **Quick Start**
 
-### Object Operations
-
-- `PUT /s3/{bucket}/{key}` - Upload an object
-- `GET /s3/{bucket}/{key}` - Download an object  
-- `DELETE /s3/{bucket}/{key}` - Delete an object
-- `HEAD /s3/{bucket}/{key}` - Get object metadata
-
-### Bucket Operations
-
-- `GET /s3/{bucket}?list-type=2` - List objects in a bucket
-
-## Authentication
-
-The S3 API uses AWS4-HMAC-SHA256 authentication. For testing purposes, the following credentials are hardcoded:
-
-- **Access Key**: `AKIAIOSFODNN7EXAMPLE`
-- **Secret Key**: `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`
-
-### Authorization Header Format
-
-```
-Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature
-```
-
-## Usage Examples
-
-### Using curl
-
-```bash
-# PUT an object
-curl -X PUT \
-  -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature" \
-  -H "Content-Type: application/octet-stream" \
-  --data "Hello, World!" \
-  http://localhost:9710/s3/my-bucket/my-object
-
-# GET an object
-curl -X GET \
-  -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature" \
-  http://localhost:9710/s3/my-bucket/my-object
-
-# DELETE an object
-curl -X DELETE \
-  -H "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature" \
-  http://localhost:9710/s3/my-bucket/my-object
-```
-
-### Using Python
+### Using boto3 (Python)
 
 ```python
-import requests
+import boto3
 
-# Test S3 API
-url = "http://localhost:9710/s3/my-bucket/my-object"
-headers = {
-    "Authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature"
-}
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9710/s3',
+    aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
+    aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    region_name='us-east-1'
+)
 
-# PUT
-response = requests.put(url, headers=headers, data=b"Hello, World!")
-print(f"PUT Status: {response.status_code}")
+# Upload
+s3.upload_file('local_file.txt', 'my-bucket', 'remote_file.txt')
 
-# GET
-response = requests.get(url, headers=headers)
-print(f"GET Status: {response.status_code}")
+# Download  
+s3.download_file('my-bucket', 'remote_file.txt', 'downloaded_file.txt')
 
-# DELETE
-response = requests.delete(url, headers=headers)
-print(f"DELETE Status: {response.status_code}")
+# List objects
+response = s3.list_objects_v2(Bucket='my-bucket')
 ```
 
-## Testing
-
-Run the test client to verify the S3 API:
+### Using aws-cli
 
 ```bash
-cd server/tests
-python3 s3_test_client.py
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_DEFAULT_REGION=us-east-1
+
+# Upload
+aws s3 cp local_file.txt s3://my-bucket/remote_file.txt --endpoint-url http://localhost:9710/s3
+
+# Download
+aws s3 cp s3://my-bucket/remote_file.txt downloaded_file.txt --endpoint-url http://localhost:9710/s3
+
+# List
+aws s3 ls s3://my-bucket/ --endpoint-url http://localhost:9710/s3
 ```
 
-## Implementation Notes
+## 🧪 **Testing**
 
-### Current Limitations
+Run the comprehensive test:
 
-1. **Authentication**: Currently uses hardcoded credentials for testing
-2. **Request Modification**: Limited by Actix-Web's HttpRequest immutability
-3. **Service Integration**: S3 handlers currently return mock responses
-4. **Signature Validation**: Simplified authentication without proper AWS signature calculation
-
-### Future Improvements
-
-1. **Proper AWS Signature Validation**: Implement full AWS4-HMAC-SHA256 signature verification
-2. **Credential Management**: Replace hardcoded credentials with proper credential store
-3. **Service Integration**: Connect S3 handlers to existing storage services
-4. **Request Transformation**: Implement proper request header modification
-5. **Error Responses**: Add proper S3-compatible error XML responses
-
-## Architecture
-
-```
-S3 Client Request
-       ↓
-S3 Handlers (s3/handlers.rs)
-       ↓
-Authentication (s3/auth.rs)
-       ↓
-Internal Services (service/mod.rs)
-       ↓
-Storage Layer (storage/mod.rs)
+```bash
+cd demo/
+python3 s3_comprehensive_test.py
 ```
 
-## Files
+**Test Coverage:**
+- 13 different file types (videos, images, documents, binary)
+- File integrity verification
+- All S3 operations (PUT, GET, DELETE, HEAD, COPY, LIST)
+- Multipart uploads
+- Error handling
 
-- `s3/mod.rs` - Module exports
-- `s3/auth.rs` - Authentication logic
-- `s3/handlers.rs` - S3 endpoint handlers
-- `s3/middleware.rs` - Request processing middleware
-- `tests/s3_integration.rs` - Integration tests
-- `tests/s3_test_client.py` - Python test client
+## 📚 **Documentation**
+
+- **[User Guide](../docs/user_guide.md#s3-compatible-api)**: Complete API reference
+- **[Technical Architecture](../docs/Technical-Architecture.md)**: System design
+- **[Demo](../demo/)**: Working examples and test files

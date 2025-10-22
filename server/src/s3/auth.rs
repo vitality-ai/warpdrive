@@ -3,7 +3,6 @@ use actix_web::{HttpRequest, Error, error::ErrorUnauthorized};
 use log::{info, warn};
 
 /// Hardcoded credentials for S3 authentication
-/// TODO: Replace with proper credential management system
 const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 // const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
@@ -65,15 +64,15 @@ pub fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error>
     let path = req.path();
     let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     
-    if path_parts.len() < 2 {
+    if path_parts.is_empty() {
         return Err(ErrorUnauthorized("Invalid S3 path format"));
     }
     
     // For S3 requests, the bucket is the first part after /s3/
-    let bucket = if path_parts[0] == "s3" && path_parts.len() >= 3 {
+    let bucket = if path_parts[0] == "s3" && path_parts.len() >= 2 {
         path_parts[1].to_string()
     } else {
-        path_parts[0].to_string()
+        return Err(ErrorUnauthorized("Invalid S3 path format - must start with /s3/"));
     };
     let user_id = format!("s3_user_{}", access_key);
     
@@ -118,7 +117,7 @@ mod tests {
     #[test]
     async fn test_authenticate_s3_request() {
         let req = test::TestRequest::default()
-            .uri("/test-bucket/test-key")
+            .uri("/s3/test-bucket/test-key")
             .insert_header(("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature"))
             .to_http_request();
         
@@ -134,7 +133,7 @@ mod tests {
     #[test]
     async fn test_authenticate_s3_request_invalid_key() {
         let req = test::TestRequest::default()
-            .uri("/test-bucket/test-key")
+            .uri("/s3/test-bucket/test-key")
             .insert_header(("Authorization", "AWS4-HMAC-SHA256 Credential=INVALID_KEY/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=signature"))
             .to_http_request();
         

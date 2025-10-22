@@ -7,6 +7,7 @@
 pub mod local_store;
 pub mod mock_store;
 pub mod config;
+pub mod deletion_worker;
 
 #[cfg(test)]
 mod comprehensive_test;
@@ -57,83 +58,143 @@ lazy_static! {
     };
 }
 
-/// Legacy API compatibility: Processes incoming flatbuffer data and writes files to storage
+/// Unified storage function: Processes incoming data and writes files to storage
 /// Returns a vector of (offset, size) pairs for each written file
-pub fn write_files_to_storage(context: &crate::service::user_context::UserContext, body: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
-    info!("write_files_to_storage called for user: {}, bucket: {}, body size: {}", context.user_id, context.bucket, body.len());
-    let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
-
-    // Deserialize binary data into FileDataList using flatbuffer
-    let file_data_list = match root::<FileDataList>(&body) {
-        Ok(data) => {
-            info!("Successfully parsed FlatBuffers data");
-            data
-        },
-        Err(e) => {
-            error!("Failed to parse FlatBuffers data: {:?}", e);
-            return Err(ErrorBadRequest(format!("Failed to parse FlatBuffers data: {:?}", e)));
-        },
-    };
-    let files = match file_data_list.files() {
-        Some(files) => {
-            info!("Found {} files in FlatBuffers data", files.len());
-            files
-        },
-        None => {
-            error!("No files found in FlatBuffers data");
-            return Err(ErrorBadRequest("No files found in FlatBuffers data"));
-        },
-    };
-    info!("Deserialized {} files for user: {}, bucket: {}", files.len(), context.user_id, context.bucket);
-
-    for (index, file_data) in files.iter().enumerate() {
-        let data = match file_data.data() {
-            Some(data) => data,
-            None => {
-                error!("No data in file at index {}", index);
-                continue;
-            }
-        };
-
-        info!("Attempting to write file {} to storage for user: {}, bucket: {}", index, context.user_id, context.bucket);
-        match STORAGE_INSTANCE.write_data(&context.user_id, &context.bucket, data.bytes()) {
+/// 
+/// # Arguments
+/// * `context` - User context for storage operations
+/// * `body` - Raw data to store
+/// * `is_s3_compatible` - If true, treats body as raw S3 data; if false, parses as FlatBuffers
+pub fn write_files_to_storage(context: &crate::service::user_context::UserContext, body: &[u8], is_s3_compatible: bool) -> Result<Vec<(u64, u64)>, Error> {
+    info!("write_files_to_storage called for user: {}, bucket: {}, body size: {}, s3_compatible: {}", 
+          context.user_id, context.bucket, body.len(), is_s3_compatible);
+    
+    if is_s3_compatible {
+        // S3 compatibility: treat raw data as a single file
+        info!("Processing as S3-compatible raw data");
+        match STORAGE_INSTANCE.write_data(&context.user_id, &context.bucket, body) {
             Ok((offset, size)) => {
-                offset_size_list.push((offset, size));
-                info!("Successfully written file {} at offset {} with size {} for user: {}, bucket: {}", 
-                      index, offset, size, context.user_id, context.bucket);
+                info!("Successfully written S3 data at offset {} with size {} for user: {}, bucket: {}", 
+                      offset, size, context.user_id, context.bucket);
+                Ok(vec![(offset, size)])
             }
             Err(e) => {
-                error!("Failed to write file {} to storage for user: {}, bucket: {}: {}", index, context.user_id, context.bucket, e);
-                return Err(ErrorInternalServerError(e));
+                error!("Failed to write S3 data to storage for user: {}, bucket: {}: {}", context.user_id, context.bucket, e);
+                Err(ErrorInternalServerError(e))
             }
         }
-    }
+    } else {
+        // Legacy FlatBuffers compatibility: parse and process multiple files
+        info!("Processing as FlatBuffers data");
+        let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
 
-    Ok(offset_size_list)
+        // Deserialize binary data into FileDataList using flatbuffer
+        let file_data_list = match root::<FileDataList>(&body) {
+            Ok(data) => {
+                info!("Successfully parsed FlatBuffers data");
+                data
+            },
+            Err(e) => {
+                error!("Failed to parse FlatBuffers data: {:?}", e);
+                return Err(ErrorBadRequest(format!("Failed to parse FlatBuffers data: {:?}", e)));
+            },
+        };
+        let files = match file_data_list.files() {
+            Some(files) => {
+                info!("Found {} files in FlatBuffers data", files.len());
+                files
+            },
+            None => {
+                error!("No files found in FlatBuffers data");
+                return Err(ErrorBadRequest("No files found in FlatBuffers data"));
+            },
+        };
+        info!("Deserialized {} files for user: {}, bucket: {}", files.len(), context.user_id, context.bucket);
+
+        for (index, file_data) in files.iter().enumerate() {
+            let data = match file_data.data() {
+                Some(data) => data,
+                None => {
+                    error!("No data in file at index {}", index);
+                    continue;
+                }
+            };
+
+            info!("Attempting to write file {} to storage for user: {}, bucket: {}", index, context.user_id, context.bucket);
+            match STORAGE_INSTANCE.write_data(&context.user_id, &context.bucket, data.bytes()) {
+                Ok((offset, size)) => {
+                    offset_size_list.push((offset, size));
+                    info!("Successfully written file {} at offset {} with size {} for user: {}, bucket: {}", 
+                          index, offset, size, context.user_id, context.bucket);
+                }
+                Err(e) => {
+                    error!("Failed to write file {} to storage for user: {}, bucket: {}: {}", index, context.user_id, context.bucket, e);
+                    return Err(ErrorInternalServerError(e));
+                }
+            }
+        }
+
+        Ok(offset_size_list)
+    }
 }
 
-/// Legacy API compatibility: Retrieves and combines files from storage into a FlatBuffer
-pub fn get_files_from_storage(context: &crate::service::user_context::UserContext, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
-    info!("Getting files from storage using new abstraction");
-    let mut builder = FlatBufferBuilder::new();
-    let mut file_data_vec = Vec::new();
-    info!("Building the flatbuffer to share");
+/// Unified function: Retrieves files from storage
+/// 
+/// # Arguments
+/// * `context` - User context for storage operations
+/// * `offset_size_list` - List of (offset, size) pairs to retrieve
+/// * `is_s3_compatible` - If true, returns raw data; if false, returns FlatBuffer
+pub fn get_files_from_storage(context: &crate::service::user_context::UserContext, offset_size_list: Vec<(u64, u64)>, is_s3_compatible: bool) -> Result<Vec<u8>, Error> {
+    info!("Getting files from storage using new abstraction, s3_compatible: {}", is_s3_compatible);
     
-    for &(offset, size) in offset_size_list.iter() {
-        let data = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
-            .map_err(ErrorInternalServerError)?;
+    if is_s3_compatible {
+        // S3 compatibility: return raw data
+        info!("Processing as S3-compatible raw data");
         
-        let data_vector = builder.create_vector(&data);
-        let file_data = FileData::create(&mut builder, &FileDataArgs { data: Some(data_vector) });
-        file_data_vec.push(file_data);
+        if offset_size_list.is_empty() {
+            return Err(ErrorBadRequest("No data found"));
+        }
+        
+        if offset_size_list.len() > 1 {
+            // If we have multiple chunks, concatenate them (this shouldn't happen for S3)
+            warn!("S3 data has multiple chunks, concatenating them");
+            let mut combined_data = Vec::new();
+            for &(offset, size) in &offset_size_list {
+                let chunk = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
+                    .map_err(ErrorInternalServerError)?;
+                combined_data.extend_from_slice(&chunk);
+            }
+            Ok(combined_data)
+        } else {
+            // Single chunk (normal case for S3)
+            let (offset, size) = offset_size_list[0];
+            let data = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
+                .map_err(ErrorInternalServerError)?;
+            Ok(data)
+        }
+    } else {
+        // Legacy FlatBuffers compatibility: build FlatBuffer
+        info!("Processing as FlatBuffers data");
+        let mut builder = FlatBufferBuilder::new();
+        let mut file_data_vec = Vec::new();
+        info!("Building the flatbuffer to share");
+        
+        for &(offset, size) in offset_size_list.iter() {
+            let data = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
+                .map_err(ErrorInternalServerError)?;
+            
+            let data_vector = builder.create_vector(&data);
+            let file_data = FileData::create(&mut builder, &FileDataArgs { data: Some(data_vector) });
+            file_data_vec.push(file_data);
+        }
+        
+        info!("Successfully built the buffer");
+        let files = builder.create_vector(&file_data_vec);
+        let file_data_list = FileDataList::create(&mut builder, &FileDataListArgs { files: Some(files) });
+        builder.finish(file_data_list, None);
+        info!("Sending buffer");
+        Ok(builder.finished_data().to_vec())
     }
-    
-    info!("Successfully built the buffer");
-    let files = builder.create_vector(&file_data_vec);
-    let file_data_list = FileDataList::create(&mut builder, &FileDataListArgs { files: Some(files) });
-    builder.finish(file_data_list, None);
-    info!("Sending buffer");
-    Ok(builder.finished_data().to_vec())
 }
 
 /// Legacy API compatibility: Handles the deletion process and logs the deletion details
@@ -143,54 +204,7 @@ pub fn delete_and_log(context: &crate::service::user_context::UserContext, key: 
     Ok(())
 }
 
-/// S3-compatible function: Writes raw binary data to storage (not FlatBuffers)
-/// Returns a vector of (offset, size) pairs for metadata storage
-pub fn write_s3_data_to_storage(context: &crate::service::user_context::UserContext, data: &[u8]) -> Result<Vec<(u64, u64)>, Error> {
-    info!("write_s3_data_to_storage called for user: {}, bucket: {}, data size: {}", context.user_id, context.bucket, data.len());
-    
-    // For S3 compatibility, we treat the raw data as a single file
-    // This is different from the FlatBuffers approach which expects multiple files
-    match STORAGE_INSTANCE.write_data(&context.user_id, &context.bucket, data) {
-        Ok((offset, size)) => {
-            info!("Successfully written S3 data at offset {} with size {} for user: {}, bucket: {}", 
-                  offset, size, context.user_id, context.bucket);
-            Ok(vec![(offset, size)])
-        }
-        Err(e) => {
-            error!("Failed to write S3 data to storage for user: {}, bucket: {}: {}", context.user_id, context.bucket, e);
-            Err(ErrorInternalServerError(e))
-        }
-    }
-}
 
-/// S3-compatible function: Retrieves raw binary data from storage (not FlatBuffers)
-/// Takes offset_size_list and returns the raw data
-pub fn get_s3_data_from_storage(context: &crate::service::user_context::UserContext, offset_size_list: Vec<(u64, u64)>) -> Result<Vec<u8>, Error> {
-    info!("Getting S3 data from storage using new abstraction");
-    
-    // For S3 compatibility, we expect a single file (unlike FlatBuffers which can have multiple)
-    if offset_size_list.is_empty() {
-        return Err(ErrorBadRequest("No data found"));
-    }
-    
-    if offset_size_list.len() > 1 {
-        // If we have multiple chunks, concatenate them (this shouldn't happen for S3)
-        warn!("S3 data has multiple chunks, concatenating them");
-        let mut combined_data = Vec::new();
-        for &(offset, size) in &offset_size_list {
-            let chunk = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
-                .map_err(ErrorInternalServerError)?;
-            combined_data.extend_from_slice(&chunk);
-        }
-        Ok(combined_data)
-    } else {
-        // Single chunk (normal case for S3)
-        let (offset, size) = offset_size_list[0];
-        let data = STORAGE_INSTANCE.read_data(&context.user_id, &context.bucket, offset, size)
-            .map_err(ErrorInternalServerError)?;
-        Ok(data)
-    }
-}
 
 #[cfg(test)]
 mod tests {

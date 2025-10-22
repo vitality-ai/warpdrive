@@ -9,8 +9,13 @@ use std::collections::HashMap;
 use actix_web::Error;
 use actix_web::error::{ErrorInternalServerError, ErrorNotFound};
 use log::{warn, info};
-use serde_json::json;
 use std::sync::{Arc, Mutex};
+use lazy_static::lazy_static;
+
+// Global mutex to synchronize concurrent writes to storage files
+lazy_static! {
+    static ref STORAGE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+}
 
 fn get_storage_directory() -> PathBuf {
     // Try to get the storage directory from environment variable
@@ -92,6 +97,7 @@ impl LocalXFSBinaryStore {
             .create(true)
             .read(true)
             .write(true)
+            .append(false)  // Don't use append mode to allow seeking
             .open(&file_path)
     }
 
@@ -123,6 +129,9 @@ impl LocalXFSBinaryStore {
 
 impl Storage for LocalXFSBinaryStore {
     fn write_data(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+        // Acquire global lock to synchronize concurrent writes
+        let _lock = STORAGE_WRITE_LOCK.lock().unwrap();
+        
         // Write data to the bucket binary file and return real offset/size
         let mut file = self.open_bucket_file_for_write(user_id, bucket)
             .map_err(ErrorInternalServerError)?;
@@ -130,7 +139,12 @@ impl Storage for LocalXFSBinaryStore {
         let offset = file.seek(SeekFrom::End(0))
             .map_err(ErrorInternalServerError)?;
         
+        
         file.write_all(data)
+            .map_err(ErrorInternalServerError)?;
+        
+        // Flush to ensure data is written
+        file.flush()
             .map_err(ErrorInternalServerError)?;
         
         let size = data.len() as u64;
@@ -138,6 +152,7 @@ impl Storage for LocalXFSBinaryStore {
         info!("Wrote data for user {} bucket {} at offset {} with size {}", 
               user_id, bucket, offset, size);
         
+        // Lock is automatically released when _lock goes out of scope
         Ok((offset, size))
     }
     
@@ -153,6 +168,7 @@ impl Storage for LocalXFSBinaryStore {
         file.read_exact(&mut buffer)
             .map_err(ErrorInternalServerError)?;
         
+        
         info!("Read data for user {} bucket {} from offset {} with size {}", 
               user_id, bucket, offset, size);
         
@@ -160,28 +176,13 @@ impl Storage for LocalXFSBinaryStore {
     }
     
     fn log_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
-        // Log deletion to JSON file (matches original behavior)
-        let log_path = format!("{}_{}.json", user_id, bucket);
-        let mut log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(ErrorInternalServerError)?;
-            
-        let log_entry = json!({
-            key: {
-                "offset_size": offset_size_list
-            }
-        });
+        // Queue deletion event in SQLite for background worker to process
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        let metadata_store = SQLiteMetadataStore::new();
+        metadata_store.queue_deletion(user_id, bucket, key, offset_size_list)?;
         
-        log_file.seek(SeekFrom::End(0))
-            .map_err(ErrorInternalServerError)?;
-        writeln!(log_file, "{}", log_entry.to_string())
-            .map_err(ErrorInternalServerError)?;
-            
-        info!("Logged deletion for user {} key {} with {} chunks", 
-              user_id, key, offset_size_list.len());
-        
+        info!("Queued deletion event for user {} bucket {} key {} with {} chunks", 
+              user_id, bucket, key, offset_size_list.len());
         Ok(())
     }
     

@@ -79,6 +79,11 @@ impl MetadataService {
     pub fn append_metadata(&self, bucket: &str, key: &str, offset_size_bytes: &[u8]) -> Result<(), Error> {
         self.update_metadata(bucket, key, offset_size_bytes)
     }
+    
+    /// List objects in a bucket
+    pub fn list_objects(&self, bucket: &str) -> Result<Vec<String>, Error> {
+        METADATA_STORE.list_objects(&self.user, bucket)
+    }
 }
 
 #[cfg(test)]

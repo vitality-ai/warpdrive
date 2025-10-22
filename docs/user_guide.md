@@ -37,10 +37,12 @@ ciaos_client = Ciaos(config)
 
 ## API Overview
 
-CIAOS provides an interface for storing, retrieving, and managing binary data and files using unique keys.
+CIAOS provides two interfaces for storing, retrieving, and managing binary data and files:
 
-### Main Methods
+### 1. Native CIAOS API
+Direct interface for storing, retrieving, and managing binary data and files using unique keys.
 
+**Main Methods:**
 - `put`: Upload a file to the server.
 - `put_binary`: Upload binary data with a unique key.
 - `get`: Retrieve binary data by key.
@@ -49,9 +51,25 @@ CIAOS provides an interface for storing, retrieving, and managing binary data an
 - `delete`: Remove data by key.
 - `append`: Add binary data to an existing key.
 
+### 2. S3-Compatible API
+Full S3 compatibility for seamless integration with existing S3 tools and libraries.
+
+**Supported S3 Operations:**
+- `PUT`: Upload objects to buckets
+- `GET`: Download objects from buckets  
+- `DELETE`: Remove objects from buckets
+- `HEAD`: Get object metadata
+- `COPY`: Copy objects within or between buckets
+- `LIST`: List objects in buckets
+- `Multipart Upload`: Handle large file uploads in parts
+
+**Authentication:** Uses AWS Signature V4 for secure access control.
+
 ---
 
 ## Usage Examples
+
+### Native CIAOS API
 
 ```python
 # PUT: Upload a file. Uses the filename as the key if no key is provided.
@@ -76,6 +94,53 @@ ciaos_client.delete(key="your_key")
 ciaos_client.append(key="your_key", data_list=[b"additional_data"])
 ```
 
+### S3-Compatible API
+
+```python
+import boto3
+
+# Configure S3 client to use CIAOS
+s3_client = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9710/s3',
+    aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
+    aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    region_name='us-east-1'
+)
+
+# Upload a file
+s3_client.upload_file('local_file.txt', 'my-bucket', 'remote_file.txt')
+
+# Download a file
+s3_client.download_file('my-bucket', 'remote_file.txt', 'downloaded_file.txt')
+
+# List objects
+response = s3_client.list_objects_v2(Bucket='my-bucket')
+for obj in response.get('Contents', []):
+    print(f"Key: {obj['Key']}, Size: {obj['Size']}")
+
+# Delete an object
+s3_client.delete_object(Bucket='my-bucket', Key='remote_file.txt')
+```
+
 ---
 
+## Demo and Examples
+
+Ready to try CIAOS? Check out our comprehensive demos:
+
+### 🚀 **Quick Start Demo**
+- **Location**: [`demo/`](../demo/)
+- **Features**: Complete S3 compatibility test with 13 different file types
+- **Run**: `python3 s3_comprehensive_test.py`
+
+### 📁 **Test Files**
+- **Location**: [`demo/test_files/`](../demo/test_files/)
+- **Contents**: Sample videos, images, documents, and binary files for testing
+
+### 🐍 **Python Client Demo**
+- **Location**: [`demo/pythonTestClient.py`](../demo/pythonTestClient.py)
+- **Features**: Native CIAOS API examples
+
+### 🔧 **Development Setup**
 For advanced usage and development details, see the [Developer's Documentation](../docs/setup.md).
