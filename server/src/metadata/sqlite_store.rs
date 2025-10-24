@@ -1,87 +1,92 @@
 //! SQLite implementation of MetadataStorage trait
 
 use crate::metadata::{MetadataStorage, Metadata, ObjectId};
+use crate::config::MetadataConfig;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 use std::sync::Mutex;
 use rusqlite::{params, Connection};
 use std::sync::Arc;
-use log::{warn, info, error};
+use log::{warn, info, error, debug};
 use actix_web::Error;
-use lazy_static::lazy_static;
-use std::env;
 use std::path::{Path, PathBuf};
 
-fn get_db_path() -> PathBuf {
-    // Try to get the path from environment variable
-    match env::var("DB_FILE") {
-        Ok(path) => {
-            info!("Using database path from environment: {}", path);
-            PathBuf::from(path)
-        }
-        Err(_) => {
-            warn!("Metadata database location not defined in environment");
-            // Create default path: ./metadata/metadata.sqlite
-            let default_path = Path::new("metadata").join("metadata.sqlite");
-            
-            // Create directory if it doesn't exist
-            if let Some(parent) = default_path.parent() {
-                std::fs::create_dir_all(parent).expect("Failed to create metadata directory");
-            }
-            info!("Using default database path: {}", default_path.display());
-            default_path
-        }
+fn get_db_path(config: Option<&MetadataConfig>) -> PathBuf {
+    let path = if let Some(cfg) = config {
+        PathBuf::from(&cfg.db_path)
+    } else {
+        Path::new("metadata").join("metadata.sqlite")
+    };
+    
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("Failed to create metadata directory");
     }
+    path
 }
 
-lazy_static! {
-    static ref DB_CONN: Arc<Mutex<Connection>> = {
-        let db_path = get_db_path();
-        let conn = Connection::open(&db_path).expect("Failed to open the database");
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS haystack (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user TEXT NOT NULL,
-                bucket TEXT NOT NULL DEFAULT 'default',
-                key TEXT NOT NULL,
-                offset_size_list BLOB,
-                UNIQUE(user, bucket, key)
-            )",
-            [],
-        )
-        .expect("Failed to create table");
-        
-        // Create deletion queue table for WAL
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS deletion_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                bucket TEXT NOT NULL,
-                key TEXT NOT NULL,
-                offset_size_list BLOB NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                processed BOOLEAN DEFAULT FALSE
-            )",
-            [],
-        )
-        .expect("Failed to create deletion_queue table");
-        
-        // Add migration for existing data
-        conn.execute(
-            "ALTER TABLE haystack ADD COLUMN bucket TEXT DEFAULT 'default'",
-            [],
-        ).ok(); // Ignore error if column already exists
-        
-        Arc::new(Mutex::new(conn))
-    };
+fn create_connection(config: Option<&MetadataConfig>) -> Connection {
+    let db_path = get_db_path(config);
+    let conn = Connection::open(&db_path).expect("Failed to open the database");
+    
+    // Configure SQLite based on config
+    if let Some(cfg) = config {
+        if cfg.wal_mode {
+            let mut stmt = conn.prepare("PRAGMA journal_mode=WAL")
+                .expect("Failed to prepare WAL mode statement");
+            let _: String = stmt.query_row([], |row| row.get(0))
+                .expect("Failed to enable WAL mode");
+            info!("Enabled WAL mode for SQLite database");
+        }
+    }
+    
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS haystack (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user TEXT NOT NULL,
+            bucket TEXT NOT NULL DEFAULT 'default',
+            key TEXT NOT NULL,
+            offset_size_list BLOB,
+            UNIQUE(user, bucket, key)
+        )",
+        [],
+    )
+    .expect("Failed to create table");
+    
+    // Create deletion queue table for WAL
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS deletion_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            key TEXT NOT NULL,
+            offset_size_list BLOB NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            processed BOOLEAN DEFAULT FALSE
+        )",
+        [],
+    )
+    .expect("Failed to create deletion_queue table");
+    
+    // Add migration for existing data
+    conn.execute(
+        "ALTER TABLE haystack ADD COLUMN bucket TEXT DEFAULT 'default'",
+        [],
+    ).ok(); // Ignore error if column already exists
+    
+    conn
 }
 
 /// SQLite implementation of MetadataStorage
-pub struct SQLiteMetadataStore;
+pub struct SQLiteMetadataStore {
+    db_conn: Arc<Mutex<Connection>>,
+}
 
 impl SQLiteMetadataStore {
     /// Create a new SQLite metadata store
-    pub fn new() -> Self {
-        Self
+    pub fn new(config: Option<&MetadataConfig>) -> Self {
+        let conn = create_connection(config);
+        Self {
+            db_conn: Arc::new(Mutex::new(conn)),
+        }
     }
 }
 
@@ -92,7 +97,7 @@ impl MetadataStorage for SQLiteMetadataStore {
         let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
         info!("Serialized metadata, size: {} bytes", offset_size_bytes.len());
         
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         info!("Acquired database connection lock");
         
         let result = conn.execute(
@@ -102,7 +107,7 @@ impl MetadataStorage for SQLiteMetadataStore {
         
         match result {
             Ok(_) => {
-                info!("Successfully inserted metadata for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
+                debug!("Successfully inserted metadata for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
                 Ok(())
             },
             Err(e) => {
@@ -113,7 +118,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
     
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT offset_size_list FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
@@ -130,7 +135,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
     
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         conn.execute(
             "DELETE FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3",
             params![user_id, bucket, object_id],
@@ -140,7 +145,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
     
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT key FROM haystack WHERE user = ?1 AND bucket = ?2")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
@@ -159,7 +164,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
         info!("SQLite object_exists called for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         
@@ -175,7 +180,7 @@ impl MetadataStorage for SQLiteMetadataStore {
         let offset_size_list = metadata.to_offset_size_list();
         let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
         
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         conn.execute(
             "UPDATE haystack SET offset_size_list = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
             params![offset_size_bytes, user_id, bucket, object_id],
@@ -185,13 +190,22 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
     
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         conn.execute(
             "UPDATE haystack SET key = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
             params![new_object_id, user_id, bucket, old_object_id],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         
         Ok(())
+    }
+    
+    fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        // Call the existing queue_deletion implementation
+        SQLiteMetadataStore::queue_deletion(self, user_id, bucket, key, offset_size_list)
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -201,20 +215,19 @@ impl SQLiteMetadataStore {
     pub fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         let offset_size_bytes = serialize_offset_size(&offset_size_list.to_vec())?;
         
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         conn.execute(
             "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, bucket, key, offset_size_bytes],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         
-        info!("Queued deletion for user {} bucket {} key {} with {} chunks", 
-              user_id, bucket, key, offset_size_list.len());
+        // Queued deletion for background processing
         Ok(())
     }
     
     /// Get pending deletion events (for worker processing)
     pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, bucket, key, offset_size_list, created_at 
              FROM deletion_queue 
@@ -248,7 +261,7 @@ impl SQLiteMetadataStore {
     
     /// Mark deletion event as processed
     pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         conn.execute(
             "UPDATE deletion_queue SET processed = TRUE WHERE id = ?1",
             params![id],
@@ -259,13 +272,13 @@ impl SQLiteMetadataStore {
     
     /// Clean up old processed deletion events (older than 7 days)
     pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = self.db_conn.lock().unwrap();
         let count = conn.execute(
             "DELETE FROM deletion_queue WHERE processed = TRUE AND created_at < datetime('now', '-7 days')",
             [],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         
-        info!("Cleaned up {} old deletion events", count);
+        // Cleaned up old deletion events
         Ok(count)
     }
     
@@ -288,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_sqlite_metadata_store_basic_operations() {
-        let store = SQLiteMetadataStore::new();
+        let store = SQLiteMetadataStore::new(None);
         
         // Create test metadata
         let mut metadata = Metadata::from_offset_size_list(vec![(100, 200), (300, 400)]);

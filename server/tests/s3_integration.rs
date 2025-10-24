@@ -7,12 +7,15 @@ use warp_drive::s3::handlers::{
     s3_head_object_handler,
     s3_list_objects_handler
 };
+use warp_drive::app_state::AppState;
 
 /// Test S3 PUT object endpoint
 #[actix_web::test]
 async fn test_s3_put_object() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::put().to(s3_put_object_handler))
     ).await;
 
@@ -33,8 +36,10 @@ async fn test_s3_put_object() {
 /// Test S3 GET object endpoint
 #[actix_web::test]
 async fn test_s3_get_object() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
     ).await;
 
@@ -53,8 +58,10 @@ async fn test_s3_get_object() {
 /// Test S3 DELETE object endpoint
 #[actix_web::test]
 async fn test_s3_delete_object() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::delete().to(s3_delete_object_handler))
     ).await;
 
@@ -73,8 +80,10 @@ async fn test_s3_delete_object() {
 /// Test S3 HEAD object endpoint
 #[actix_web::test]
 async fn test_s3_head_object() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::head().to(s3_head_object_handler))
     ).await;
 
@@ -93,8 +102,10 @@ async fn test_s3_head_object() {
 /// Test S3 List objects endpoint
 #[actix_web::test]
 async fn test_s3_list_objects() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}", web::get().to(s3_list_objects_handler))
     ).await;
 
@@ -113,8 +124,10 @@ async fn test_s3_list_objects() {
 /// Test S3 authentication with invalid credentials
 #[actix_web::test]
 async fn test_s3_authentication_invalid() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
     ).await;
 
@@ -133,8 +146,10 @@ async fn test_s3_authentication_invalid() {
 /// Test S3 authentication with missing authorization header
 #[actix_web::test]
 async fn test_s3_authentication_missing() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
     ).await;
 
@@ -152,8 +167,10 @@ async fn test_s3_authentication_missing() {
 /// Test S3 bucket mismatch
 #[actix_web::test]
 async fn test_s3_bucket_mismatch() {
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
     ).await;
 

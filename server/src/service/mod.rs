@@ -1,18 +1,20 @@
 //service/mod.rs
 pub mod metadata_service;
+pub mod storage_service;
 pub mod user_context;
 
 use actix_web::{ web, HttpResponse,Error, HttpRequest};
 use futures::StreamExt;
 use bytes::BytesMut;
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use actix_web::error::{ErrorInternalServerError,ErrorBadRequest};
 use log_mdc;
 
 
-use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
 use crate::service::metadata_service::MetadataService;
+use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
+use crate::app_state::AppState;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 
 
@@ -48,16 +50,16 @@ fn header_handler(req: HttpRequest) -> Result<UserContext, Error> {
     Ok(context)
 }
 
-pub async fn put_service(key: String, mut payload: web::Payload, req: HttpRequest) -> Result<HttpResponse, Error>{
+pub async fn put_service(key: String, mut payload: web::Payload, req: HttpRequest, app_state: web::Data<AppState>) -> Result<HttpResponse, Error>{
 
     let context = header_handler(req)?;
-    info!("PUT service called for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
+    debug!("PUT service called for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
 
-    let db = MetadataService::new(&context.user_id)?;
-    info!("MetadataService created for user: {}", context.user_id);
+    let mdservice = &app_state.metadata_service;
+    debug!("MetadataService created for user: {}", context.user_id);
     
-    let key_exists = db.check_key(&context.bucket, &key).map_err(ErrorInternalServerError)?;
-    info!("Key exists check result: {} for key: {} in bucket: {}", key_exists, key, context.bucket);
+    let key_exists = mdservice.check_key(&context, &key).map_err(ErrorInternalServerError)?;
+    debug!("Key exists check result: {} for key: {} in bucket: {}", key_exists, key, context.bucket);
     
     if key_exists {
         warn!("Key already exists: {} in bucket: {}", key, context.bucket);
@@ -78,7 +80,7 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     info!("Total received data size: {} bytes", bytes.len());
 
-    let offset_size_list = write_files_to_storage(&context, &bytes, false)?;
+    let offset_size_list = app_state.storage_service.write_files_to_storage(&context, &bytes, false)?;
 
 
     if offset_size_list.is_empty()  {
@@ -86,45 +88,43 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
         return Ok(HttpResponse::BadRequest().body("No data in data list"));
     }
 
-    info!("Serializing offset and size and uploading");
+    debug!("Serializing offset and size and uploading");
 
-    info!("Serializing offset_size_list with {} entries", offset_size_list.len());
+    debug!("Serializing offset_size_list with {} entries", offset_size_list.len());
     let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
-    info!("Successfully serialized offset_size_bytes, size: {} bytes", offset_size_bytes.len());
+    debug!("Successfully serialized offset_size_bytes, size: {} bytes", offset_size_bytes.len());
 
-    info!("Writing metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
-    db.write_metadata(&context.bucket, &key, &offset_size_bytes)
+    debug!("Writing metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
+    mdservice.write_metadata(&context, &key, &offset_size_bytes)
         .map_err(|e| {
             error!("Failed to write metadata for user: {}, bucket: {}, key: {}: {}", context.user_id, context.bucket, key, e);
             ErrorInternalServerError(e)
         })?;
-    info!("Successfully wrote metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
+    debug!("Successfully wrote metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
 
-    info!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
+    debug!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
     Ok(HttpResponse::Ok().body(format!("Data uploaded successfully: key = {}, bucket = {}", key, context.bucket)))
 }
 
-pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, Error>{
+pub async fn get_service(key: String, req: HttpRequest, app_state: web::Data<AppState>) -> Result<HttpResponse, Error>{
 
     let context = header_handler(req)?;
 
-    let db = MetadataService::new(&context.user_id)?;
-    db.check_key_nonexistance(&context.bucket, &key)?;
+    let mdservice = &app_state.metadata_service;
+    mdservice.check_key_nonexistance(&context, &key)?;
     info!("Retrieving data for key: {} in bucket: {}", key, context.bucket);
 
     // Connect to the SQLite database and retrieve offset and size data
-    let offset_size_bytes = match db.read_metadata(&context.bucket, &key) {
-        Ok(offset_size_bytes) => offset_size_bytes,
-        Err(e) => {
+    let offset_size_bytes = mdservice.read_metadata(&context, &key)
+        .map_err(|e| {
             warn!("Key does not exist or database error: {}", e);
-            return Ok(HttpResponse::BadRequest().body("Key does not exist"));
-        }
-    };
+            ErrorBadRequest("Key does not exist")
+        })?;
 
     // Deserialize offset and size data
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
 
-    let data = get_files_from_storage(&context, offset_size_list, false)?;
+    let data = app_state.storage_service.get_files_from_storage(&context, offset_size_list, false)?;
 
     // Return the FlatBuffers serialized data
     Ok(HttpResponse::Ok()
@@ -132,11 +132,11 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
         .body(data))
 }
 
-pub async fn append_service(key: String, mut payload: web::Payload, req: HttpRequest ) -> Result<HttpResponse, Error> {
+pub async fn append_service(key: String, mut payload: web::Payload, req: HttpRequest, app_state: web::Data<AppState>) -> Result<HttpResponse, Error> {
     let context = header_handler(req)?;
 
-    let db = MetadataService::new(&context.user_id)?;
-    db.check_key_nonexistance(&context.bucket, &key)?;
+    let mdservice = &app_state.metadata_service;
+    mdservice.check_key_nonexistance(&context, &key)?;
     info!("Starting chunk load");
     let mut bytes = BytesMut::new();
     while let Some(chunk) = payload.next().await {
@@ -150,7 +150,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
     info!("Total received data size: {} bytes", bytes.len());
 
-    let mut offset_size_list_append = write_files_to_storage(&context, &bytes, false)?;
+    let mut offset_size_list_append = app_state.storage_service.write_files_to_storage(&context, &bytes, false)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -158,15 +158,13 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
         return Ok(HttpResponse::BadRequest().body("No data in data list"));
     }
    
-    info!("Serializing offset and size and uploading");
+    debug!("Serializing offset and size and uploading");
 
-    let offset_size_bytes = match db.read_metadata(&context.bucket, &key) {
-        Ok(offset_size_bytes) => offset_size_bytes,
-        Err(e) => {
+    let offset_size_bytes = mdservice.read_metadata(&context, &key)
+        .map_err(|e| {
             warn!("Key does not exist or database error: {}", e);
-            return Ok(HttpResponse::BadRequest().body("Key does not exist"));
-        }
-    };
+            ErrorBadRequest("Key does not exist")
+        })?;
     
         // Deserialize offset and size data
     let mut offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
@@ -176,7 +174,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
 
     let offset_size_bytes_append = serialize_offset_size(&offset_size_list)?;
 
-    db.append_metadata(&context.bucket, &key, &offset_size_bytes_append)
+    mdservice.append_metadata(&context, &key, &offset_size_bytes_append)
             .map_err(ErrorInternalServerError)?;
     
     info!("Data apended successfully with key: {}", key);
@@ -184,48 +182,44 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
 }
 
-pub async fn delete_service(key: String, req: HttpRequest)-> Result<HttpResponse, Error>{
+pub async fn delete_service(key: String, req: HttpRequest, app_state: web::Data<AppState>) -> Result<HttpResponse, Error>{
 
     let context = header_handler(req)?;
 
-    let db = MetadataService::new(&context.user_id)?;
-    db.check_key_nonexistance(&context.bucket, &key)?;
-    let offset_size_bytes = match db.read_metadata(&context.bucket, &key) {
-        Ok(offset_size_bytes) => offset_size_bytes,
-        Err(e) => {
+    let mdservice = &app_state.metadata_service;
+    mdservice.check_key_nonexistance(&context, &key)?;
+    let offset_size_bytes = mdservice.read_metadata(&context, &key)
+        .map_err(|e| {
             warn!("Key does not exist or database error: {}", e);
-            return Ok(HttpResponse::BadRequest().body("Key does not exist"));
-        }
-    };
+            ErrorBadRequest("Key does not exist")
+        })?;
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
     // Deserialize offset and size data
     
-    delete_and_log(&context, &key, offset_size_list)?;
-
-    match db.delete_metadata(&context.bucket, &key) {
-        Ok(()) => Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {} in bucket = {}", key, context.bucket))),
-        Err(e) => Ok(HttpResponse::InternalServerError().body(format!("Failed to delete key: {}", e))),
-    }
+    // Queue deletion for background processing and delete metadata immediately
+    mdservice.queue_deletion(&context.user_id, &context.bucket, &key, &offset_size_list)?;
+    
+    Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {} in bucket = {}", key, context.bucket)))
 }
 
-pub async fn update_key_service(old_key: String, new_key: String, req: HttpRequest)->  Result<HttpResponse, Error>{
+pub async fn update_key_service(old_key: String, new_key: String, req: HttpRequest, app_state: web::Data<AppState>) -> Result<HttpResponse, Error>{
     
     let context = header_handler(req)?;
 
-    let db = MetadataService::new(&context.user_id)?;
-    db.check_key_nonexistance(&context.bucket, &old_key)?;
+    let mdservice = &app_state.metadata_service;
+    mdservice.check_key_nonexistance(&context, &old_key)?;
     // Update the key in the database
-    match db.rename_key(&context.bucket, &old_key, &new_key) {
+    match mdservice.rename_key(&context, &old_key, &new_key) {
         Ok(()) => Ok(HttpResponse::Ok().body(format!("Key updated successfully from {} to {} in bucket {}", old_key, new_key, context.bucket))),
         Err(e) => Ok(HttpResponse::InternalServerError().body(format!("Failed to update key: {}", e))),
     }
 }
 
-pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRequest ) ->  Result<HttpResponse, Error>{
+pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRequest, app_state: web::Data<AppState> ) ->  Result<HttpResponse, Error>{
     let context = header_handler(req)?;
 
-    let db = MetadataService::new(&context.user_id)?;
-    db.check_key_nonexistance(&context.bucket, &key)?;
+    let mdservice = &app_state.metadata_service;
+    mdservice.check_key_nonexistance(&context, &key)?;
 
     info!("Starting chunk load");
     let mut bytes = BytesMut::new();
@@ -242,7 +236,7 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     info!("Total received data size: {} bytes", bytes.len());
     info!("Starting deserialization");
     
-    let offset_size_list = write_files_to_storage(&context, &bytes, false)?;
+    let offset_size_list = app_state.storage_service.write_files_to_storage(&context, &bytes, false)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);
@@ -251,10 +245,10 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     
 
     let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
-    db.update_metadata(&context.bucket, &key, &offset_size_bytes)
+    mdservice.update_metadata(&context, &key, &offset_size_bytes)
     .map_err(ErrorInternalServerError)?;
 
-    info!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
+    debug!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
     Ok(HttpResponse::Ok().body(format!("Data uploaded successfully: key = {}, bucket = {}", key, context.bucket)))
 
 

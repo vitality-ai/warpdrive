@@ -6,7 +6,6 @@
 
 pub mod sqlite_store;
 pub mod mock_store;
-pub mod config;
 
 #[cfg(test)]
 mod comprehensive_test;
@@ -31,6 +30,8 @@ pub struct Metadata {
     pub chunks: Vec<DataChunk>,
     /// Optional additional metadata that can be extended for future use
     pub properties: HashMap<String, String>,
+    /// Checksum for data integrity verification
+    pub checksum: Option<String>,
 }
 
 impl Metadata {
@@ -44,6 +45,21 @@ impl Metadata {
         Self {
             chunks,
             properties: HashMap::new(),
+            checksum: None,
+        }
+    }
+    
+    /// Create a new metadata instance from offset-size list with checksum
+    pub fn from_offset_size_list_with_checksum(offset_size_list: Vec<(u64, u64)>, checksum: String) -> Self {
+        let chunks = offset_size_list
+            .into_iter()
+            .map(|(offset, size)| DataChunk { offset, size })
+            .collect();
+        
+        Self {
+            chunks,
+            properties: HashMap::new(),
+            checksum: Some(checksum),
         }
     }
     
@@ -53,6 +69,16 @@ impl Metadata {
             .iter()
             .map(|chunk| (chunk.offset, chunk.size))
             .collect()
+    }
+    
+    /// Get the checksum if available
+    pub fn get_checksum(&self) -> Option<&String> {
+        self.checksum.as_ref()
+    }
+    
+    /// Set the checksum
+    pub fn set_checksum(&mut self, checksum: String) {
+        self.checksum = Some(checksum);
     }
 }
 
@@ -84,6 +110,12 @@ pub trait MetadataStorage: Send + Sync {
     
     /// Update the key (object_id) for an existing object
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error>;
+    
+    /// Queue deletion for background processing
+    fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
+    
+    /// Get a reference to the underlying type for downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[cfg(test)]

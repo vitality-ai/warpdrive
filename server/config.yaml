@@ -1,0 +1,34 @@
+# WarpDrive Configuration File
+# This file configures the application's storage, metadata, and server settings
+
+# Server Configuration
+server:
+  host: "127.0.0.1"
+  port: 9710
+  workers: 4
+  max_payload_size: 1073741824
+
+# Storage Configuration
+storage:
+  backend: "LocalXFS"
+  base_path: "./data/storage"
+  temp_path: "./data/temp"
+
+# Metadata Configuration  
+metadata:
+  backend: "SQLite"
+  db_path: "./data/metadata.db"
+  pool_size: 10
+  wal_mode: true
+
+# Deletion Worker Configuration
+deletion:
+  enabled: true
+  cleanup_interval: 300
+  batch_size: 100
+  retry_attempts: 3
+  retry_delay: 5
+
+# Logging Configuration
+logging:
+  config_file: "server_log.yaml"
