@@ -1,5 +1,6 @@
-use actix_web::{test, App, http::StatusCode};
+use actix_web::{test, App, http::StatusCode, web};
 use warp_drive::api::{put, get, append, delete, update_key, update};
+use warp_drive::app_state::AppState;
 
 // bring in your generated flatbuffers schema
 use warp_drive::util::flatbuffer_store_generated::store::{
@@ -26,8 +27,10 @@ async fn test_basic_api_endpoints() {
     let buf = builder.finished_data();
 
     // 2. Create test app with actix-web
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -118,8 +121,10 @@ async fn test_user_isolation() {
     let buf = builder.finished_data();
 
     // 2. Create test app
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -210,8 +215,10 @@ async fn test_append_endpoint() {
     builder.finish(file_list, None);
     let buf = builder.finished_data();
 
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -288,8 +295,10 @@ async fn test_delete_endpoint() {
     builder.finish(file_list, None);
     let buf = builder.finished_data();
 
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -360,8 +369,10 @@ async fn test_update_key_endpoint() {
     builder.finish(file_list, None);
     let buf = builder.finished_data();
 
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -442,8 +453,10 @@ async fn test_update_endpoint() {
     builder.finish(file_list, None);
     let buf = builder.finished_data();
 
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -524,8 +537,10 @@ async fn test_update_endpoint() {
 #[actix_web::test]
 async fn test_error_cases() {
     // Test various error cases
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)
@@ -606,8 +621,10 @@ async fn test_bucket_feature() {
     builder.finish(file_list, None);
     let buf = builder.finished_data();
 
+    let app_state = web::Data::new(AppState::new());
     let app = test::init_service(
         App::new()
+            .app_data(app_state.clone())
             .service(put)
             .service(get)
             .service(append)

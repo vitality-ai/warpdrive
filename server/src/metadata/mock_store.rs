@@ -158,6 +158,16 @@ impl MetadataStorage for MockMetadataStore {
             old_object_id
         )))
     }
+    
+    fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        // For mock store, just return Ok (no-op for testing)
+        // In a real implementation, this would queue the deletion for background processing
+        Ok(())
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

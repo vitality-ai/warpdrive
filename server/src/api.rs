@@ -1,26 +1,29 @@
 //api.rs
 use actix_web::{web, HttpRequest, HttpResponse,Error };
-use log::info;
+use log::{info, debug};
 
 use crate::service::{get_service, put_service ,append_service , delete_service, update_key_service,update_service};
+use crate::app_state::AppState;
 
 #[actix_web::post("/put/{key}")]
 async fn put(
     key: web::Path<String>,
     payload: web::Payload,
     req: HttpRequest,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    info!("Uploading data with key: {}", key);
-    put_service(key.into_inner(), payload, req).await
+    debug!("Uploading data with key: {}", key);
+    put_service(key.into_inner(), payload, req, app_state).await
 }
 
 #[actix_web::get("/get/{key}")]
 async fn get(
     key: web::Path<String>,
     req: HttpRequest,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     info!("checking key and retrieving : {}", key);
-    get_service(key.into_inner(), req).await
+    get_service(key.into_inner(), req, app_state).await
 }
 
 
@@ -29,18 +32,20 @@ async fn append(
     key: web::Path<String>,
     payload: web::Payload,
     req: HttpRequest,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     info!("appending data with key: {}", key);
-    append_service(key.into_inner(), payload, req).await
+    append_service(key.into_inner(), payload, req, app_state).await
 }
 
 #[actix_web::delete("/delete/{key}")]
 async fn delete(
     key: web::Path<String>,
     req: HttpRequest,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     info!("deleting data with key: {}", key);
-    delete_service(key.into_inner(), req).await
+    delete_service(key.into_inner(), req, app_state).await
 }
 
 
@@ -48,10 +53,11 @@ async fn delete(
 async fn update_key(
     path: web::Path<(String, String)>,
     req: HttpRequest,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     let (old_key, new_key) = path.into_inner();
     info!("updating old key with key: {}", new_key);
-    update_key_service(old_key, new_key, req).await
+    update_key_service(old_key, new_key, req, app_state).await
 }
 
 
@@ -60,7 +66,8 @@ async fn update(
     key: web::Path<String>,
     payload: web::Payload,
     req: HttpRequest,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    info!("Uploading data with key: {}", key);
-    update_service(key.into_inner(), payload, req).await
+    debug!("Uploading data with key: {}", key);
+    update_service(key.into_inner(), payload, req, app_state).await
 }

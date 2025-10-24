@@ -4,6 +4,7 @@
 //! and perform the actual cleanup of storage chunks.
 
 use crate::metadata::sqlite_store::{SQLiteMetadataStore, DeletionEvent};
+use crate::config::DeletionConfig;
 use log::{info, warn, error};
 use std::time::Duration;
 use tokio::time;
@@ -17,10 +18,20 @@ pub struct DeletionWorker {
 
 impl DeletionWorker {
     pub fn new() -> Self {
+        Self::from_config(&DeletionConfig {
+            enabled: true,
+            cleanup_interval: 300,
+            batch_size: 100,
+            retry_attempts: 3,
+            retry_delay: 5,
+        })
+    }
+    
+    pub fn from_config(config: &DeletionConfig) -> Self {
         Self {
-            metadata_store: SQLiteMetadataStore::new(),
-            batch_size: 100, // Process up to 100 deletions at a time
-            cleanup_interval: Duration::from_secs(300), // Run every 5 minutes
+            metadata_store: SQLiteMetadataStore::new(None),
+            batch_size: config.batch_size as i32,
+            cleanup_interval: Duration::from_secs(config.cleanup_interval),
         }
     }
     
@@ -51,8 +62,6 @@ impl DeletionWorker {
             return Ok(());
         }
         
-        info!("Processing {} deletion events", events.len());
-        
         for event in events {
             if let Err(e) = self.process_deletion_event(&event).await {
                 error!("Failed to process deletion event {}: {}", event.id, e);
@@ -75,9 +84,6 @@ impl DeletionWorker {
     
     /// Process a single deletion event
     async fn process_deletion_event(&self, event: &DeletionEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Processing deletion: user={}, bucket={}, key={}, chunks={}", 
-              event.user_id, event.bucket, event.key, event.offset_size_list.len());
-        
         // 1. Mark storage chunks as deleted/free in the binary files
         self.mark_chunks_as_deleted(&event.user_id, &event.offset_size_list).await?;
         
@@ -87,9 +93,6 @@ impl DeletionWorker {
         // 3. Check if compaction is needed (optional - can be done separately)
         self.check_compaction_needed(&event.user_id).await?;
         
-        info!("Successfully processed deletion for user {} key {} - freed {} bytes", 
-              event.user_id, event.key, self.calculate_total_size(&event.offset_size_list));
-        
         Ok(())
     }
     
@@ -97,7 +100,7 @@ impl DeletionWorker {
     async fn mark_chunks_as_deleted(&self, user_id: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // For each chunk, mark it as deleted in the storage system
         for &(offset, size) in offset_size_list {
-            info!("Marking chunk as deleted: user={}, offset={}, size={}", user_id, offset, size);
+            // Mark chunk as deleted (implementation would go here)
         }
         
         Ok(())
@@ -105,15 +108,15 @@ impl DeletionWorker {
     
     /// Update storage statistics after deletion
     async fn update_storage_statistics(&self, user_id: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let freed_bytes = self.calculate_total_size(offset_size_list);
-        
-        info!("Updated storage statistics: user={}, freed_bytes={}", user_id, freed_bytes);
+        let _freed_bytes = self.calculate_total_size(offset_size_list);
+        // Update storage statistics (implementation would go here)
         Ok(())
     }
     
     /// Check if storage compaction is needed
     async fn check_compaction_needed(&self, user_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Checked compaction for user={}", user_id);
+        // Check if compaction is needed (implementation would go here)
+        let _user_id = user_id;
         Ok(())
     }
     

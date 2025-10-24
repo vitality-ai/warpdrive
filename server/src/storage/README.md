@@ -98,7 +98,7 @@ store.log_deletion("user_id", "key", &[(offset, size)])?;
 The module provides backward-compatible functions that match the original storage API:
 
 ```rust
-use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
+use crate::storage::{write_files_to_storage, get_files_from_storage};
 
 // Process flatbuffer data and write files
 let offset_size_list = write_files_to_storage("user", &flatbuffer_data)?;
@@ -107,7 +107,7 @@ let offset_size_list = write_files_to_storage("user", &flatbuffer_data)?;
 let flatbuffer_data = get_files_from_storage("user", offset_size_list)?;
 
 // Delete and log files
-delete_and_log("user", "key", offset_size_list)?;
+// Delete is now handled through StorageService
 ```
 
 ## Storage Trait Interface
