@@ -1,6 +1,7 @@
 //service/mod.rs
 pub mod metadata_service;
 pub mod user_context;
+pub mod storage_service;
 
 use actix_web::{ web, HttpResponse,Error, HttpRequest};
 use futures::StreamExt;
@@ -10,7 +11,7 @@ use actix_web::error::{ErrorInternalServerError,ErrorBadRequest};
 use log_mdc;
 
 
-use crate::storage::{write_files_to_storage, get_files_from_storage, delete_and_log};
+use crate::service::storage_service::{StorageService, StorageMode};
 use crate::service::metadata_service::MetadataService;
 use crate::service::user_context::UserContext;
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
@@ -78,7 +79,9 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     info!("Total received data size: {} bytes", bytes.len());
 
-    let offset_size_list = write_files_to_storage(&context, &bytes, false)?;
+    // Write incoming FlatBuffers payload to storage and collect (offset, size)
+    let storage_service = StorageService::new();
+    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
 
 
     if offset_size_list.is_empty()  {
@@ -124,7 +127,9 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
     // Deserialize offset and size data
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
 
-    let data = get_files_from_storage(&context, offset_size_list, false)?;
+    // Build FlatBuffers payload from stored chunks
+    let storage_service = StorageService::new();
+    let data = storage_service.read_object(&context, &offset_size_list, StorageMode::Native)?;
 
     // Return the FlatBuffers serialized data
     Ok(HttpResponse::Ok()
@@ -150,7 +155,9 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
     info!("Total received data size: {} bytes", bytes.len());
 
-    let mut offset_size_list_append = write_files_to_storage(&context, &bytes, false)?;
+    // Write additional FlatBuffers payload chunks to storage
+    let storage_service = StorageService::new();
+    let mut offset_size_list_append = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -187,25 +194,9 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
 pub async fn delete_service(key: String, req: HttpRequest)-> Result<HttpResponse, Error>{
 
     let context = header_handler(req)?;
-
-    let db = MetadataService::new(&context.user_id)?;
-    db.check_key_nonexistance(&context.bucket, &key)?;
-    let offset_size_bytes = match db.read_metadata(&context.bucket, &key) {
-        Ok(offset_size_bytes) => offset_size_bytes,
-        Err(e) => {
-            warn!("Key does not exist or database error: {}", e);
-            return Ok(HttpResponse::BadRequest().body("Key does not exist"));
-        }
-    };
-    let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-    // Deserialize offset and size data
-    
-    delete_and_log(&context, &key, offset_size_list)?;
-
-    match db.delete_metadata(&context.bucket, &key) {
-        Ok(()) => Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {} in bucket = {}", key, context.bucket))),
-        Err(e) => Ok(HttpResponse::InternalServerError().body(format!("Failed to delete key: {}", e))),
-    }
+    let storage_service = StorageService::new();
+    storage_service.delete_object(&context, &key)?;
+    Ok(HttpResponse::Ok().body(format!("File deleted successfully: key = {} in bucket = {}", key, context.bucket)))
 }
 
 pub async fn update_key_service(old_key: String, new_key: String, req: HttpRequest)->  Result<HttpResponse, Error>{
@@ -242,7 +233,9 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     info!("Total received data size: {} bytes", bytes.len());
     info!("Starting deserialization");
     
-    let offset_size_list = write_files_to_storage(&context, &bytes, false)?;
+    // Rewrite with provided FlatBuffers payload
+    let storage_service = StorageService::new();
+    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);

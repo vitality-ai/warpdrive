@@ -84,6 +84,11 @@ impl MetadataService {
     pub fn list_objects(&self, bucket: &str) -> Result<Vec<String>, Error> {
         METADATA_STORE.list_objects(&self.user, bucket)
     }
+
+    /// Queue deletion event for background worker (not part of MetadataStorage trait)
+    pub fn queue_deletion(&self, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        METADATA_STORE.queue_deletion(&self.user, bucket, key, offset_size_list)
+    }
 }
 
 #[cfg(test)]

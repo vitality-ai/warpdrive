@@ -21,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1.0", features = ["full"] }
 md5 = "0.7.0"
 hex = "0.4.3"
+sha2 = "0.10"
 
 
 [dev-dependencies]

@@ -84,6 +84,9 @@ pub trait MetadataStorage: Send + Sync {
     
     /// Update the key (object_id) for an existing object
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error>;
+
+    /// Queue deletion for background processing (WAL style). Implementations may no-op if unsupported.
+    fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
 }
 
 #[cfg(test)]
