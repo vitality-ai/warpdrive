@@ -193,6 +193,10 @@ impl MetadataStorage for SQLiteMetadataStore {
         
         Ok(())
     }
+
+    fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        SQLiteMetadataStore::queue_deletion(self, user_id, bucket, key, offset_size_list)
+    }
 }
 
 /// Deletion queue operations for WAL functionality

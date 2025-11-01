@@ -84,6 +84,35 @@ impl MetadataService {
     pub fn list_objects(&self, bucket: &str) -> Result<Vec<String>, Error> {
         METADATA_STORE.list_objects(&self.user, bucket)
     }
+
+    /// Queue deletion event for background worker (not part of MetadataStorage trait)
+    pub fn queue_deletion(&self, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        METADATA_STORE.queue_deletion(&self.user, bucket, key, offset_size_list)
+    }
+
+    /// Get pending deletion events for background worker processing
+    /// Returns an empty vector if the backend doesn't support deletion queueing
+    pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<crate::metadata::sqlite_store::DeletionEvent>, Error> {
+        // Access SQLite-specific deletion queue methods
+        // In the future, this could be abstracted through the MetadataStorage trait
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        let store = SQLiteMetadataStore::new();
+        store.get_pending_deletions(limit)
+    }
+
+    /// Mark a deletion event as processed
+    pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        let store = SQLiteMetadataStore::new();
+        store.mark_deletion_processed(id)
+    }
+
+    /// Clean up old processed deletion events (older than 7 days)
+    pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        let store = SQLiteMetadataStore::new();
+        store.cleanup_old_deletions()
+    }
 }
 
 #[cfg(test)]

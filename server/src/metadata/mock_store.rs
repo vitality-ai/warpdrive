@@ -158,6 +158,11 @@ impl MetadataStorage for MockMetadataStore {
             old_object_id
         )))
     }
+
+    fn queue_deletion(&self, _user_id: &str, _bucket: &str, _key: &str, _offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        // No-op for mock; simulate success
+        Ok(())
+    }
 }
 
 #[cfg(test)]

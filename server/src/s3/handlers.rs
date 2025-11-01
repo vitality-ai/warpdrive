@@ -8,7 +8,7 @@ use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
 // use crate::service::{get_service, put_service, delete_service};
 use crate::service::metadata_service::MetadataService;
 use crate::service::user_context::UserContext;
-// use crate::storage::{get_files_from_storage};
+use crate::service::storage_service::{StorageService, StorageMode};
 use crate::util::serializer::deserialize_offset_size;
 
 /// S3-compatible PUT object handler
@@ -74,17 +74,19 @@ pub async fn s3_put_object_handler(
         
         // Read existing metadata to get offset/size info for cleanup
         let existing_offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-        let existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
+        let _existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
         
         // Delete existing data from storage
-        crate::storage::delete_and_log(&context, &key, existing_offset_size_list)?;
+        let storage_service = StorageService::new();
+        storage_service.delete_object(&context, &key)?;
         
         // Delete existing metadata
         db.delete_metadata(&context.bucket, &key)?;
     }
     
-    // Use S3-compatible storage system for raw binary data
-    let offset_size_list = crate::storage::write_files_to_storage(&context, &bytes, true)?;
+    // Store the raw bytes as a single chunk
+    let storage_service = StorageService::new();
+    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::S3)?;
     
     if offset_size_list.is_empty() {
         return Ok(HttpResponse::BadRequest().body("No data to store"));
@@ -135,7 +137,9 @@ pub async fn s3_get_object_handler(
     // Use S3-compatible storage system for raw binary data
     let offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-    let data = crate::storage::get_files_from_storage(&context, offset_size_list, true)?;
+    // Concatenate chunks into a single response body
+    let storage_service = StorageService::new();
+    let data = storage_service.read_object(&context, &offset_size_list, StorageMode::S3)?;
     
     
     // Return the actual data directly without conversion
@@ -183,15 +187,9 @@ pub async fn s3_delete_object_handler(
         return Ok(HttpResponse::NotFound().body("Object not found"));
     }
     
-    // Use the existing storage system (same as delete_service)
-    let offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-    let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-    
-    // Delete from storage
-    crate::storage::delete_and_log(&context, &key, offset_size_list)?;
-    
-    // Delete metadata
-    db.delete_metadata(&context.bucket, &key)?;
+    // Use service to delete object and metadata
+    let storage_service = StorageService::new();
+    storage_service.delete_object(&context, &key)?;
     
     // Return success response
     Ok(HttpResponse::Ok()
@@ -330,10 +328,11 @@ pub async fn s3_copy_object_handler(
         
         // Read existing metadata to get offset/size info for cleanup
         let existing_offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-        let existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
+        let _existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
         
         // Delete existing data from storage
-        crate::storage::delete_and_log(&context, &key, existing_offset_size_list)?;
+        let storage_service = StorageService::new();
+        storage_service.delete_object(&context, &key)?;
         
         // Delete existing metadata
         db.delete_metadata(&context.bucket, &key)?;
@@ -343,11 +342,10 @@ pub async fn s3_copy_object_handler(
     let offset_size_bytes = db.read_metadata(&context.bucket, source_key)?;
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
     
-    // Get source data using S3-compatible function
-    let source_data = crate::storage::get_files_from_storage(&context, offset_size_list, true)?;
-    
-    // Write to new location using S3-compatible function
-    let new_offset_size_list = crate::storage::write_files_to_storage(&context, &source_data, true)?;
+    // Read and combine source data
+    let storage_service = StorageService::new();
+    let source_data = storage_service.read_object(&context, &offset_size_list, StorageMode::S3)?;
+    let new_offset_size_list = storage_service.write_object(&context, &source_data, StorageMode::S3)?;
     let new_offset_size_bytes = crate::util::serializer::serialize_offset_size(&new_offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &new_offset_size_bytes)?;
     
@@ -444,8 +442,9 @@ pub async fn s3_upload_part_handler(
     let context = UserContext::with_bucket(auth_result.user_id, auth_result.bucket);
     let db = MetadataService::new(&context.user_id)?;
     
-    // Store the part data
-    let offset_size_list = crate::storage::write_files_to_storage(&context, &bytes, true)?;
+    // Store the part data as a single chunk
+    let storage_service = StorageService::new();
+    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::S3)?;
     let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     
     // Use a special key format for parts: {original_key}.part.{part_number}.{upload_id}
@@ -518,24 +517,25 @@ pub async fn s3_complete_multipart_upload_handler(
     // Combine all parts
     let mut combined_data = Vec::new();
     for (_part_num, part_key) in &parts {
+        // Read and append part data
         let offset_size_bytes = db.read_metadata(&context.bucket, part_key)?;
         let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-        let part_data = crate::storage::get_files_from_storage(&context, offset_size_list, true)?;
-        
-        combined_data.extend_from_slice(&part_data);
+        let storage_service = StorageService::new();
+        let part = storage_service.read_object(&context, &offset_size_list, StorageMode::S3)?;
+        combined_data.extend_from_slice(&part);
     }
     
     
-    // Store combined data
-    let final_offset_size_list = crate::storage::write_files_to_storage(&context, &combined_data, true)?;
+    // Store combined data as single chunk
+    let storage_service = StorageService::new();
+    let final_offset_size_list = storage_service.write_object(&context, &combined_data, StorageMode::S3)?;
     let final_offset_size_bytes = crate::util::serializer::serialize_offset_size(&final_offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &final_offset_size_bytes)?;
     
     // Clean up part files
     for (_, part_key) in &parts {
-        let offset_size_bytes = db.read_metadata(&context.bucket, part_key)?;
-        let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-        crate::storage::delete_and_log(&context, part_key, offset_size_list)?;
+        let storage_service = StorageService::new();
+        storage_service.delete_object(&context, &part_key)?;
         db.delete_metadata(&context.bucket, part_key)?;
     }
     
@@ -581,9 +581,8 @@ pub async fn s3_abort_multipart_upload_handler(
     for obj_key in all_objects {
         if obj_key.starts_with(&format!("{}.part.", key)) && obj_key.ends_with(&format!(".{}", upload_id)) {
             // Delete the part
-            let offset_size_bytes = db.read_metadata(&context.bucket, &obj_key)?;
-            let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-            crate::storage::delete_and_log(&context, &obj_key, offset_size_list)?;
+            let storage_service = StorageService::new();
+            storage_service.delete_object(&context, &obj_key)?;
             db.delete_metadata(&context.bucket, &obj_key)?;
         }
     }
