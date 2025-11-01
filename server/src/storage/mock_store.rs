@@ -122,7 +122,6 @@ impl Storage for MockBinaryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::hash::{Hash, Hasher};
 
     #[test]
     fn test_mock_binary_store_basic_operations() {

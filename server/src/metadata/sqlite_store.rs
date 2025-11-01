@@ -195,8 +195,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
-        // Reuse existing queue implementation
-        SQLiteMetadataStore::new().queue_deletion(user_id, bucket, key, offset_size_list)
+        SQLiteMetadataStore::queue_deletion(self, user_id, bucket, key, offset_size_list)
     }
 }
 

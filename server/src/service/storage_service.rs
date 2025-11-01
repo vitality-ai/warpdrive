@@ -93,6 +93,12 @@ impl StorageService {
         db.delete_metadata(&context.bucket, key)
             .map_err(|e| actix_web::error::ErrorInternalServerError(e))
     }
+
+    /// Delete storage chunks directly (used by deletion worker)
+    pub fn delete_chunks(&self, context: &UserContext, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
+        let store = self.store();
+        store.delete(&context.user_id, &context.bucket, offset_size_list)
+    }
 }
 
 

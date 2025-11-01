@@ -11,7 +11,7 @@ use warp_drive::s3::handlers::{
     s3_list_objects_handler,
     s3_multipart_router
 };
-use warp_drive::storage::deletion_worker::start_deletion_worker;
+use warp_drive::service::deletion_worker::start_deletion_worker;
 // ^ use the name from your Cargo.toml [package].name
 // e.g., if Cargo.toml says name = "warp_drive"
  

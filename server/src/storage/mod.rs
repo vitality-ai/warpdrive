@@ -5,7 +5,6 @@
 pub mod local_store;
 pub mod mock_store;
 pub mod config;
-pub mod deletion_worker;
 
 use actix_web::Error;
 

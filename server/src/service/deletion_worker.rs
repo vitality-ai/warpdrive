@@ -1,16 +1,20 @@
 //! Background deletion worker for processing deletion queue
 //! 
-//! This worker runs periodically to process deletion events from the SQLite queue
-//! and perform the actual cleanup of storage chunks.
+//! This worker runs periodically to process deletion events, free up space,
+//! and trigger compaction when there's enough free space at the top of the file.
+//! Since we're append-only, if there's enough free space at top we compact,
+//! otherwise we leave holes until compaction becomes easier.
 
-use crate::metadata::sqlite_store::{SQLiteMetadataStore, DeletionEvent};
+use crate::service::metadata_service::MetadataService;
+use crate::service::storage_service::StorageService;
+use crate::service::user_context::UserContext;
+use crate::metadata::sqlite_store::DeletionEvent;
 use log::{info, warn, error};
 use std::time::Duration;
 use tokio::time;
 
 /// Background deletion worker
 pub struct DeletionWorker {
-    metadata_store: SQLiteMetadataStore,
     batch_size: i32,
     cleanup_interval: Duration,
 }
@@ -18,7 +22,6 @@ pub struct DeletionWorker {
 impl DeletionWorker {
     pub fn new() -> Self {
         Self {
-            metadata_store: SQLiteMetadataStore::new(),
             batch_size: 100, // Process up to 100 deletions at a time
             cleanup_interval: Duration::from_secs(300), // Run every 5 minutes
         }
@@ -43,9 +46,22 @@ impl DeletionWorker {
     
     /// Process pending deletion events
     async fn process_deletions(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Get pending deletion events
-        let events = self.metadata_store.get_pending_deletions(self.batch_size)
-            .map_err(|e| format!("Failed to get pending deletions: {}", e))?;
+        // Get pending deletion events through metadata service
+        let metadata_service = match MetadataService::new("system") {
+            Ok(service) => service,
+            Err(e) => {
+                error!("Failed to create metadata service: {}", e);
+                return Err(format!("Failed to create metadata service: {}", e).into());
+            }
+        };
+        
+        let events = match metadata_service.get_pending_deletions(self.batch_size) {
+            Ok(events) => events,
+            Err(e) => {
+                error!("Failed to get pending deletions: {}", e);
+                return Err(format!("Failed to get pending deletions: {}", e).into());
+            }
+        };
         
         if events.is_empty() {
             return Ok(());
@@ -58,15 +74,15 @@ impl DeletionWorker {
                 error!("Failed to process deletion event {}: {}", event.id, e);
                 // Continue with other events even if one fails
             } else {
-                // Mark as processed
-                if let Err(e) = self.metadata_store.mark_deletion_processed(event.id) {
+                // Mark as processed through metadata service
+                if let Err(e) = metadata_service.mark_deletion_processed(event.id) {
                     error!("Failed to mark deletion event {} as processed: {}", event.id, e);
                 }
             }
         }
         
         // Clean up old processed events
-        if let Err(e) = self.metadata_store.cleanup_old_deletions() {
+        if let Err(e) = metadata_service.cleanup_old_deletions() {
             warn!("Failed to cleanup old deletion events: {}", e);
         }
         
@@ -77,43 +93,24 @@ impl DeletionWorker {
     async fn process_deletion_event(&self, event: &DeletionEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Processing deletion: user={}, bucket={}, key={}, chunks={}", 
               event.user_id, event.bucket, event.key, event.offset_size_list.len());
-        
-        // 1. Mark storage chunks as deleted/free in the binary files
-        self.mark_chunks_as_deleted(&event.user_id, &event.offset_size_list).await?;
-        
-        // 2. Update storage statistics (free space, etc.)
-        self.update_storage_statistics(&event.user_id, &event.offset_size_list).await?;
-        
-        // 3. Check if compaction is needed (optional - can be done separately)
-        self.check_compaction_needed(&event.user_id).await?;
-        
-        info!("Successfully processed deletion for user {} key {} - freed {} bytes", 
-              event.user_id, event.key, self.calculate_total_size(&event.offset_size_list));
-        
-        Ok(())
-    }
-    
-    /// Mark storage chunks as deleted in the binary storage files
-    async fn mark_chunks_as_deleted(&self, user_id: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // For each chunk, mark it as deleted in the storage system
-        for &(offset, size) in offset_size_list {
-            info!("Marking chunk as deleted: user={}, offset={}, size={}", user_id, offset, size);
+
+        // Create user context for this deletion
+        let context = UserContext::with_bucket(event.user_id.clone(), event.bucket.clone());
+
+        // Use storage service to delete the actual chunks (marks them as free)
+        let storage_service = StorageService::new();
+        if let Err(e) = storage_service.delete_chunks(&context, &event.offset_size_list) {
+            return Err(format!("Failed to delete chunks: {}", e).into());
         }
+
+        let freed_bytes = self.calculate_total_size(&event.offset_size_list);
+        info!("Freed {} bytes for user {} bucket {}", freed_bytes, event.user_id, event.bucket);
+
+        // Check if we should trigger compaction
+        // For now, we'll leave holes until there's enough free space at top of file
+        // This is a simplified approach - in the future we can add compaction logic here
+        // that checks if free space at top >= some threshold, then compact
         
-        Ok(())
-    }
-    
-    /// Update storage statistics after deletion
-    async fn update_storage_statistics(&self, user_id: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let freed_bytes = self.calculate_total_size(offset_size_list);
-        
-        info!("Updated storage statistics: user={}, freed_bytes={}", user_id, freed_bytes);
-        Ok(())
-    }
-    
-    /// Check if storage compaction is needed
-    async fn check_compaction_needed(&self, user_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Checked compaction for user={}", user_id);
         Ok(())
     }
     
