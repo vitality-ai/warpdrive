@@ -1,5 +1,5 @@
-# Use Rust official image as base
-FROM rust:1.82.0-slim-bullseye
+# Use Rust official image as base (1.82+ not supported by some deps; use 1.84+)
+FROM rust:1.84-slim-bookworm
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

@@ -2,15 +2,22 @@
 use actix_web::{test, web, App, http::StatusCode};
 use warp_drive::s3::handlers::{
     s3_put_object_handler,
-    s3_get_object_handler, 
+    s3_get_object_handler,
     s3_delete_object_handler,
     s3_head_object_handler,
     s3_list_objects_handler
 };
 
+/// Ensure Console auth is not configured so S3 requests return 401 (Warpdrive only supports Console auth).
+fn ensure_no_console_config() {
+    std::env::remove_var("VITALITY_CONSOLE_URL");
+    std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
+}
+
 /// Test S3 PUT object endpoint
 #[actix_web::test]
 async fn test_s3_put_object() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::put().to(s3_put_object_handler))
@@ -33,6 +40,7 @@ async fn test_s3_put_object() {
 /// Test S3 GET object endpoint
 #[actix_web::test]
 async fn test_s3_get_object() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
@@ -53,6 +61,7 @@ async fn test_s3_get_object() {
 /// Test S3 DELETE object endpoint
 #[actix_web::test]
 async fn test_s3_delete_object() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::delete().to(s3_delete_object_handler))
@@ -73,6 +82,7 @@ async fn test_s3_delete_object() {
 /// Test S3 HEAD object endpoint
 #[actix_web::test]
 async fn test_s3_head_object() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::head().to(s3_head_object_handler))
@@ -93,6 +103,7 @@ async fn test_s3_head_object() {
 /// Test S3 List objects endpoint
 #[actix_web::test]
 async fn test_s3_list_objects() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}", web::get().to(s3_list_objects_handler))
@@ -113,6 +124,7 @@ async fn test_s3_list_objects() {
 /// Test S3 authentication with invalid credentials
 #[actix_web::test]
 async fn test_s3_authentication_invalid() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
@@ -133,6 +145,7 @@ async fn test_s3_authentication_invalid() {
 /// Test S3 authentication with missing authorization header
 #[actix_web::test]
 async fn test_s3_authentication_missing() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
@@ -152,6 +165,7 @@ async fn test_s3_authentication_missing() {
 /// Test S3 bucket mismatch
 #[actix_web::test]
 async fn test_s3_bucket_mismatch() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
@@ -172,6 +186,7 @@ async fn test_s3_bucket_mismatch() {
 /// Test S3 with curl-like requests
 #[actix_web::test]
 async fn test_s3_curl_simulation() {
+    ensure_no_console_config();
     let app = test::init_service(
         App::new()
             .route("/s3/{bucket}/{key}", web::put().to(s3_put_object_handler))
@@ -213,4 +228,56 @@ async fn test_s3_curl_simulation() {
     assert!(put_resp.status().is_client_error() || put_resp.status().is_server_error() || put_resp.status().is_success());
     assert!(get_resp.status().is_client_error() || get_resp.status().is_server_error() || get_resp.status().is_success());
     assert!(delete_resp.status().is_client_error() || delete_resp.status().is_server_error() || delete_resp.status().is_success());
+}
+
+// --- Console / SigV4 auth integration tests ---
+
+/// When VITALITY_CONSOLE_URL is set but WARPDRIVE_SERVICE_SECRET is not set, auth fails with 401 (invalid configuration).
+#[actix_web::test]
+async fn test_s3_console_url_without_service_secret_returns_401() {
+    std::env::set_var("VITALITY_CONSOLE_URL", "http://localhost:9999");
+    std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
+
+    let app = test::init_service(
+        App::new()
+            .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
+    ).await;
+
+    let req = test::TestRequest::get()
+        .uri("/s3/test-bucket/test-key")
+        .insert_header(("Authorization", "AWS4-HMAC-SHA256 Credential=somekey/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=x"))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    std::env::remove_var("VITALITY_CONSOLE_URL");
+}
+
+/// When both VITALITY_CONSOLE_URL and WARPDRIVE_SERVICE_SECRET are set, Warpdrive uses Console auth.
+/// Use an unreachable URL so the s3-credentials fetch fails and we get 401 (no mock needed; avoids
+/// flakiness from parallel tests sharing env).
+#[actix_web::test]
+async fn test_s3_console_auth_unreachable_returns_401() {
+    std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:0");
+    std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-secret");
+
+    let app = test::init_service(
+        App::new()
+            .route("/s3/{bucket}/{key}", web::get().to(s3_get_object_handler))
+    ).await;
+
+    let req = test::TestRequest::get()
+        .uri("/s3/test-bucket/test-key")
+        .insert_header((
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=somekey/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=invalid"
+        ))
+        .to_request();
+
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    std::env::remove_var("VITALITY_CONSOLE_URL");
+    std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
 }

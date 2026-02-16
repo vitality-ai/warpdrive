@@ -34,6 +34,14 @@ WarpDrive is a general purpose KV/Object store focused on workloads that require
 
 See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
 
+### S3 authentication (Vitality Console)
+
+S3 API requests are authenticated via **Vitality Console**. Generate API keys in the Console UI and use them with any S3-compatible client (e.g. boto3).
+
+- **`VITALITY_CONSOLE_URL`** (optional): Base URL of Vitality Console (e.g. `http://localhost:8000`). If set, Warpdrive fetches credentials from Console, caches them, and verifies each request's SigV4 signature locally. If unset, a hardcoded test key is accepted.
+- **`WARPDRIVE_SERVICE_SECRET`** (required when `VITALITY_CONSOLE_URL` is set): Shared secret for `POST {url}/api/auth/s3-credentials`. Must match the value in Console's `.env`.
+- Put these in a `.env` file in `server/` (see `server/.env.example`).
+
 ---
 
 ## Developer's Corner

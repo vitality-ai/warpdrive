@@ -62,6 +62,14 @@ pub type ObjectId = String;
 /// User identifier type 
 pub type UserId = String;
 
+/// Per-bucket stats for list-buckets (object count and total size in bytes)
+#[derive(Debug, Clone)]
+pub struct BucketStats {
+    pub name: String,
+    pub object_count: u64,
+    pub total_size: u64,
+}
+
 /// Trait defining the metadata storage interface
 pub trait MetadataStorage: Send + Sync {
     /// Store metadata for an object
@@ -87,6 +95,9 @@ pub trait MetadataStorage: Send + Sync {
 
     /// Queue deletion for background processing (WAL style). Implementations may no-op if unsupported.
     fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
+
+    /// List buckets for a user with object count and total size per bucket (for Console enrichment).
+    fn list_buckets_with_stats(&self, user_id: &str) -> Result<Vec<BucketStats>, Error>;
 }
 
 #[cfg(test)]

@@ -64,6 +64,8 @@ cargo build
 cargo run
 ```
 
+**S3 authentication:** Add a `.env` file in the `server/` directory (see `server/.env.example`). Set `VITALITY_CONSOLE_URL` to your Vitality Console base URL and `WARPDRIVE_SERVICE_SECRET` to the same value as in Console's `.env`. Warpdrive calls `POST .../api/auth/s3-credentials` on cache miss and verifies each request's SigV4 signature locally. S3 credentials are generated in the Vitality Console UI.
+
 ---
  
 ### 5. Test the Application Locally with the Demo Client App

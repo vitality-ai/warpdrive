@@ -1,6 +1,6 @@
 //! SQLite implementation of MetadataStorage trait
 
-use crate::metadata::{MetadataStorage, Metadata, ObjectId};
+use crate::metadata::{MetadataStorage, Metadata, ObjectId, BucketStats};
 use crate::util::serializer::{serialize_offset_size, deserialize_offset_size};
 use std::sync::Mutex;
 use rusqlite::{params, Connection};
@@ -12,7 +12,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn get_db_path() -> PathBuf {
-    // Try to get the path from environment variable
     match env::var("DB_FILE") {
         Ok(path) => {
             info!("Using database path from environment: {}", path);
@@ -20,10 +19,7 @@ fn get_db_path() -> PathBuf {
         }
         Err(_) => {
             warn!("Metadata database location not defined in environment");
-            // Create default path: ./metadata/metadata.sqlite
             let default_path = Path::new("metadata").join("metadata.sqlite");
-            
-            // Create directory if it doesn't exist
             if let Some(parent) = default_path.parent() {
                 std::fs::create_dir_all(parent).expect("Failed to create metadata directory");
             }
@@ -87,24 +83,15 @@ impl SQLiteMetadataStore {
 
 impl MetadataStorage for SQLiteMetadataStore {
     fn put_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
-        info!("SQLite put_metadata called for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
         let offset_size_list = metadata.to_offset_size_list();
         let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
-        info!("Serialized metadata, size: {} bytes", offset_size_bytes.len());
-        
         let conn = DB_CONN.lock().unwrap();
-        info!("Acquired database connection lock");
-        
         let result = conn.execute(
             "INSERT INTO haystack (user, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, bucket, object_id, offset_size_bytes],
         );
-        
         match result {
-            Ok(_) => {
-                info!("Successfully inserted metadata for user: {}, bucket: {}, object_id: {}", user_id, bucket, object_id);
-                Ok(())
-            },
+            Ok(_) => Ok(()),
             Err(e) => {
                 error!("Failed to insert metadata for user: {}, bucket: {}, object_id: {}: {}", user_id, bucket, object_id, e);
                 Err(actix_web::error::ErrorInternalServerError(e))
@@ -196,6 +183,39 @@ impl MetadataStorage for SQLiteMetadataStore {
 
     fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         SQLiteMetadataStore::queue_deletion(self, user_id, bucket, key, offset_size_list)
+    }
+
+    fn list_buckets_with_stats(&self, user_id: &str) -> Result<Vec<BucketStats>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT bucket, offset_size_list FROM haystack WHERE user = ?1",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let row_iter = stmt.query_map(params![user_id], |row| {
+            let bucket: String = row.get(0)?;
+            let blob: Option<Vec<u8>> = row.get(1)?;
+            Ok((bucket, blob))
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows: Vec<_> = row_iter.collect::<Result<Vec<_>, _>>().map_err(actix_web::error::ErrorInternalServerError)?;
+
+        let mut by_bucket: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+        for (bucket, blob) in rows {
+            let object_size: u64 = blob
+                .as_ref()
+                .and_then(|b| deserialize_offset_size(b).ok())
+                .map(|list: Vec<(u64, u64)>| list.iter().map(|(_off, size)| size).sum::<u64>())
+                .unwrap_or(0);
+            let entry = by_bucket.entry(bucket).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += object_size;
+        }
+        Ok(by_bucket
+            .into_iter()
+            .map(|(name, (object_count, total_size))| BucketStats {
+                name,
+                object_count,
+                total_size,
+            })
+            .collect())
     }
 }
 

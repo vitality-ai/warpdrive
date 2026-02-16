@@ -9,6 +9,8 @@ use warp_drive::s3::handlers::{
     s3_delete_object_handler,
     s3_head_object_handler,
     s3_list_objects_handler,
+    s3_list_buckets_handler,
+    s3_create_bucket_handler,
     s3_multipart_router
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
@@ -17,6 +19,8 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
  
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Load .env from current dir or server dir so VITALITY_CONSOLE_URL etc. are set
+    let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
     info!("Starting server on 127.0.0.1:8080");
     
@@ -30,11 +34,14 @@ async fn main() -> std::io::Result<()> {
                 // Configure payload size limits for large files (up to 5GB - S3 standard)
                 .app_data(web::PayloadConfig::default().limit(5 * 1024 * 1024 * 1024))
                 // S3-compatible API endpoints with /s3/ prefix to avoid conflicts
+                .route("/s3", web::get().to(s3_list_buckets_handler))
+                .route("/s3/", web::get().to(s3_list_buckets_handler))
                 .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
                 .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
                 .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
                 .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
                 .route("/s3/{bucket}", web::get().to(s3_list_objects_handler))
+                .route("/s3/{bucket}", web::put().to(s3_create_bucket_handler))
                 // Multipart upload endpoints - these need to be handled by a router
                 .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
                 // Original API endpoints (must come after S3 routes)
