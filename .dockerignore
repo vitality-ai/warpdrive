@@ -1,0 +1,12 @@
+.git
+.github
+myenv
+target
+**/target
+data
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.bin
+demo
+tests

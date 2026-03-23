@@ -1,10 +1,12 @@
 // S3-compatible request handlers
 use actix_web::{web, HttpRequest, HttpResponse, Error};
-use log::{info, warn};
+use log::{debug, info, warn};
 use futures::StreamExt;
 use bytes::BytesMut;
-use serde::Serialize;
 
+use std::collections::HashMap;
+
+use crate::metadata::BucketStats;
 use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
 // use crate::service::{get_service, put_service, delete_service};
 use crate::service::metadata_service::MetadataService;
@@ -12,35 +14,86 @@ use crate::service::user_context::UserContext;
 use crate::service::storage_service::{StorageService, StorageMode};
 use crate::util::serializer::deserialize_offset_size;
 
-/// List buckets response item (for GET /s3/)
-#[derive(Serialize)]
-struct ListBucketsItem {
-    name: String,
-    object_count: u64,
-    total_size: u64,
+/// S3 API XML namespace (ListAllMyBucketsResult, ListBucketResult, etc.)
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+/// Optional Warpdrive extension elements on each `<Bucket>` for Console/dashboard (ignored by typical S3 clients).
+const WARPDRIVE_LIST_BUCKETS_EXT_NS: &str = "http://warpdrive.vitality.dev/doc/listbuckets/1";
+
+fn xml_escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
-/// S3-compatible list buckets handler
-/// Handles GET /s3/ or GET /s3 - returns JSON with buckets that have at least one object and their stats.
+/// S3-compatible list buckets handler (AWS ListBuckets).
+/// GET `/s3` or `/s3/` returns `ListAllMyBucketsResult` XML (`application/xml`).
+/// Each bucket includes standard `Name` and `CreationDate`, plus optional extension elements
+/// `ObjectCount` and `TotalSize` in `WARPDRIVE_LIST_BUCKETS_EXT_NS` for Vitality Console stats.
 pub async fn s3_list_buckets_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
     let auth_result = authenticate_s3_request(&req).await?;
     if !auth_result.bucket.is_empty() {
         return Ok(HttpResponse::BadRequest().body("Unexpected bucket in path for list-buckets"));
     }
     info!("S3 List Buckets: user={}", auth_result.user_id);
+    let registered = auth_result.allowed_buckets.clone();
     let db = MetadataService::new(&auth_result.user_id)?;
-    let stats = db.list_buckets_with_stats()?;
-    let buckets: Vec<ListBucketsItem> = stats
+    let haystack_stats = db.list_buckets_with_stats()?;
+    let mut stats_by_name: HashMap<String, BucketStats> = haystack_stats
         .into_iter()
-        .map(|s| ListBucketsItem {
-            name: s.name,
-            object_count: s.object_count,
-            total_size: s.total_size,
-        })
+        .map(|s| (s.name.clone(), s))
         .collect();
+    let mut stats: Vec<BucketStats> = Vec::new();
+    for name in registered {
+        if let Some(s) = stats_by_name.remove(&name) {
+            stats.push(s);
+        } else {
+            stats.push(BucketStats {
+                name,
+                object_count: 0,
+                total_size: 0,
+            });
+        }
+    }
+    stats.sort_by(|a, b| a.name.cmp(&b.name));
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z");
+    let mut buckets_xml = String::new();
+    for s in stats {
+        buckets_xml.push_str(&format!(
+            "    <Bucket>\n        <Name>{}</Name>\n        <CreationDate>{}</CreationDate>\n        <ObjectCount xmlns=\"{}\">{}</ObjectCount>\n        <TotalSize xmlns=\"{}\">{}</TotalSize>\n    </Bucket>\n",
+            xml_escape_text(&s.name),
+            now,
+            WARPDRIVE_LIST_BUCKETS_EXT_NS,
+            s.object_count,
+            WARPDRIVE_LIST_BUCKETS_EXT_NS,
+            s.total_size,
+        ));
+    }
+    let owner_id = xml_escape_text(&auth_result.user_id);
+    let xml_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult xmlns="{s3}">
+    <Owner>
+        <ID>{owner_id}</ID>
+    </Owner>
+    <Buckets>
+{buckets_xml}    </Buckets>
+</ListAllMyBucketsResult>"#,
+        s3 = S3_XMLNS,
+        owner_id = owner_id,
+        buckets_xml = buckets_xml,
+    );
     Ok(HttpResponse::Ok()
-        .content_type("application/json")
-        .json(serde_json::json!({ "buckets": buckets })))
+        .content_type("application/xml")
+        .body(xml_body))
 }
 
 /// S3-compatible PUT object handler
@@ -69,7 +122,7 @@ pub async fn s3_put_object_handler(
     let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
@@ -148,7 +201,7 @@ pub async fn s3_get_object_handler(
     let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
@@ -201,7 +254,7 @@ pub async fn s3_delete_object_handler(
     let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
@@ -242,7 +295,7 @@ pub async fn s3_head_object_handler(
     let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // For HEAD requests, we just return metadata without the body
     // This is a simplified implementation - in practice, you'd check if the object exists
@@ -300,7 +353,7 @@ pub async fn s3_list_objects_handler(
     let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Check if this is a list request
     if query.get("list-type") != Some(&"2".to_string()) {
@@ -357,7 +410,7 @@ pub async fn s3_copy_object_handler(
     let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Get copy source from headers
     let copy_source = match req.headers().get("x-amz-copy-source") {

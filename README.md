@@ -36,11 +36,13 @@ See the [User Guide](docs/user_guide.md) for installation, configuration, and AP
 
 ### S3 authentication (Vitality Console)
 
-S3 API requests are authenticated via **Vitality Console** using a single auth path (Console-issued credentials + SigV4). Generate API keys in the Console UI and use them with any S3-compatible client (e.g. boto3).
+S3 API requests are authenticated via **Vitality Console**. Generate API keys in the Console UI and use them with any S3-compatible client (e.g. boto3). For any request that includes a bucket in the path (upload, download, list objects, etc.), Console must have that bucket registered for the key’s owner, or the request is rejected (**403**). **ListBuckets** (`GET /s3`) does not require a bucket name.
 
 - **`VITALITY_CONSOLE_URL`** (required): Base URL of Vitality Console (e.g. `http://localhost:8000`). WarpDrive fetches credentials from Console, caches them, and verifies each request's SigV4 signature locally.
 - **`WARPDRIVE_SERVICE_SECRET`** (required): Shared secret for `POST {url}/api/auth/s3-credentials`. Must match the value in Console's `.env`.
 - Put these in a `.env` file in `server/` (see `server/.env.example`).
+
+**List buckets (`GET /s3` or `GET /s3/`):** Returns AWS **ListAllMyBucketsResult** XML (`application/xml`), same namespace as S3. Vitality Console can read optional extension elements `ObjectCount` and `TotalSize` (separate XML namespace) for per-bucket stats; standard S3 clients (e.g. boto3 `list_buckets()`) ignore those.
 
 ---
 

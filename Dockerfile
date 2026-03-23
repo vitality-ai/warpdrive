@@ -1,10 +1,12 @@
-# Use Rust official image as base (1.82+ not supported by some deps; use 1.84+)
-FROM rust:1.84-slim-bookworm
+# time crate (transitive dep) requires rustc >= 1.88 as of time@0.3.47
+FROM rust:1.88-slim-bookworm
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
+    libssl-dev \
     libsqlite3-dev \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 
@@ -19,11 +21,8 @@ RUN mkdir /data
 # Copy project files
 COPY server/ /server/
 
-# Build the application
-RUN cargo build 
+RUN cargo build --release
 
-# Expose port
 EXPOSE 9710
 
-# Run the server
-CMD ["cargo", "run"]
+CMD ["/server/target/release/warp_drive"]

@@ -1,6 +1,14 @@
 # Warpdrive S3 demo
 
-Warpdrive uses **one auth path**: Vitality Console + AWS SigV4. Buckets are created in the Console only; use a bucket that exists there (every user gets a `default` bucket on registration).
+Warpdrive uses **one auth path**: Vitality Console + AWS SigV4.
+
+### Important: bucket name in `test_user_auth.txt`
+
+**Vitality Console** is the source of truth for bucket names. On each S3 request that targets a bucket (anything other than **ListBuckets** `GET /s3`), Warpdrive calls Console **`s3-credentials`** with the path bucket; Console returns **403** if that bucket is not registered for the key’s owner.
+
+So **`bucket_name` in `test_user_auth.txt` must exist in the Console** (e.g. `default` or a bucket you created in the UI), or uploads will fail after authentication.
+
+**ListBuckets** (`GET /s3`) does not send a bucket to Console and only lists buckets that already have metadata in Warpdrive for your user.
 
 ## Setup
 
@@ -10,14 +18,13 @@ Warpdrive uses **one auth path**: Vitality Console + AWS SigV4. Buckets are crea
 
 2. **Vitality Console**: running with the same `WARPDRIVE_SERVICE_SECRET` in its `.env`.
 
-3. **Credentials file**: create `demo/test_user_auth.txt` with an API key and a bucket name from Console:
+3. **Credentials file**: create `demo/test_user_auth.txt` with an API key and a **bucket that exists in the Console**:
    ```
    access_key=<your access key from Console>
    secret_key=<your secret key from Console>
-   bucket_name=<bucket name from Console, or 'default'>
+   bucket_name=<bucket from Console, e.g. default>
    user=<optional, for reference>
    ```
-   The bucket must exist in the Console (create it in the UI or use the automatic `default` bucket).
 
 ## Run
 
