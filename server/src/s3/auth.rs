@@ -232,7 +232,10 @@ fn parse_authorization_header_full(auth_header: &str) -> Result<ParsedAuthHeader
     let credential_end = credential_part.find(',').unwrap_or(credential_part.len());
     let credential = credential_part[..credential_end].trim();
     let parts: Vec<&str> = credential.splitn(2, '/').collect();
-    let access_key = parts.get(0).ok_or_else(|| ErrorUnauthorized("Invalid Credential"))?.to_string();
+    let access_key = parts.get(0).ok_or_else(|| ErrorUnauthorized("Invalid Credential"))?.trim().to_string();
+    if access_key.is_empty() {
+        return Err(ErrorUnauthorized("Invalid Credential: access key is empty"));
+    }
     let scope = parts.get(1).ok_or_else(|| ErrorUnauthorized("Invalid Credential"))?;
     let scope_parts: Vec<&str> = scope.splitn(4, '/').collect();
     let date = scope_parts.get(0).ok_or_else(|| ErrorUnauthorized("Invalid Credential"))?.to_string();
