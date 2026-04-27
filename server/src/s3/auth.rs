@@ -1,7 +1,7 @@
 // S3 Authentication module
 use actix_web::{HttpRequest, Error, error::{ErrorBadRequest, ErrorForbidden, ErrorUnauthorized}};
 use lazy_static::lazy_static;
-use log::{info, warn};
+use log::{debug, warn};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -57,7 +57,7 @@ fn auth_config_from_env() -> (Option<String>, Option<String>, u64) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_SECS);
     if let Some(ref u) = base_url {
-        info!(
+        debug!(
             "S3 auth: Vitality Console at {} (cache per access_key: secret + registered bucket set)",
             u
         );
@@ -88,7 +88,7 @@ async fn fetch_credential_bundle_from_console(
     let url = format!("{}/api/auth/s3-credentials", base_url.trim_end_matches('/'));
     let ak_p = access_key_log_prefix(access_key);
     let body_json = serde_json::json!({ "access_key": access_key });
-    info!(
+    debug!(
         "Console s3-credentials (bundle) → POST {} access_key={}",
         url, ak_p
     );
@@ -120,7 +120,7 @@ async fn fetch_credential_bundle_from_console(
             "Console s3-credentials bundle returned registered_buckets=[] — owner has no rows in Console buckets table (create `default` or another bucket in the UI)"
         );
     }
-    info!(
+    debug!(
         "Console s3-credentials (bundle) ← HTTP 200 owner_id={} registered_buckets={:?}",
         body.owner_id, buckets
     );
@@ -130,7 +130,7 @@ async fn fetch_credential_bundle_from_console(
 fn invalidate_s3_credential_cache(access_key: &str) {
     if let Ok(mut cache) = CREDENTIAL_CACHE.write() {
         if cache.remove(access_key).is_some() {
-            info!(
+            debug!(
                 "S3 credential cache INVALIDATED access_key={}",
                 access_key_log_prefix(access_key)
             );
@@ -153,7 +153,7 @@ async fn load_or_refresh_credential_bundle(
         let cached = CREDENTIAL_CACHE.read().map_err(|_| ErrorUnauthorized("Cache lock"))?;
         if let Some(c) = cached.get(&cache_key) {
             if c.expires_at > Instant::now() {
-                info!(
+                debug!(
                     "S3 credential cache HIT access_key={} owner={} allowed_bucket_count={}",
                     access_key_log_prefix(access_key),
                     c.owner_id,
@@ -169,7 +169,7 @@ async fn load_or_refresh_credential_bundle(
         }
     }
 
-    info!(
+    debug!(
         "S3 credential cache MISS/EXPIRED access_key={} — refreshing bundle from Console",
         access_key_log_prefix(access_key)
     );
@@ -188,7 +188,7 @@ async fn load_or_refresh_credential_bundle(
             expires_at,
         },
     );
-    info!(
+    debug!(
         "S3 credential cache REFRESHED access_key={} owner={} allowed_buckets={:?}",
         access_key_log_prefix(access_key),
         owner_id,
@@ -383,9 +383,14 @@ fn verify_sigv4(
 
     let mut mac = HmacSha256::new_from_slice(&k_signing).map_err(|_| ErrorUnauthorized("HMAC init"))?;
     mac.update(string_to_sign.as_bytes());
-    let expected_sig = hex::encode(mac.finalize().into_bytes());
 
-    if expected_sig != parsed.signature {
+    // SigV4 signatures are hex; accept either upper/lowercase from clients and
+    // verify in constant time against the computed HMAC bytes.
+    let provided_sig = hex::decode(parsed.signature.trim()).map_err(|_| {
+        warn!("SigV4 signature is not valid hex");
+        ErrorUnauthorized("Invalid signature format")
+    })?;
+    if mac.verify_slice(&provided_sig).is_err() {
         warn!(
             "SigV4 signature mismatch (canonical_uri={}, query_len={})",
             canonical_uri,
@@ -489,7 +494,7 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
         ));
     }
 
-    info!(
+    debug!(
         "S3 auth: request_path={} extracted_bucket={:?} list_buckets={}",
         req.path(),
         bucket,
@@ -554,7 +559,7 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
     allowed_buckets_vec.sort();
 
     verify_sigv4(req, &secret_key, &parsed)?;
-    info!(
+    debug!(
         "S3 Authentication successful: request_path={} user={} path_bucket={:?} SigV4 OK",
         req.path(),
         owner_id,
@@ -599,7 +604,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_authenticate_s3_request_invalid_key() {
+    async fn test_authenticate_s3_request_errors_when_console_config_missing() {
         std::env::remove_var("VITALITY_CONSOLE_URL");
         let req = test::TestRequest::default()
             .uri("/s3/test-bucket/test-key")

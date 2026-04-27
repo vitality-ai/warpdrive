@@ -643,6 +643,18 @@ pub async fn s3_complete_multipart_upload_handler(
     }
     
     
+    // S3 overwrite semantics: if the final key already exists, remove the old
+    // object first so metadata insert for the completed multipart object does
+    // not fail on UNIQUE(user, bucket, key).
+    if db.check_key(&context.bucket, &key)? {
+        info!(
+            "S3 CompleteMultipartUpload: overwriting existing object bucket={}, key={}",
+            bucket, key
+        );
+        let storage_service = StorageService::new();
+        storage_service.delete_object(&context, &key)?;
+    }
+
     // Store combined data as single chunk
     let storage_service = StorageService::new();
     let final_offset_size_list = storage_service.write_object(&context, &combined_data, StorageMode::S3)?;

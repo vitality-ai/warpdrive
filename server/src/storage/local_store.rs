@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::env;
 use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
-use log::{warn, info};
+use log::{debug, trace, warn};
 use std::sync::Mutex;
 use lazy_static::lazy_static;
 
@@ -20,7 +20,7 @@ fn get_storage_directory() -> PathBuf {
     // Try to get the storage directory from environment variable
     match env::var("STORAGE_DIRECTORY") {
         Ok(dir) => {
-            info!("Using storage directory from environment: {}", dir);
+            debug!("Using storage directory from environment: {}", dir);
             PathBuf::from(dir)
         }
         Err(_) => {
@@ -31,7 +31,7 @@ fn get_storage_directory() -> PathBuf {
                 std::fs::create_dir_all(&default_path)
                     .expect("Failed to create default storage directory");
             }
-            info!("Using default storage directory: {}", default_path.display());
+            debug!("Using default storage directory: {}", default_path.display());
             default_path
         }
     }
@@ -100,7 +100,7 @@ impl Storage for LocalXFSBinaryStore {
         
         let size = data.len() as u64;
         
-        info!("Wrote data for user {} bucket {} at offset {} with size {}", 
+        debug!("Wrote data for user {} bucket {} at offset {} with size {}", 
               user_id, bucket, offset, size);
         
         // Lock is automatically released when _lock goes out of scope
@@ -120,7 +120,7 @@ impl Storage for LocalXFSBinaryStore {
             .map_err(ErrorInternalServerError)?;
         
         
-        info!("Read data for user {} bucket {} from offset {} with size {}", 
+        trace!("Read data for user {} bucket {} from offset {} with size {}", 
               user_id, bucket, offset, size);
         
         Ok(buffer)
@@ -133,7 +133,7 @@ impl Storage for LocalXFSBinaryStore {
         // Key is not part of the low-level contract anymore; deletion is range-based
         metadata_store.queue_deletion(user_id, bucket, "", offset_size_list)?;
         
-        info!("Queued deletion event for user {} bucket {} with {} chunks", 
+        debug!("Queued deletion event for user {} bucket {} with {} chunks", 
               user_id, bucket, offset_size_list.len());
         Ok(())
     }
