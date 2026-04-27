@@ -1,5 +1,5 @@
 // S3 Authentication module
-use actix_web::{HttpRequest, Error, error::{ErrorBadRequest, ErrorForbidden, ErrorUnauthorized}};
+use actix_web::{HttpRequest, Error, error::{ErrorBadRequest, ErrorForbidden, ErrorServiceUnavailable, ErrorUnauthorized}};
 use lazy_static::lazy_static;
 use log::{debug, warn};
 use serde::Deserialize;
@@ -8,7 +8,11 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 lazy_static! {
-    static ref HTTP_CLIENT: reqwest::Client = reqwest::Client::new();
+    static ref HTTP_CLIENT: reqwest::Client = reqwest::Client::builder()
+        // Protect Actix workers from hanging indefinitely when Console is slow/unreachable.
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to create reqwest client");
     /// One entry per `access_key`: secret, owner, and Console-registered bucket names (refreshed on TTL).
     static ref CREDENTIAL_CACHE: RwLock<HashMap<String, CachedCredential>> = RwLock::new(HashMap::new());
 }
@@ -99,20 +103,31 @@ async fn fetch_credential_bundle_from_console(
         .send()
         .await
         .map_err(|e| {
-            warn!("Vitality Console s3-credentials (bundle) request failed: {}", e);
-            ErrorUnauthorized("Authentication service unavailable")
+            if e.is_timeout() {
+                warn!("Vitality Console s3-credentials (bundle) request timed out: {}", e);
+                ErrorServiceUnavailable("Authentication service timeout")
+            } else {
+                warn!("Vitality Console s3-credentials (bundle) request failed: {}", e);
+                ErrorServiceUnavailable("Authentication service unavailable")
+            }
         })?;
     let status = res.status();
     if !status.is_success() {
-        warn!(
-            "Console s3-credentials (bundle) ← HTTP {} access_key={}",
-            status, ak_p
-        );
-        return Err(ErrorUnauthorized("Invalid access key or service secret"));
+        warn!("Console s3-credentials (bundle) ← HTTP {} access_key={}", status, ak_p);
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ErrorUnauthorized("Invalid access key or service secret"));
+        }
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+        {
+            return Err(ErrorServiceUnavailable("Authentication service unavailable"));
+        }
+        return Err(ErrorUnauthorized("Authentication request rejected"));
     }
     let body: S3CredentialsResponse = res.json().await.map_err(|e| {
         warn!("Failed to parse s3-credentials (bundle) response: {}", e);
-        ErrorUnauthorized("Invalid access key")
+        ErrorServiceUnavailable("Invalid response from authentication service")
     })?;
     let buckets = body.registered_buckets;
     if buckets.is_empty() {
