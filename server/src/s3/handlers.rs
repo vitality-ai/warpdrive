@@ -1,15 +1,100 @@
 // S3-compatible request handlers
 use actix_web::{web, HttpRequest, HttpResponse, Error};
-use log::{info, warn};
+use log::{debug, info, warn};
 use futures::StreamExt;
 use bytes::BytesMut;
 
+use std::collections::HashMap;
+
+use crate::metadata::BucketStats;
 use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
 // use crate::service::{get_service, put_service, delete_service};
 use crate::service::metadata_service::MetadataService;
 use crate::service::user_context::UserContext;
 use crate::service::storage_service::{StorageService, StorageMode};
 use crate::util::serializer::deserialize_offset_size;
+
+/// S3 API XML namespace (ListAllMyBucketsResult, ListBucketResult, etc.)
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+/// Optional Warpdrive extension elements on each `<Bucket>` for Console/dashboard (ignored by typical S3 clients).
+const WARPDRIVE_LIST_BUCKETS_EXT_NS: &str = "http://warpdrive.vitality.dev/doc/listbuckets/1";
+
+fn xml_escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// S3-compatible list buckets handler (AWS ListBuckets).
+/// GET `/s3` or `/s3/` returns `ListAllMyBucketsResult` XML (`application/xml`).
+/// Each bucket includes standard `Name` and `CreationDate`, plus optional extension elements
+/// `ObjectCount` and `TotalSize` in `WARPDRIVE_LIST_BUCKETS_EXT_NS` for Vitality Console stats.
+pub async fn s3_list_buckets_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(&req).await?;
+    if !auth_result.bucket.is_empty() {
+        return Ok(HttpResponse::BadRequest().body("Unexpected bucket in path for list-buckets"));
+    }
+    info!("S3 List Buckets: user={}", auth_result.user_id);
+    let registered = auth_result.allowed_buckets.clone();
+    let db = MetadataService::new(&auth_result.user_id)?;
+    let haystack_stats = db.list_buckets_with_stats()?;
+    let mut stats_by_name: HashMap<String, BucketStats> = haystack_stats
+        .into_iter()
+        .map(|s| (s.name.clone(), s))
+        .collect();
+    let mut stats: Vec<BucketStats> = Vec::new();
+    for name in registered {
+        if let Some(s) = stats_by_name.remove(&name) {
+            stats.push(s);
+        } else {
+            stats.push(BucketStats {
+                name,
+                object_count: 0,
+                total_size: 0,
+            });
+        }
+    }
+    stats.sort_by(|a, b| a.name.cmp(&b.name));
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z");
+    let mut buckets_xml = String::new();
+    for s in stats {
+        buckets_xml.push_str(&format!(
+            "    <Bucket>\n        <Name>{}</Name>\n        <CreationDate>{}</CreationDate>\n        <ObjectCount xmlns=\"{}\">{}</ObjectCount>\n        <TotalSize xmlns=\"{}\">{}</TotalSize>\n    </Bucket>\n",
+            xml_escape_text(&s.name),
+            now,
+            WARPDRIVE_LIST_BUCKETS_EXT_NS,
+            s.object_count,
+            WARPDRIVE_LIST_BUCKETS_EXT_NS,
+            s.total_size,
+        ));
+    }
+    let owner_id = xml_escape_text(&auth_result.user_id);
+    let xml_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult xmlns="{s3}">
+    <Owner>
+        <ID>{owner_id}</ID>
+    </Owner>
+    <Buckets>
+{buckets_xml}    </Buckets>
+</ListAllMyBucketsResult>"#,
+        s3 = S3_XMLNS,
+        owner_id = owner_id,
+        buckets_xml = buckets_xml,
+    );
+    Ok(HttpResponse::Ok()
+        .content_type("application/xml")
+        .body(xml_body))
+}
 
 /// S3-compatible PUT object handler
 /// Handles requests like: PUT /s3/{bucket}/{key}
@@ -34,10 +119,10 @@ pub async fn s3_put_object_handler(
     info!("S3 PUT Object: bucket={}, key={}", bucket, key);
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
@@ -95,7 +180,7 @@ pub async fn s3_put_object_handler(
     // Serialize and store metadata (same as put_service)
     let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &offset_size_bytes)?;
-    
+
     // Return success response
     Ok(HttpResponse::Ok()
         .insert_header(("ETag", format!("\"{}\"", "s3-etag-placeholder")))
@@ -113,10 +198,10 @@ pub async fn s3_get_object_handler(
     info!("S3 GET Object: bucket={}, key={}", bucket, key);
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
@@ -166,10 +251,10 @@ pub async fn s3_delete_object_handler(
     info!("S3 DELETE Object: bucket={}, key={}", bucket, key);
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
@@ -207,10 +292,10 @@ pub async fn s3_head_object_handler(
     info!("S3 HEAD Object: bucket={}, key={}", bucket, key);
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // For HEAD requests, we just return metadata without the body
     // This is a simplified implementation - in practice, you'd check if the object exists
@@ -218,6 +303,38 @@ pub async fn s3_head_object_handler(
     
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Type", "application/octet-stream"))
+        .insert_header(("Content-Length", "0"))
+        .body(""))
+}
+
+/// Validate S3 bucket name (3-63 chars, lowercase/numbers/hyphens/dots, no consecutive/leading/trailing hyphens or dots)
+fn validate_bucket_name(bucket: &str) -> Result<(), Error> {
+    if bucket.len() < 3 || bucket.len() > 63 {
+        return Err(actix_web::error::ErrorBadRequest("Bucket name must be 3-63 characters"));
+    }
+    if bucket.starts_with('.') || bucket.ends_with('.') || bucket.starts_with('-') || bucket.ends_with('-') {
+        return Err(actix_web::error::ErrorBadRequest("Bucket name cannot start or end with . or -"));
+    }
+    if bucket.contains("..") || bucket.contains("--") {
+        return Err(actix_web::error::ErrorBadRequest("Bucket name cannot contain consecutive . or -"));
+    }
+    if !bucket.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-') {
+        return Err(actix_web::error::ErrorBadRequest("Bucket name must be lowercase letters, numbers, hyphens, or dots only"));
+    }
+    Ok(())
+}
+
+/// S3-compatible create bucket handler (no-op: no bucket table in Warpdrive)
+/// Handles PUT /s3/{bucket} - validates name and returns 201 for S3 API compatibility.
+pub async fn s3_create_bucket_handler(
+    path: web::Path<String>,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let bucket = path.into_inner();
+    let _auth_result = authenticate_s3_request(&req).await?;
+    validate_bucket_name(&bucket)?;
+    info!("S3 Create Bucket (no-op): bucket={}", bucket);
+    Ok(HttpResponse::Created()
         .insert_header(("Content-Length", "0"))
         .body(""))
 }
@@ -233,10 +350,10 @@ pub async fn s3_list_objects_handler(
     info!("S3 List Objects: bucket={}", bucket);
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Check if this is a list request
     if query.get("list-type") != Some(&"2".to_string()) {
@@ -290,10 +407,10 @@ pub async fn s3_copy_object_handler(
     info!("S3 COPY Object: bucket={}, key={}", bucket, key);
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Log the authentication result
-    info!("S3 Authentication successful: user={}, bucket={}", auth_result.user_id, auth_result.bucket);
+    debug!("S3 handler: authenticated user={}, bucket={}", auth_result.user_id, auth_result.bucket);
     
     // Get copy source from headers
     let copy_source = match req.headers().get("x-amz-copy-source") {
@@ -380,7 +497,7 @@ pub async fn s3_create_multipart_upload_handler(
     }
     
     // Authenticate the request
-    let _auth_result = authenticate_s3_request(&req)?;
+    let _auth_result = authenticate_s3_request(&req).await?;
     
     // Generate upload ID
     let upload_id = format!("upload_{}", chrono::Utc::now().timestamp_millis());
@@ -418,7 +535,7 @@ pub async fn s3_upload_part_handler(
         .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?;
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Process the payload
     let mut bytes = BytesMut::new();
@@ -473,7 +590,7 @@ pub async fn s3_complete_multipart_upload_handler(
         .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?;
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Process the payload to get part list
     let mut bytes = BytesMut::new();
@@ -526,6 +643,18 @@ pub async fn s3_complete_multipart_upload_handler(
     }
     
     
+    // S3 overwrite semantics: if the final key already exists, remove the old
+    // object first so metadata insert for the completed multipart object does
+    // not fail on UNIQUE(user, bucket, key).
+    if db.check_key(&context.bucket, &key)? {
+        info!(
+            "S3 CompleteMultipartUpload: overwriting existing object bucket={}, key={}",
+            bucket, key
+        );
+        let storage_service = StorageService::new();
+        storage_service.delete_object(&context, &key)?;
+    }
+
     // Store combined data as single chunk
     let storage_service = StorageService::new();
     let final_offset_size_list = storage_service.write_object(&context, &combined_data, StorageMode::S3)?;
@@ -571,7 +700,7 @@ pub async fn s3_abort_multipart_upload_handler(
         .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?;
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     
     // Find and delete all parts for this upload
     let context = UserContext::with_bucket(auth_result.user_id, auth_result.bucket);

@@ -15,31 +15,90 @@ Features tested:
 - All S3 operations (PUT, GET, DELETE, HEAD, LIST, COPY)
 
 Usage:
-    python3 s3_comprehensive_test.py
+    python3 s3_comprehensive_test.py              # upload, test, then delete all objects
+    python3 s3_comprehensive_test.py --no-cleanup  # leave objects in bucket (for haystack / Console UI)
+    SKIP_CLEANUP=1 python3 s3_comprehensive_test.py  # same as --no-cleanup
 
 Requirements:
     pip install boto3 requests
 """
 
 import os
+import sys
 import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 import requests
 import json
 import time
 from pathlib import Path
 
 # Configuration
-SERVER_URL = "http://localhost:9710/s3"
-BUCKET_NAME = "ciaos-test-bucket"
+# Host only (no /s3). Override: WARPDRIVE_ORIGIN=http://other:9710
+WARPDRIVE_ORIGIN = os.environ.get("WARPDRIVE_ORIGIN", "http://localhost:9710").rstrip("/")
+# boto3 path-style URLs are {endpoint}/{bucket}/{key} → must end with /s3 for Warpdrive routes
+S3_ENDPOINT_URL = f"{WARPDRIVE_ORIGIN}/s3"
 TEST_FILES_DIR = "test_files"
 DOWNLOAD_DIR = "downloaded_files"
 
-# S3 Configuration
+# S3 credentials and bucket from demo/test_user_auth.txt (bucket must exist in Vitality Console)
+def _load_auth_file():
+    auth_path = Path(__file__).resolve().parent / "test_user_auth.txt"
+    if not auth_path.exists():
+        print("❌ demo/test_user_auth.txt not found.")
+        print("   Create an API key in Vitality Console, then create this file with:")
+        print("   access_key=<your access key>")
+        print("   secret_key=<your secret key>")
+        print("   bucket_name=<must exist in Vitality Console for this user, e.g. default>")
+        print("   user=<optional, for reference>")
+        sys.exit(1)
+    creds = {}
+    with open(auth_path) as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                creds[k.strip()] = v.strip()
+    access_key = creds.get("access_key", "").strip()
+    secret_key = creds.get("secret_key", "").strip()
+    if not access_key or not secret_key:
+        print("❌ demo/test_user_auth.txt must contain access_key= and secret_key= (from Vitality Console).")
+        sys.exit(1)
+    bucket_name = creds.get("bucket_name", "").strip() or "default"
+    user = creds.get("user", "").strip()
+    return access_key, secret_key, bucket_name, user
+
+
+def _print_401_help():
+    print("\n   💡 401 Unauthorized – check:")
+    print("      • Vitality Console is running (e.g. http://localhost:8000)")
+    print("      • Credentials in demo/test_user_auth.txt match an API key created in Console")
+    print("      • WARPDRIVE_SERVICE_SECRET is the same in warpdrive/server/.env and Vitality Console .env")
+    print()
+
+
+def _print_bucket_check_help():
+    print("\n   💡 Wrong/missing bucket is NOT rejected? Check:")
+    print("      • Rebuild & restart Vitality Console **backend** so POST /api/auth/s3-credentials")
+    print("        accepts JSON field `bucket` (older images ignored it — random buckets looked “allowed”).")
+    print("      • docker compose: docker compose build console-backend --no-cache && docker compose up -d")
+    print("      • This script uses path-style S3 URLs (see BotoConfig addressing_style).")
+    print()
+
+
+_ACCESS_KEY, _SECRET_KEY, BUCKET_NAME, _USER = _load_auth_file()
+# Path-style: PUT http://host:9710/s3/{bucket}/{key} — required for Warpdrive routes.
+# Without this, some boto3/botocore versions use virtual-hosted style and the bucket
+# may not appear in /s3/{bucket}/..., so Console never receives bucket for verification.
 S3_CONFIG = {
-    'endpoint_url': SERVER_URL,
-    'aws_access_key_id': 'AKIAIOSFODNN7EXAMPLE',
-    'aws_secret_access_key': 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-    'region_name': 'us-east-1'
+    "endpoint_url": S3_ENDPOINT_URL,
+    "aws_access_key_id": _ACCESS_KEY,
+    "aws_secret_access_key": _SECRET_KEY,
+    "region_name": "us-east-1",
+    "config": BotoConfig(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"},
+    ),
 }
 
 def create_directories():
@@ -68,14 +127,14 @@ def get_test_files():
     return test_files
 
 def test_server_connection():
-    """Test if the S3 server is running"""
+    """Test if Warpdrive is reachable (GET /s3 may return 401 without auth — still means server is up)."""
     try:
-        response = requests.get(f"{SERVER_URL}/s3/{BUCKET_NAME}", timeout=5)
-        print(f"✅ Server is running at {SERVER_URL}")
+        r = requests.get(f"{WARPDRIVE_ORIGIN}/s3", timeout=5)
+        print(f"✅ Warpdrive reachable at {WARPDRIVE_ORIGIN} (GET /s3 → HTTP {r.status_code})")
         return True
     except requests.exceptions.RequestException as e:
         print(f"❌ Server connection failed: {e}")
-        print(f"   Make sure the server is running on {SERVER_URL}")
+        print(f"   Make sure Warpdrive is running on {WARPDRIVE_ORIGIN}")
         return False
 
 def setup_s3_client():
@@ -92,24 +151,35 @@ def upload_files(s3_client, files):
     """Upload files to S3"""
     print(f"\n⬆️  Uploading {len(files)} files to S3...")
     uploaded_files = []
-    
+    _401_help_shown = [False]  # use list so inner function can set it
+
     for filepath in files:
         filename = Path(filepath).name
         s3_key = f"test/{filename}"
-        
+
         try:
             print(f"   Uploading: {filename}")
-            # Use a small delay to avoid race conditions
             time.sleep(0.1)
             s3_client.upload_file(filepath, BUCKET_NAME, s3_key)
-            # Verify upload with a small delay
             time.sleep(0.1)
             s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
             uploaded_files.append(s3_key)
             print(f"   ✅ {filename}")
+        except ClientError as e:
+            print(f"   ❌ {filename}: {e}")
+            err = e.response.get("Error", {}) if e.response else {}
+            code = err.get("Code", "")
+            if code in ("403", "AccessDenied") or "403" in str(e):
+                _print_bucket_check_help()
+            if not _401_help_shown[0] and ("401" in str(e) or code == "401"):
+                _print_401_help()
+                _401_help_shown[0] = True
         except Exception as e:
             print(f"   ❌ {filename}: {e}")
-    
+            if not _401_help_shown[0] and ("401" in str(e) or "Unauthorized" in str(e)):
+                _print_401_help()
+                _401_help_shown[0] = True
+
     return uploaded_files
 
 def download_files(s3_client, uploaded_files):
@@ -216,8 +286,8 @@ def test_s3_operations(s3_client):
         print(f"✅ COPY successful: {source_key} -> {dest_key}")
         
         # Clean up copied file
-        s3_client.delete_object(Bucket=BUCKET_NAME, Key=dest_key)
-        print(f"✅ Cleaned up copied file")
+        #s3_client.delete_object(Bucket=BUCKET_NAME, Key=dest_key)
+        #print(f"✅ Cleaned up copied file")
         
     except Exception as e:
         print(f"❌ COPY operation failed: {e}")
@@ -237,24 +307,35 @@ def test_s3_operations(s3_client):
             
     except Exception as e:
         print(f"❌ LIST operation failed: {e}")
+        if "401" in str(e) or "Unauthorized" in str(e):
+            _print_401_help()
 
-def cleanup_test_files(s3_client, uploaded_files):
-    """Clean up test files from S3"""
+def cleanup_test_files(s3_client, uploaded_files, skip=False):
+    """Clean up test files from S3. If skip=True, leaves objects in place (so they appear in haystack / Console UI)."""
+    if skip:
+        print(f"\n⏭️  Skipping cleanup (--no-cleanup): {len(uploaded_files)} objects left in bucket for inspection.")
+        return
     print(f"\n🧹 Cleaning up {len(uploaded_files)} test files...")
-    
     for s3_key in uploaded_files:
         try:
             s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
         except Exception as e:
             print(f"❌ Failed to delete {s3_key}: {e}")
-    
     print("✅ Cleanup completed")
 
 def main():
     """Main test function"""
     print("🚀 CIAOS S3 Comprehensive Test")
     print("=" * 50)
-    
+    print(f"   Credentials: test_user_auth.txt (access_key={_ACCESS_KEY[:8]}...)")
+    print(f"   Bucket: {BUCKET_NAME}" + (f" (user={_USER})" if _USER else ""))
+    print(f"   S3 endpoint: {S3_ENDPOINT_URL}")
+    print()
+    print("ℹ️  Bucket must exist in Vitality Console")
+    print("   Warpdrive asks Console to verify this bucket for your API key (except ListBuckets).")
+    print("   Create the bucket in the Console UI (or use `default`) or S3 calls will fail with 403.")
+    print()
+
     # Step 1: Create directories
     create_directories()
     
@@ -289,8 +370,9 @@ def main():
     # Step 8: Test S3 operations
     test_s3_operations(s3_client)
     
-    # Step 9: Cleanup
-    cleanup_test_files(s3_client, uploaded_files)
+    # Step 9: Cleanup (unless --no-cleanup or SKIP_CLEANUP=1)
+    skip_cleanup = "--no-cleanup" in sys.argv or os.environ.get("SKIP_CLEANUP", "").strip().lower() in ("1", "true", "yes")
+    #cleanup_test_files(s3_client, uploaded_files, skip=skip_cleanup)
     
     # Final results
     print(f"\n🎉 Comprehensive test completed!")

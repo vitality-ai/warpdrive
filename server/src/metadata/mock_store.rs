@@ -1,6 +1,6 @@
 //! Mock implementation of MetadataStorage trait for testing
 
-use crate::metadata::{MetadataStorage, Metadata, ObjectId};
+use crate::metadata::{MetadataStorage, Metadata, ObjectId, BucketStats};
 use actix_web::Error;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -162,6 +162,29 @@ impl MetadataStorage for MockMetadataStore {
     fn queue_deletion(&self, _user_id: &str, _bucket: &str, _key: &str, _offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         // No-op for mock; simulate success
         Ok(())
+    }
+
+    fn list_buckets_with_stats(&self, user_id: &str) -> Result<Vec<BucketStats>, Error> {
+        let data = self.data.lock().unwrap();
+        let user_data = match data.get(user_id) {
+            Some(u) => u,
+            None => return Ok(Vec::new()),
+        };
+        Ok(user_data
+            .iter()
+            .map(|(bucket_name, keys)| {
+                let object_count = keys.len() as u64;
+                let total_size: u64 = keys
+                    .values()
+                    .map(|m| m.chunks.iter().map(|c| c.size).sum::<u64>())
+                    .sum();
+                BucketStats {
+                    name: bucket_name.clone(),
+                    object_count,
+                    total_size,
+                }
+            })
+            .collect())
     }
 }
 

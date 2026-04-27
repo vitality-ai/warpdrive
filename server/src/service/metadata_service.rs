@@ -1,6 +1,6 @@
 //! Metadata service layer that bridges the old Database interface with the new MetadataStorage trait
 
-use crate::metadata::{MetadataStorage, Metadata, config::MetadataConfig};
+use crate::metadata::{MetadataStorage, Metadata, BucketStats, config::MetadataConfig};
 use std::sync::Arc;
 use actix_web::Error;
 use lazy_static::lazy_static;
@@ -83,6 +83,11 @@ impl MetadataService {
     /// List objects in a bucket
     pub fn list_objects(&self, bucket: &str) -> Result<Vec<String>, Error> {
         METADATA_STORE.list_objects(&self.user, bucket)
+    }
+
+    /// List buckets for this user with object count and total size per bucket
+    pub fn list_buckets_with_stats(&self) -> Result<Vec<BucketStats>, Error> {
+        METADATA_STORE.list_buckets_with_stats(&self.user)
     }
 
     /// Queue deletion event for background worker (not part of MetadataStorage trait)

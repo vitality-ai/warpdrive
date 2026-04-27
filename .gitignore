@@ -177,4 +177,9 @@ tla/states
 
 # Demo download folders (output from tests)
 demo/downloaded_files/
+demo/test_user_auth.txt
+
+# cursor files
+.cursorrules
+.cursor
 

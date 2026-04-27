@@ -9,7 +9,7 @@ pub async fn handle_s3_request(req: HttpRequest) -> Result<HttpResponse, Error> 
     info!("Handling S3 request: {}", req.path());
     
     // Authenticate the request
-    let auth_result = authenticate_s3_request(&req)?;
+    let auth_result = authenticate_s3_request(&req).await?;
     info!("S3 authentication successful for user: {}, bucket: {}", auth_result.user_id, auth_result.bucket);
     
     // Return success response

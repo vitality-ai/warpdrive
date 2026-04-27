@@ -3,7 +3,7 @@
 use crate::storage::{Storage, local_store::LocalXFSBinaryStore, mock_store::MockBinaryStore};
 use std::sync::Arc;
 use std::env;
-use log::{info, warn};
+use log::{debug, warn};
 
 /// Available binary storage backends
 #[derive(Debug, Clone, PartialEq)]
@@ -51,7 +51,7 @@ impl StorageConfig {
             Ok(backend_str) => {
                 match backend_str.parse::<StorageBackend>() {
                     Ok(backend) => {
-                        info!("Using storage backend from environment: {:?}", backend);
+                        debug!("Using storage backend from environment: {:?}", backend);
                         backend
                     }
                     Err(e) => {
@@ -61,7 +61,7 @@ impl StorageConfig {
                 }
             }
             Err(_) => {
-                info!("No storage backend specified in environment, using default LocalXFS");
+                debug!("No storage backend specified in environment, using default LocalXFS");
                 StorageBackend::default()
             }
         };

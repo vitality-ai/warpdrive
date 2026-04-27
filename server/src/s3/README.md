@@ -11,23 +11,26 @@ WarpDrive provides full S3 compatibility for seamless integration with existing 
 
 ## 🚀 **Quick Start**
 
+**Authentication:** Warpdrive uses Vitality Console only. Create an API key in Console and use that access key + secret for all S3 requests. Set `VITALITY_CONSOLE_URL` and `WARPDRIVE_SERVICE_SECRET` in Warpdrive's `.env`.
+
 ### Using boto3 (Python)
 
 ```python
 import boto3
 
+# Use credentials from Vitality Console (API key)
 s3 = boto3.client(
     's3',
     endpoint_url='http://localhost:9710/s3',
-    aws_access_key_id='AKIAIOSFODNN7EXAMPLE',
-    aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    aws_access_key_id='<your Console API access key>',
+    aws_secret_access_key='<your Console API secret key>',
     region_name='us-east-1'
 )
 
 # Upload
 s3.upload_file('local_file.txt', 'my-bucket', 'remote_file.txt')
 
-# Download  
+# Download
 s3.download_file('my-bucket', 'remote_file.txt', 'downloaded_file.txt')
 
 # List objects
@@ -37,8 +40,8 @@ response = s3.list_objects_v2(Bucket='my-bucket')
 ### Using aws-cli
 
 ```bash
-export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_ACCESS_KEY_ID=<your Console API access key>
+export AWS_SECRET_ACCESS_KEY=<your Console API secret key>
 export AWS_DEFAULT_REGION=us-east-1
 
 # Upload
