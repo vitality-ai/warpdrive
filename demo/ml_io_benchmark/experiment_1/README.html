@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ML I/O benchmark experiment 1</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --ink: #0f172a;
+      --muted: #475569;
+      --paper: #f8fafc;
+      --card: #ffffff;
+      --accent: #0ea5e9;
+      --border: #e2e8f0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(165deg, #ecfeff 0%, #f8fafc 35%, #fff1f2 100%);
+      margin: 0;
+      line-height: 1.6;
+      font-size: 17px;
+    }
+    .wrap {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 4rem;
+    }
+    header {
+      margin-bottom: 2rem;
+    }
+    h1 {
+      font-size: 1.85rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+      margin: 0 0 0.5rem;
+    }
+    .lede {
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin: 0;
+    }
+    .tag {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #0369a1;
+      background: #e0f2fe;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      margin-bottom: 0.75rem;
+    }
+    h2 {
+      font-size: 1.25rem;
+      margin: 2.25rem 0 0.75rem;
+      color: #0c4a6e;
+    }
+    p { margin: 0 0 1rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      margin: 1.5rem 0;
+      box-shadow: 0 4px 24px rgba(15, 23, 42, 0.06);
+    }
+    .chart-box {
+      position: relative;
+      height: 280px;
+      margin: 1rem 0 0.5rem;
+    }
+    .chart-box.tall { height: 380px; }
+    .chart-box.medium { height: 260px; }
+    figcaption {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 0.5rem;
+    }
+    ul { margin: 0 0 1rem; padding-left: 1.2rem; }
+    li { margin-bottom: 0.35rem; }
+    .takeaways {
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      margin: 2rem 0;
+    }
+    .takeaways h2 { margin-top: 0; color: #92400e; }
+    footer {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+    }
+    .refs {
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .refs ol {
+      padding-left: 1.25rem;
+      margin: 0.5rem 0 0;
+    }
+    .refs li { margin-bottom: 0.65rem; }
+    .refs a { color: #0369a1; word-break: break-all; }
+    sup.refs { font-size: 0.75em; }
+    sup.refs a { text-decoration: none; font-weight: 600; }
+    .pullquote {
+      border-left: 4px solid var(--accent);
+      padding: 0.5rem 0 0.5rem 1rem;
+      margin: 1.25rem 0;
+      color: #334155;
+      font-style: italic;
+    }
+    @media print {
+      body { background: white; }
+      .card { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <span class="tag">ML I/O benchmark · experiment 1 · May 2026</span>
+      <h1>Warpdrive, I/O-heavy ML, and a local baseline</h1>
+      <p class="lede">
+        This is an effort to make <strong>Warpdrive</strong> blazing fast for <strong>I/O-heavy machine learning</strong> workloads,
+        the kind where workloads spend more time moving data between systems than actually training.
+        At LLM scale that shows up as multi-terabyte checkpoint saves, massive sharded datasets, and pipelines that must keep hardware continuously fed
+        <sup class="refs"><a href="#ref1">1</a>, <a href="#ref2">2</a></sup>.
+        The same pressure appears outside generative models too: vision and recommender systems dealing with large shard caches, repeated epoch reads, and frequent artifact writes to a shared store
+        <sup class="refs"><a href="#ref3">3</a></sup>.
+      </p>
+      <p class="lede" style="margin-top:1rem;">
+        The goal is to define a <strong>useful yet efficient</strong> system and not just build yet another blob store for the sake of showing that I've done it. Since my approach to building any system is product first you'll always see most engineering optimisations as an after thought. 
+      </p>
+
+    </header>
+
+    <h2>What we run (and how it maps to production workloads)</h2>
+    <p>
+      <strong>Workload A (shard sweep)</strong> is the scenario in the next section: big opaque shards, concurrent workers, and repeated read passes over object storage or local files. In production that is closest to <strong>dataloader fleets hitting object storage</strong> (WebDataset-style shards, TFRecord or Parquet-backed training, or any pattern with concurrent GETs on multi-hundred-MB objects instead of one GET per tiny file).
+    </p>
+    <p>
+      <strong>Workload B (training-shaped):</strong> one serialized dataset blob, load it, train a small CNN on CPU, write checkpoints on a schedule, then stress fat checkpoint round-trips.
+      In production this is closest to <strong>publishing a dataset or snapshot</strong> (large PUT), <strong>hydrating a node</strong> (large GET), and <strong>checkpointing model and optimizer state</strong> to shared storage for resume and collaboration.
+      Training time still dominates the clock in our run, which is normal when the loop is non-trivial.
+    </p>
+    <p>
+      We compare <strong>Warpdrive</strong> to <strong>MinIO</strong>, each from a Docker image with an S3-compatible API over HTTP, as reproducible S3 peers.
+      Both have deployment styles where they tend to look best, for example MinIO on fast local disks or a purpose-built distributed layout, and Warpdrive with its <strong>XFS-oriented local binary store</strong> and other production tuning when you are optimizing the full stack.
+      This experiment does not chase those settings. We use one ordinary host layout, start the services in a straightforward way, and measure what the <strong>application sees</strong>: end-to-end wall time and client-observed latency for generic boto3 and PyTorch I/O. That is usually the signal teams care about before they redesign storage or networking.
+    </p>
+    <p class="lede" style="margin-top:1rem;">
+      We still run a <strong>local-disk</strong> benchmark alongside S3-compatible backends. I've picked local as a baseline for people who might ask why not keep everything in a local file system.
+    </p>
+
+    <div class="card" style="margin-top:1.25rem;">
+      <strong>System details (experiment 1)</strong>
+      <ul style="margin:0.75rem 0 0;padding-left:1.25rem;color:var(--muted);">
+        <li><strong>Hardware (benchmark host):</strong> Apple MacBook Air (Apple M3). <strong>CPU:</strong> 8 cores (4 performance, 4 efficiency). <strong>Memory:</strong> 16&nbsp;GB unified. <strong>GPU:</strong> integrated Apple M3, 8 GPU cores, Metal&nbsp;3.</li>
+        <li><strong>OS:</strong> macOS 15.7 (build 24G419).</li>
+        <li><strong>MinIO:</strong> Docker image; S3-compatible API over HTTP to a mapped port on loopback.</li>
+        <li><strong>Warpdrive:</strong> Docker image; S3-compatible API over HTTP to a mapped port on loopback.</li>
+        <li><strong>Local baseline:</strong> reads and writes on the host filesystem (no HTTP), for contrast with the S3 paths.</li>
+        <li><strong>Client stack:</strong> boto3, PyTorch <code>torch.save</code> / <code>torch.load</code>, and the two workload scripts in this folder; chart numbers come from the JSON run reports saved alongside them.</li>
+        <li><strong>Run conditions:</strong> single machine; Warpdrive, MinIO, and local paths exercised from the same Python process and wall clock.</li>
+      </ul>
+    </div>
+
+    <h2>Workload A: I/O-bound shard sweep</h2>
+    <p>
+      We use <strong>eight</strong> synthetic shards of <strong>128&nbsp;MiB</strong> each (about <strong>1&nbsp;GiB</strong> total), upload them once, then treat them like big training files on storage.
+      <strong>Four</strong> workers run in parallel and each one downloads every shard in full for <strong>three</strong> rounds, which is about <strong>3&nbsp;GiB</strong> read and mimics a small fleet hammering object storage on large GETs.
+      After each download the client checksums the bytes and runs a tiny PyTorch op so the loop still looks like ML, but the measured time is really <strong>GET throughput</strong>, not FLOPs.
+      On <strong>local disk</strong> later rounds can get much faster once the OS cache warms; <strong>Warpdrive</strong> and <strong>MinIO</strong> still pay HTTP on every fetch, and that gap is what the charts show.
+    </p>
+
+    <div class="card">
+      <strong>End-to-end run time (stage + all reads + report)</strong>
+      <div class="chart-box">
+        <canvas id="chartIoTotal" aria-label="Bar chart: total seconds by storage"></canvas>
+      </div>
+      <figcaption style="font-size:0.9rem;color:var(--muted);line-height:1.55;">
+        <strong>Lower is better</strong> (stage + three read rounds + report). Local collapses once the page cache warms; the object stores pay full HTTP, with Warpdrive serving parallel GETs from a streaming response path.
+      </figcaption>
+    </div>
+
+    <div class="card">
+      <strong>Effective read throughput (3&nbsp;GiB ÷ sum of round wall times)</strong>
+      <p style="margin:0.35rem 0 0;font-size:0.95rem;color:var(--muted);">
+        Each <strong>round</strong> reads all eight shards once (<strong>1&nbsp;GiB</strong>); three rounds ⇒ <strong>3&nbsp;GiB</strong>.
+        <strong>Round wall time</strong> is elapsed seconds for that full round (parallel workers). The MiB/s value is <strong>3&nbsp;GiB ÷ (sum of the three round times)</strong>, an average for the whole read phase.
+      </p>
+      <div class="chart-box">
+        <canvas id="chartIoThroughput" aria-label="Bar chart: MiB per second by storage"></canvas>
+      </div>
+      <figcaption style="font-size:0.9rem;color:var(--muted);line-height:1.55;">
+        <strong>Higher is better.</strong> Local is mostly showing page-cache ceiling; the two S3 bars are the fair pair, with MinIO slightly ahead on effective MiB/s in this run.
+      </figcaption>
+    </div>
+
+    <h2>Workload B: Training-shaped I/O</h2>
+    <p>
+      <strong>65k</strong> synthetic <strong>3×32×32</strong> samples (roughly <strong>770&nbsp;MiB</strong> serialized as one dataset blob),
+      <strong>12</strong> CPU epochs on a small CNN, checkpoint every <strong>3</strong> epochs, then three deliberate
+      <strong>fat checkpoint</strong> save/load round-trips (~50&nbsp;MiB class payloads) to stress PUT/GET of “big state.”
+    </p>
+
+    <div class="card">
+      <strong>Highlight: dataset upload (PUT) only, seconds</strong>
+      <p style="margin:0.5rem 0 0;font-size:0.95rem;color:var(--muted);">
+        One phase where <strong>Warpdrive beat local and MinIO</strong> in our run is staging the single <code>.pt</code> blob. The script uses one S3 <code>PutObject</code> after <code>torch.save</code>. Warpdrive still handles the body as a <strong>chunked HTTP ingest</strong>, persists it with an <strong>append-oriented store and extent metadata.</strong>
+      </p>
+      <div class="chart-box medium">
+        <canvas id="chartPtPutOnly" aria-label="Bar chart: dataset PUT seconds only"></canvas>
+      </div>
+      <figcaption style="font-size:0.9rem;color:var(--muted);line-height:1.55;">
+        <strong>Lower is better</strong> (<code>dataset_stage_to_storage_s</code>). Same boto3 <code>PutObject</code> to both peers; in our run Warpdrive’s <strong>chunked ingest plus append/extent persistence</strong> (and multipart-capable server stack) won this phase.
+      </figcaption>
+    </div>
+
+    <div class="card">
+      <strong>Total wall time: Local vs Warpdrive vs MinIO</strong>
+      <div class="chart-box">
+        <canvas id="chartPtTotal" aria-label="Bar chart: PyTorch workload total seconds"></canvas>
+      </div>
+      <figcaption style="font-size:0.9rem;color:var(--muted);line-height:1.55;">
+        <strong>Lower is better</strong> (end-to-end script). Height is mostly training; you cannot read this as a pure S3 race (local skips HTTP on reload, and MinIO’s bar also reflects a longer training segment in this capture).
+      </figcaption>
+    </div>
+
+    <div class="card">
+      <strong>Where the time went: stacked (seconds, full scale)</strong>
+      <div class="chart-box tall">
+        <canvas id="chartPtStack" aria-label="Stacked bar chart: phase times"></canvas>
+      </div>
+      <figcaption style="font-size:0.9rem;color:var(--muted);line-height:1.55;">
+        <strong>Lower total height is better.</strong> The stack is almost all training; the interesting storage signal is the thin I/O slivers, not who has the tallest bar.
+      </figcaption>
+    </div>
+
+    <h2>Summary</h2>
+    <p class="lede" style="margin:0 0 1rem;">
+      On the training-oriented workload, Warpdrive outperformed both MinIO and local storage on dataset PUT time, and also surpassed MinIO during the large GET phase that repeatedly reloads the same blob. Although local storage achieved the lowest overall wall-clock time by bypassing the HTTP stack entirely, the large-blob dataset PUT phase was still faster on Warpdrive, showing that overall execution time alone does not capture the performance characteristics of individual workload phases.
+    </p>
+    <p class="lede" style="margin:0 0 1rem;">
+      The shard-sweep experiments further showed local storage scaling aggressively once the page cache was warmed. Between Warpdrive and MinIO, MinIO achieved slightly higher effective read throughput on this highly parallel access pattern in the evaluated session.
+    </p>
+    <p class="lede" style="margin:0;">
+      These experiments are part of a broader effort to identify the most effective interfaces for running ML workloads on object storage systems and to optimize read/write paths specifically for ML-driven access patterns rather than generic storage workloads.
+    </p>
+
+    <div class="refs">
+      <h2 style="color:var(--ink);font-size:1.1rem;margin:2rem 0 0.5rem;">References</h2>
+      <ol>
+        <li id="ref1">MLCommons. <em>Announcing the MLPerf Storage v2.0 Checkpointing Workload.</em> <a href="https://mlcommons.org/2025/08/storage-2-checkpointing/">https://mlcommons.org/2025/08/storage-2-checkpointing/</a></li>
+        <li id="ref2">MLCommons. <em>MLPerf Storage v2.0 Results.</em> <a href="https://mlcommons.org/2025/08/mlperf-storage-v2-0-results/">https://mlcommons.org/2025/08/mlperf-storage-v2-0-results/</a></li>
+        <li id="ref3">Amazon Web Services. <em>Applying data loading best practices for ML training with Amazon S3 clients.</em> <a href="https://aws.amazon.com/blogs/machine-learning/applying-data-loading-best-practices-for-ml-training-with-amazon-s3-clients/">https://aws.amazon.com/blogs/machine-learning/applying-data-loading-best-practices-for-ml-training-with-amazon-s3-clients/</a></li>
+        <li id="ref4">Liu et al. <em>I/O in Machine Learning Applications on HPC Systems: A 360-degree Survey.</em> arXiv:2404.10386. <a href="https://arxiv.org/abs/2404.10386">https://arxiv.org/abs/2404.10386</a></li>
+      </ol>
+    </div>
+
+    <footer>
+      <strong>ML I/O benchmark experiment 1.</strong> Static HTML + Chart.js. Open <code>README.html</code> in a browser, screenshot as needed. Numbers embedded from <code>io_bound_run_report_*</code> and <code>pytorch_training_io_report_*</code> in this directory (2026-05-02 runs). Not a sponsored or third-party audit: an engineering notebook you can reproduce.
+    </footer>
+  </div>
+
+  <script>
+    Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+    Chart.defaults.color = "#475569";
+
+    const colors = {
+      local: "rgba(16, 185, 129, 0.85)",
+      warpdrive: "rgba(14, 165, 233, 0.9)",
+      minio: "rgba(249, 115, 22, 0.9)",
+      train: "rgba(99, 102, 241, 0.85)",
+      stage: "rgba(244, 63, 94, 0.75)",
+      load: "rgba(234, 179, 8, 0.85)",
+      ckpt: "rgba(20, 184, 166, 0.8)",
+      rt: "rgba(168, 85, 247, 0.75)",
+    };
+
+    // io_bound (from io_bound_run_report_* 20260502)
+    new Chart(document.getElementById("chartIoTotal"), {
+      type: "bar",
+      data: {
+        labels: ["Local disk", "Warpdrive", "MinIO"],
+        datasets: [{
+          label: "Total wall time (s)",
+          data: [2.27, 11.95, 12.88],
+          backgroundColor: [colors.local, colors.warpdrive, colors.minio],
+          borderRadius: 8,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          title: { display: false },
+        },
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: "Seconds" } },
+        },
+      },
+    });
+
+    new Chart(document.getElementById("chartIoThroughput"), {
+      type: "bar",
+      data: {
+        labels: ["Local (cache-heavy)", "Warpdrive", "MinIO"],
+        datasets: [{
+          label: "MiB/s",
+          data: [3105, 390, 435],
+          backgroundColor: [colors.local, colors.warpdrive, colors.minio],
+          borderRadius: 8,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: "MiB/s" } },
+        },
+      },
+    });
+
+    // pytorch_training_io: local 104938Z, warpdrive 104202Z, minio 103454Z
+    new Chart(document.getElementById("chartPtTotal"), {
+      type: "bar",
+      data: {
+        labels: ["Local disk", "Warpdrive", "MinIO"],
+        datasets: [{
+          label: "Total (s)",
+          data: [261.59, 270.45, 314.94],
+          backgroundColor: [colors.local, colors.warpdrive, colors.minio],
+          borderRadius: 8,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: "Seconds" } },
+        },
+      },
+    });
+
+    new Chart(document.getElementById("chartPtPutOnly"), {
+      type: "bar",
+      data: {
+        labels: ["Local disk", "Warpdrive", "MinIO"],
+        datasets: [{
+          label: "Dataset stage (PUT) s",
+          data: [3.6065, 3.4148, 4.3041],
+          backgroundColor: [colors.local, colors.warpdrive, colors.minio],
+          borderRadius: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: {
+            beginAtZero: true,
+            title: { display: true, text: "Seconds" },
+            suggestedMax: 5,
+          },
+        },
+      },
+    });
+
+    new Chart(document.getElementById("chartPtStack"), {
+      type: "bar",
+      data: {
+        labels: ["Local disk", "Warpdrive", "MinIO"],
+        datasets: [
+          {
+            label: "Synth build",
+            data: [1.6711, 1.6799, 1.6731],
+            backgroundColor: "#94a3b8",
+          },
+          {
+            label: "Dataset stage (PUT)",
+            data: [3.6065, 3.4148, 4.3041],
+            backgroundColor: colors.stage,
+          },
+          {
+            label: "Dataset load (GET)",
+            data: [0.599, 1.7719, 2.133],
+            backgroundColor: colors.load,
+          },
+          {
+            label: "DataLoader init",
+            data: [0.0002, 0.003, 0.0006],
+            backgroundColor: "#cbd5e1",
+          },
+          {
+            label: "Training (12 epochs)",
+            data: [253.6911, 260.2677, 303.1745],
+            backgroundColor: colors.train,
+          },
+          {
+            label: "In-train checkpoints",
+            data: [0.1018, 0.2243, 0.3119],
+            backgroundColor: colors.ckpt,
+          },
+          {
+            label: "Round-trip I/O (3×)",
+            data: [0.5993, 1.1792, 1.2856],
+            backgroundColor: colors.rt,
+          },
+          {
+            label: "Other (unattributed wall)",
+            data: [1.3229, 1.9043, 2.0599],
+            backgroundColor: "rgba(148, 163, 184, 0.45)",
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: "bottom", labels: { boxWidth: 12, padding: 10 } },
+          tooltip: {
+            callbacks: {
+              footer: function (items) {
+                if (!items.length) return "";
+                var i = items[0].datasetIndex;
+                if (i !== 7) return "";
+                return "Residual so bar height = total_wall_s from report";
+              },
+            },
+          },
+        },
+        scales: {
+          x: { stacked: true },
+          y: {
+            stacked: true,
+            beginAtZero: true,
+            min: 0,
+            suggestedMax: 330,
+            title: { display: true, text: "Seconds" },
+          },
+        },
+      },
+    });
+  </script>
+</body>
+</html>

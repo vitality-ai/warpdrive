@@ -1,10 +1,11 @@
 // S3-compatible request handlers
 use actix_web::{web, HttpRequest, HttpResponse, Error};
-use log::{debug, info, warn};
-use futures::StreamExt;
-use bytes::BytesMut;
+use log::{debug, error, info, warn};
+use bytes::{Bytes, BytesMut};
+use futures::stream::{self, StreamExt as _};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::metadata::BucketStats;
 use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
@@ -18,6 +19,25 @@ use crate::util::serializer::deserialize_offset_size;
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// Optional Warpdrive extension elements on each `<Bucket>` for Console/dashboard (ignored by typical S3 clients).
 const WARPDRIVE_LIST_BUCKETS_EXT_NS: &str = "http://warpdrive.vitality.dev/doc/listbuckets/1";
+
+/// Max bytes read from disk per blocking slice when streaming S3 GetObject (bounds peak RAM).
+const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Split metadata extents into <= `S3_GET_STREAM_CHUNK` pieces for streaming bodies.
+fn s3_get_stream_slices(chunks: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(base, total) in chunks {
+        let mut off = base;
+        let mut rem = total;
+        while rem > 0 {
+            let n = rem.min(S3_GET_STREAM_CHUNK);
+            out.push((off, n));
+            off += n;
+            rem -= n;
+        }
+    }
+    out
+}
 
 fn xml_escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -222,16 +242,59 @@ pub async fn s3_get_object_handler(
     // Use S3-compatible storage system for raw binary data
     let offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-    // Concatenate chunks into a single response body
-    let storage_service = StorageService::new();
-    let data = storage_service.read_object(&context, &offset_size_list, StorageMode::S3)?;
-    
-    
-    // Return the actual data directly without conversion
+    let est_bytes: u64 = offset_size_list.iter().map(|(_, sz)| *sz as u64).sum();
+    let stream_slices = Arc::new(s3_get_stream_slices(&offset_size_list));
+    warn!(
+        "S3 GET: streaming body bucket={} key={} est_bytes={} stream_slices={}",
+        bucket,
+        key,
+        est_bytes,
+        stream_slices.len()
+    );
+
+    let ctx = context.clone();
+    let bucket_log = bucket.clone();
+    let key_log = key.clone();
+
+    let byte_stream = stream::try_unfold(0usize, move |idx| {
+        let slices = Arc::clone(&stream_slices);
+        let context = ctx.clone();
+        let bucket_log = bucket_log.clone();
+        let key_log = key_log.clone();
+        async move {
+            if idx >= slices.len() {
+                return Ok::<Option<(Bytes, usize)>, Error>(None);
+            }
+            let (off, sz) = slices[idx];
+            let context = context.clone();
+            let chunk = web::block(move || {
+                StorageService::new()
+                    .read_s3_extent(&context, off, sz)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| {
+                error!(
+                    "S3 GET stream: blocking task failed bucket={} key={} slice={} err={:?}",
+                    bucket_log, key_log, idx, e
+                );
+                actix_web::error::ErrorInternalServerError(e)
+            })?
+            .map_err(|msg| {
+                error!(
+                    "S3 GET stream: read_extent failed bucket={} key={} slice={} err={}",
+                    bucket_log, key_log, idx, msg
+                );
+                actix_web::error::ErrorInternalServerError(msg)
+            })?;
+            Ok(Some((Bytes::from(chunk), idx + 1)))
+        }
+    });
+
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
-        .insert_header(("Content-Length", data.len().to_string()))
-        .body(data))
+        .insert_header(("Content-Length", est_bytes.to_string()))
+        .streaming(byte_stream))
 }
 
 /// S3-compatible DELETE object handler

@@ -77,6 +77,18 @@ impl StorageService {
         }
     }
 
+    /// One contiguous extent on the backing store (S3 object byte range).
+    /// Used by streaming GET to cap peak RAM per read.
+    pub fn read_s3_extent(
+        &self,
+        context: &UserContext,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, Error> {
+        self.store()
+            .read(&context.user_id, &context.bucket, offset, size)
+    }
+
     // Delete an object: read metadata, delete ranges, remove metadata
     pub fn delete_object(&self, context: &UserContext, key: &str) -> Result<(), Error> {
         let db = MetadataService::new(&context.user_id)?;
