@@ -37,6 +37,15 @@ from torch.utils.data import DataLoader, TensorDataset
 _ML_ROOT = Path(__file__).resolve().parent
 _WARPDRIVE_ROOT = _ML_ROOT.parents[3]
 
+
+def _rel(path: Path) -> str:
+    """Path relative to experiment_1/ for portable JSON reports."""
+    try:
+        return str(path.resolve().relative_to(_ML_ROOT))
+    except ValueError:
+        return path.name
+
+
 # "local" | "warpdrive" | "minio"
 STORAGE = "local"
 
@@ -46,8 +55,9 @@ LR = 1e-3
 NUM_WORKERS = 0  # keep 0 so dataloader I/O stays easy to reason about; data already in RAM
 
 # Synthetic vision dataset size (float32 CHW). Total bytes ≈ N * 3 * 32 * 32 * 4.
-# Warpdrive currently buffers full objects on GET: one request ≈ one large Vec in RAM.
-# Low Docker memory limits → OOMKilled (exit 137). Lower N and/or CHECKPOINT_PADDING_MIB if needed.
+# Warpdrive streams GetObject from disk in ~8 MiB slices (bounded server RAM per request).
+# This script still calls Body.read(), so each GET is one full object in the client process.
+# Tight memory on the machine running the benchmark → OOMKilled (exit 137); lower N and/or CHECKPOINT_PADDING_MIB.
 SYNTH_NUM_SAMPLES = 65536
 SYNTH_C, SYNTH_H, SYNTH_W = 3, 32, 32
 
@@ -260,8 +270,8 @@ def main() -> None:
             ),
             "s3_bucket": bucket or None,
             "artifact_prefix": prefix,
-            "local_artifact_dir": str(LOCAL_ARTIFACT_DIR),
-            "report_path": str(report_path),
+            "local_artifact_dir": _rel(LOCAL_ARTIFACT_DIR),
+            "report_path": _rel(report_path),
         },
         "timings_sec": {},
         "dataset_bytes": 0,

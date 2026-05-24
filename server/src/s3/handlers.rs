@@ -155,14 +155,7 @@ pub async fn s3_put_object_handler(
     // S3 overwrite: delete existing object before appending new extents.
     if db.check_key(&context.bucket, &key)? {
         info!("S3 PUT: Overwriting existing object for bucket={}, key={}", bucket, key);
-
-        let existing_offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-        let _existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
-
-        let storage_service = StorageService::new();
-        storage_service.delete_object(&context, &key)?;
-
-        db.delete_metadata(&context.bucket, &key)?;
+        StorageService::new().delete_object(&context, &key)?;
     }
 
     // Stream body to storage: each HTTP chunk is appended as its own extent (bounded RAM ≈ chunk).
@@ -351,7 +344,6 @@ pub async fn s3_delete_object_handler(
     
     // Use service to delete object and metadata
     let storage_service = StorageService::new();
-    storage_service.delete_object(&context, &key)?;
     
     // Return success response
     Ok(HttpResponse::Ok()
@@ -519,17 +511,7 @@ pub async fn s3_copy_object_handler(
     // If destination already exists, delete it first
     if db.check_key(&context.bucket, &key)? {
         info!("S3 COPY: Overwriting existing destination object for bucket={}, key={}", bucket, key);
-        
-        // Read existing metadata to get offset/size info for cleanup
-        let existing_offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-        let _existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
-        
-        // Delete existing data from storage
-        let storage_service = StorageService::new();
-        storage_service.delete_object(&context, &key)?;
-        
-        // Delete existing metadata
-        db.delete_metadata(&context.bucket, &key)?;
+        StorageService::new().delete_object(&context, &key)?;
     }
     
     // Read source metadata
@@ -781,9 +763,7 @@ pub async fn s3_abort_multipart_upload_handler(
     for obj_key in all_objects {
         if obj_key.starts_with(&format!("{}.part.", key)) && obj_key.ends_with(&format!(".{}", upload_id)) {
             // Delete the part
-            let storage_service = StorageService::new();
-            storage_service.delete_object(&context, &obj_key)?;
-            db.delete_metadata(&context.bucket, &obj_key)?;
+            StorageService::new().delete_object(&context, &obj_key)?;
         }
     }
     

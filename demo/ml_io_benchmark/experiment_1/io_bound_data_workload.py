@@ -35,6 +35,14 @@ import torch
 _ML_ROOT = Path(__file__).resolve().parent
 _WARPDRIVE_ROOT = _ML_ROOT.parents[3]
 
+
+def _rel(path: Path) -> str:
+    """Path relative to experiment_1/ for portable JSON reports."""
+    try:
+        return str(path.resolve().relative_to(_ML_ROOT))
+    except ValueError:
+        return path.name
+
 # "warpdrive" | "minio" | "local"
 STORAGE = "minio"
 
@@ -226,7 +234,7 @@ def stage_local() -> Dict[str, Any]:
     elapsed = time.perf_counter() - t0
     # Use strings so report JSON is serializable (Path is not).
     return {
-        "paths": [str(p.resolve()) for p in paths],
+        "paths": [_rel(p) for p in paths],
         "bytes_written": total,
         "stage_s": round(elapsed, 4),
     }
@@ -315,7 +323,7 @@ def main() -> None:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config": {
             "run_id": run_id,
-            "local_run_report_path": str(report_path),
+            "local_run_report_path": _rel(report_path),
             "storage": STORAGE,
             "num_shards": NUM_SHARDS,
             "shard_size_bytes": SHARD_SIZE_BYTES,
@@ -328,7 +336,7 @@ def main() -> None:
                 if STORAGE == "minio"
                 else (S3_ENDPOINT_URL if STORAGE == "warpdrive" else None)
             ),
-            "local_shard_dir": str(LOCAL_SHARD_DIR),
+            "local_shard_dir": _rel(LOCAL_SHARD_DIR),
             "skip_stage": SKIP_STAGE,
         },
         "staging": {},
