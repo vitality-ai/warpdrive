@@ -342,9 +342,8 @@ pub async fn s3_delete_object_handler(
         return Ok(HttpResponse::NotFound().body("Object not found"));
     }
     
-    // Use service to delete object and metadata
-    let storage_service = StorageService::new();
-    
+    StorageService::new().delete_object(&context, &key)?;
+
     // Return success response
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Length", "0"))
