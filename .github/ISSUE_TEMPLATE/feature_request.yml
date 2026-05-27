@@ -1,0 +1,52 @@
+name: Feature request
+description: Propose a new feature with clear user impact and product usage.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the feature you want to add.
+      placeholder: A short and clear feature description.
+    validations:
+      required: true
+
+  - type: textarea
+    id: practical_use_cases
+    attributes:
+      label: Practical use cases
+      description: List the real-world use cases this feature unlocks.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: input
+    id: product_usage
+    attributes:
+      label: Product that will use this feature
+      description: Once implemented, which product, service, or customer workflow will use this?
+      placeholder: Example: Vitality Console dataset ingestion pipeline
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What pain point does this solve today?
+      placeholder: Describe the current limitation and who is affected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: success_criteria
+    attributes:
+      label: Success criteria
+      description: How will we know this feature is complete and useful?
+      placeholder: Define expected behavior, outcomes, or metrics.
+    validations:
+      required: true
