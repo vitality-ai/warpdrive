@@ -14,7 +14,7 @@ body:
       required: true
 
   - type: textarea
-    id: practical_usecases
+    id: practical_use_cases
     attributes:
       label: Practical use cases
       description: List the real-world use cases this feature unlocks.
