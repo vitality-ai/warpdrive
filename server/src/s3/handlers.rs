@@ -1,10 +1,11 @@
 // S3-compatible request handlers
 use actix_web::{web, HttpRequest, HttpResponse, Error};
-use log::{debug, info, warn};
-use futures::StreamExt;
-use bytes::BytesMut;
+use log::{debug, error, info, warn};
+use bytes::{Bytes, BytesMut};
+use futures::stream::{self, StreamExt as _};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::metadata::BucketStats;
 use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
@@ -12,12 +13,32 @@ use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
 use crate::service::metadata_service::MetadataService;
 use crate::service::user_context::UserContext;
 use crate::service::storage_service::{StorageService, StorageMode};
+use crate::storage::config::StorageConfig;
 use crate::util::serializer::deserialize_offset_size;
 
 /// S3 API XML namespace (ListAllMyBucketsResult, ListBucketResult, etc.)
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// Optional Warpdrive extension elements on each `<Bucket>` for Console/dashboard (ignored by typical S3 clients).
 const WARPDRIVE_LIST_BUCKETS_EXT_NS: &str = "http://warpdrive.vitality.dev/doc/listbuckets/1";
+
+/// Max bytes read from disk per blocking slice when streaming S3 GetObject (bounds peak RAM).
+const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Split metadata extents into <= `S3_GET_STREAM_CHUNK` pieces for streaming bodies.
+fn s3_get_stream_slices(chunks: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(base, total) in chunks {
+        let mut off = base;
+        let mut rem = total;
+        while rem > 0 {
+            let n = rem.min(S3_GET_STREAM_CHUNK);
+            out.push((off, n));
+            off += n;
+            rem -= n;
+        }
+    }
+    out
+}
 
 fn xml_escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -126,58 +147,60 @@ pub async fn s3_put_object_handler(
     
     // Create authenticated request with proper headers
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
-    
-    // Process the payload - use Vec<u8> for better memory management
-    let mut bytes = Vec::new();
-    while let Some(chunk) = payload.next().await {
-        let chunk = chunk.map_err(|e| {
+
+    // Context + metadata before consuming the body so overwrite can run first.
+    let context = UserContext::with_bucket(auth_result.user_id, auth_result.bucket);
+    let db = MetadataService::new(&context.user_id)?;
+
+    // S3 overwrite: delete existing object before appending new extents.
+    if db.check_key(&context.bucket, &key)? {
+        info!("S3 PUT: Overwriting existing object for bucket={}, key={}", bucket, key);
+        StorageService::new().delete_object(&context, &key)?;
+    }
+
+    // Stream body to storage: each HTTP chunk is appended as its own extent (bounded RAM ≈ chunk).
+    let store = StorageConfig::from_env().create_store();
+    let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
+
+    while let Some(chunk_result) = payload.next().await {
+        let chunk = chunk_result.map_err(|e| {
             warn!("Error reading payload chunk: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
-        bytes.extend_from_slice(&chunk);
+        if chunk.is_empty() {
+            continue;
+        }
+        let context_c = context.clone();
+        let store_c = Arc::clone(&store);
+        let buf = chunk.to_vec();
+        let pair = web::block(move || {
+            store_c
+                .write(&context_c.user_id, &context_c.bucket, &buf)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| {
+            error!(
+                "S3 PUT: blocking write task failed bucket={} key={} err={:?}",
+                bucket, key, e
+            );
+            actix_web::error::ErrorInternalServerError("storage write task failed")
+        })?;
+        let (off, sz) = pair.map_err(|msg| {
+            error!(
+                "S3 PUT: write failed bucket={} key={} err={}",
+                bucket, key, msg
+            );
+            actix_web::error::ErrorInternalServerError(msg)
+        })?;
+        offset_size_list.push((off, sz));
     }
-    
-    if bytes.is_empty() {
+
+    if offset_size_list.is_empty() {
         warn!("Empty payload for PUT request");
         return Ok(HttpResponse::BadRequest().body("Empty payload"));
     }
-    
-    
-    
-    // Create user context for storage operations
-    let context = UserContext::with_bucket(auth_result.user_id, auth_result.bucket);
-    
-    // Get metadata service
-    let db = MetadataService::new(&context.user_id)?;
-    
-    // For S3 compatibility, allow overwriting existing objects
-    // (S3 allows PUT to overwrite existing objects)
-    
-    // If object already exists, delete it first (S3 overwrite behavior)
-    if db.check_key(&context.bucket, &key)? {
-        info!("S3 PUT: Overwriting existing object for bucket={}, key={}", bucket, key);
-        
-        // Read existing metadata to get offset/size info for cleanup
-        let existing_offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-        let _existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
-        
-        // Delete existing data from storage
-        let storage_service = StorageService::new();
-        storage_service.delete_object(&context, &key)?;
-        
-        // Delete existing metadata
-        db.delete_metadata(&context.bucket, &key)?;
-    }
-    
-    // Store the raw bytes as a single chunk
-    let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::S3)?;
-    
-    if offset_size_list.is_empty() {
-        return Ok(HttpResponse::BadRequest().body("No data to store"));
-    }
-    
-    // Serialize and store metadata (same as put_service)
+
     let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &offset_size_bytes)?;
 
@@ -222,16 +245,63 @@ pub async fn s3_get_object_handler(
     // Use S3-compatible storage system for raw binary data
     let offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
     let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-    // Concatenate chunks into a single response body
-    let storage_service = StorageService::new();
-    let data = storage_service.read_object(&context, &offset_size_list, StorageMode::S3)?;
-    
-    
-    // Return the actual data directly without conversion
+    let est_bytes: u64 = offset_size_list.iter().map(|(_, sz)| *sz as u64).sum();
+    let stream_slices = Arc::new(s3_get_stream_slices(&offset_size_list));
+    warn!(
+        "S3 GET: streaming body bucket={} key={} est_bytes={} stream_slices={}",
+        bucket,
+        key,
+        est_bytes,
+        stream_slices.len()
+    );
+
+    // One store for the whole response: read_s3_extent() would call create_store() per slice.
+    let store = StorageConfig::from_env().create_store();
+
+    let ctx = context.clone();
+    let bucket_log = bucket.clone();
+    let key_log = key.clone();
+
+    let byte_stream = stream::try_unfold(0usize, move |idx| {
+        let slices = Arc::clone(&stream_slices);
+        let context = ctx.clone();
+        let bucket_log = bucket_log.clone();
+        let key_log = key_log.clone();
+        let store = Arc::clone(&store);
+        async move {
+            if idx >= slices.len() {
+                return Ok::<Option<(Bytes, usize)>, Error>(None);
+            }
+            let (off, sz) = slices[idx];
+            let context = context.clone();
+            let chunk = web::block(move || {
+                store
+                    .read(&context.user_id, &context.bucket, off, sz)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| {
+                error!(
+                    "S3 GET stream: blocking task failed bucket={} key={} slice={} err={:?}",
+                    bucket_log, key_log, idx, e
+                );
+                actix_web::error::ErrorInternalServerError(e)
+            })?
+            .map_err(|msg| {
+                error!(
+                    "S3 GET stream: read_extent failed bucket={} key={} slice={} err={}",
+                    bucket_log, key_log, idx, msg
+                );
+                actix_web::error::ErrorInternalServerError(msg)
+            })?;
+            Ok(Some((Bytes::from(chunk), idx + 1)))
+        }
+    });
+
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
-        .insert_header(("Content-Length", data.len().to_string()))
-        .body(data))
+        .insert_header(("Content-Length", est_bytes.to_string()))
+        .streaming(byte_stream))
 }
 
 /// S3-compatible DELETE object handler
@@ -272,10 +342,8 @@ pub async fn s3_delete_object_handler(
         return Ok(HttpResponse::NotFound().body("Object not found"));
     }
     
-    // Use service to delete object and metadata
-    let storage_service = StorageService::new();
-    storage_service.delete_object(&context, &key)?;
-    
+    StorageService::new().delete_object(&context, &key)?;
+
     // Return success response
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Length", "0"))
@@ -442,17 +510,7 @@ pub async fn s3_copy_object_handler(
     // If destination already exists, delete it first
     if db.check_key(&context.bucket, &key)? {
         info!("S3 COPY: Overwriting existing destination object for bucket={}, key={}", bucket, key);
-        
-        // Read existing metadata to get offset/size info for cleanup
-        let existing_offset_size_bytes = db.read_metadata(&context.bucket, &key)?;
-        let _existing_offset_size_list = deserialize_offset_size(&existing_offset_size_bytes)?;
-        
-        // Delete existing data from storage
-        let storage_service = StorageService::new();
-        storage_service.delete_object(&context, &key)?;
-        
-        // Delete existing metadata
-        db.delete_metadata(&context.bucket, &key)?;
+        StorageService::new().delete_object(&context, &key)?;
     }
     
     // Read source metadata
@@ -627,19 +685,17 @@ pub async fn s3_complete_multipart_upload_handler(
         }
     }
     
-    // Sort parts by part number
+    // Sort parts by part number and build the final manifest directly from part manifests.
+    // This avoids re-reading and rewriting the full object at completion time.
     parts.sort_by_key(|(part_num, _)| *part_num);
-    
-    
-    // Combine all parts
-    let mut combined_data = Vec::new();
+    if parts.is_empty() {
+        return Ok(HttpResponse::BadRequest().body("No uploaded parts found for uploadId"));
+    }
+    let mut final_offset_size_list: Vec<(u64, u64)> = Vec::new();
     for (_part_num, part_key) in &parts {
-        // Read and append part data
         let offset_size_bytes = db.read_metadata(&context.bucket, part_key)?;
         let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-        let storage_service = StorageService::new();
-        let part = storage_service.read_object(&context, &offset_size_list, StorageMode::S3)?;
-        combined_data.extend_from_slice(&part);
+        final_offset_size_list.extend(offset_size_list);
     }
     
     
@@ -655,16 +711,12 @@ pub async fn s3_complete_multipart_upload_handler(
         storage_service.delete_object(&context, &key)?;
     }
 
-    // Store combined data as single chunk
-    let storage_service = StorageService::new();
-    let final_offset_size_list = storage_service.write_object(&context, &combined_data, StorageMode::S3)?;
+    // Store final object metadata as an ordered list of already-uploaded part extents.
     let final_offset_size_bytes = crate::util::serializer::serialize_offset_size(&final_offset_size_list)?;
     db.write_metadata(&context.bucket, &key, &final_offset_size_bytes)?;
     
-    // Clean up part files
+    // Clean up multipart part metadata. Keep chunk data: final object now references it.
     for (_, part_key) in &parts {
-        let storage_service = StorageService::new();
-        storage_service.delete_object(&context, &part_key)?;
         db.delete_metadata(&context.bucket, part_key)?;
     }
     
@@ -710,9 +762,7 @@ pub async fn s3_abort_multipart_upload_handler(
     for obj_key in all_objects {
         if obj_key.starts_with(&format!("{}.part.", key)) && obj_key.ends_with(&format!(".{}", upload_id)) {
             // Delete the part
-            let storage_service = StorageService::new();
-            storage_service.delete_object(&context, &obj_key)?;
-            db.delete_metadata(&context.bucket, &obj_key)?;
+            StorageService::new().delete_object(&context, &obj_key)?;
         }
     }
     

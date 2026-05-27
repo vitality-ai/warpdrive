@@ -1,0 +1,77 @@
+{
+  "created_at_utc": "2026-05-02T10:00:14.151268+00:00",
+  "config": {
+    "run_id": "20260502T100014Z",
+    "local_run_report_path": "/Users/cj/cj/personal/warpdrive/demo/ml_io_benchmark/experiment_1/io_bound_run_report_warpdrive_20260502T100014Z.json",
+    "storage": "warpdrive",
+    "num_shards": 8,
+    "shard_size_bytes": 134217728,
+    "fetch_rounds": 3,
+    "fetch_workers": 4,
+    "s3_prefix": "ml-io-stress/shards",
+    "local_shard_dir": "/Users/cj/cj/personal/warpdrive/demo/ml_io_benchmark/experiment_1/data/io_stress_shards",
+    "skip_stage": false
+  },
+  "staging": {
+    "keys": [
+      "ml-io-stress/shards/shard_0000.bin",
+      "ml-io-stress/shards/shard_0001.bin",
+      "ml-io-stress/shards/shard_0002.bin",
+      "ml-io-stress/shards/shard_0003.bin",
+      "ml-io-stress/shards/shard_0004.bin",
+      "ml-io-stress/shards/shard_0005.bin",
+      "ml-io-stress/shards/shard_0006.bin",
+      "ml-io-stress/shards/shard_0007.bin"
+    ],
+    "bytes_uploaded": 1073741824,
+    "stage_s": 4.074
+  },
+  "rounds": [
+    {
+      "round_index": 1,
+      "round_wall_s": 3.1748,
+      "bytes_read": 1073741824,
+      "throughput_mib_per_s": 322.538,
+      "avg_fetch_ms": 1479.051,
+      "max_fetch_ms": 1518.426,
+      "sum_compute_ms": 85.51
+    },
+    {
+      "round_index": 2,
+      "round_wall_s": 2.4363,
+      "bytes_read": 1073741824,
+      "throughput_mib_per_s": 420.305,
+      "avg_fetch_ms": 1047.364,
+      "max_fetch_ms": 1388.616,
+      "sum_compute_ms": 40.962
+    },
+    {
+      "round_index": 3,
+      "round_wall_s": 2.2585,
+      "bytes_read": 1073741824,
+      "throughput_mib_per_s": 453.398,
+      "avg_fetch_ms": 989.592,
+      "max_fetch_ms": 1170.265,
+      "sum_compute_ms": 39.088
+    }
+  ],
+  "timings_sec": {
+    "stage_s": 4.074,
+    "sum_round_wall_s": 7.8696,
+    "sum_compute_all_rounds_ms": 165.56,
+    "total_wall_s": 11.9478,
+    "total_bytes_moved_read": 3221225472,
+    "effective_read_mib_per_s": 390.363,
+    "write_report_local_s": 0.0004
+  },
+  "analysis": {
+    "per_round_throughput_mib_per_s": [
+      322.538,
+      420.305,
+      453.398
+    ],
+    "compute_ms_vs_read_wall_ms": 7869.6,
+    "sum_compute_all_rounds_ms": 165.56,
+    "note": "Workload is I/O bound if sum_compute_all_rounds_ms is tiny vs 1000*sum_round_wall_s. With FETCH_WORKERS>1, round_wall_s is wall time; avg_fetch_ms is mean per-shard latency."
+  }
+}

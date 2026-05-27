@@ -1,6 +1,11 @@
+# Console: only WARN and ERROR (less noise when tailing docker logs).
+# File: full INFO trail for debugging (see logs/application.log).
 appenders:
   stdout:
     kind: console
+    filters:
+      - kind: threshold
+        level: warn
     encoder:
       pattern: "{d} - {l} - {m}{n}"
   file:

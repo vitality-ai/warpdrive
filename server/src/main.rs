@@ -22,7 +22,7 @@ async fn main() -> std::io::Result<()> {
     // Load .env from current dir or server dir so VITALITY_CONSOLE_URL etc. are set
     let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
-    info!("Starting server on 127.0.0.1:8080");
+    info!("Starting HTTP server on 0.0.0.0:9710 (S3 under /s3/...)");
     
     // Start the deletion worker as a background task (non-blocking)
     let _deletion_worker_handle = start_deletion_worker();
