@@ -26,7 +26,7 @@ WarpDrive is a general purpose KV/Object store focused on workloads that require
 3. User Access Management and S3 middleware - [Repo](https://github.com/vitality-ai/Vitality-console)
 4. Search - Seeks contribution for design. - [Discussion](https://github.com/cia-labs/Storage-service/issues/35)
    - Practical/Product use case: Vitality Console and AI data pipelines need fast object lookup by metadata/key patterns to discover datasets, checkpoints, and snapshots without manual path traversal.
-5. Availability - Seeks contribution for design - [Discussion (to be created)](https://github.com/vitality-ai/warpdrive/issues/new/choose).
+5. Availability - Seeks contribution for design - [Discussion (to be created)](https://github.com/vitality-ai/warpdrive/issues/new/choose)
    - Practical/Product use case: production WarpDrive deployments serving training and data-ingestion workloads require high uptime and quick failover so long-running jobs are not interrupted.
 6. Client Library - Client package is currently available for Python only. [Repo](https://github.com/vitality-ai/python-sdk).
 7. Compute and Storage Infrastructure Research - [Repo](https://github.com/vitality-ai/NexCSAD).
