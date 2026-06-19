@@ -47,6 +47,8 @@ pub struct S3AuthResult {
     pub bucket: String,
     /// Snapshot of Console-registered buckets for this key (from credential cache at refresh time).
     pub allowed_buckets: Vec<String>,
+    /// True for the hardcoded admin user — skips bucket membership checks so any bucket is reachable.
+    pub allow_all_buckets: bool,
 }
 
 /// Returns (base_url, service_secret, cache_ttl_secs).
@@ -475,12 +477,14 @@ fn extract_bucket_from_path(req: &HttpRequest) -> Result<String, Error> {
     Ok(path_parts[1].to_string())
 }
 
-/// Authenticate S3 request (async). Requires Vitality Console: `VITALITY_CONSOLE_URL` and
-/// `WARPDRIVE_SERVICE_SECRET`.
+/// Authenticate S3 request (async).
 ///
-/// **Credential cache (per `access_key`):** stores `secret_key`, `owner_id`, and `registered_buckets`
-/// from a single `s3-credentials` bundle refresh. Non-empty path buckets must be in that set
-/// (TTL `S3_AUTH_CACHE_TTL_SECS`, default 300s).
+/// **Admin bypass:** if `WARPDRIVE_ADMIN_ACCESS_KEY` and `WARPDRIVE_ADMIN_SECRET_KEY` are set and
+/// the request's access key matches, SigV4 is verified against the admin secret without contacting
+/// Vitality Console. The returned result has `allow_all_buckets = true`.
+///
+/// **Console path:** requires `VITALITY_CONSOLE_URL` + `WARPDRIVE_SERVICE_SECRET`. Credential
+/// cache TTL is `S3_AUTH_CACHE_TTL_SECS` (default 300 s).
 pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error> {
     let auth_header = req
         .headers()
@@ -499,8 +503,6 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
     let access_key = parsed.access_key.clone();
     let bucket = extract_bucket_from_path(req)?;
 
-    // If the client does not use path-style URLs (/s3/{bucket}/...), we see an empty bucket here
-    // and would skip Console's bucket check — reject everything except ListBuckets.
     if !is_list_buckets_request(req) && bucket.is_empty() {
         warn!(
             "S3 auth: empty bucket in path for {} {} — use path-style endpoint so the URL is /s3/{{bucket}}/key",
@@ -514,50 +516,50 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
 
     debug!(
         "S3 auth: request_path={} extracted_bucket={:?} list_buckets={}",
-        req.path(),
-        bucket,
-        is_list_buckets_request(req)
+        req.path(), bucket, is_list_buckets_request(req)
     );
 
+    // --- Admin user bypass (no Console required) ---
+    let admin_access_key = std::env::var("WARPDRIVE_ADMIN_ACCESS_KEY").ok();
+    let admin_secret_key = std::env::var("WARPDRIVE_ADMIN_SECRET_KEY").ok();
+
+    if let (Some(ref aak), Some(ref ask)) = (&admin_access_key, &admin_secret_key) {
+        if access_key == *aak {
+            verify_sigv4(req, ask, &parsed)?;
+            debug!("S3 auth: admin bypass OK path_bucket={:?}", bucket);
+            return Ok(S3AuthResult {
+                access_key,
+                user_id: "admin".to_string(),
+                bucket,
+                allowed_buckets: vec![],
+                allow_all_buckets: true,
+            });
+        }
+    }
+
+    // --- Vitality Console path ---
     let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
 
     let base_url = base_url.ok_or_else(|| {
-        warn!("VITALITY_CONSOLE_URL not set");
-        ErrorUnauthorized("VITALITY_CONSOLE_URL and WARPDRIVE_SERVICE_SECRET must be set")
+        warn!("VITALITY_CONSOLE_URL not set and no admin credentials configured");
+        ErrorUnauthorized("No authentication method configured (set WARPDRIVE_ADMIN_ACCESS_KEY or VITALITY_CONSOLE_URL)")
     })?;
     let service_secret = service_secret.ok_or_else(|| {
         warn!("WARPDRIVE_SERVICE_SECRET not set");
-        ErrorUnauthorized("VITALITY_CONSOLE_URL and WARPDRIVE_SERVICE_SECRET must be set")
+        ErrorUnauthorized("WARPDRIVE_SERVICE_SECRET must be set when using Vitality Console")
     })?;
 
     let (mut owner_id, mut secret_key, mut allowed_buckets, cache_hit) =
-        load_or_refresh_credential_bundle(
-            &access_key,
-            &base_url,
-            &service_secret,
-            cache_ttl_secs,
-        )
-        .await?;
+        load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
 
-    // Stale cache can hold registered_buckets=[] from an earlier refresh (e.g. before `default`
-    // existed). Re-fetch once when we had a cache hit and the allowlist is still empty but the
-    // client targets a bucket — avoids 403 until TTL without extra round-trips on every miss.
-    if cache_hit
-        && allowed_buckets.is_empty()
-        && !bucket.is_empty()
-    {
+    if cache_hit && allowed_buckets.is_empty() && !bucket.is_empty() {
         warn!(
-            "S3 auth: empty cached bucket set for path_bucket={:?} — invalidating cache and re-fetching from Console",
+            "S3 auth: empty cached bucket set for path_bucket={:?} — invalidating and re-fetching",
             bucket
         );
         invalidate_s3_credential_cache(&access_key);
-        let (o, s, ab, _) = load_or_refresh_credential_bundle(
-            &access_key,
-            &base_url,
-            &service_secret,
-            cache_ttl_secs,
-        )
-        .await?;
+        let (o, s, ab, _) =
+            load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
         owner_id = o;
         secret_key = s;
         allowed_buckets = ab;
@@ -578,16 +580,15 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
 
     verify_sigv4(req, &secret_key, &parsed)?;
     debug!(
-        "S3 Authentication successful: request_path={} user={} path_bucket={:?} SigV4 OK",
-        req.path(),
-        owner_id,
-        bucket
+        "S3 auth: Console path OK request_path={} user={} path_bucket={:?}",
+        req.path(), owner_id, bucket
     );
     Ok(S3AuthResult {
         access_key,
         user_id: owner_id,
         bucket,
         allowed_buckets: allowed_buckets_vec,
+        allow_all_buckets: false,
     })
 }
 
