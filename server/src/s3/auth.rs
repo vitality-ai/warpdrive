@@ -1,5 +1,5 @@
 // S3 Authentication module
-use actix_web::{HttpRequest, Error, error::{ErrorBadRequest, ErrorForbidden, ErrorServiceUnavailable, ErrorUnauthorized}};
+use actix_web::{HttpRequest, HttpResponse, Error, error::{ErrorBadRequest, ErrorForbidden, ErrorServiceUnavailable, ErrorUnauthorized}};
 use lazy_static::lazy_static;
 use log::{debug, warn};
 use serde::Deserialize;
@@ -488,18 +488,38 @@ fn extract_bucket_from_path(req: &HttpRequest) -> Result<String, Error> {
 ///
 /// **Console path:** requires `VITALITY_CONSOLE_URL` + `WARPDRIVE_SERVICE_SECRET`. Credential
 /// cache TTL is `S3_AUTH_CACHE_TTL_SECS` (default 300 s).
+fn s3_access_denied(message: &str) -> Error {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\n\
+           <Code>AccessDenied</Code>\n\
+           <Message>{}</Message>\n\
+           <RequestId>warpdrive</RequestId>\n\
+         </Error>",
+        message
+    );
+    let msg = message.to_string();
+    actix_web::error::InternalError::from_response(
+        msg,
+        HttpResponse::Forbidden()
+            .content_type("application/xml")
+            .insert_header(("x-amz-request-id", "warpdrive"))
+            .body(body),
+    ).into()
+}
+
 pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error> {
     let auth_header = req
         .headers()
         .get("Authorization")
         .ok_or_else(|| {
             warn!("Missing Authorization header");
-            ErrorUnauthorized("Missing Authorization header")
+            s3_access_denied("Access Denied")
         })?
         .to_str()
         .map_err(|_| {
             warn!("Invalid Authorization header format");
-            ErrorUnauthorized("Invalid Authorization header")
+            s3_access_denied("Access Denied")
         })?;
 
     let parsed = parse_authorization_header_full(auth_header)?;

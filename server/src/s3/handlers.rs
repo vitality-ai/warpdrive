@@ -52,6 +52,19 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// S3 URL-encoding for listing responses: percent-encode all bytes except unreserved chars and '/'.
+fn s3_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+            b'-' | b'_' | b'.' | b'~' | b'/' => out.push(byte as char),
+            b => { out.push('%'); out.push_str(&format!("{:02X}", b)); }
+        }
+    }
+    out
+}
+
 /// Build an S3-spec XML error response.
 fn s3_error(status: StatusCode, code: &str, message: &str, resource: &str) -> HttpResponse {
     let body = format!(
@@ -195,7 +208,10 @@ fn validate_object_key(key: &str, bucket: &str) -> Result<(), HttpResponse> {
 // ListBuckets  GET /s3  or  GET /s3/
 // ---------------------------------------------------------------------------
 
-pub async fn s3_list_buckets_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+pub async fn s3_list_buckets_handler(
+    query: web::Query<HashMap<String, String>>,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
     let auth_result = authenticate_s3_request(&req).await?;
     if !auth_result.bucket.is_empty() {
         return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest",
@@ -214,11 +230,30 @@ pub async fn s3_list_buckets_handler(req: HttpRequest) -> Result<HttpResponse, E
         Some(auth_result.allowed_buckets.iter().map(|s| s.as_str()).collect())
     };
 
+    // Pagination params: max-buckets + continuation-token (new ListBuckets API)
+    let max_buckets: usize = query.get("max-buckets")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    let after: &str = query.get("continuation-token").map(|s| s.as_str()).unwrap_or("");
+
     let mut buckets_xml = String::new();
+    let mut count = 0usize;
+    let mut last_name = String::new();
+    let mut truncated = false;
+
     for stat in &all_stats {
         if let Some(ref allowed) = allowed_set {
             if !allowed.contains(stat.name.as_str()) { continue; }
         }
+        if !after.is_empty() && stat.name.as_str() <= after {
+            continue;
+        }
+        if count >= max_buckets {
+            truncated = true;
+            break;
+        }
+        last_name = stat.name.clone();
+        count += 1;
         buckets_xml.push_str(&format!(
             "    <Bucket>\n\
              \t<Name>{name}</Name>\n\
@@ -229,14 +264,22 @@ pub async fn s3_list_buckets_handler(req: HttpRequest) -> Result<HttpResponse, E
         ));
     }
 
+    let continuation_xml = if truncated {
+        format!("    <ContinuationToken>{}</ContinuationToken>\n", xml_escape(&last_name))
+    } else {
+        String::new()
+    };
+
     let owner_id = xml_escape(&auth_result.user_id);
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListAllMyBucketsResult xmlns=\"{s3}\">\n\
              <Owner><ID>{owner}</ID><DisplayName>{owner}</DisplayName></Owner>\n\
              <Buckets>\n{buckets}</Buckets>\n\
+             {continuation}\
          </ListAllMyBucketsResult>",
         s3 = S3_XMLNS, owner = owner_id, buckets = buckets_xml,
+        continuation = continuation_xml,
     );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
@@ -685,67 +728,257 @@ pub async fn s3_list_objects_handler(
 
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    info!("S3 ListObjects: bucket={}", bucket);
-
-    let objects = db.list_objects(&bucket)?;
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z");
-
-    // Support both V1 (no list-type) and V2 (list-type=2) with basic response.
-    // Full prefix/delimiter/pagination support is Batch 2.
     let list_type = query.get("list-type").map(|s| s.as_str()).unwrap_or("1");
     let is_v2 = list_type == "2";
 
-    let mut contents_xml = String::new();
-    for object_key in &objects {
-        let (size, etag, last_modified) = db.get_object_full(&bucket, object_key)
-            .map(|m| (
-                m.size,
-                m.etag.unwrap_or_default(),
-                m.last_modified.unwrap_or_else(|| now.to_string()),
-            ))
-            .unwrap_or((0, String::new(), now.to_string()));
-        contents_xml.push_str(&format!(
-            "    <Contents>\n\
-             \t<Key>{key}</Key>\n\
-             \t<Size>{size}</Size>\n\
-             \t<LastModified>{lm}</LastModified>\n\
-             \t<ETag>&quot;{etag}&quot;</ETag>\n\
-             \t<StorageClass>STANDARD</StorageClass>\n\
-             \t</Contents>\n",
-            key = xml_escape(object_key),
-            size = size,
-            lm = last_modified,
-            etag = etag.trim_matches('"'),
-        ));
+    let prefix    = query.get("prefix").map(|s| s.as_str()).unwrap_or("");
+    let delimiter = query.get("delimiter").map(|s| s.as_str()).unwrap_or("");
+    let url_encode = query.get("encoding-type").map(|s| s == "url").unwrap_or(false);
+    let allow_unordered = query.get("allow-unordered").map(|s| s == "true").unwrap_or(false);
+
+    // allow-unordered + delimiter is invalid (Ceph RGW extension)
+    if allow_unordered && !delimiter.is_empty() {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                           "allow-unordered is not supported with delimiter", &bucket));
     }
 
+    // Validate and parse max-keys
+    let max_keys: usize = if let Some(mk) = query.get("max-keys") {
+        match mk.parse::<i64>() {
+            Ok(n) if n >= 0 => n as usize,
+            _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                    "Argument maxKeys must be an integer between 0 and 2147483647",
+                                    &bucket)),
+        }
+    } else {
+        1000
+    };
+
+    // V2: continuation-token overrides start-after for the effective position.
+    let is_continuation = is_v2 && query.contains_key("continuation-token");
+    let effective_marker: &str = if is_v2 {
+        if let Some(ct) = query.get("continuation-token") {
+            ct.as_str()
+        } else {
+            query.get("start-after").map(|s| s.as_str()).unwrap_or("")
+        }
+    } else {
+        query.get("marker").map(|s| s.as_str()).unwrap_or("")
+    };
+
+    let fetch_owner = is_v2 && query.get("fetch-owner").map(|s| s == "true").unwrap_or(false);
+
+    info!("S3 ListObjects{}: bucket={} prefix={:?} delim={:?} max_keys={} marker={:?}",
+          if is_v2 { "V2" } else { "V1" }, bucket, prefix, delimiter, max_keys, effective_marker);
+
+    let all_keys = db.list_objects(&bucket)?;
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+    let owner_id = auth_result.user_id.clone();
+
+    // --- Core listing algorithm ---
+    // Keys from SQLite are already sorted lexicographically (ORDER BY key).
+    let mut contents_xml   = String::new();
+    let mut prefixes_xml   = String::new();
+    let mut last_common_prefix = String::new();
+    let mut last_key       = String::new();
+    let mut count          = 0usize;
+    let mut truncated      = false;
+
+    if max_keys > 0 {
+        'outer: for key in &all_keys {
+            let key = key.as_str();
+
+            // Skip keys at or before the effective marker
+            if !effective_marker.is_empty() && key <= effective_marker {
+                continue;
+            }
+
+            // Apply prefix filter
+            if !key.starts_with(prefix) {
+                continue;
+            }
+
+            // Check for delimiter grouping
+            if !delimiter.is_empty() {
+                let after_prefix = &key[prefix.len()..];
+                if let Some(pos) = after_prefix.find(delimiter) {
+                    let group = format!("{}{}{}", prefix, &after_prefix[..pos], delimiter);
+
+                    // If the group falls at or before the marker, skip the whole group
+                    if !effective_marker.is_empty() && group.as_str() <= effective_marker {
+                        continue;
+                    }
+
+                    // Deduplicate: skip if we already emitted this common prefix
+                    if group == last_common_prefix {
+                        continue;
+                    }
+
+                    // A new common prefix counts as 1 toward max_keys
+                    if count >= max_keys {
+                        truncated = true;
+                        break 'outer;
+                    }
+
+                    last_common_prefix = group.clone();
+                    last_key = group.clone();
+                    count += 1;
+
+                    let disp = if url_encode { s3_url_encode(&group) } else { xml_escape(&group) };
+                    prefixes_xml.push_str(&format!(
+                        "    <CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>\n", disp
+                    ));
+                    continue;
+                }
+            }
+
+            // Regular content item
+            if count >= max_keys {
+                truncated = true;
+                break;
+            }
+
+            last_key = key.to_string();
+            count += 1;
+
+            let meta = db.get_object_full(&bucket, key).ok();
+            let size = meta.as_ref().map(|m| m.size).unwrap_or(0);
+            let etag = meta.as_ref().and_then(|m| m.etag.clone()).unwrap_or_default();
+            let lm   = meta.as_ref().and_then(|m| m.last_modified.clone())
+                           .unwrap_or_else(|| now.clone());
+
+            let disp_key = if url_encode { s3_url_encode(key) } else { xml_escape(key) };
+
+            // V1 always includes <Owner>; V2 only when fetch-owner=true
+            let owner_xml = if !is_v2 || fetch_owner {
+                format!("      <Owner><ID>{id}</ID><DisplayName>{id}</DisplayName></Owner>\n",
+                        id = xml_escape(&owner_id))
+            } else {
+                String::new()
+            };
+
+            contents_xml.push_str(&format!(
+                "    <Contents>\n\
+                 \t<Key>{key}</Key>\n\
+                 \t<LastModified>{lm}</LastModified>\n\
+                 \t<ETag>&quot;{etag}&quot;</ETag>\n\
+                 \t<Size>{size}</Size>\n\
+                 \t<StorageClass>STANDARD</StorageClass>\n\
+                 {owner}\
+                 \t</Contents>\n",
+                key   = disp_key,
+                lm    = lm,
+                etag  = etag.trim_matches('"'),
+                size  = size,
+                owner = owner_xml,
+            ));
+        }
+    }
+
+    // Optional fields present only when the corresponding parameter was supplied
+    let delimiter_xml = if !delimiter.is_empty() {
+        format!("    <Delimiter>{}</Delimiter>\n", xml_escape(delimiter))
+    } else {
+        String::new()
+    };
+    let encoding_xml = if url_encode {
+        "    <EncodingType>url</EncodingType>\n".to_string()
+    } else {
+        String::new()
+    };
+
+    let truncated_str  = if truncated { "true" } else { "false" };
+    // V1: botocore does NOT URL-decode top-level <Prefix>, so never url-encode it.
+    // V2: botocore DOES URL-decode top-level <Prefix>, so url-encode when requested.
+    let v1_prefix  = xml_escape(prefix);
+    let v2_prefix  = if url_encode { s3_url_encode(prefix) } else { xml_escape(prefix) };
+    let encoded_bucket = xml_escape(&bucket);
+
     let xml = if is_v2 {
+        // Echo ContinuationToken when it was sent
+        let continuation_xml = if is_continuation {
+            let ct = query.get("continuation-token").unwrap();
+            format!("    <ContinuationToken>{}</ContinuationToken>\n", xml_escape(ct))
+        } else {
+            String::new()
+        };
+
+        // NextContinuationToken when there are more results
+        let next_token_xml = if truncated {
+            format!("    <NextContinuationToken>{}</NextContinuationToken>\n",
+                    xml_escape(&last_key))
+        } else {
+            String::new()
+        };
+
+        // StartAfter echoed when it was the pagination param (even alongside ContinuationToken)
+        let start_after_xml = if let Some(sa) = query.get("start-after") {
+            if !sa.is_empty() {
+                let disp = if url_encode { s3_url_encode(sa) } else { xml_escape(sa) };
+                format!("    <StartAfter>{}</StartAfter>\n", disp)
+            } else { String::new() }
+        } else { String::new() };
+
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <ListBucketResult xmlns=\"{s3}\">\n\
                  <Name>{bucket}</Name>\n\
-                 <Prefix></Prefix>\n\
+                 <Prefix>{prefix}</Prefix>\n\
+                 {delimiter}{encoding}\
+                 <MaxKeys>{max_keys}</MaxKeys>\n\
+                 {continuation}\
+                 {next_token}\
+                 {start_after}\
                  <KeyCount>{count}</KeyCount>\n\
-                 <MaxKeys>1000</MaxKeys>\n\
-                 <IsTruncated>false</IsTruncated>\n\
-                 {contents}\
-             </ListBucketResult>",
-            s3 = S3_XMLNS, bucket = xml_escape(&bucket),
-            count = objects.len(), contents = contents_xml,
+                 <IsTruncated>{truncated}</IsTruncated>\n\
+                 {contents}{prefixes}</ListBucketResult>",
+            s3          = S3_XMLNS,
+            bucket      = encoded_bucket,
+            prefix      = v2_prefix,
+            delimiter   = delimiter_xml,
+            encoding    = encoding_xml,
+            max_keys    = max_keys,
+            continuation = continuation_xml,
+            next_token  = next_token_xml,
+            start_after = start_after_xml,
+            count       = count,
+            truncated   = truncated_str,
+            contents    = contents_xml,
+            prefixes    = prefixes_xml,
         )
     } else {
+        // V1: always echo <Marker>; include <NextMarker> when truncated
+        let marker_val = query.get("marker").map(|s| s.as_str()).unwrap_or("");
+        let disp_marker = if url_encode { s3_url_encode(marker_val) } else { xml_escape(marker_val) };
+
+        let next_marker_xml = if truncated {
+            format!("    <NextMarker>{}</NextMarker>\n", xml_escape(&last_key))
+        } else {
+            String::new()
+        };
+
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <ListBucketResult xmlns=\"{s3}\">\n\
                  <Name>{bucket}</Name>\n\
-                 <Prefix></Prefix>\n\
-                 <Marker></Marker>\n\
-                 <MaxKeys>1000</MaxKeys>\n\
-                 <IsTruncated>false</IsTruncated>\n\
-                 {contents}\
-             </ListBucketResult>",
-            s3 = S3_XMLNS, bucket = xml_escape(&bucket),
-            contents = contents_xml,
+                 <Prefix>{prefix}</Prefix>\n\
+                 <Marker>{marker}</Marker>\n\
+                 {next_marker}\
+                 {delimiter}{encoding}\
+                 <MaxKeys>{max_keys}</MaxKeys>\n\
+                 <IsTruncated>{truncated}</IsTruncated>\n\
+                 {contents}{prefixes}</ListBucketResult>",
+            s3          = S3_XMLNS,
+            bucket      = encoded_bucket,
+            prefix      = v1_prefix,
+            marker      = disp_marker,
+            next_marker = next_marker_xml,
+            delimiter   = delimiter_xml,
+            encoding    = encoding_xml,
+            max_keys    = max_keys,
+            truncated   = truncated_str,
+            contents    = contents_xml,
+            prefixes    = prefixes_xml,
         )
     };
 
