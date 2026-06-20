@@ -61,6 +61,30 @@ lazy_static! {
         conn.execute("ALTER TABLE objects ADD COLUMN cache_control TEXT", []).ok();
         conn.execute("ALTER TABLE objects ADD COLUMN expires TEXT", []).ok();
         conn.execute("ALTER TABLE objects ADD COLUMN content_encoding TEXT", []).ok();
+        conn.execute("ALTER TABLE objects ADD COLUMN parts_manifest TEXT", []).ok();
+
+        // Multipart upload tracking tables
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS multipart_uploads (
+                upload_id     TEXT NOT NULL PRIMARY KEY,
+                user_id       TEXT NOT NULL,
+                bucket        TEXT NOT NULL,
+                key           TEXT NOT NULL,
+                content_type  TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                initiated_at  TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'in_progress',
+                final_etag    TEXT
+            );
+            CREATE TABLE IF NOT EXISTS multipart_parts (
+                upload_id    TEXT NOT NULL,
+                part_number  INTEGER NOT NULL,
+                etag         TEXT NOT NULL,
+                size         INTEGER NOT NULL,
+                extents_blob BLOB NOT NULL,
+                PRIMARY KEY (upload_id, part_number)
+            );"
+        ).expect("Failed to create multipart tables");
 
         // Deletion WAL — extent ranges queued for background GC
         conn.execute(
@@ -414,6 +438,184 @@ pub struct DeletionEvent {
     pub key: String,
     pub offset_size_list: Vec<(u64, u64)>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartUploadRow {
+    pub upload_id: String,
+    pub user_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub content_type: Option<String>,
+    pub metadata_json: String,
+    pub initiated_at: String,
+    pub status: String,
+    pub final_etag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartPartRow {
+    pub part_number: i32,
+    pub etag: String,
+    pub size: u64,
+    pub extents_blob: Vec<u8>,
+}
+
+/// Multipart upload management
+impl SQLiteMetadataStore {
+    pub fn create_multipart_upload(
+        &self, upload_id: &str, user_id: &str, bucket: &str, key: &str,
+        content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
+    ) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO multipart_uploads
+             (upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUploadRow>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
+                    initiated_at, status, final_etag
+             FROM multipart_uploads WHERE upload_id = ?1",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![upload_id], |row| {
+            Ok(MultipartUploadRow {
+                upload_id: row.get(0)?,
+                user_id: row.get(1)?,
+                bucket: row.get(2)?,
+                key: row.get(3)?,
+                content_type: row.get(4)?,
+                metadata_json: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "{}".to_string()),
+                initiated_at: row.get(6)?,
+                status: row.get::<_, String>(7)?,
+                final_etag: row.get(8)?,
+            })
+        });
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn mark_multipart_completed(&self, upload_id: &str, final_etag: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE multipart_uploads SET status = 'completed', final_etag = ?1 WHERE upload_id = ?2",
+            params![final_etag, upload_id],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+            params![upload_id],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn list_bucket_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadRow>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
+                    initiated_at, status, final_etag
+             FROM multipart_uploads
+             WHERE bucket = ?1 AND status = 'in_progress'
+             ORDER BY key, initiated_at",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows = stmt.query_map(params![bucket], |row| {
+            Ok(MultipartUploadRow {
+                upload_id: row.get(0)?,
+                user_id: row.get(1)?,
+                bucket: row.get(2)?,
+                key: row.get(3)?,
+                content_type: row.get(4)?,
+                metadata_json: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "{}".to_string()),
+                initiated_at: row.get(6)?,
+                status: row.get::<_, String>(7)?,
+                final_etag: row.get(8)?,
+            })
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        Ok(result)
+    }
+
+    pub fn upsert_multipart_part(
+        &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
+    ) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO multipart_parts (upload_id, part_number, etag, size, extents_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![upload_id, part_number, etag, size as i64, extents_blob],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn list_multipart_parts(&self, upload_id: &str) -> Result<Vec<MultipartPartRow>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT part_number, etag, size, extents_blob
+             FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows = stmt.query_map(params![upload_id], |row| {
+            Ok(MultipartPartRow {
+                part_number: row.get(0)?,
+                etag: row.get(1)?,
+                size: row.get::<_, i64>(2)? as u64,
+                extents_blob: row.get(3)?,
+            })
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        Ok(result)
+    }
+
+    pub fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "DELETE FROM multipart_parts WHERE upload_id = ?1",
+            params![upload_id],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_parts_manifest(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT parts_manifest FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![user_id, bucket, key], |row| {
+            row.get::<_, Option<String>>(0)
+        });
+        match result {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn set_parts_manifest(&self, user_id: &str, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE objects SET parts_manifest = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
+            params![manifest, user_id, bucket, key],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

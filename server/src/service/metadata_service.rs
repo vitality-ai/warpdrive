@@ -136,6 +136,71 @@ impl MetadataService {
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
         SQLiteMetadataStore::new().cleanup_old_deletions()
     }
+
+    // --- Multipart upload management ---
+
+    pub fn create_multipart_upload(
+        &self, upload_id: &str, bucket: &str, key: &str,
+        content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
+    ) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().create_multipart_upload(
+            upload_id, &self.user, bucket, key, content_type, metadata_json, initiated_at,
+        )
+    }
+
+    pub fn get_multipart_upload(&self, upload_id: &str)
+        -> Result<Option<crate::metadata::sqlite_store::MultipartUploadRow>, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_multipart_upload(upload_id)
+    }
+
+    pub fn mark_multipart_completed(&self, upload_id: &str, final_etag: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().mark_multipart_completed(upload_id, final_etag)
+    }
+
+    pub fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_multipart_upload(upload_id)
+    }
+
+    pub fn list_multipart_uploads_for_bucket(&self, bucket: &str)
+        -> Result<Vec<crate::metadata::sqlite_store::MultipartUploadRow>, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().list_bucket_multipart_uploads(bucket)
+    }
+
+    pub fn upsert_multipart_part(
+        &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
+    ) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().upsert_multipart_part(upload_id, part_number, etag, size, extents_blob)
+    }
+
+    pub fn list_multipart_parts(&self, upload_id: &str)
+        -> Result<Vec<crate::metadata::sqlite_store::MultipartPartRow>, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().list_multipart_parts(upload_id)
+    }
+
+    pub fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_parts_for_upload(upload_id)
+    }
+
+    pub fn get_parts_manifest(&self, bucket: &str, key: &str) -> Result<Option<String>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_parts_manifest(&self.user, bucket, key)
+    }
+
+    pub fn set_parts_manifest(&self, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_parts_manifest(&self.user, bucket, key, manifest)
+    }
 }
 
 #[cfg(test)]
