@@ -341,8 +341,8 @@ fn verify_sigv4(
         ));
     }
 
-    // Every header named in Authorization SignedHeaders must be present on the request with valid
-    // UTF-8. Silently omitting missing headers lets clients claim they signed host/date without
+    // Every header named in Authorization SignedHeaders must be present on the request.
+    // Silently omitting missing headers lets clients claim they signed host/date without
     // sending them.
     let mut canonical_headers: Vec<String> = Vec::with_capacity(parsed.signed_headers.len());
     for name in &parsed.signed_headers {
@@ -350,12 +350,21 @@ fn verify_sigv4(
             .headers()
             .get(name.as_str())
             .ok_or_else(|| ErrorUnauthorized("SigV4 SignedHeaders entry not present on request"))?;
-        let value_str = value
-            .to_str()
-            .map_err(|_| ErrorUnauthorized("SigV4 signed header has invalid encoding"))?;
-        canonical_headers.push(format!("{}:{}", name, value_str.trim()));
+        // actix-web's to_str() requires printable ASCII; non-ASCII bytes (e.g. UTF-8 user
+        // metadata) return Err even when valid UTF-8. Use from_utf8_lossy so we treat the raw
+        // bytes as UTF-8 (same as botocore, which encodes header values as UTF-8 before signing).
+        let raw = String::from_utf8_lossy(value.as_bytes());
+        let value_str = raw.trim().to_string();
+        canonical_headers.push(format!("{}:{}", name, value_str));
     }
-    canonical_headers.sort_unstable();
+    // Sort by header name only (not by full "name:value" string) — important when one header name
+    // is a prefix of another (e.g. "x-amz-copy-source" vs "x-amz-copy-source-if-match"): sorting
+    // full strings puts them in the wrong order because ':' (58) > '-' (45).
+    canonical_headers.sort_unstable_by(|a, b| {
+        let a_name = a.split(':').next().unwrap_or("");
+        let b_name = b.split(':').next().unwrap_or("");
+        a_name.cmp(b_name)
+    });
     let canonical_headers_str = canonical_headers.join("\n");
     let signed_headers_str = parsed.signed_headers.join(";");
 
