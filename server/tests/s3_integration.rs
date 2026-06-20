@@ -157,9 +157,9 @@ async fn test_s3_authentication_missing() {
 
     let resp = test::call_service(&app, req).await;
     println!("Missing Auth Response status: {:?}", resp.status());
-    
-    // Should return 401 Unauthorized
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // S3 returns 403 AccessDenied (not 401) for missing Authorization header
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// Test S3 bucket mismatch
