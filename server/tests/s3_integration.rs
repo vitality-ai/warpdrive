@@ -1,5 +1,6 @@
 // S3-compatible API integration tests
 use actix_web::{test, web, App, http::StatusCode};
+use std::sync::Mutex;
 use warp_drive::s3::handlers::{
     s3_put_object_handler,
     s3_get_object_handler,
@@ -7,6 +8,10 @@ use warp_drive::s3::handlers::{
     s3_head_object_handler,
     s3_list_objects_handler
 };
+
+// Env vars are process-global state. Serialize every test that reads or writes
+// them so parallel test threads don't race on VITALITY_CONSOLE_URL / WARPDRIVE_SERVICE_SECRET.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Ensure Console auth is not configured so S3 requests return 401 (Warpdrive only supports Console auth).
 fn ensure_no_console_config() {
@@ -17,6 +22,7 @@ fn ensure_no_console_config() {
 /// Test S3 PUT object endpoint
 #[actix_web::test]
 async fn test_s3_put_object() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -40,6 +46,7 @@ async fn test_s3_put_object() {
 /// Test S3 GET object endpoint
 #[actix_web::test]
 async fn test_s3_get_object() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -61,6 +68,7 @@ async fn test_s3_get_object() {
 /// Test S3 DELETE object endpoint
 #[actix_web::test]
 async fn test_s3_delete_object() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -82,6 +90,7 @@ async fn test_s3_delete_object() {
 /// Test S3 HEAD object endpoint
 #[actix_web::test]
 async fn test_s3_head_object() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -103,6 +112,7 @@ async fn test_s3_head_object() {
 /// Test S3 List objects endpoint
 #[actix_web::test]
 async fn test_s3_list_objects() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -124,6 +134,7 @@ async fn test_s3_list_objects() {
 /// Test S3 authentication with invalid credentials
 #[actix_web::test]
 async fn test_s3_authentication_invalid() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -145,6 +156,7 @@ async fn test_s3_authentication_invalid() {
 /// Test S3 authentication with missing authorization header
 #[actix_web::test]
 async fn test_s3_authentication_missing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -165,6 +177,7 @@ async fn test_s3_authentication_missing() {
 /// Test S3 bucket mismatch
 #[actix_web::test]
 async fn test_s3_bucket_mismatch() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -186,6 +199,7 @@ async fn test_s3_bucket_mismatch() {
 /// Test S3 with curl-like requests
 #[actix_web::test]
 async fn test_s3_curl_simulation() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_no_console_config();
     let app = test::init_service(
         App::new()
@@ -235,6 +249,7 @@ async fn test_s3_curl_simulation() {
 /// When VITALITY_CONSOLE_URL is set but WARPDRIVE_SERVICE_SECRET is not set, auth fails with 401 (invalid configuration).
 #[actix_web::test]
 async fn test_s3_console_url_without_service_secret_returns_401() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("VITALITY_CONSOLE_URL", "http://localhost:9999");
     std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
 
@@ -259,6 +274,7 @@ async fn test_s3_console_url_without_service_secret_returns_401() {
 /// flakiness from parallel tests sharing env).
 #[actix_web::test]
 async fn test_s3_console_auth_unreachable_returns_401() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:0");
     std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-secret");
 
