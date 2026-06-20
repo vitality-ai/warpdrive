@@ -329,6 +329,45 @@ test_put_object_if_match
 
 ---
 
+## feat/batch-4-range-requests — Batch 4 complete
+
+**Branch:** `feat/batch-4-range-requests`  
+**RFC Batch:** Batch 4 (Range Requests & Content-Encoding)  
+**Newly passing:** 4
+
+Key changes:
+- Range GET: tri-state `RangeResult` enum — distinguishes no-header (200) from unsatisfiable (416) from valid (206)
+- Suffix range `bytes=-N` now returns last N bytes correctly
+- Out-of-bounds ranges (start >= object size, or any range on empty object) return 416 `InvalidRange`
+- `Content-Encoding` stored on PUT, returned on GET/HEAD, copied on CopyObject
+- `aws-chunked` stripped from stored `Content-Encoding` (transport-only encoding per S3 spec)
+
+### Verified Passing
+
+```
+test_ranged_request_invalid_range
+test_ranged_request_empty_object
+test_ranged_request_return_trailing_bytes_response_code
+test_object_content_encoding_aws_chunked
+```
+
+### Already passing (no change needed)
+
+```
+test_ranged_request_response_code
+test_ranged_request_skip_leading_bytes_response_code
+test_ranged_big_request_response_code
+```
+
+### Intentionally deferred (2 tests)
+
+- `test_100_continue` — second assertion requires public-write ACL (Batch 10)
+- `test_read_through` — skipped by test suite (requires `[s3 cloud]` config section)
+
+**Running total: 210 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>
