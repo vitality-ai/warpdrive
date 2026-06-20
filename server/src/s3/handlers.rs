@@ -125,20 +125,60 @@ fn stream_slices(chunks: &[(u64, u64)]) -> Vec<(u64, u64)> {
     out
 }
 
-/// Parse `Range: bytes=X-Y` or `bytes=X-` → (start, end_inclusive) in logical object space.
-/// Returns None if the header is absent or unparseable.
-fn parse_range_header(req: &HttpRequest, total: u64) -> Option<(u64, u64)> {
-    let hdr = req.headers().get("range")?.to_str().ok()?;
-    let bytes = hdr.strip_prefix("bytes=")?;
-    let (start_s, end_s) = bytes.split_once('-')?;
-    let start: u64 = start_s.parse().ok()?;
+enum RangeResult {
+    None,
+    Valid(u64, u64),
+    Unsatisfiable,
+}
+
+/// Parse `Range: bytes=X-Y`, `bytes=X-`, or `bytes=-N` (suffix).
+/// Returns None if no header, Valid(start, end_inclusive) for satisfiable ranges, Unsatisfiable for 416.
+fn parse_range_header(req: &HttpRequest, total: u64) -> RangeResult {
+    let hdr = match req.headers().get("range").and_then(|v| v.to_str().ok()) {
+        Some(h) => h.to_string(),
+        None => return RangeResult::None,
+    };
+    let bytes = match hdr.strip_prefix("bytes=") {
+        Some(b) => b.to_string(),
+        None => return RangeResult::Unsatisfiable,
+    };
+    // Suffix range: bytes=-N → last N bytes
+    if bytes.starts_with('-') {
+        let n: u64 = match bytes[1..].parse().ok() {
+            Some(n) => n,
+            None => return RangeResult::Unsatisfiable,
+        };
+        if n == 0 || total == 0 {
+            return RangeResult::Unsatisfiable;
+        }
+        let start = total.saturating_sub(n);
+        return RangeResult::Valid(start, total - 1);
+    }
+    // Standard range: bytes=start-[end]
+    let (start_s, end_s) = match bytes.split_once('-') {
+        Some(pair) => pair,
+        None => return RangeResult::Unsatisfiable,
+    };
+    let start: u64 = match start_s.parse().ok() {
+        Some(s) => s,
+        None => return RangeResult::Unsatisfiable,
+    };
     let end: u64 = if end_s.is_empty() {
         total.saturating_sub(1)
     } else {
-        end_s.parse().ok()?
+        match end_s.parse::<u64>().ok() {
+            Some(e) => e,
+            None => return RangeResult::Unsatisfiable,
+        }
     };
-    if start > end || end >= total { return None; }
-    Some((start, end))
+    if total == 0 || start >= total {
+        return RangeResult::Unsatisfiable;
+    }
+    let end = end.min(total - 1);
+    if start > end {
+        return RangeResult::Unsatisfiable;
+    }
+    RangeResult::Valid(start, end)
 }
 
 /// Map a logical byte range [range_start, range_end] onto the storage extents.
@@ -508,6 +548,18 @@ pub async fn s3_put_object_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Strip aws-chunked from Content-Encoding — it's a transport encoding, not stored per S3 spec.
+    let content_encoding = req.headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            let stripped: Vec<&str> = s.split(',')
+                .map(|p| p.trim())
+                .filter(|p| !p.eq_ignore_ascii_case("aws-chunked"))
+                .collect();
+            if stripped.is_empty() { None } else { Some(stripped.join(", ")) }
+        });
+
     let store = StorageConfig::from_env().create_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
     let mut body_buf: Vec<u8> = Vec::new(); // for MD5
@@ -576,6 +628,7 @@ pub async fn s3_put_object_handler(
     metadata.user_metadata = user_metadata;
     metadata.cache_control = cache_control;
     metadata.expires = expires;
+    metadata.content_encoding = content_encoding;
 
     db.put_object_full(&bucket, &key, metadata)?;
 
@@ -669,13 +722,20 @@ pub async fn s3_get_object_handler(
     }
 
     // Resolve Range header if present.
-    let (slices, response_len, range_header) = if let Some((rs, re)) = parse_range_header(&req, total_size) {
-        let s = range_slices(&extents, rs, re);
-        let len = re - rs + 1;
-        let hdr = format!("bytes {}-{}/{}", rs, re, total_size);
-        (s, len, Some(hdr))
-    } else {
-        (stream_slices(&extents), total_size, None)
+    let (slices, response_len, range_header) = match parse_range_header(&req, total_size) {
+        RangeResult::Valid(rs, re) => {
+            let s = range_slices(&extents, rs, re);
+            let len = re - rs + 1;
+            let hdr = format!("bytes {}-{}/{}", rs, re, total_size);
+            (s, len, Some(hdr))
+        }
+        RangeResult::Unsatisfiable => {
+            let resource = format!("/{}/{}", bucket, key);
+            return Ok(s3_error(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange",
+                               "The requested range is not valid for the request. \
+                                Please try another range.", &resource));
+        }
+        RangeResult::None => (stream_slices(&extents), total_size, None),
     };
 
     info!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
@@ -730,6 +790,9 @@ pub async fn s3_get_object_handler(
     if let Some(exp) = &meta.expires {
         resp.insert_header(("Expires", exp.as_str()));
     }
+    if let Some(enc) = &meta.content_encoding {
+        resp.insert_header(("Content-Encoding", enc.as_str()));
+    }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
     }
@@ -778,6 +841,9 @@ pub async fn s3_head_object_handler(
     }
     if let Some(exp) = &meta.expires {
         resp.insert_header(("Expires", exp.as_str()));
+    }
+    if let Some(enc) = &meta.content_encoding {
+        resp.insert_header(("Content-Encoding", enc.as_str()));
     }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
@@ -1417,11 +1483,14 @@ pub async fn s3_copy_object_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("COPY");
 
-    let (content_type, user_metadata) = if directive == "REPLACE" {
+    let (content_type, content_encoding, user_metadata) = if directive == "REPLACE" {
         let ct = req.headers().get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
+        let ce = req.headers().get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let um: HashMap<String, String> = req.headers().iter()
             .filter_map(|(name, value)| {
                 let n = name.as_str().to_lowercase();
@@ -1432,10 +1501,11 @@ pub async fn s3_copy_object_handler(
                 } else { None }
             })
             .collect();
-        (ct, um)
+        (ct, ce, um)
     } else {
         (
             src_meta.content_type.clone().unwrap_or_else(|| "application/octet-stream".into()),
+            src_meta.content_encoding.clone(),
             src_meta.user_metadata.clone(),
         )
     };
@@ -1455,6 +1525,7 @@ pub async fn s3_copy_object_handler(
     dst_meta.etag = Some(etag.clone());
     dst_meta.size = src_data.len() as u64;
     dst_meta.content_type = Some(content_type);
+    dst_meta.content_encoding = content_encoding;
     dst_meta.last_modified = Some(last_modified.clone());
     dst_meta.user_metadata = user_metadata;
 

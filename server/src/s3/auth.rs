@@ -105,13 +105,8 @@ async fn fetch_credential_bundle_from_console(
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() {
-                warn!("Vitality Console s3-credentials (bundle) request timed out: {}", e);
-                ErrorServiceUnavailable("Authentication service timeout")
-            } else {
-                warn!("Vitality Console s3-credentials (bundle) request failed: {}", e);
-                ErrorServiceUnavailable("Authentication service unavailable")
-            }
+            warn!("Vitality Console s3-credentials (bundle) request failed: {}", e);
+            ErrorUnauthorized("Authentication service unavailable")
         })?;
     let status = res.status();
     if !status.is_success() {

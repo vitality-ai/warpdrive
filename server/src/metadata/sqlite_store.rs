@@ -51,14 +51,16 @@ lazy_static! {
                 user_metadata    TEXT,
                 cache_control    TEXT,
                 expires          TEXT,
+                content_encoding TEXT,
                 UNIQUE(user, bucket, key)
             )",
             [],
         ).expect("Failed to create objects table");
 
-        // Migrate existing databases that predate cache_control/expires columns
+        // Migrate existing databases that predate these columns
         conn.execute("ALTER TABLE objects ADD COLUMN cache_control TEXT", []).ok();
         conn.execute("ALTER TABLE objects ADD COLUMN expires TEXT", []).ok();
+        conn.execute("ALTER TABLE objects ADD COLUMN content_encoding TEXT", []).ok();
 
         // Deletion WAL — extent ranges queued for background GC
         conn.execute(
@@ -105,8 +107,8 @@ impl MetadataStorage for SQLiteMetadataStore {
         let conn = DB_CONN.lock().unwrap();
         let result = conn.execute(
             "INSERT INTO objects
-                (user, bucket, key, offset_size_list, etag, size, content_type, last_modified, user_metadata, cache_control, expires)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (user, bucket, key, offset_size_list, etag, size, content_type, last_modified, user_metadata, cache_control, expires, content_encoding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 user_id, bucket, object_id,
                 offset_size_bytes,
@@ -117,6 +119,7 @@ impl MetadataStorage for SQLiteMetadataStore {
                 user_metadata_json,
                 metadata.cache_control,
                 metadata.expires,
+                metadata.content_encoding,
             ],
         );
         match result {
@@ -131,7 +134,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT offset_size_list, etag, size, content_type, last_modified, user_metadata, cache_control, expires
+            "SELECT offset_size_list, etag, size, content_type, last_modified, user_metadata, cache_control, expires, content_encoding
              FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
 
@@ -145,6 +148,7 @@ impl MetadataStorage for SQLiteMetadataStore {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         }).map_err(|e| {
             warn!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
@@ -153,7 +157,7 @@ impl MetadataStorage for SQLiteMetadataStore {
             ))
         })?;
 
-        let (offset_size_bytes, etag, size, content_type, last_modified, user_metadata_json, cache_control, expires) = row;
+        let (offset_size_bytes, etag, size, content_type, last_modified, user_metadata_json, cache_control, expires, content_encoding) = row;
         let offset_size_list = crate::util::serializer::deserialize_offset_size(&offset_size_bytes)?;
         let user_metadata: std::collections::HashMap<String, String> = user_metadata_json
             .as_deref()
@@ -168,6 +172,7 @@ impl MetadataStorage for SQLiteMetadataStore {
         metadata.user_metadata = user_metadata;
         metadata.cache_control = cache_control;
         metadata.expires = expires;
+        metadata.content_encoding = content_encoding;
         Ok(metadata)
     }
 
@@ -223,14 +228,16 @@ impl MetadataStorage for SQLiteMetadataStore {
                 last_modified    = ?5,
                 user_metadata    = ?6,
                 cache_control    = ?7,
-                expires          = ?8
-             WHERE user = ?9 AND bucket = ?10 AND key = ?11",
+                expires          = ?8,
+                content_encoding = ?9
+             WHERE user = ?10 AND bucket = ?11 AND key = ?12",
             params![
                 offset_size_bytes,
                 metadata.etag, metadata.size as i64,
                 metadata.content_type, metadata.last_modified,
                 user_metadata_json,
                 metadata.cache_control, metadata.expires,
+                metadata.content_encoding,
                 user_id, bucket, object_id,
             ],
         ).map_err(actix_web::error::ErrorInternalServerError)?;

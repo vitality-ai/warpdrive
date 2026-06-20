@@ -38,6 +38,8 @@ pub struct Metadata {
     pub cache_control: Option<String>,
     /// `Expires` header value stored on PUT (RFC 2616 date string).
     pub expires: Option<String>,
+    /// `Content-Encoding` header value stored on PUT (e.g. `"gzip"`).
+    pub content_encoding: Option<String>,
 }
 
 impl Metadata {
@@ -58,6 +60,7 @@ impl Metadata {
             user_metadata: HashMap::new(),
             cache_control: None,
             expires: None,
+            content_encoding: None,
         }
     }
 
