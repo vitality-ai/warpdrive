@@ -368,6 +368,57 @@ test_ranged_big_request_response_code
 
 ---
 
+## feat/batch-5-multi-delete-copy — Batch 5 complete
+
+**Branch:** `feat/batch-5-multi-delete-copy`  
+**RFC Batch:** Batch 5 (Multi-Object Delete & CopyObject fixes)  
+**Newly passing:** 5
+
+Key changes:
+- `DeleteObjects`: enforce 1000-key limit → 400 `MalformedXML`
+- `ListObjectVersions`: respect `MaxKeys` and return paginated results with `IsTruncated`/`NextKeyMarker` (was returning all objects in one batch, breaking teardown cleanup for large buckets)
+- `xml_unescape` helper: XML-unescape keys parsed from `delete_objects` request body — fixes teardown failures for buckets containing keys with `&`, `<`, `>` characters
+- `percent_decode` helper: URL-decode `x-amz-copy-source` key before lookup (so `anyfilename%25.txt` in header → `anyfilename%.txt` lookup)
+- `s3_upload_part_copy_handler`: new handler for UploadPartCopy (`PUT ?partNumber&uploadId + x-amz-copy-source`); validates `x-amz-copy-source-range` — malformed format → 400 `InvalidArgument`, out-of-bounds → 416 `InvalidRange`
+- Dispatch: UploadPartCopy routed before regular UploadPart and CopyObject
+
+### Newly passing (5)
+
+```
+test_multi_object_delete_key_limit
+test_multi_objectv2_delete_key_limit
+test_upload_part_copy_percent_encoded_key
+test_multipart_copy_improper_range
+test_multipart_copy_invalid_range
+```
+
+### Already passing before this batch (13)
+
+```
+test_multi_object_delete
+test_multi_objectv2_delete
+test_object_copy_zero_size
+test_object_copy_16m
+test_object_copy_same_bucket
+test_object_copy_diff_bucket
+test_object_copy_verify_contenttype
+test_object_copy_to_itself
+test_object_copy_to_itself_with_metadata
+test_object_copy_retaining_metadata
+test_object_copy_replacing_metadata
+test_object_copy_bucket_not_found
+test_object_copy_key_not_found
+```
+
+### Intentionally deferred (2 tests)
+
+- `test_object_copy_not_owned_bucket` — requires real multi-user auth; both `s3 main` and `s3 alt` share the same `adminkey` credentials
+- `test_object_copy_not_owned_object_bucket` — same reason
+
+**Running total: 215 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

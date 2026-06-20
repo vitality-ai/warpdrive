@@ -52,6 +52,14 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+     .replace("&lt;", "<")
+     .replace("&gt;", ">")
+     .replace("&quot;", "\"")
+     .replace("&apos;", "'")
+}
+
 /// Encode a stored metadata value as a HeaderValue for HTTP responses.
 /// boto3/urllib3 1.x decodes response headers as Latin-1 (ISO-8859-1). Metadata values
 /// are stored internally as UTF-8 Rust Strings; we encode each Unicode code point to its
@@ -260,6 +268,26 @@ fn parse_http_date(s: &str) -> Option<i64> {
     None
 }
 
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(hex) = std::str::from_utf8(&bytes[i+1..i+3]).ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Validate S3 bucket name rules.
 fn validate_bucket_name(bucket: &str) -> Result<(), HttpResponse> {
     if bucket.len() < 3 || bucket.len() > 63 {
@@ -463,13 +491,19 @@ pub async fn s3_put_object_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     // Dispatch sub-operations
-    if req.headers().contains_key("x-amz-copy-source") {
-        return s3_copy_object_handler(path, req).await;
-    }
     if let Ok(query) = web::Query::<HashMap<String, String>>::from_query(req.query_string()) {
+        if req.headers().contains_key("x-amz-copy-source")
+            && query.contains_key("partNumber")
+            && query.contains_key("uploadId")
+        {
+            return s3_upload_part_copy_handler(path, query, req).await;
+        }
         if query.contains_key("partNumber") && query.contains_key("uploadId") {
             return s3_upload_part_handler(path, query, payload, req).await;
         }
+    }
+    if req.headers().contains_key("x-amz-copy-source") {
+        return s3_copy_object_handler(path, req).await;
     }
 
     let (bucket, key) = path.into_inner();
@@ -1223,13 +1257,32 @@ async fn s3_list_object_versions_handler_inner(bucket: &str, req: &HttpRequest) 
 
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
 
+    let query = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .unwrap_or_else(|_| web::Query(HashMap::new()));
+    let max_keys: usize = query.get("max-keys")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000)
+        .min(1000);
+    let key_marker = query.get("key-marker").cloned().unwrap_or_default();
+    let prefix = query.get("prefix").cloned().unwrap_or_default();
+
     info!("S3 ListObjectVersions: bucket={}", bucket);
 
-    let objects = db.list_objects(bucket)?;
+    let all_objects = db.list_objects(bucket)?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z");
 
+    // Apply prefix filter and key-marker pagination (same semantics as ListObjects).
+    let filtered: Vec<&String> = all_objects.iter()
+        .filter(|k| k.starts_with(&prefix))
+        .filter(|k| key_marker.is_empty() || k.as_str() > key_marker.as_str())
+        .collect();
+
+    let is_truncated = filtered.len() > max_keys;
+    let page = &filtered[..filtered.len().min(max_keys)];
+    let next_key_marker = if is_truncated { page.last().map(|k| k.as_str()).unwrap_or("") } else { "" };
+
     let mut versions_xml = String::new();
-    for key in &objects {
+    for key in page {
         let (size, etag, last_modified) = db.get_object_full(bucket, key)
             .map(|m| (
                 m.size,
@@ -1255,18 +1308,32 @@ async fn s3_list_object_versions_handler_inner(bucket: &str, req: &HttpRequest) 
         ));
     }
 
+    let truncation_xml = if is_truncated {
+        format!(
+            "    <NextKeyMarker>{}</NextKeyMarker>\n    <NextVersionIdMarker>null</NextVersionIdMarker>\n",
+            xml_escape(next_key_marker)
+        )
+    } else { String::new() };
+
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListVersionsResult xmlns=\"{s3}\">\n\
              <Name>{bucket}</Name>\n\
-             <Prefix></Prefix>\n\
-             <KeyMarker></KeyMarker>\n\
+             <Prefix>{prefix}</Prefix>\n\
+             <KeyMarker>{km}</KeyMarker>\n\
              <VersionIdMarker></VersionIdMarker>\n\
-             <MaxKeys>1000</MaxKeys>\n\
-             <IsTruncated>false</IsTruncated>\n\
-             {versions}\
+             <MaxKeys>{max_keys}</MaxKeys>\n\
+             <IsTruncated>{truncated}</IsTruncated>\n\
+             {trunc_xml}{versions}\
          </ListVersionsResult>",
-        s3 = S3_XMLNS, bucket = xml_escape(bucket), versions = versions_xml,
+        s3 = S3_XMLNS,
+        bucket = xml_escape(bucket),
+        prefix = xml_escape(&prefix),
+        km = xml_escape(&key_marker),
+        max_keys = max_keys,
+        truncated = is_truncated,
+        trunc_xml = truncation_xml,
+        versions = versions_xml,
     );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
@@ -1317,7 +1384,7 @@ pub async fn s3_delete_objects_handler(
             remaining = &remaining[obj_start + 8..];
             let obj_end = remaining.find("</Object>").unwrap_or(remaining.len());
             let obj_body = &remaining[..obj_end];
-            if let Some(key) = extract_xml_tag(obj_body, "Key") {
+            if let Some(key) = extract_xml_tag(obj_body, "Key").map(|k| xml_unescape(&k)) {
                 objs.push(ObjReq {
                     key,
                     etag: extract_xml_tag(obj_body, "ETag"),
@@ -1329,6 +1396,13 @@ pub async fn s3_delete_objects_handler(
         }
         objs
     };
+
+    if objects.len() > 1000 {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "MalformedXML",
+                           "The XML you provided was not well-formed or did not validate \
+                            against our published schema. The number of keys in the request \
+                            exceeds the maximum allowed.", &bucket));
+    }
 
     let context = crate::service::user_context::UserContext::with_bucket(
         auth_result.user_id.clone(), auth_result.bucket.clone()
@@ -1419,13 +1493,14 @@ pub async fn s3_copy_object_handler(
                                    "Missing x-amz-copy-source header", &dst_bucket)),
     };
 
-    // Source format: /src-bucket/src-key  (leading slash optional, percent-encoded)
+    // Source format: /src-bucket/src-key  (leading slash optional, percent-encoded key)
     let source = copy_source.trim_start_matches('/');
-    let (src_bucket, src_key) = match source.splitn(2, '/').collect::<Vec<_>>().as_slice() {
+    let (src_bucket, src_key_enc) = match source.splitn(2, '/').collect::<Vec<_>>().as_slice() {
         [b, k] => (b.to_string(), k.to_string()),
         _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
                                 "Invalid x-amz-copy-source format (expected bucket/key)", &dst_bucket)),
     };
+    let src_key = percent_decode(&src_key_enc);
 
     info!("S3 CopyObject: {}/{} → {}/{}", src_bucket, src_key, dst_bucket, dst_key);
 
@@ -1621,6 +1696,109 @@ pub async fn s3_upload_part_handler(
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
     Ok(HttpResponse::Ok().insert_header(("ETag", etag)).body(""))
+}
+
+// ---------------------------------------------------------------------------
+// UploadPartCopy  PUT /s3/{bucket}/{key}?partNumber=N&uploadId=ID + x-amz-copy-source
+// ---------------------------------------------------------------------------
+
+pub async fn s3_upload_part_copy_handler(
+    path: web::Path<(String, String)>,
+    query: web::Query<HashMap<String, String>>,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let (bucket, key) = path.into_inner();
+    let part_number = query.get("partNumber")
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing partNumber"))?.clone();
+    let upload_id = query.get("uploadId")
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?.clone();
+
+    let auth_result = authenticate_s3_request(&req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+
+    // Parse x-amz-copy-source → /src-bucket/src-key (percent-encoded)
+    let copy_source = match req.headers().get("x-amz-copy-source") {
+        Some(h) => h.to_str().unwrap_or("").to_string(),
+        None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                   "Missing x-amz-copy-source", &bucket)),
+    };
+    let source = copy_source.trim_start_matches('/');
+    let (src_bucket, src_key_enc) = match source.splitn(2, '/').collect::<Vec<_>>().as_slice() {
+        [b, k] => (b.to_string(), k.to_string()),
+        _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                "Invalid x-amz-copy-source", &bucket)),
+    };
+    let src_key = percent_decode(&src_key_enc);
+
+    if !db.check_key(&src_bucket, &src_key)? {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                           "The source key does not exist", &format!("/{}/{}", src_bucket, src_key)));
+    }
+    let src_meta = db.get_object_full(&src_bucket, &src_key)?;
+    let src_size = src_meta.size;
+    let src_extents = src_meta.to_offset_size_list();
+
+    // Validate x-amz-copy-source-range if present (must be bytes=start-end, in-bounds).
+    let copy_range_header = req.headers().get("x-amz-copy-source-range")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+    let (read_extents, part_size) = if let Some(ref range_str) = copy_range_header {
+        // Format must be "bytes=start-end" — anything else is InvalidArgument (improper format).
+        let bytes_part = match range_str.strip_prefix("bytes=") {
+            Some(b) => b,
+            None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                       "The x-amz-copy-source-range value is not valid", &bucket)),
+        };
+        let (start_s, end_s) = match bytes_part.split_once('-') {
+            Some(pair) => pair,
+            None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                       "The x-amz-copy-source-range value is not valid", &bucket)),
+        };
+        let start: u64 = match start_s.parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                         "The x-amz-copy-source-range value is not valid", &bucket)),
+        };
+        let end: u64 = match end_s.parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                         "The x-amz-copy-source-range value is not valid", &bucket)),
+        };
+        // Range format is valid; now check bounds — out-of-bounds is InvalidRange.
+        if src_size == 0 || start >= src_size || start > end || end >= src_size {
+            return Ok(s3_error(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange",
+                               "The x-amz-copy-source-range value is not valid", &bucket));
+        }
+        (range_slices(&src_extents, start, end), end - start + 1)
+    } else {
+        (range_slices(&src_extents, 0, src_size.saturating_sub(1)), src_size)
+    };
+
+    // Read source bytes and write as a new part.
+    let storage_service = StorageService::new();
+    let src_context = UserContext::with_bucket(auth_result.user_id.clone(), src_bucket.clone());
+    let part_bytes = storage_service.read_object(&src_context, &read_extents, StorageMode::S3)?;
+
+    let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+    let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3)?;
+    let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
+
+    let part_key = format!("{}.part.{}.{}", key, part_number, upload_id);
+    db.write_metadata(&auth_result.bucket, &part_key, &offset_size_bytes)?;
+
+    let etag = format!("\"{}\"", hex::encode(md5::compute(&part_bytes).0));
+    let last_modified = rfc2616_now();
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CopyPartResult xmlns=\"{s3}\">\n\
+             <LastModified>{lm}</LastModified>\n\
+             <ETag>{etag}</ETag>\n\
+         </CopyPartResult>",
+        s3 = S3_XMLNS,
+        lm = xml_escape(&last_modified),
+        etag = xml_escape(&etag),
+    );
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
 
 pub async fn s3_complete_multipart_upload_handler(
