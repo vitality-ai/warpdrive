@@ -12,14 +12,14 @@ Highest. Every S3 client hits these operations on every request. Nothing else in
 
 ## Schema Change
 
-Add columns to the `haystack` table:
+Add columns to the `objects` table:
 
 ```sql
-ALTER TABLE haystack ADD COLUMN etag TEXT;
-ALTER TABLE haystack ADD COLUMN size INTEGER;
-ALTER TABLE haystack ADD COLUMN content_type TEXT;
-ALTER TABLE haystack ADD COLUMN last_modified TEXT;
-ALTER TABLE haystack ADD COLUMN user_metadata TEXT;  -- JSON blob of x-amz-meta-* headers
+ALTER TABLE objects ADD COLUMN etag TEXT;
+ALTER TABLE objects ADD COLUMN size INTEGER;
+ALTER TABLE objects ADD COLUMN content_type TEXT;
+ALTER TABLE objects ADD COLUMN last_modified TEXT;
+ALTER TABLE objects ADD COLUMN user_metadata TEXT;  -- JSON blob of x-amz-meta-* headers
 ALTER TABLE objects ADD COLUMN cache_control TEXT;
 ALTER TABLE objects ADD COLUMN expires TEXT;
 ```

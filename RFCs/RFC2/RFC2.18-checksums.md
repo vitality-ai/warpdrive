@@ -13,8 +13,8 @@ Medium-Low. Additional checksum algorithms (CRC32, CRC32C, SHA-1, SHA-256, CRC64
 ## Schema Change
 
 ```sql
-ALTER TABLE haystack ADD COLUMN checksum_algorithm TEXT;  -- 'CRC32', 'CRC32C', 'SHA1', 'SHA256', 'CRC64NVME'
-ALTER TABLE haystack ADD COLUMN checksum_value TEXT;
+ALTER TABLE objects ADD COLUMN checksum_algorithm TEXT;  -- 'CRC32', 'CRC32C', 'SHA1', 'SHA256', 'CRC64NVME'
+ALTER TABLE objects ADD COLUMN checksum_value TEXT;
 ```
 
 ## Changes Required

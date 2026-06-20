@@ -17,7 +17,7 @@ ACL is hardcoded for the admin user: admin always has full access to everything 
 ## Schema Change
 
 ```sql
-ALTER TABLE haystack ADD COLUMN acl TEXT DEFAULT 'private';
+ALTER TABLE objects ADD COLUMN acl TEXT DEFAULT 'private';
 
 CREATE TABLE bucket_acl (
     bucket TEXT PRIMARY KEY,
