@@ -34,6 +34,10 @@ pub struct Metadata {
     pub last_modified: Option<String>,
     /// `x-amz-meta-*` headers stored as `{"key": "value"}` (header name without prefix).
     pub user_metadata: HashMap<String, String>,
+    /// `Cache-Control` header value stored on PUT.
+    pub cache_control: Option<String>,
+    /// `Expires` header value stored on PUT (RFC 2616 date string).
+    pub expires: Option<String>,
 }
 
 impl Metadata {
@@ -52,6 +56,8 @@ impl Metadata {
             content_type: None,
             last_modified: None,
             user_metadata: HashMap::new(),
+            cache_control: None,
+            expires: None,
         }
     }
 
@@ -60,10 +66,11 @@ impl Metadata {
     }
 }
 
-/// Per-bucket stats for list-buckets
+/// Per-bucket info for list-buckets
 #[derive(Debug, Clone)]
 pub struct BucketStats {
     pub name: String,
+    pub created_at: String,
     pub object_count: u64,
     pub total_size: u64,
 }
@@ -88,6 +95,9 @@ pub trait MetadataStorage: Send + Sync {
     fn delete_bucket(&self, user_id: &str, bucket: &str) -> Result<(), Error>;
     fn bucket_exists(&self, user_id: &str, bucket: &str) -> Result<bool, Error>;
     fn list_all_buckets_for_user(&self, user_id: &str) -> Result<Vec<String>, Error>;
+
+    /// Returns (object_count, total_bytes) for a single bucket.
+    fn bucket_object_stats(&self, user_id: &str, bucket: &str) -> Result<(u64, u64), Error>;
 }
 
 #[cfg(test)]

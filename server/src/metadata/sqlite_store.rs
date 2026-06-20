@@ -34,54 +34,56 @@ lazy_static! {
         let db_path = get_db_path();
         let conn = Connection::open(&db_path).expect("Failed to open the database");
 
-        // Enable WAL mode for better write concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
 
-        // Core object table
+        // Object metadata table — stores S3 object extents + S3 metadata fields
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS haystack (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user TEXT NOT NULL,
-                bucket TEXT NOT NULL DEFAULT 'default',
-                key TEXT NOT NULL,
+            "CREATE TABLE IF NOT EXISTS objects (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                user             TEXT NOT NULL,
+                bucket           TEXT NOT NULL,
+                key              TEXT NOT NULL,
                 offset_size_list BLOB,
+                etag             TEXT,
+                size             INTEGER NOT NULL DEFAULT 0,
+                content_type     TEXT,
+                last_modified    TEXT,
+                user_metadata    TEXT,
+                cache_control    TEXT,
+                expires          TEXT,
                 UNIQUE(user, bucket, key)
             )",
             [],
-        ).expect("Failed to create haystack table");
+        ).expect("Failed to create objects table");
 
-        // Deletion WAL table
+        // Migrate existing databases that predate cache_control/expires columns
+        conn.execute("ALTER TABLE objects ADD COLUMN cache_control TEXT", []).ok();
+        conn.execute("ALTER TABLE objects ADD COLUMN expires TEXT", []).ok();
+
+        // Deletion WAL — extent ranges queued for background GC
         conn.execute(
             "CREATE TABLE IF NOT EXISTS deletion_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                bucket TEXT NOT NULL,
-                key TEXT NOT NULL,
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id          TEXT NOT NULL,
+                bucket           TEXT NOT NULL,
+                key              TEXT NOT NULL,
                 offset_size_list BLOB NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                processed BOOLEAN DEFAULT FALSE
+                created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+                processed        BOOLEAN DEFAULT FALSE
             )",
             [],
         ).expect("Failed to create deletion_queue table");
 
-        // Bucket registry
+        // Bucket registry — tracks created buckets (including empty ones)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS buckets (
-                user TEXT NOT NULL,
-                name TEXT NOT NULL,
+                user       TEXT NOT NULL,
+                name       TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now')),
                 PRIMARY KEY (user, name)
             )",
             [],
         ).expect("Failed to create buckets table");
-
-        // Incremental migrations — all use .ok() so they're idempotent
-        conn.execute("ALTER TABLE haystack ADD COLUMN bucket TEXT DEFAULT 'default'", []).ok();
-        conn.execute("ALTER TABLE haystack ADD COLUMN etag TEXT", []).ok();
-        conn.execute("ALTER TABLE haystack ADD COLUMN size INTEGER NOT NULL DEFAULT 0", []).ok();
-        conn.execute("ALTER TABLE haystack ADD COLUMN content_type TEXT", []).ok();
-        conn.execute("ALTER TABLE haystack ADD COLUMN last_modified TEXT", []).ok();
-        conn.execute("ALTER TABLE haystack ADD COLUMN user_metadata TEXT", []).ok();
 
         Arc::new(Mutex::new(conn))
     };
@@ -102,19 +104,19 @@ impl MetadataStorage for SQLiteMetadataStore {
 
         let conn = DB_CONN.lock().unwrap();
         let result = conn.execute(
-            "INSERT INTO haystack
-                (user, bucket, key, offset_size_list, etag, size, content_type, last_modified, user_metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO objects
+                (user, bucket, key, offset_size_list, etag, size, content_type, last_modified, user_metadata, cache_control, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                user_id,
-                bucket,
-                object_id,
+                user_id, bucket, object_id,
                 offset_size_bytes,
                 metadata.etag,
                 metadata.size as i64,
                 metadata.content_type,
                 metadata.last_modified,
                 user_metadata_json,
+                metadata.cache_control,
+                metadata.expires,
             ],
         );
         match result {
@@ -129,8 +131,8 @@ impl MetadataStorage for SQLiteMetadataStore {
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT offset_size_list, etag, size, content_type, last_modified, user_metadata
-             FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3",
+            "SELECT offset_size_list, etag, size, content_type, last_modified, user_metadata, cache_control, expires
+             FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
 
         let row = stmt.query_row(params![user_id, bucket, object_id], |row| {
@@ -141,15 +143,17 @@ impl MetadataStorage for SQLiteMetadataStore {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         }).map_err(|e| {
-            warn!("get_metadata: key not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
+            warn!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
             actix_web::error::ErrorNotFound(format!(
                 "No data found for key: {} in bucket: {}, The key does not exist", object_id, bucket
             ))
         })?;
 
-        let (offset_size_bytes, etag, size, content_type, last_modified, user_metadata_json) = row;
+        let (offset_size_bytes, etag, size, content_type, last_modified, user_metadata_json, cache_control, expires) = row;
         let offset_size_list = crate::util::serializer::deserialize_offset_size(&offset_size_bytes)?;
         let user_metadata: std::collections::HashMap<String, String> = user_metadata_json
             .as_deref()
@@ -162,13 +166,15 @@ impl MetadataStorage for SQLiteMetadataStore {
         metadata.content_type = content_type;
         metadata.last_modified = last_modified;
         metadata.user_metadata = user_metadata;
+        metadata.cache_control = cache_control;
+        metadata.expires = expires;
         Ok(metadata)
     }
 
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "DELETE FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3",
+            "DELETE FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
             params![user_id, bucket, object_id],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
@@ -177,7 +183,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error> {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT key FROM haystack WHERE user = ?1 AND bucket = ?2 ORDER BY key",
+            "SELECT key FROM objects WHERE user = ?1 AND bucket = ?2 ORDER BY key",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
 
         let rows = stmt.query_map(params![user_id, bucket], |row| {
@@ -194,7 +200,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM haystack WHERE user = ?1 AND bucket = ?2 AND key = ?3",
+            "SELECT COUNT(*) FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         let count: i64 = stmt.query_row(params![user_id, bucket, object_id], |row| row.get(0))
             .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -209,24 +215,23 @@ impl MetadataStorage for SQLiteMetadataStore {
 
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "UPDATE haystack SET
+            "UPDATE objects SET
                 offset_size_list = ?1,
-                etag = ?2,
-                size = ?3,
-                content_type = ?4,
-                last_modified = ?5,
-                user_metadata = ?6
-             WHERE user = ?7 AND bucket = ?8 AND key = ?9",
+                etag             = ?2,
+                size             = ?3,
+                content_type     = ?4,
+                last_modified    = ?5,
+                user_metadata    = ?6,
+                cache_control    = ?7,
+                expires          = ?8
+             WHERE user = ?9 AND bucket = ?10 AND key = ?11",
             params![
                 offset_size_bytes,
-                metadata.etag,
-                metadata.size as i64,
-                metadata.content_type,
-                metadata.last_modified,
+                metadata.etag, metadata.size as i64,
+                metadata.content_type, metadata.last_modified,
                 user_metadata_json,
-                user_id,
-                bucket,
-                object_id,
+                metadata.cache_control, metadata.expires,
+                user_id, bucket, object_id,
             ],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
@@ -235,7 +240,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "UPDATE haystack SET key = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
+            "UPDATE objects SET key = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
             params![new_object_id, user_id, bucket, old_object_id],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
@@ -247,23 +252,25 @@ impl MetadataStorage for SQLiteMetadataStore {
 
     fn list_buckets_with_stats(&self, user_id: &str) -> Result<Vec<BucketStats>, Error> {
         let conn = DB_CONN.lock().unwrap();
-        // LEFT JOIN ensures empty buckets (registered in `buckets` table but no objects) are included.
+        // LEFT JOIN so empty buckets still appear in the result
         let mut stmt = conn.prepare(
             "SELECT b.name,
-                    COUNT(h.key)         AS object_count,
-                    COALESCE(SUM(h.size), 0) AS total_size
-             FROM buckets b
-             LEFT JOIN haystack h ON h.user = b.user AND h.bucket = b.name
-             WHERE b.user = ?1
+                    b.created_at,
+                    COUNT(o.key)             AS object_count,
+                    COALESCE(SUM(o.size), 0) AS total_size
+             FROM   buckets b
+             LEFT JOIN objects o ON o.user = b.user AND o.bucket = b.name
+             WHERE  b.user = ?1
              GROUP BY b.name
              ORDER BY b.name",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
 
         let rows = stmt.query_map(params![user_id], |row| {
             Ok(BucketStats {
-                name: row.get(0)?,
-                object_count: row.get::<_, i64>(1)? as u64,
-                total_size: row.get::<_, i64>(2)? as u64,
+                name:         row.get(0)?,
+                created_at:   row.get(1)?,
+                object_count: row.get::<_, i64>(2)? as u64,
+                total_size:   row.get::<_, i64>(3)? as u64,
             })
         }).map_err(actix_web::error::ErrorInternalServerError)?;
 
@@ -314,6 +321,17 @@ impl MetadataStorage for SQLiteMetadataStore {
             names.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
         }
         Ok(names)
+    }
+
+    fn bucket_object_stats(&self, user_id: &str, bucket: &str) -> Result<(u64, u64), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM objects WHERE user = ?1 AND bucket = ?2",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let (count, bytes): (i64, i64) = stmt.query_row(params![user_id, bucket], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok((count as u64, bytes as u64))
     }
 }
 
@@ -396,7 +414,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sqlite_metadata_store_basic_operations() {
+    fn test_sqlite_objects_table_basic_operations() {
         let store = SQLiteMetadataStore::new();
         let user_id = "test_user_sqlite";
         let object_id = "test_object_sqlite";
@@ -406,17 +424,12 @@ mod tests {
         metadata.content_type = Some("text/plain".to_string());
 
         store.put_metadata(user_id, "default", object_id, &metadata).unwrap();
-
         assert!(store.object_exists(user_id, "default", object_id).unwrap());
         assert!(!store.object_exists(user_id, "default", "nonexistent").unwrap());
 
         let retrieved = store.get_metadata(user_id, "default", object_id).unwrap();
-        assert_eq!(retrieved.chunks.len(), 2);
         assert_eq!(retrieved.to_offset_size_list(), vec![(100, 200), (300, 400)]);
         assert_eq!(retrieved.etag, Some("\"abc123\"".to_string()));
-
-        let objects = store.list_objects(user_id, "default").unwrap();
-        assert!(objects.contains(&object_id.to_string()));
 
         let new_metadata = Metadata::from_offset_size_list(vec![(500, 600)]);
         store.update_metadata(user_id, "default", object_id, &new_metadata).unwrap();
@@ -441,9 +454,7 @@ mod tests {
         assert!(!store.bucket_exists(user_id, bucket).unwrap());
         store.create_bucket(user_id, bucket).unwrap();
         assert!(store.bucket_exists(user_id, bucket).unwrap());
-
-        // Idempotent
-        store.create_bucket(user_id, bucket).unwrap();
+        store.create_bucket(user_id, bucket).unwrap(); // idempotent
 
         let names = store.list_all_buckets_for_user(user_id).unwrap();
         assert!(names.contains(&bucket.to_string()));

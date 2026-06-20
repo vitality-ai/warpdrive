@@ -4,6 +4,7 @@ use crate::metadata::{MetadataStorage, Metadata, ObjectId, BucketStats};
 use actix_web::Error;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use chrono::Utc;
 
 /// Mock implementation of MetadataStorage for testing
 pub struct MockMetadataStore {
@@ -142,6 +143,7 @@ impl MetadataStorage for MockMetadataStore {
 
         // All registered buckets, including empty ones
         let registered = buckets.get(user_id).cloned().unwrap_or_default();
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
         let mut stats: Vec<BucketStats> = registered.iter().map(|name| {
             let (object_count, total_size) = data
                 .get(user_id)
@@ -152,7 +154,7 @@ impl MetadataStorage for MockMetadataStore {
                     (count, size)
                 })
                 .unwrap_or((0, 0));
-            BucketStats { name: name.clone(), object_count, total_size }
+            BucketStats { name: name.clone(), created_at: now.clone(), object_count, total_size }
         }).collect();
         stats.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(stats)
@@ -186,6 +188,19 @@ impl MetadataStorage for MockMetadataStore {
             .unwrap_or_default();
         names.sort();
         Ok(names)
+    }
+
+    fn bucket_object_stats(&self, user_id: &str, bucket: &str) -> Result<(u64, u64), Error> {
+        let data = self.data.lock().unwrap();
+        let (count, bytes) = data.get(user_id)
+            .and_then(|u| u.get(bucket))
+            .map(|b| {
+                let count = b.len() as u64;
+                let bytes: u64 = b.values().map(|m| m.size).sum();
+                (count, bytes)
+            })
+            .unwrap_or((0, 0));
+        Ok((count, bytes))
     }
 }
 

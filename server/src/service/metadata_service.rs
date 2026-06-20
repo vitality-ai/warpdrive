@@ -112,6 +112,10 @@ impl MetadataService {
         METADATA_STORE.list_buckets_with_stats(&self.user)
     }
 
+    pub fn bucket_object_stats(&self, bucket: &str) -> Result<(u64, u64), Error> {
+        METADATA_STORE.bucket_object_stats(&self.user, bucket)
+    }
+
     // --- Deletion WAL ---
 
     pub fn queue_deletion(&self, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {

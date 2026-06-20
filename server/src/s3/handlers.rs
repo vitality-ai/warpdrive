@@ -1,11 +1,26 @@
 // S3-compatible request handlers
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
+use actix_web::body::{BodySize, MessageBody};
 use log::{debug, error, info, warn};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+/// Empty body that reports a custom Content-Length for HEAD responses.
+/// actix-web derives Content-Length from MessageBody::size(); this type
+/// lets us advertise the real object size without sending any bytes.
+struct HeadBody(u64);
+impl MessageBody for HeadBody {
+    type Error = std::convert::Infallible;
+    fn size(&self) -> BodySize { BodySize::Sized(self.0) }
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Self::Error>>> {
+        Poll::Ready(None)
+    }
+}
 
 use crate::metadata::Metadata;
 use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
@@ -16,7 +31,6 @@ use crate::storage::config::StorageConfig;
 use crate::util::serializer::deserialize_offset_size;
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
-const WARPDRIVE_LIST_BUCKETS_EXT_NS: &str = "http://warpdrive.vitality.dev/doc/listbuckets/1";
 const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -52,7 +66,10 @@ fn s3_error(status: StatusCode, code: &str, message: &str, resource: &str) -> Ht
         msg  = xml_escape(message),
         res  = xml_escape(resource),
     );
-    HttpResponse::build(status).content_type("application/xml").body(body)
+    HttpResponse::build(status)
+        .content_type("application/xml")
+        .insert_header(("x-amz-request-id", "warpdrive"))
+        .body(body)
 }
 
 /// Return 404 NoSuchBucket if the bucket is not registered for this user.
@@ -78,6 +95,54 @@ fn stream_slices(chunks: &[(u64, u64)]) -> Vec<(u64, u64)> {
             off += n;
             rem -= n;
         }
+    }
+    out
+}
+
+/// Parse `Range: bytes=X-Y` or `bytes=X-` → (start, end_inclusive) in logical object space.
+/// Returns None if the header is absent or unparseable.
+fn parse_range_header(req: &HttpRequest, total: u64) -> Option<(u64, u64)> {
+    let hdr = req.headers().get("range")?.to_str().ok()?;
+    let bytes = hdr.strip_prefix("bytes=")?;
+    let (start_s, end_s) = bytes.split_once('-')?;
+    let start: u64 = start_s.parse().ok()?;
+    let end: u64 = if end_s.is_empty() {
+        total.saturating_sub(1)
+    } else {
+        end_s.parse().ok()?
+    };
+    if start > end || end >= total { return None; }
+    Some((start, end))
+}
+
+/// Map a logical byte range [range_start, range_end] onto the storage extents.
+/// Returns a list of (storage_offset, read_size) covering exactly the requested bytes.
+fn range_slices(chunks: &[(u64, u64)], range_start: u64, range_end: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut logical = 0u64;
+    for &(storage_off, chunk_size) in chunks {
+        let chunk_end = logical + chunk_size; // exclusive
+        if chunk_end <= range_start {
+            logical = chunk_end;
+            continue;
+        }
+        if logical >= range_end + 1 {
+            break;
+        }
+        // overlap: [max(logical, range_start), min(chunk_end, range_end+1))
+        let read_start = range_start.max(logical);
+        let read_end   = (range_end + 1).min(chunk_end);
+        let skip       = read_start - logical;
+        let read_size  = read_end - read_start;
+        let mut off = storage_off + skip;
+        let mut rem = read_size;
+        while rem > 0 {
+            let n = rem.min(S3_GET_STREAM_CHUNK);
+            out.push((off, n));
+            off += n;
+            rem -= n;
+        }
+        logical = chunk_end;
     }
     out
 }
@@ -113,6 +178,19 @@ fn validate_bucket_name(bucket: &str) -> Result<(), HttpResponse> {
     Ok(())
 }
 
+/// Reject keys containing C0/C1 control characters (matches S3's URI parse rejection).
+fn validate_object_key(key: &str, bucket: &str) -> Result<(), HttpResponse> {
+    if key.chars().any(|c| {
+        let n = c as u32;
+        n < 0x20 || (n >= 0x7F && n <= 0x9F)
+    }) {
+        return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidURI",
+                            "Couldn't parse the specified URI.",
+                            &format!("/{}/{}", bucket, key)));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ListBuckets  GET /s3  or  GET /s3/
 // ---------------------------------------------------------------------------
@@ -127,37 +205,27 @@ pub async fn s3_list_buckets_handler(req: HttpRequest) -> Result<HttpResponse, E
 
     let db = MetadataService::new(&auth_result.user_id)?;
 
-    // For admin (allow_all_buckets), pull the full list from the buckets table so that
-    // empty buckets are included. For Console users, restrict to the allowed set.
-    let names: Vec<String> = if auth_result.allow_all_buckets {
-        db.list_all_buckets()?
+    let all_stats = db.list_buckets_with_stats()?;
+
+    // Admin sees all registered buckets; Console users see only allowed ones.
+    let allowed_set: Option<std::collections::HashSet<&str>> = if auth_result.allow_all_buckets {
+        None
     } else {
-        auth_result.allowed_buckets.clone()
+        Some(auth_result.allowed_buckets.iter().map(|s| s.as_str()).collect())
     };
 
-    // Overlay stats (size + count) for each registered bucket.
-    let stats_map: HashMap<String, (u64, u64)> = db
-        .list_buckets_with_stats()?
-        .into_iter()
-        .map(|s| (s.name, (s.object_count, s.total_size)))
-        .collect();
-
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z");
     let mut buckets_xml = String::new();
-    for name in &names {
-        let (count, size) = stats_map.get(name).copied().unwrap_or((0, 0));
+    for stat in &all_stats {
+        if let Some(ref allowed) = allowed_set {
+            if !allowed.contains(stat.name.as_str()) { continue; }
+        }
         buckets_xml.push_str(&format!(
             "    <Bucket>\n\
              \t<Name>{name}</Name>\n\
-             \t<CreationDate>{now}</CreationDate>\n\
-             \t<ObjectCount xmlns=\"{ext}\">{count}</ObjectCount>\n\
-             \t<TotalSize xmlns=\"{ext}\">{size}</TotalSize>\n\
+             \t<CreationDate>{ctime}</CreationDate>\n\
              \t</Bucket>\n",
-            name = xml_escape(name),
-            now  = now,
-            ext  = WARPDRIVE_LIST_BUCKETS_EXT_NS,
-            count = count,
-            size  = size,
+            name  = xml_escape(&stat.name),
+            ctime = xml_escape(&stat.created_at),
         ));
     }
 
@@ -235,10 +303,21 @@ pub async fn s3_head_bucket_handler(
 
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    Ok(HttpResponse::Ok()
-        .insert_header(("Content-Type", "application/xml"))
-        .insert_header(("Content-Length", "0"))
-        .body(""))
+    let mut resp = HttpResponse::Ok();
+    resp.insert_header(("Content-Type", "application/xml"));
+    resp.insert_header(("Content-Length", "0"));
+
+    // Return bucket stats when ?read-stats=true is requested (RGW extension).
+    let query = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .unwrap_or_else(|_| web::Query(HashMap::new()));
+    if query.contains_key("read-stats") {
+        if let Ok((count, bytes)) = db.bucket_object_stats(&bucket) {
+            resp.insert_header(("x-rgw-object-count", count.to_string()));
+            resp.insert_header(("x-rgw-bytes-used", bytes.to_string()));
+        }
+    }
+
+    Ok(resp.body(""))
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +375,16 @@ pub async fn s3_put_object_handler(
         .unwrap_or("application/octet-stream")
         .to_string();
 
+    let cache_control = req.headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let expires = req.headers()
+        .get("expires")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let store = StorageConfig::from_env().create_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
     let mut body_buf: Vec<u8> = Vec::new(); // for MD5
@@ -330,12 +419,40 @@ pub async fn s3_put_object_handler(
     let etag = md5_etag(&body_buf);
     let last_modified = rfc2616_now();
 
+    // Validate Content-MD5 if provided (RFC 1864 / S3 spec).
+    if let Some(raw) = req.headers().get("content-md5").and_then(|v| v.to_str().ok()) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidDigest",
+                               "The Content-MD5 you specified is not valid.",
+                               &format!("/{}/{}", bucket, key)));
+        }
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(raw) {
+            Ok(decoded) if decoded.len() == 16 => {
+                let body_md5 = md5::compute(&body_buf).0;
+                if decoded.as_slice() != &body_md5 {
+                    return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
+                                       "The Content-MD5 you specified did not match what we received.",
+                                       &format!("/{}/{}", bucket, key)));
+                }
+            }
+            _ => {
+                return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidDigest",
+                                   "The Content-MD5 you specified is not valid.",
+                                   &format!("/{}/{}", bucket, key)));
+            }
+        }
+    }
+
     let mut metadata = Metadata::from_offset_size_list(offset_size_list);
     metadata.etag = Some(etag.clone());
     metadata.size = size;
     metadata.content_type = Some(content_type);
     metadata.last_modified = Some(last_modified);
     metadata.user_metadata = user_metadata;
+    metadata.cache_control = cache_control;
+    metadata.expires = expires;
 
     db.put_object_full(&bucket, &key, metadata)?;
 
@@ -355,6 +472,9 @@ pub async fn s3_get_object_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+
+    if let Err(resp) = validate_object_key(&key, &bucket) { return Ok(resp); }
+
     let auth_result = authenticate_s3_request(&req).await?;
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
 
@@ -367,14 +487,25 @@ pub async fn s3_get_object_handler(
     }
 
     let meta = db.get_object_full(&bucket, &key)?;
-    let slices = Arc::new(stream_slices(&meta.to_offset_size_list()));
-    let content_length = meta.size;
+    let total_size = meta.size;
     let etag = meta.etag.clone().unwrap_or_default();
     let content_type = meta.content_type.clone().unwrap_or_else(|| "application/octet-stream".into());
     let last_modified = meta.last_modified.clone().unwrap_or_default();
+    let extents = meta.to_offset_size_list();
 
-    info!("S3 GetObject: bucket={} key={} size={}", bucket, key, content_length);
+    // Resolve Range header if present.
+    let (slices, response_len, range_header) = if let Some((rs, re)) = parse_range_header(&req, total_size) {
+        let s = range_slices(&extents, rs, re);
+        let len = re - rs + 1;
+        let hdr = format!("bytes {}-{}/{}", rs, re, total_size);
+        (s, len, Some(hdr))
+    } else {
+        (stream_slices(&extents), total_size, None)
+    };
 
+    info!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
+
+    let slices = Arc::new(slices);
     let store = StorageConfig::from_env().create_store();
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let bucket_log = bucket.clone();
@@ -406,14 +537,24 @@ pub async fn s3_get_object_handler(
         }
     });
 
-    let mut resp = HttpResponse::Ok();
+    let status = if range_header.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    let mut resp = HttpResponse::build(status);
     resp.content_type(content_type.as_str());
-    resp.insert_header(("Content-Length", content_length.to_string()));
+    resp.insert_header(("Content-Length", response_len.to_string()));
     resp.insert_header(("ETag", etag));
+    resp.insert_header(("Accept-Ranges", "bytes"));
+    if let Some(cr) = range_header {
+        resp.insert_header(("Content-Range", cr));
+    }
     if !last_modified.is_empty() {
         resp.insert_header(("Last-Modified", last_modified));
     }
-    // Echo user metadata
+    if let Some(cc) = &meta.cache_control {
+        resp.insert_header(("Cache-Control", cc.as_str()));
+    }
+    if let Some(exp) = &meta.expires {
+        resp.insert_header(("Expires", exp.as_str()));
+    }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k).as_str(), v.as_str()));
     }
@@ -429,6 +570,9 @@ pub async fn s3_head_object_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+
+    if let Err(resp) = validate_object_key(&key, &bucket) { return Ok(resp); }
+
     let auth_result = authenticate_s3_request(&req).await?;
 
     let db = MetadataService::new(&auth_result.user_id)?;
@@ -446,17 +590,26 @@ pub async fn s3_head_object_handler(
 
     info!("S3 HeadObject: bucket={} key={} size={}", bucket, key, meta.size);
 
+    let object_size = meta.size;
     let mut resp = HttpResponse::Ok();
-    resp.insert_header(("Content-Length", meta.size.to_string()));
     resp.insert_header(("Content-Type", content_type));
     resp.insert_header(("ETag", etag));
+    resp.insert_header(("Accept-Ranges", "bytes"));
     if !last_modified.is_empty() {
         resp.insert_header(("Last-Modified", last_modified));
+    }
+    if let Some(cc) = &meta.cache_control {
+        resp.insert_header(("Cache-Control", cc.as_str()));
+    }
+    if let Some(exp) = &meta.expires {
+        resp.insert_header(("Expires", exp.as_str()));
     }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k).as_str(), v.as_str()));
     }
-    Ok(resp.body(""))
+    // Use HeadBody so actix-web derives Content-Length from the real object
+    // size (via MessageBody::size) rather than from the zero-byte body.
+    Ok(resp.message_body(HeadBody(object_size)).unwrap().map_into_boxed_body())
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +628,21 @@ pub async fn s3_delete_object_handler(
     }
 
     let (bucket, key) = path.into_inner();
+
+    // S3 returns 404 NoSuchBucket for anonymous requests to non-existent buckets
+    // (before even evaluating auth). Check bucket existence first when no Authorization
+    // header is present so we match this behaviour instead of returning 401.
+    let has_auth = req.headers().contains_key("authorization")
+        || req.query_string().contains("X-Amz-Signature");
+    if !has_auth {
+        if let Ok(db) = MetadataService::new("admin") {
+            if matches!(db.bucket_exists(&bucket), Ok(false)) {
+                return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchBucket",
+                                   "The specified bucket does not exist", &bucket));
+            }
+        }
+    }
+
     let auth_result = authenticate_s3_request(&req).await?;
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
 
@@ -506,6 +674,12 @@ pub async fn s3_list_objects_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let bucket = path.into_inner();
+
+    // Dispatch list-object-versions (?versions query param)
+    if query.contains_key("versions") {
+        return s3_list_object_versions_handler_inner(&bucket, &req).await;
+    }
+
     let auth_result = authenticate_s3_request(&req).await?;
     let db = MetadataService::new(&auth_result.user_id)?;
 
@@ -523,16 +697,25 @@ pub async fn s3_list_objects_handler(
 
     let mut contents_xml = String::new();
     for object_key in &objects {
+        let (size, etag, last_modified) = db.get_object_full(&bucket, object_key)
+            .map(|m| (
+                m.size,
+                m.etag.unwrap_or_default(),
+                m.last_modified.unwrap_or_else(|| now.to_string()),
+            ))
+            .unwrap_or((0, String::new(), now.to_string()));
         contents_xml.push_str(&format!(
             "    <Contents>\n\
              \t<Key>{key}</Key>\n\
-             \t<Size>0</Size>\n\
-             \t<LastModified>{now}</LastModified>\n\
-             \t<ETag>&quot;&quot;</ETag>\n\
+             \t<Size>{size}</Size>\n\
+             \t<LastModified>{lm}</LastModified>\n\
+             \t<ETag>&quot;{etag}&quot;</ETag>\n\
              \t<StorageClass>STANDARD</StorageClass>\n\
              \t</Contents>\n",
             key = xml_escape(object_key),
-            now = now,
+            size = size,
+            lm = last_modified,
+            etag = etag.trim_matches('"'),
         ));
     }
 
@@ -566,6 +749,142 @@ pub async fn s3_list_objects_handler(
         )
     };
 
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+}
+
+// ---------------------------------------------------------------------------
+// ListObjectVersions  GET /s3/{bucket}?versions
+// For non-versioned buckets each object appears as VersionId=null / IsLatest=true.
+// ---------------------------------------------------------------------------
+
+async fn s3_list_object_versions_handler_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    info!("S3 ListObjectVersions: bucket={}", bucket);
+
+    let objects = db.list_objects(bucket)?;
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z");
+
+    let mut versions_xml = String::new();
+    for key in &objects {
+        let (size, etag, last_modified) = db.get_object_full(bucket, key)
+            .map(|m| (
+                m.size,
+                m.etag.unwrap_or_default(),
+                m.last_modified.unwrap_or_else(|| now.to_string()),
+            ))
+            .unwrap_or((0, String::new(), now.to_string()));
+        versions_xml.push_str(&format!(
+            "    <Version>\n\
+             \t<Key>{key}</Key>\n\
+             \t<VersionId>null</VersionId>\n\
+             \t<IsLatest>true</IsLatest>\n\
+             \t<LastModified>{lm}</LastModified>\n\
+             \t<ETag>&quot;{etag}&quot;</ETag>\n\
+             \t<Size>{size}</Size>\n\
+             \t<StorageClass>STANDARD</StorageClass>\n\
+             \t<Owner><ID>admin</ID><DisplayName>admin</DisplayName></Owner>\n\
+             \t</Version>\n",
+            key = xml_escape(key),
+            lm = last_modified,
+            etag = etag.trim_matches('"'),
+            size = size,
+        ));
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListVersionsResult xmlns=\"{s3}\">\n\
+             <Name>{bucket}</Name>\n\
+             <Prefix></Prefix>\n\
+             <KeyMarker></KeyMarker>\n\
+             <VersionIdMarker></VersionIdMarker>\n\
+             <MaxKeys>1000</MaxKeys>\n\
+             <IsTruncated>false</IsTruncated>\n\
+             {versions}\
+         </ListVersionsResult>",
+        s3 = S3_XMLNS, bucket = xml_escape(bucket), versions = versions_xml,
+    );
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+}
+
+// ---------------------------------------------------------------------------
+// DeleteObjects  POST /s3/{bucket}?delete
+// Parses the <Delete><Object><Key>...</Key></Object>...</Delete> body and
+// deletes each named key. Returns a <DeleteResult> response.
+// ---------------------------------------------------------------------------
+
+pub async fn s3_delete_objects_handler(
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+    mut payload: web::Payload,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    if !query.contains_key("delete") {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest",
+                           "Missing ?delete parameter for multi-object delete", ""));
+    }
+    let bucket = path.into_inner();
+    let auth_result = authenticate_s3_request(&req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+
+    if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+
+    let mut body_bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(|e| {
+            warn!("DeleteObjects: payload read error: {}", e);
+            actix_web::error::ErrorInternalServerError("Error reading payload")
+        })?;
+        body_bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&body_bytes);
+
+    // Minimal XML parse: extract all <Key>...</Key> values between <Object> tags.
+    let keys: Vec<String> = {
+        let mut keys = Vec::new();
+        let mut remaining = body.as_ref();
+        while let Some(start) = remaining.find("<Key>") {
+            remaining = &remaining[start + 5..];
+            if let Some(end) = remaining.find("</Key>") {
+                keys.push(remaining[..end].to_string());
+                remaining = &remaining[end + 6..];
+            } else {
+                break;
+            }
+        }
+        keys
+    };
+
+    let context = crate::service::user_context::UserContext::with_bucket(
+        auth_result.user_id.clone(), auth_result.bucket.clone()
+    );
+    let storage_service = crate::service::storage_service::StorageService::new();
+
+    let mut deleted_xml = String::new();
+    for key in &keys {
+        if db.check_key(&bucket, key)? {
+            storage_service.delete_object(&context, key)?;
+        }
+        db.delete_metadata(&bucket, key).ok(); // idempotent
+        deleted_xml.push_str(&format!(
+            "    <Deleted><Key>{}</Key></Deleted>\n",
+            xml_escape(key),
+        ));
+    }
+
+    info!("S3 DeleteObjects: bucket={} deleted={}", bucket, keys.len());
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <DeleteResult xmlns=\"{s3}\">\n\
+             {deleted}\
+         </DeleteResult>",
+        s3 = S3_XMLNS, deleted = deleted_xml,
+    );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
 

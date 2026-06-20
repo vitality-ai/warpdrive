@@ -13,6 +13,7 @@ use warp_drive::s3::handlers::{
     s3_list_buckets_handler,
     s3_create_bucket_handler,
     s3_delete_bucket_handler,
+    s3_delete_objects_handler,
     s3_multipart_router,
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
@@ -30,25 +31,38 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(actix_web::middleware::Logger::default())
             .app_data(web::PayloadConfig::default().limit(5 * 1024 * 1024 * 1024))
-            // S3-compatible API
+            // S3-compatible API — prefixed form (/s3/...)
             .route("/s3",               web::get().to(s3_list_buckets_handler))
             .route("/s3/",              web::get().to(s3_list_buckets_handler))
             .route("/s3/{bucket}",      web::put().to(s3_create_bucket_handler))
             .route("/s3/{bucket}",      web::delete().to(s3_delete_bucket_handler))
             .route("/s3/{bucket}",      web::head().to(s3_head_bucket_handler))
             .route("/s3/{bucket}",      web::get().to(s3_list_objects_handler))
+            .route("/s3/{bucket}",      web::post().to(s3_delete_objects_handler))
             .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
-            // Original native API
+            // Original native API (registered before root S3 routes to take priority on conflicts)
             .service(put)
             .service(get)
             .service(append)
             .service(delete)
             .service(update_key)
             .service(update)
+            // S3-compatible API — root form (/{bucket}/...) for standard boto3 / Ceph s3-tests
+            .route("/",                  web::get().to(s3_list_buckets_handler))
+            .route("/{bucket}",          web::put().to(s3_create_bucket_handler))
+            .route("/{bucket}",          web::delete().to(s3_delete_bucket_handler))
+            .route("/{bucket}",          web::head().to(s3_head_bucket_handler))
+            .route("/{bucket}",          web::get().to(s3_list_objects_handler))
+            .route("/{bucket}",          web::post().to(s3_delete_objects_handler))
+            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
+            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
+            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
+            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
+            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
     })
     .bind(("0.0.0.0", 9710))?
     .run()

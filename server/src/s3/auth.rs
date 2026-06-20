@@ -453,28 +453,31 @@ fn percent_encode_uri(s: &str) -> String {
     out
 }
 
-/// True only for AWS ListBuckets: GET/HEAD `/s3` or `/s3/` (no bucket segment).
+/// True only for AWS ListBuckets: GET/HEAD at the S3 root (no bucket in path).
 fn is_list_buckets_request(req: &HttpRequest) -> bool {
     let method = req.method();
     if method != actix_web::http::Method::GET && method != actix_web::http::Method::HEAD {
         return false;
     }
     let p = req.path();
-    p == "/s3" || p == "/s3/"
+    // /s3 and /s3/ are the warpdrive-prefixed forms; / is the root S3 form (for Ceph s3-tests).
+    p == "/s3" || p == "/s3/" || p == "/"
 }
 
-/// Extract bucket from request path. Path must start with /s3/.
-/// For /s3 or /s3/ (list-buckets), returns Ok("").
+/// Extract bucket from request path.
+/// Handles both the warpdrive-prefixed form (/s3/{bucket}/...) and the standard
+/// root form (/{bucket}/...) that Ceph s3-tests and boto3 clients use by default.
 fn extract_bucket_from_path(req: &HttpRequest) -> Result<String, Error> {
     let path = req.path();
-    let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if path_parts.is_empty() || path_parts[0] != "s3" {
-        return Err(ErrorUnauthorized("Invalid S3 path format"));
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // Skip the "s3" prefix if present (warpdrive path-style: /s3/{bucket}/...)
+    let bucket_idx = if parts.first().copied() == Some("s3") { 1 } else { 0 };
+
+    if parts.len() <= bucket_idx || parts[bucket_idx].is_empty() {
+        return Ok(String::new()); // list-buckets call
     }
-    if path_parts.len() < 2 || path_parts[1].is_empty() {
-        return Ok(String::new());
-    }
-    Ok(path_parts[1].to_string())
+    Ok(parts[bucket_idx].to_string())
 }
 
 /// Authenticate S3 request (async).
