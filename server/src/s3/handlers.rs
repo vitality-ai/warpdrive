@@ -52,6 +52,19 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Encode a stored metadata value as a HeaderValue for HTTP responses.
+/// boto3/urllib3 1.x decodes response headers as Latin-1 (ISO-8859-1). Metadata values
+/// are stored internally as UTF-8 Rust Strings; we encode each Unicode code point to its
+/// low byte (safe for the Latin-1 range U+0000..U+00FF) so the round-trip is lossless
+/// for any character that was originally in the Latin-1 range.
+fn metadata_value_header(v: &str) -> actix_web::http::header::HeaderValue {
+    let bytes: Vec<u8> = v.chars()
+        .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
+        .collect();
+    actix_web::http::header::HeaderValue::from_bytes(&bytes)
+        .unwrap_or_else(|_| actix_web::http::header::HeaderValue::from_static(""))
+}
+
 /// S3 URL-encoding for listing responses: percent-encode all bytes except unreserved chars and '/'.
 fn s3_url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
@@ -168,6 +181,43 @@ fn rfc2616_now() -> String {
 /// Compute MD5 ETag (double-quoted) from accumulated bytes.
 fn md5_etag(data: &[u8]) -> String {
     format!("\"{}\"", hex::encode(md5::compute(data).0))
+}
+
+/// Strip surrounding double quotes from an ETag for comparison (handles `"hash"` and `hash`).
+#[inline]
+fn normalize_etag(etag: &str) -> &str {
+    etag.trim().trim_matches('"')
+}
+
+/// Return a 412 PreconditionFailed S3 error response.
+#[inline]
+fn s3_precondition_failed(resource: &str) -> HttpResponse {
+    s3_error(StatusCode::PRECONDITION_FAILED, "PreconditionFailed",
+             "At least one of the pre-conditions you specified did not hold",
+             resource)
+}
+
+/// Extract the text content of the first occurrence of `<tag>…</tag>` in `src`.
+fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = src.find(&open)? + open.len();
+    let end = src[start..].find(&close)?;
+    Some(src[start..start + end].to_string())
+}
+
+/// Parse an HTTP date string (RFC 2616 / RFC 1123: "Mon, 01 Jan 2024 00:00:00 GMT")
+/// into a comparable integer (Unix seconds).  Returns None if parsing fails.
+fn parse_http_date(s: &str) -> Option<i64> {
+    // Try RFC 2616 format first: "Mon, 01 Jan 2024 00:00:00 GMT"
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(dt.and_utc().timestamp());
+    }
+    // Fallback: RFC 2822 (includes timezone offset)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        return Some(dt.timestamp());
+    }
+    None
 }
 
 /// Validate S3 bucket name rules.
@@ -393,18 +443,48 @@ pub async fn s3_put_object_handler(
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
 
+    // Conditional PUT: check If-Match / If-None-Match before overwriting.
+    let if_match_put = req.headers().get("if-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let if_none_match_put = req.headers().get("if-none-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    if if_match_put.is_some() || if_none_match_put.is_some() {
+        let resource = format!("/{}/{}", bucket, key);
+        let obj_exists = db.check_key(&bucket, &key)?;
+        let cur_etag = if obj_exists {
+            db.get_object_full(&bucket, &key)?.etag.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if let Some(ref im) = if_match_put {
+            if !obj_exists {
+                return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                                   "The specified key does not exist.", &resource));
+            }
+            if im != "*" && normalize_etag(im) != normalize_etag(&cur_etag) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+        if let Some(ref inm) = if_none_match_put {
+            if obj_exists && (inm == "*" || normalize_etag(inm) == normalize_etag(&cur_etag)) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+    }
+
     // Delete existing object first (S3 PUT is idempotent / overwrites).
     if db.check_key(&bucket, &key)? {
         StorageService::new().delete_object(&context, &key)?;
     }
 
-    // Parse user metadata from x-amz-meta-* headers.
+    // Parse user metadata from x-amz-meta-* headers. Use from_utf8_lossy so non-ASCII
+    // values (e.g. UTF-8 user metadata sent by boto3) are preserved rather than dropped.
     let user_metadata: HashMap<String, String> = req.headers().iter()
         .filter_map(|(name, value)| {
             let n = name.as_str().to_lowercase();
             if n.starts_with("x-amz-meta-") {
                 let meta_key = n.trim_start_matches("x-amz-meta-").to_string();
-                let meta_val = value.to_str().ok()?.to_string();
+                let meta_val = String::from_utf8_lossy(value.as_bytes()).trim().to_string();
                 Some((meta_key, meta_val))
             } else {
                 None
@@ -536,6 +616,58 @@ pub async fn s3_get_object_handler(
     let last_modified = meta.last_modified.clone().unwrap_or_default();
     let extents = meta.to_offset_size_list();
 
+    // Conditional GET: evaluate If-Match, If-None-Match, If-Unmodified-Since, If-Modified-Since.
+    {
+        let get_if_match = req.headers().get("if-match")
+            .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+        let get_if_none_match = req.headers().get("if-none-match")
+            .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+        let get_if_modified = req.headers().get("if-modified-since")
+            .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+        let get_if_unmodified = req.headers().get("if-unmodified-since")
+            .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+        let resource = format!("/{}/{}", bucket, key);
+
+        // If-Match: 412 if current etag doesn't match.
+        if let Some(ref im) = get_if_match {
+            if im != "*" && normalize_etag(im) != normalize_etag(&etag) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+        // If-Unmodified-Since: 412 if object was modified after the given date.
+        if let Some(ref ius) = get_if_unmodified {
+            if let (Some(hdr_ts), Some(obj_ts)) =
+                (parse_http_date(ius), parse_http_date(&last_modified))
+            {
+                if obj_ts > hdr_ts {
+                    return Ok(s3_precondition_failed(&resource));
+                }
+            }
+        }
+        // If-None-Match: 304 if current etag matches.
+        if let Some(ref inm) = get_if_none_match {
+            if inm == "*" || normalize_etag(inm) == normalize_etag(&etag) {
+                let mut r = HttpResponse::NotModified();
+                if !etag.is_empty() { r.insert_header(("ETag", etag.as_str())); }
+                if !last_modified.is_empty() { r.insert_header(("Last-Modified", last_modified.as_str())); }
+                return Ok(r.finish());
+            }
+        }
+        // If-Modified-Since: 304 if object was NOT modified after the given date.
+        if let Some(ref ims) = get_if_modified {
+            if let (Some(hdr_ts), Some(obj_ts)) =
+                (parse_http_date(ims), parse_http_date(&last_modified))
+            {
+                if obj_ts <= hdr_ts {
+                    let mut r = HttpResponse::NotModified();
+                    if !etag.is_empty() { r.insert_header(("ETag", etag.as_str())); }
+                    if !last_modified.is_empty() { r.insert_header(("Last-Modified", last_modified.as_str())); }
+                    return Ok(r.finish());
+                }
+            }
+        }
+    }
+
     // Resolve Range header if present.
     let (slices, response_len, range_header) = if let Some((rs, re)) = parse_range_header(&req, total_size) {
         let s = range_slices(&extents, rs, re);
@@ -599,7 +731,7 @@ pub async fn s3_get_object_handler(
         resp.insert_header(("Expires", exp.as_str()));
     }
     for (k, v) in &meta.user_metadata {
-        resp.insert_header((format!("x-amz-meta-{}", k).as_str(), v.as_str()));
+        resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
     }
     Ok(resp.streaming(byte_stream))
 }
@@ -648,7 +780,7 @@ pub async fn s3_head_object_handler(
         resp.insert_header(("Expires", exp.as_str()));
     }
     for (k, v) in &meta.user_metadata {
-        resp.insert_header((format!("x-amz-meta-{}", k).as_str(), v.as_str()));
+        resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
     }
     // Use HeadBody so actix-web derives Content-Length from the real object
     // size (via MessageBody::size) rather than from the zero-byte body.
@@ -693,6 +825,35 @@ pub async fn s3_delete_object_handler(
     let db = MetadataService::new(&auth_result.user_id)?;
 
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+
+    // Conditional DELETE: If-Match, x-amz-if-match-last-modified-time, x-amz-if-match-size
+    let if_match_del = req.headers().get("if-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let if_mtime_del = req.headers().get("x-amz-if-match-last-modified-time")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let if_size_del = req.headers().get("x-amz-if-match-size")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    if (if_match_del.is_some() || if_mtime_del.is_some() || if_size_del.is_some())
+        && db.check_key(&bucket, &key)?
+    {
+        let meta = db.get_object_full(&bucket, &key)?;
+        let resource = format!("/{}/{}", bucket, key);
+        if let Some(ref im) = if_match_del {
+            if im != "*" && normalize_etag(im) != normalize_etag(meta.etag.as_deref().unwrap_or("")) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+        if let Some(ref mtime) = if_mtime_del {
+            if mtime != meta.last_modified.as_deref().unwrap_or("") {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+        if let Some(ref sz) = if_size_del {
+            if sz.parse::<u64>().map(|expected| expected != meta.size).unwrap_or(false) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+    }
 
     // S3 DELETE is idempotent — 204 even if the key didn't exist.
     if db.check_key(&bucket, &key)? {
@@ -1076,20 +1237,31 @@ pub async fn s3_delete_objects_handler(
     }
     let body = String::from_utf8_lossy(&body_bytes);
 
-    // Minimal XML parse: extract all <Key>...</Key> values between <Object> tags.
-    let keys: Vec<String> = {
-        let mut keys = Vec::new();
+    // Parse each <Object> block extracting Key plus optional ETag/LastModifiedTime/Size.
+    struct ObjReq {
+        key: String,
+        etag: Option<String>,
+        last_modified_time: Option<String>,
+        size: Option<u64>,
+    }
+    let objects: Vec<ObjReq> = {
+        let mut objs = Vec::new();
         let mut remaining = body.as_ref();
-        while let Some(start) = remaining.find("<Key>") {
-            remaining = &remaining[start + 5..];
-            if let Some(end) = remaining.find("</Key>") {
-                keys.push(remaining[..end].to_string());
-                remaining = &remaining[end + 6..];
-            } else {
-                break;
+        while let Some(obj_start) = remaining.find("<Object>") {
+            remaining = &remaining[obj_start + 8..];
+            let obj_end = remaining.find("</Object>").unwrap_or(remaining.len());
+            let obj_body = &remaining[..obj_end];
+            if let Some(key) = extract_xml_tag(obj_body, "Key") {
+                objs.push(ObjReq {
+                    key,
+                    etag: extract_xml_tag(obj_body, "ETag"),
+                    last_modified_time: extract_xml_tag(obj_body, "LastModifiedTime"),
+                    size: extract_xml_tag(obj_body, "Size").and_then(|s| s.parse::<u64>().ok()),
+                });
             }
+            remaining = &remaining[obj_end..];
         }
-        keys
+        objs
     };
 
     let context = crate::service::user_context::UserContext::with_bucket(
@@ -1098,25 +1270,66 @@ pub async fn s3_delete_objects_handler(
     let storage_service = crate::service::storage_service::StorageService::new();
 
     let mut deleted_xml = String::new();
-    for key in &keys {
+    let mut errors_xml = String::new();
+
+    for obj_req in &objects {
+        let key = &obj_req.key;
+        let has_cond = obj_req.etag.is_some() || obj_req.last_modified_time.is_some() || obj_req.size.is_some();
+
+        if has_cond && db.check_key(&bucket, key)? {
+            let meta = db.get_object_full(&bucket, key)?;
+            let mut failed = false;
+
+            if !failed {
+                if let Some(ref req_etag) = obj_req.etag {
+                    if normalize_etag(req_etag) != normalize_etag(meta.etag.as_deref().unwrap_or("")) {
+                        failed = true;
+                    }
+                }
+            }
+            if !failed {
+                if let Some(ref req_mtime) = obj_req.last_modified_time {
+                    if req_mtime != meta.last_modified.as_deref().unwrap_or("") {
+                        failed = true;
+                    }
+                }
+            }
+            if !failed {
+                if let Some(req_size) = obj_req.size {
+                    if req_size != meta.size {
+                        failed = true;
+                    }
+                }
+            }
+
+            if failed {
+                errors_xml.push_str(&format!(
+                    "    <Error><Key>{}</Key><Code>PreconditionFailed</Code>\
+                     <Message>At least one of the pre-conditions you specified did not hold</Message></Error>\n",
+                    xml_escape(key),
+                ));
+                continue;
+            }
+        }
+
         if db.check_key(&bucket, key)? {
             storage_service.delete_object(&context, key)?;
         }
-        db.delete_metadata(&bucket, key).ok(); // idempotent
+        db.delete_metadata(&bucket, key).ok();
         deleted_xml.push_str(&format!(
             "    <Deleted><Key>{}</Key></Deleted>\n",
             xml_escape(key),
         ));
     }
 
-    info!("S3 DeleteObjects: bucket={} deleted={}", bucket, keys.len());
+    info!("S3 DeleteObjects: bucket={} objects={}", bucket, objects.len());
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <DeleteResult xmlns=\"{s3}\">\n\
-             {deleted}\
+             {deleted}{errors}\
          </DeleteResult>",
-        s3 = S3_XMLNS, deleted = deleted_xml,
+        s3 = S3_XMLNS, deleted = deleted_xml, errors = errors_xml,
     );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
@@ -1154,12 +1367,43 @@ pub async fn s3_copy_object_handler(
     if let Err(resp) = require_bucket(&db, &src_bucket) { return Ok(resp); }
     if let Err(resp) = require_bucket(&db, &dst_bucket) { return Ok(resp); }
 
+    // Self-copy without REPLACE directive is invalid (S3 returns 400 InvalidRequest).
+    let directive_early = req.headers().get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+    if src_bucket == dst_bucket && src_key == dst_key && directive_early != "REPLACE" {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest",
+                           "This copy request is illegal because it is trying to copy an object \
+                            to itself without changing the object's metadata, storage class, \
+                            website redirect location or encryption attributes.",
+                           &format!("/{}/{}", src_bucket, src_key)));
+    }
+
     if !db.check_key(&src_bucket, &src_key)? {
         return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
                            "The source key does not exist", &format!("/{}/{}", src_bucket, src_key)));
     }
 
     let src_meta = db.get_object_full(&src_bucket, &src_key)?;
+
+    // CopyObject conditionals: x-amz-copy-source-if-match / x-amz-copy-source-if-none-match
+    let copy_if_match = req.headers().get("x-amz-copy-source-if-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let copy_if_none_match = req.headers().get("x-amz-copy-source-if-none-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let src_etag_val = src_meta.etag.clone().unwrap_or_default();
+    let copy_resource = format!("/{}/{}", src_bucket, src_key);
+    if let Some(ref im) = copy_if_match {
+        if im != "*" && normalize_etag(im) != normalize_etag(&src_etag_val) {
+            return Ok(s3_precondition_failed(&copy_resource));
+        }
+    }
+    if let Some(ref inm) = copy_if_none_match {
+        if inm == "*" || normalize_etag(inm) == normalize_etag(&src_etag_val) {
+            return Ok(s3_precondition_failed(&copy_resource));
+        }
+    }
+
     let src_context = UserContext::with_bucket(auth_result.user_id.clone(), src_bucket.clone());
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), dst_bucket.clone());
 
@@ -1183,7 +1427,7 @@ pub async fn s3_copy_object_handler(
                 let n = name.as_str().to_lowercase();
                 if n.starts_with("x-amz-meta-") {
                     let k = n.trim_start_matches("x-amz-meta-").to_string();
-                    let v = value.to_str().ok()?.to_string();
+                    let v = String::from_utf8_lossy(value.as_bytes()).trim().to_string();
                     Some((k, v))
                 } else { None }
             })
@@ -1323,6 +1567,35 @@ pub async fn s3_complete_multipart_upload_handler(
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
+    // Conditional CompleteMultipartUpload: If-Match / If-None-Match (checks existing object).
+    let if_match_cmu = req.headers().get("if-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let if_none_match_cmu = req.headers().get("if-none-match")
+        .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    if if_match_cmu.is_some() || if_none_match_cmu.is_some() {
+        let resource = format!("/{}/{}", bucket, key);
+        let obj_exists = db.check_key(&bucket, &key)?;
+        let cur_etag = if obj_exists {
+            db.get_object_full(&bucket, &key)?.etag.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if let Some(ref im) = if_match_cmu {
+            if !obj_exists {
+                return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                                   "The specified key does not exist.", &resource));
+            }
+            if im != "*" && normalize_etag(im) != normalize_etag(&cur_etag) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+        if let Some(ref inm) = if_none_match_cmu {
+            if obj_exists && (inm == "*" || normalize_etag(inm) == normalize_etag(&cur_etag)) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+    }
+
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
@@ -1366,8 +1639,13 @@ pub async fn s3_complete_multipart_upload_handler(
         StorageService::new().delete_object(&context, &key)?;
     }
 
-    let final_bytes = crate::util::serializer::serialize_offset_size(&final_extents)?;
-    db.write_metadata(&bucket, &key, &final_bytes)?;
+    // Store the final object with a proper ETag so subsequent conditional requests can
+    // check against it. Use put_object_full so the etag field is persisted.
+    let multipart_etag = format!("\"s3-etag-multipart-{}\"", parts.len());
+    let mut final_metadata = Metadata::from_offset_size_list(final_extents.clone());
+    final_metadata.etag = Some(multipart_etag.clone());
+    final_metadata.last_modified = Some(rfc2616_now());
+    db.put_object_full(&bucket, &key, final_metadata)?;
 
     for (_, part_key) in &parts {
         db.delete_metadata(&bucket, part_key)?;
@@ -1381,11 +1659,12 @@ pub async fn s3_complete_multipart_upload_handler(
              <Location>http://{bucket}.s3.amazonaws.com/{key}</Location>\n\
              <Bucket>{bucket}</Bucket>\n\
              <Key>{key}</Key>\n\
-             <ETag>&quot;s3-etag-multipart&quot;</ETag>\n\
+             <ETag>{etag}</ETag>\n\
          </CompleteMultipartUploadResult>",
         s3 = S3_XMLNS,
         bucket = xml_escape(&bucket),
         key = xml_escape(&key),
+        etag = xml_escape(&multipart_etag),
     );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
