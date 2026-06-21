@@ -41,6 +41,11 @@ The naive fix is to rewrite the flat file in place: scan for holes, copy live da
 
 ---
 
+> **Checkpoint 1 — Problem established**
+> The current flat-file layout has no space reclaim path. Deletes remove the SQLite row but bytes stay on disk forever. In-place compaction is ruled out: it invalidates all offsets, is unsafe under crashes, and blocks reads. We need a layout where freeing space means deleting a whole file.
+
+---
+
 ### Step 3 — Segments: reclaim a whole file at a time
 
 Splitting the bucket storage into fixed-size segment files gives us that unit. A cold, under-utilized segment can be compacted by copying its survivors elsewhere and then deleting the entire `.seg` file. No other segment is touched.
@@ -80,6 +85,11 @@ The orange region is wasted disk space — bytes that are dead but still occupy 
 
 ---
 
+> **Checkpoint 2 — Storage structure decided**
+> Storage splits into fixed-size 512 MB segment files per bucket. No schema change needed: the existing global offset encodes the segment file and seek position via integer divide and modulo. Segment utilization is computed on demand from the `objects` table — no counters, no new tables, no drift on crash. A segment is "cold" when the live bytes queried from SQLite fall below threshold T.
+
+---
+
 ### Step 5 — Where do survivors go?
 
 When we compact a cold segment, the live bytes have to go somewhere. Two options:
@@ -98,7 +108,7 @@ Whether this actually hurts performance in practice — i.e., whether I/O interf
 
 Before committing to either approach, we wanted a formal cost model. Two metrics:
 
-- **WA (write amplification)** — how many times is each user byte written? Once fresh (cost 1), plus once during compaction if the segment containing it gets compacted. Worst case: `WA = 1 + T` where T is the cold threshold.
+- **WA (write amplification)** — how many times is each user byte written? Once fresh (cost 1), plus once per compaction it lives through. A byte gets compacted every time the segment it's in goes cold before the byte is deleted. The full model is `WA = 1 + k` where k depends on T and how long objects live — see the Analytical Modeling section.
 - **SA (space amplification)** — how much disk does a byte occupy beyond its live size? At worst case utilization T, with headroom fraction f: `SA = 1 / (T * (1 - f))`.
 
 The objective is to minimize `α*WA + β*SA` where α and β express how much you care about each.
@@ -112,6 +122,11 @@ The objective `α*(1 + T) + β*(1 + T)/T` is nonlinear because of the `β/T` ter
 ![Objective function vs T for different priority weights](plot_objective_surface.png)
 
 Each curve is a different priority weighting. The dot marks where each curve hits its minimum — the optimal T for that weighting. For the balanced and SA-heavy curves the minimum sits at the right boundary (T = 0.5), not in the interior. The optimizer is always pushing toward compacting aggressively — lower T values just waste more space without improving write efficiency. The red dotted line at T = 0.30 (our proposed value) is deliberately conservative: we accepted worse SA in exchange for not compacting segments that might only be temporarily cold.
+
+---
+
+> **Checkpoint 3 — Cost model established**
+> We have two knobs: T (cold threshold) and f (headroom fraction). Write amplification is WA = 1 + k, where k is the average number of times a byte gets compacted — it grows with object lifetime and with T. Space amplification is SA = (1+T)/T once headroom is set to its minimum feasible value f = T/(1+T). Both metrics are now functions of T alone. The optimizer finds T* = sqrt(β/α), capped at 0.5 — meaning T = 0.5, f = 0.33 is optimal for almost any weighting that cares about space at all. Our proposed T = 0.30 is intentionally conservative.
 
 ---
 
@@ -160,6 +175,11 @@ Left: as ρ increases from 1 (no interference), Approach A's effective cost rise
 
 ---
 
+> **Checkpoint 4 — Approach decision deferred to benchmarks**
+> Without headroom (A): lower SA, but compaction and fresh writes share the active segment. With headroom (B): 50% worse SA at T = 0.5, but compaction is fully isolated in active-1. WA is the same in both. The decision reduces to a single measurement: ρ, the throughput slowdown compaction causes in A. If ρ < 1.67 (balanced weights), implement A. If ρ > 1.67, implement B. The benchmark is designed to measure this.
+
+---
+
 ### Step 9 — Making compaction lock-free
 
 The compaction process is naturally crash-safe and lock-free without any additional coordination:
@@ -173,6 +193,11 @@ If the server crashes during step 1: the commit never happened, old offsets are 
 For reads: a reader that fetches old offsets from SQLite before the commit continues reading from the old file (which still exists). A reader that fetches after the commit gets new offsets and reads from the new location. The one race — reading old offset, commit fires, file is deleted before the reader opens it — is handled by: (a) the grace period on deletion (in-flight readers finish before the file disappears), and (b) an `ENOENT` retry that re-reads the offset from SQLite, which by that point has the new value.
 
 No mutexes. No read locks. No blocking the writer.
+
+---
+
+> **Checkpoint 5 — Design complete**
+> We have a full design ready to implement. Segment files give us space reclamation without schema changes. Utilization comes from SQLite for free. The compaction process is crash-safe and lock-free: copy survivors → commit offsets atomically → delete old segment after a grace period. The one open question is whether to implement A or B, which the benchmark resolves by measuring ρ. Everything else — segment size, headroom, cold threshold — has optimal values derived from the cost model and can be tuned after benchmarking.
 
 ---
 
@@ -329,33 +354,75 @@ Left: each curve is a different object lifetime L. Short-lived objects (L = 1, b
 
 The benchmark measures actual WA directly as total bytes written ÷ total user bytes written, which captures all of this without needing to know L. The model gives us the shape of the relationship; the benchmark pins the exact number.
 
-**Space amplification** is the ratio of disk space occupied to actual live data. The worst case is a segment just above the compaction threshold — it hasn't been compacted yet, so it holds T fraction of live data in (1-f) fraction of the segment:
+**Space amplification** is the ratio of total disk used to actual live data. SA = 3 means you are using 3× as much disk as your data actually needs — two thirds of the storage is dead bytes waiting to be reclaimed.
+
+The worst case for SA is a segment sitting just above the cold threshold — it has accumulated the maximum tolerable dead bytes and hasn't been compacted yet. Let's walk through a concrete example.
+
+Take a 512 MB segment with T = 0.5 and no headroom (f = 0, Approach A):
 
 ```
-SA = 1 / (T × (1-f))
+Data capacity  = (1 - f) × S  =  (1 - 0) × 512 MB  =  512 MB
+Live bytes     = T × 512 MB   =  0.5 × 512 MB        =  256 MB   ← half is dead
+Disk used      = 512 MB       (the whole file is on disk)
+
+SA  =  disk used / live bytes  =  512 / 256  =  2.0
 ```
 
-The smaller T is, the more disk space you waste before compaction kicks in.
+For every 1 MB of real data you have, you're occupying 2 MB of disk. The other 1 MB is dead bytes that haven't been reclaimed yet.
 
-**Tying f to T:** The headroom must be large enough to absorb all survivors from one cold segment. A segment with utilization T has T×(1-f)×S live bytes; the headroom is f×S bytes. For them to fit:
-
-```
-f  ≥  T / (1 + T)
-```
-
-Setting f to its minimum value (the tightest headroom that still works) and substituting into SA:
+Now add headroom for Approach B with T = 0.5 and f = 0.33 (headroom takes up 33% of the segment):
 
 ```
-SA = (1 + T) / T
+Data capacity  = (1 - 0.33) × 512 MB  =  342 MB
+Live bytes     = T × 342 MB            =  0.5 × 342 MB  =  171 MB
+Disk used      = 512 MB
+
+SA  =  512 / 171  =  3.0
 ```
 
-Now both metrics are functions of T alone — one knob controls everything.
+SA went from 2.0 to 3.0 just because of the headroom — 170 MB per segment is now permanently reserved and not counted as live data.
+
+The general formula is:
+
+```
+SA  =  1 / (T × (1-f))
+```
+
+**What happens with a lower T?** Say T = 0.3 (Approach A, f = 0):
+
+```
+Live bytes  =  0.3 × 512 MB  =  154 MB   ← only 30% alive, 70% dead
+SA  =  512 / 154  =  3.3
+```
+
+Lower T means you tolerate more dead bytes before compacting, so SA gets worse. This is the fundamental tension: aggressive compaction (high T) gives better SA but more write overhead.
+
+**Tying f to T:** Headroom must be large enough to absorb all survivors when we compact a cold segment. A cold segment has `T×(1-f)×S` live bytes that need to fit into headroom `f×S`:
+
+```
+f×S  ≥  T×(1-f)×S
+  f  ≥  T / (1 + T)
+```
+
+At T = 0.5: f ≥ 0.5/1.5 = 0.33. That's exactly the 33% we used above — it's the minimum headroom that guarantees survivors always fit.
+
+Substituting f = T/(1+T) back into the SA formula:
+
+```
+SA  =  1 / (T × (1 - T/(1+T)))
+    =  1 / (T × 1/(1+T))
+    =  (1 + T) / T
+```
+
+Verified with our examples: at T = 0.5, SA = 1.5/0.5 = 3.0 ✓. At T = 0.3, SA = 1.3/0.3 = 4.3.
+
+Now both WA and SA are functions of T alone — one knob controls the whole trade-off.
 
 ---
 
 ### Finding the best T for Approach B
 
-We want to minimize a weighted combination of WA and SA:
+We want to minimize a weighted combination of WA and SA. The optimizer uses the L = 1 approximation for WA (one compaction per byte lifetime) — a reasonable baseline until benchmarks tell us the actual object lifetime distribution:
 
 ```
 minimize over T:    α × (1 + T)  +  β × (1 + T) / T
@@ -386,11 +453,11 @@ The pure extremes (only WA or only SA) are degenerate — one wastes all disk, t
 
 ### Comparing Approach A vs Approach B
 
-At equal T, the two approaches differ only in SA:
+At equal T, the two approaches have the same WA (both compact the same bytes the same number of times) but differ in SA:
 
 ```
-Approach A (no headroom):   WA = 1 + T,   SA = 1 / T
-Approach B (with headroom): WA = 1 + T,   SA = (1 + T) / T
+Approach A (no headroom):   WA = 1 + k,   SA = 1 / T
+Approach B (with headroom): WA = 1 + k,   SA = (1 + T) / T
 ```
 
 B always has worse SA — headroom is dead space until used. The only thing that makes B worth it is if compaction into the active segment (Approach A) measurably slows fresh writes.
