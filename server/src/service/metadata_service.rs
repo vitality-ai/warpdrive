@@ -166,6 +166,11 @@ impl MetadataService {
         SQLiteMetadataStore::new().delete_multipart_upload(upload_id)
     }
 
+    pub fn delete_completed_uploads_for_key(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_completed_uploads_for_key(bucket, key)
+    }
+
     pub fn list_multipart_uploads_for_bucket(&self, bucket: &str)
         -> Result<Vec<crate::metadata::sqlite_store::MultipartUploadRow>, Error>
     {

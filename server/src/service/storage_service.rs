@@ -89,21 +89,16 @@ impl StorageService {
             .read(&context.user_id, &context.bucket, offset, size)
     }
 
-    // Delete an object: read metadata, delete ranges, remove metadata
+    // Delete an object: queue storage bytes for GC, remove metadata immediately.
     pub fn delete_object(&self, context: &UserContext, key: &str) -> Result<(), Error> {
-        let db = MetadataService::new(&context.user_id)?;
-        // Ensure key exists
-        db.check_key_nonexistance(&context.bucket, key)?;
-        // Read and deserialize ranges
-        let offset_size_bytes = db.read_metadata(&context.bucket, key)
+        let metadata = MetadataService::new(&context.user_id)?;
+        metadata.check_key_nonexistance(&context.bucket, key)?;
+        let offset_size_bytes = metadata.read_metadata(&context.bucket, key)
             .map_err(|_| ErrorBadRequest("Key does not exist"))?;
         let offset_size_list = deserialize_offset_size(&offset_size_bytes)?;
-        // Queue deletion using the metadata service
-        let db = MetadataService::new(&context.user_id)?;
-        db.queue_deletion(&context.bucket, key, &offset_size_list)?;
-        // Delete metadata
-        db.delete_metadata(&context.bucket, key)
-            .map_err(|e| actix_web::error::ErrorInternalServerError(e))
+        metadata.queue_deletion(&context.bucket, key, &offset_size_list)?;
+        metadata.delete_metadata(&context.bucket, key)?;
+        metadata.delete_completed_uploads_for_key(&context.bucket, key)
     }
 
     /// Delete storage chunks directly (used by deletion worker)

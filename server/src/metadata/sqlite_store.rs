@@ -522,6 +522,15 @@ impl SQLiteMetadataStore {
         Ok(())
     }
 
+    pub fn delete_completed_uploads_for_key(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "DELETE FROM multipart_uploads WHERE bucket = ?1 AND key = ?2 AND status = 'completed'",
+            params![bucket, key],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
     pub fn list_bucket_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadRow>, Error> {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
