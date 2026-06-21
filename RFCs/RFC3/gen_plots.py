@@ -66,69 +66,46 @@ def crossover_rho(alpha, beta):
 # ════════════════════════════════════════════════════════════════════════════
 
 def plot_address_space():
-    fig, ax = plt.subplots(figsize=(10, 3.6))
-    ax.set_xlim(0, 3)
-    ax.set_ylim(-0.6, 1.4)
+    SEG = 512  # MB units for display
+
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    ax.set_xlim(0, 3 * SEG)
+    ax.set_ylim(-0.55, 1.3)
     ax.axis("off")
 
-    SEG = 512          # MB units for display
-    colors  = [BLUE, ORANGE, GREEN]
-    labels  = ["0000000000.seg\nsealed, cold", "0000000001.seg\nsealed, headroom", "0000000002.seg\nactive"]
-    states  = ["sealed", "headroom", "active"]
-    hatches = ["//", "..", ""]
+    colors = [BLUE, ORANGE, GREEN]
+    labels = ["0000000000.seg\nsealed", "0000000001.seg\nsealed", "0000000002.seg\nactive"]
 
-    for i, (col, lbl, hatch) in enumerate(zip(colors, labels, hatches)):
+    for i, (col, lbl) in enumerate(zip(colors, labels)):
         left = i * SEG
-        # full segment bar
-        ax.barh(0, SEG, left=left, height=0.55, color=col, alpha=0.25, edgecolor=col, linewidth=1.5)
-        ax.barh(0, SEG, left=left, height=0.55, color="none", edgecolor=col, linewidth=1.5, hatch=hatch)
-
-        # offset labels
+        ax.barh(0, SEG, left=left, height=0.55, color=col, alpha=0.22, edgecolor=col, linewidth=1.8)
+        # boundary offset labels
         start_gb = i * SEG / 1024
-        end_gb   = (i + 1) * SEG / 1024
-        ax.text(left, -0.35, f"{start_gb:.2f} GB", ha="center", va="top", fontsize=9, color=GRAY)
-        ax.text(left + SEG, -0.35, f"{end_gb:.2f} GB", ha="center", va="top", fontsize=9, color=GRAY)
+        ax.text(left, -0.32, f"{start_gb:.3f} GB", ha="center", va="top", fontsize=9, color=GRAY)
+        # file label above bar
+        ax.text(left + SEG / 2, 0.62, lbl, ha="center", va="bottom",
+                fontsize=9, color=col, fontweight="bold")
 
-        # file label above
-        ax.text(left + SEG/2, 0.62, lbl, ha="center", va="bottom", fontsize=9, color=col, fontweight="bold")
+    # rightmost boundary
+    ax.text(3 * SEG, -0.32, f"{3 * SEG / 1024:.3f} GB", ha="center", va="top", fontsize=9, color=GRAY)
 
-    # headroom marker on seg 1
-    headroom = 150   # MB
-    hstart   = 1*SEG + (SEG - headroom)
-    ax.barh(0, headroom, left=hstart, height=0.55, color=ORANGE, alpha=0.55, edgecolor=ORANGE, linewidth=0)
-    ax.text(hstart + headroom/2, 0, "headroom\n150 MB", ha="center", va="center", fontsize=8,
-            color="white", fontweight="bold")
-
-    # decode example annotation
-    example_offset = 1 * SEG + 200   # MB
-    ax.annotate(
-        f"  global offset = {example_offset/1024:.3f} GB\n"
-        f"  → seg_id   = {example_offset}÷512 = 1\n"
-        f"  → local    = {example_offset%512} MB in 0000000001.seg",
-        xy=(example_offset/1024 * (512/1), 0.28),
-        xytext=(2.5 * 512 / 1024, 1.1),
-        fontsize=8.5,
-        arrowprops=dict(arrowstyle="->", color="black", lw=1),
-        bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"),
-    )
-
-    # — recompute in actual pixel coords is messy; place annotation differently —
-    # Use data coords: x axis is 0..3*SEG (=1536 MB)
-    ax.set_xlim(0, 3 * SEG)
+    # decode example: object at local offset 200 MB inside segment 1
     example_x = 1 * SEG + 200  # 712 MB
     ax.annotate(
-        f"  global_offset = {1*SEG + 200} MB\n"
-        f"  seg_id   = {1*SEG+200} ÷ 512 = 1  →  0000000001.seg\n"
-        f"  local    = {(1*SEG+200) % SEG} MB  →  seek here",
+        f"  global_offset = {example_x} MB\n"
+        f"  seg_id        = {example_x} ÷ 512  =  1  →  0000000001.seg\n"
+        f"  local_offset  = {example_x % SEG} MB  →  seek here",
         xy=(example_x, 0.28),
-        xytext=(2.0 * SEG, 1.15),
-        fontsize=8.5,
-        arrowprops=dict(arrowstyle="->", color="black", lw=1),
-        bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"),
+        xytext=(1.82 * SEG, 1.1),
+        fontsize=9,
+        arrowprops=dict(arrowstyle="->", color="black", lw=1.2),
+        bbox=dict(boxstyle="round,pad=0.35", fc="lightyellow", ec="gray"),
         va="bottom",
     )
+    # dot at the example point
+    ax.scatter([example_x], [0], color="black", s=30, zorder=5)
 
-    ax.set_title("Global Offset → Segment File Decoding  (SEGMENT_SIZE = 512 MB)", pad=12)
+    ax.set_title("Global Offset → Segment File Decoding  (SEGMENT_SIZE = 512 MB)", pad=10)
     plt.tight_layout()
     plt.savefig("plot_address_space.png", bbox_inches="tight")
     plt.close()
@@ -237,7 +214,7 @@ def plot_objective_surface():
 
     ax.set_xlabel("Cold threshold  T")
     ax.set_ylabel("Objective  α·WA + β·SA")
-    ax.set_title("Objective Function vs T  (Approach C, f = T/(1+T))")
+    ax.set_title("Objective Function vs T  (Approach B, f = T/(1+T))")
     ax.legend()
     ax.grid(True, alpha=0.25)
     plt.tight_layout()
@@ -247,7 +224,7 @@ def plot_objective_surface():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Plot 4 — WA / SA Pareto frontier for Approach C
+# Plot 4 — WA / SA Pareto frontier for Approach B
 # ════════════════════════════════════════════════════════════════════════════
 
 def plot_pareto_c():
@@ -280,7 +257,7 @@ def plot_pareto_c():
 
     ax.set_xlabel("Write Amplification (WA)")
     ax.set_ylabel("Space Amplification (SA)")
-    ax.set_title("WA / SA Pareto Frontier — Approach C")
+    ax.set_title("WA / SA Pareto Frontier — Approach B")
     ax.legend()
     ax.grid(True, alpha=0.25)
     plt.tight_layout()
@@ -290,7 +267,7 @@ def plot_pareto_c():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Plot 5 — B vs C crossover as a function of ρ
+# Plot 5 — A vs B crossover as a function of ρ
 # ════════════════════════════════════════════════════════════════════════════
 
 def plot_b_vs_c():
@@ -305,18 +282,18 @@ def plot_b_vs_c():
     vBs = [solve_B(alpha, beta, rho)["V"] for rho in rhos]
     rc  = crossover_rho(alpha, beta)
 
-    ax.plot(rhos, vBs, color=ORANGE, lw=2, label="V*(B, ρ)  — Approach B")
-    ax.axhline(vC, color=BLUE, lw=2, ls="--", label=f"V*(C) = {vC:.2f}  — Approach C")
+    ax.plot(rhos, vBs, color=ORANGE, lw=2, label="V*(A, ρ)  — Approach A")
+    ax.axhline(vC, color=BLUE, lw=2, ls="--", label=f"V*(B) = {vC:.2f}  — Approach B")
     ax.axvline(rc, color=GRAY, lw=1.2, ls=":", label=f"ρ_c = {rc:.2f}")
     ax.fill_between(rhos, vBs, vC,
                     where=[v > vC for v in vBs],
-                    alpha=0.15, color=BLUE, label="C preferred")
+                    alpha=0.15, color=BLUE, label="B preferred")
     ax.fill_between(rhos, vBs, vC,
                     where=[v <= vC for v in vBs],
-                    alpha=0.15, color=ORANGE, label="B preferred")
+                    alpha=0.15, color=ORANGE, label="A preferred")
     ax.set_xlabel("Write interference  ρ")
     ax.set_ylabel("Optimal objective  V*")
-    ax.set_title("B vs C — Balanced weights  (α = β = 0.5)")
+    ax.set_title("A vs B — Balanced weights  (α = β = 0.5)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.25)
 

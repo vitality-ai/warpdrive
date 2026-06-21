@@ -58,6 +58,8 @@ The existing `(offset, size)` pairs in SQLite are unchanged. The reader just nee
 
 ![Virtual address space to segment file decoding](plot_address_space.png)
 
+Each block is a 512 MB file on disk. The arrow shows how a single number — the global offset stored in SQLite — tells you exactly which file to open and where to seek inside it. No new columns, no mapping table. Reads just do two integer operations (divide and modulo) before opening the file.
+
 ---
 
 ### Step 4 — Utilization: how do we know when a segment is cold?
@@ -74,19 +76,21 @@ WHERE extent_start >= N * SEGMENT_SIZE
 
 ![Space amplification over time across write, delete, and compaction phases](plot_utilization_timeline.png)
 
+The orange region is wasted disk space — bytes that are dead but still occupy storage. In Phase 2, deleting 70% of the data drops live bytes immediately but disk usage stays flat. That gap is space amplification in action. Compaction in Phase 3 closes it by copying survivors out of cold segments and deleting those segment files entirely. Without compaction the orange region grows forever as the workload continues.
+
 ---
 
 ### Step 5 — Where do survivors go?
 
 When we compact a cold segment, the live bytes have to go somewhere. Two options:
 
-**Option B** — compact into the active segment. Simple: survivors are just appended like any other write. No structural change needed.
+**Option A** — compact into the active segment. Simple: survivors are just appended like any other write. No structural change needed.
 
-**Option C** — reserve headroom in `active - 1`, compact there. This completely separates fresh writes (active) from compaction writes (active - 1). The active segment is never touched by the compactor.
+**Option B** — reserve headroom in `active - 1`, compact there. This completely separates fresh writes (active) from compaction writes (active - 1). The active segment is never touched by the compactor.
 
-The motivation for C is architectural clarity: the active segment has a single writer and a single write pattern (append-only, sequential). Adding compaction writes would mean two concurrent writers with different access patterns on the same file.
+The motivation for B is architectural clarity: the active segment has a single writer and a single write pattern (append-only, sequential). Adding compaction writes would mean two concurrent writers with different access patterns on the same file.
 
-Whether this actually hurts performance in practice — i.e., whether I/O interference between fresh writes and compaction writes is measurable — is an empirical question. We formulated a model to figure out when C is actually worth the extra complexity, and ran it before deciding.
+Whether this actually hurts performance in practice — i.e., whether I/O interference between fresh writes and compaction writes is measurable — is an empirical question. We formulated a model to figure out when B is actually worth the extra complexity, and ran it before deciding.
 
 ---
 
@@ -107,6 +111,8 @@ The objective `α*(1 + T) + β*(1 + T)/T` is nonlinear because of the `β/T` ter
 
 ![Objective function vs T for different priority weights](plot_objective_surface.png)
 
+Each curve is a different priority weighting. The dot marks where each curve hits its minimum — the optimal T for that weighting. For the balanced and SA-heavy curves the minimum sits at the right boundary (T = 0.5), not in the interior. The optimizer is always pushing toward compacting aggressively — lower T values just waste more space without improving write efficiency. The red dotted line at T = 0.30 (our proposed value) is deliberately conservative: we accepted worse SA in exchange for not compacting segments that might only be temporarily cold.
+
 ---
 
 ### Step 7 — What the optimizer told us about T
@@ -119,34 +125,38 @@ Running the closed-form across a range of α/β weights:
 
 **Decision to revisit**: bump the proposed threshold closer to T* = 0.45–0.50 after benchmarking confirms real-world utilization distributions.
 
-![WA vs SA Pareto frontier for Approach C](plot_pareto_c.png)
+![WA vs SA Pareto frontier for Approach B](plot_pareto_c.png)
+
+Each point on the frontier is an operating point — a choice of T giving a specific WA/SA trade-off. Moving right means lower T: you compact less aggressively, giving less write amplification but more disk waste. Most of the frontier collapses to the same point (T = 0.5, WA = 1.5, SA = 3.0) because the optimizer hits the cap across most weightings. The proposed point (red) has worse SA than optimal — that is the cost of keeping T conservative at 0.30.
 
 ---
 
-### Step 8 — Comparing B and C: when does headroom actually pay off?
+### Step 8 — Comparing A and B: when does headroom actually pay off?
 
-The optimization above is for Approach C. But C has a cost: headroom is dead space until filled. At equal T, Approach B has strictly lower SA:
+The optimization above is for Approach B. But B has a cost: headroom is dead space until filled. At equal T, Approach A has strictly lower SA:
 
 ```
-SA_B = 1 / T               (no headroom waste)
-SA_C = (1 + T) / T         (headroom overhead)
+SA_A = 1 / T               (no headroom waste)
+SA_B = (1 + T) / T         (headroom overhead)
 
-At T = 0.5:  SA_B = 2.0,  SA_C = 3.0   (C is 50% worse)
+At T = 0.5:  SA_A = 2.0,  SA_B = 3.0   (B is 50% worse)
 ```
 
-WA is identical in both when there is no I/O interference. So at `ρ = 1`, B always wins.
+WA is identical in both when there is no I/O interference. So at `ρ = 1`, A always wins.
 
 We modeled interference as a multiplier `ρ ≥ 1` on B's effective WA and solved a bi-level program to find the crossover:
 
 ```
-α = 0.5, β = 0.5:   ρ_c = 1.67    (B needs to slow writes 67% for C to win)
-α = 0.9, β = 0.1:   ρ_c = 1.08    (WA-heavy: any contention tips to C)
-α = 0.1, β = 0.9:   ρ_c = 7.00    (Space-heavy: C almost never wins)
+α = 0.5, β = 0.5:   ρ_c = 1.67    (A needs to slow writes 67% for B to win)
+α = 0.9, β = 0.1:   ρ_c = 1.08    (WA-heavy: any contention tips to B)
+α = 0.1, β = 0.9:   ρ_c = 7.00    (Space-heavy: B almost never wins)
 ```
 
 This is the decision the benchmark has to resolve: measure actual ρ, compare to ρ_c.
 
-![Approach B vs C optimal objective as a function of interference ρ](plot_b_vs_c.png)
+![Approach A vs B optimal objective as a function of interference ρ](plot_b_vs_c.png)
+
+Left: as ρ increases from 1 (no interference), Approach A's effective cost rises while B's stays flat. They cross at ρ_c = 1.67 — the point where B's headroom overhead is exactly offset by A's interference cost. Below the crossover A wins; above it B wins. Right: ρ_c shifts significantly by priority weighting. If you care mostly about write throughput (α = 0.9), almost any interference tips you to B (ρ_c = 1.08). If you care mostly about space (α = 0.1), you would need compaction to cause a 7× throughput drop before B is worth the extra headroom overhead. The benchmark's job is to measure actual ρ and place it on this chart.
 
 ---
 
@@ -253,7 +263,7 @@ Segment N-1:  [==live==|--dead--|  headroom  ]  ← compaction destination
 Segment N:    [===fresh writes...            ]  ← active, untouched
 ```
 
-Whether this separation actually prevents I/O contention in practice is an empirical question answered by benchmarks. If contention is negligible (Approach B), C pays a higher SA cost for cleanliness with no throughput benefit.
+Whether this separation actually prevents I/O contention in practice is an empirical question answered by benchmarks. If contention is negligible (Approach A), B pays a higher SA cost for cleanliness with no throughput benefit.
 
 ### Lock-Free Compaction
 
@@ -281,160 +291,108 @@ The one race: a reader fetches old offset from SQLite, compaction commits and un
 
 ## Analytical Modeling
 
-We formulate two optimization problems. The first (single-level) finds the optimal parameters for Approach C. The second (bi-level) determines under what conditions Approach C is preferable to Approach B.
+Two questions drive this section: what are the optimal values of T and f for Approach B, and is Approach B actually better than A?
 
-### Notation
-
-| Symbol | Meaning |
-|---|---|
-| `S` | SEGMENT_SIZE (bytes) |
-| `T ∈ (0, 0.5]` | Cold threshold — compact segments with utilization below T |
-| `f ∈ [0, 0.5]` | Headroom fraction — `f*S` bytes reserved per sealed segment |
-| `u ∈ (0, T]` | Utilization of a segment at compaction time; worst case `u = T` |
-| `α, β ≥ 0, α+β=1` | Objective weights for WA and SA respectively |
-| `ρ ≥ 1` | Write interference factor for Approach B (measured from benchmarks) |
+**Symbols used:**
+- `T` — cold threshold (0 to 0.5): compact a segment when its utilization falls below this fraction
+- `f` — headroom fraction: what fraction of each segment is reserved for compaction writes
+- `α, β` — how much you care about write amplification vs space amplification (α + β = 1)
+- `ρ` — measured write interference: how much compaction slows concurrent fresh writes in Approach A
 
 ---
 
-### Derivation of WA and SA
+### Where WA and SA come from
 
-**Write Amplification (WA)**
-
-Every user byte is written once as a fresh write (cost 1). When a segment is compacted, the fraction `u` of its data capacity `(1-f)*S` that is still live must be copied to the destination segment. So:
+**Write amplification** is straightforward: every byte is written once as a fresh write, and once more if the segment it lands in gets compacted. The worst case is a segment sitting exactly at the threshold with utilization T, so:
 
 ```
-WA = 1 + u
+WA = 1 + T
 ```
 
-Worst case is `u = T` (we compact exactly at threshold), giving `WA = 1 + T`.
+A T of 0.5 means every byte is copied at most once during its lifetime (WA = 1.5). A T of 0.1 means compaction barely runs but when it does, less data moves.
 
-**Space Amplification (SA)**
-
-In steady state the worst-case segment is one sitting just above the compaction threshold — it has `u*(1-f)*S` live bytes but occupies `S` bytes on disk. Space amplification is the ratio of disk usage to live data:
+**Space amplification** is the ratio of disk space occupied to actual live data. The worst case is a segment just above the compaction threshold — it hasn't been compacted yet, so it holds T fraction of live data in (1-f) fraction of the segment:
 
 ```
-SA = S / (u * (1-f) * S)  =  1 / (u * (1-f))
+SA = 1 / (T × (1-f))
 ```
 
-At worst case `u = T`:
+The smaller T is, the more disk space you waste before compaction kicks in.
+
+**Tying f to T:** The headroom must be large enough to absorb all survivors from one cold segment. A segment with utilization T has T×(1-f)×S live bytes; the headroom is f×S bytes. For them to fit:
 
 ```
-SA = 1 / (T * (1-f))
+f  ≥  T / (1 + T)
 ```
 
-**Headroom Feasibility**
-
-The headroom `f*S` in `active - 1` must be large enough to absorb the survivors from one cold segment (`T*(1-f)*S` bytes):
-
-```
-f * S  ≥  T * (1-f) * S
-f      ≥  T / (1 + T)
-```
-
-Setting `f = T/(1+T)` (minimum feasible headroom) and substituting into SA:
+Setting f to its minimum value (the tightest headroom that still works) and substituting into SA:
 
 ```
 SA = (1 + T) / T
 ```
 
-This is the key simplification: once headroom is set to its minimum feasible value, both WA and SA are functions of T alone.
+Now both metrics are functions of T alone — one knob controls everything.
 
 ---
 
-### Problem 1 — Single-Level: Optimal Parameters for Approach C
+### Finding the best T for Approach B
 
-We minimize a weighted sum of WA and SA over T:
-
-```
-minimize_{T}    α * (1 + T)  +  β * (1 + T) / T
-                = (1 + T)(α + β/T)
-
-subject to      0 < T ≤ 0.5
-                f = T / (1 + T)          (minimum feasible headroom)
-```
-
-This is a **nonlinear convex program** in one variable. The objective contains `β/T` which is nonlinear (hyperbolic), but the second derivative `2β/T³ > 0` confirms convexity for T > 0. We solve it analytically by setting the first derivative to zero:
+We want to minimize a weighted combination of WA and SA:
 
 ```
-d/dT [(1+T)(α + β/T)]  =  α  -  β/T²  =  0
+minimize over T:    α × (1 + T)  +  β × (1 + T) / T
 
+subject to:         0 < T ≤ 0.5
+```
+
+Setting the derivative to zero gives a clean closed form:
+
+```
 T* = sqrt(β / α),   capped at 0.5
 f* = T* / (1 + T*)
 ```
 
-**Closed-form results** (T* capped at 0.5 when β/α ≥ 1):
+What this says intuitively: if you care mostly about space (high β), you want a high T — compact aggressively and accept more write overhead. If you care mostly about write throughput (high α), you want a lower T — compact only when segments are very cold. The cap at 0.5 means the answer is T = 0.5 for most practical weightings:
 
-| α | β | T* | f* | WA | SA |
-|---|---|---|---|---|---|
-| 1.0 | 0.0 | → 0 | → 0 | → 1.0 | → ∞ |
-| 0.9 | 0.1 | 0.33 | 0.25 | 1.33 | 4.00 |
-| 0.5 | 0.5 | 0.50 | 0.33 | 1.50 | 3.00 |
-| 0.1 | 0.9 | 0.50 | 0.33 | 1.50 | 3.00 |
-| 0.0 | 1.0 | → ∞ | → 1 | → ∞ | → 1.0 |
+| Priority | α | β | T* | f* | WA | SA |
+|---|---|---|---|---|---|---|
+| Only WA | 1.0 | 0.0 | → 0 | → 0 | → 1.0 | → ∞ |
+| WA-heavy | 0.9 | 0.1 | 0.33 | 0.25 | 1.33 | 4.00 |
+| Balanced | 0.5 | 0.5 | 0.50 | 0.33 | 1.50 | 3.00 |
+| SA-heavy | 0.1 | 0.9 | 0.50 | 0.33 | 1.50 | 3.00 |
+| Only SA | 0.0 | 1.0 | → ∞ | → 1 | → ∞ | → 1.0 |
 
-The solution is flat for most α/β values: `T* = 0.5, f* = 0.33` is optimal whenever SA matters at all (β/α ≥ 1). This is confirmed numerically by `optimize.py`.
+The pure extremes (only WA or only SA) are degenerate — one wastes all disk, the other rewrites all data constantly. For anything in between, T = 0.5 and f = 0.33 is the answer.
 
 ---
 
-### Problem 2 — Bi-Level: Approach B vs Approach C
+### Comparing Approach A vs Approach B
 
-Approach B compacts into the active segment (no headroom, `f = 0`). Approach C compacts into `active - 1` headroom (`f = T/(1+T)`). Their metrics at equal T are:
-
-```
-             WA          SA
-Approach B:  1 + T       1 / T              (no headroom waste)
-Approach C:  1 + T       (1 + T) / T        (headroom overhead)
-```
-
-WA is identical. B has strictly lower SA than C at any T — headroom is dead space until filled. If there is no I/O contention in B, then B dominates C.
-
-The variable that determines which approach to implement is `ρ ≥ 1` — the ratio of write throughput under idle conditions to write throughput while compaction is running concurrently on the active segment:
+At equal T, the two approaches differ only in SA:
 
 ```
-ρ = throughput_idle / throughput_during_compaction
+Approach A (no headroom):   WA = 1 + T,   SA = 1 / T
+Approach B (with headroom): WA = 1 + T,   SA = (1 + T) / T
 ```
 
-`ρ = 1` means no impact. `ρ = 2` means compaction halves fresh write throughput.
+B always has worse SA — headroom is dead space until used. The only thing that makes B worth it is if compaction into the active segment (Approach A) measurably slows fresh writes.
 
-We model effective WA inclusive of interference:
-
-```
-WA_B_eff = (1 + T) * ρ       WA_C_eff = 1 + T  (no shared segment)
-SA_B      = 1 / T             SA_C      = (1 + T) / T
-```
-
-We formulate approach selection as a **bi-level program** parameterized by ρ:
+We define `ρ` as the throughput ratio: `ρ = throughput_idle / throughput_during_compaction`. A value of 1.5 means compaction makes writes 33% slower. We solve each approach independently for its optimal T, then compare their minimum costs:
 
 ```
-Upper level:    choose x ∈ {B, C}  to minimize  V*(x, ρ)
-
-Lower level B:  V*(B, ρ) = min_{T ∈ (0, 0.5]}  α*(1+T)*ρ  +  β/T
-
-Lower level C:  V*(C)    = min_{T ∈ (0, 0.5]}  α*(1+T)    +  β*(1+T)/T
+Cost_A(ρ) = minimized over T:  α×(1+T)×ρ  +  β/T
+Cost_B     = minimized over T:  α×(1+T)    +  β×(1+T)/T
 ```
 
-**Solving** (numerically via `optimize.py`; interior optima shown below):
+B is worth adopting when `Cost_A(ρ) > Cost_B`, which happens past a crossover value ρ_c:
 
-```
-T_B* = sqrt(β / (α*ρ)), capped at 0.5    →  V*(B, ρ)  (from optimizer)
-T_C* = sqrt(β / α),     capped at 0.5    →  V*(C)      (from optimizer)
-```
+| α | β | ρ_c | Plain English |
+|---|---|---|---|
+| 0.9 | 0.1 | 1.08 | Any interference at all tips to B |
+| 0.5 | 0.5 | 1.67 | B wins if compaction slows writes by 67% |
+| 0.1 | 0.9 | 7.00 | B almost never wins — space overhead is too high |
 
-**Crossover `ρ_c`** — C is preferred when measured `ρ > ρ_c`:
-
-```
-α      β     |  ρ_c    Interpretation
--------|------|----------------------------------------------------
-0.9    0.1   |  1.08   WA-dominant: tiny interference favors C
-0.7    0.3   |  1.29   C wins at 29% throughput drop
-0.5    0.5   |  1.67   Balanced: C wins at 67% throughput drop
-0.3    0.7   |  2.56   SA-dominant: need severe contention for C
-0.1    0.9   |  7.00   Space-only: B wins in almost all cases
-```
-
-At `ρ = 1` (no interference), **B wins across all weightings**. C has higher SA because headroom is dead space that displaces live data. C is only justified if benchmarks show `ρ > ρ_c` for the target workload.
-
-`ρ` must be measured. `optimize.py` computes `V*(B, ρ)` and `V*(C)` for any measured `ρ` and outputs which approach wins and the optimal T.
+At zero interference (ρ = 1), A always wins. The benchmark measures ρ, then this table decides which approach to implement.
 
 ---
 
@@ -446,9 +404,9 @@ Benchmarks serve two purposes: validate the model predictions for WA and SA, and
 2. **Read latency** — random reads across a 10 GB dataset after compaction. Measure p50/p99 latency and MB/s.
 3. **Space reclaimed** — write 10 GB, delete 70%, run one compaction cycle. Measure bytes on disk before/after and wall time.
 4. **Measured WA** — instrument total bytes written during workload + compaction. Compare to model prediction `1 + T`.
-5. **Write interference `ρ`** — run Approach B with concurrent fresh writes during compaction. `ρ = throughput_idle / throughput_during_compaction`. Compare against `ρ_c` to determine which approach wins.
+5. **Write interference `ρ`** — run Approach A with concurrent fresh writes during compaction. `ρ = throughput_idle / throughput_during_compaction`. Compare against `ρ_c` to determine which approach wins.
 
-Results will be added to this RFC. If measured `ρ < ρ_c`, we implement B. If `ρ > ρ_c`, we implement C. The optimizer script `optimize.py` can be re-run with measured `ρ` to refine the recommended constants.
+Results will be added to this RFC. If measured `ρ < ρ_c`, we implement A. If `ρ > ρ_c`, we implement B. The optimizer script `optimize.py` can be re-run with measured `ρ` to refine the recommended constants.
 
 ---
 
