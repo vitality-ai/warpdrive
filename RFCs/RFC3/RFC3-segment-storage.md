@@ -19,6 +19,7 @@ There is no compaction, no merging, and no way to shrink disk usage after object
 - **Reads stay O(1)** — direct seek by offset within a segment file
 - **Space is actually reclaimed** — deleted object extents are freed by removing whole segment files
 - **No metadata schema change** — the existing `(offset, size)` extent format is preserved; segment identity is encoded into the global offset
+- **No new SQLite tables** — segment list comes from the filesystem, utilization computed from the existing `objects` table
 
 ---
 
@@ -40,28 +41,51 @@ Each segment has a fixed maximum size `SEGMENT_SIZE` (proposed: 512 MB). The act
 
 ### Encoding: Global Offset
 
-Segment identity is encoded directly into the global offset stored in SQLite:
+Segment identity is encoded directly into the global offset stored in SQLite. With `SEGMENT_SIZE = 512 MB = 536,870,912 bytes`, the virtual address space is:
 
 ```
-global_offset  = segment_id * SEGMENT_SIZE + local_offset
-segment_id     = global_offset / SEGMENT_SIZE
-local_offset   = global_offset % SEGMENT_SIZE
+Segment 0: bytes           0  →  536,870,911   → 0000000000.seg
+Segment 1: bytes 536,870,912  → 1,073,741,823  → 0000000001.seg
+Segment 2: bytes 1,073,741,824 → ...           → 0000000002.seg
 ```
 
-**No schema change required.** The existing `offset_size_list` blob in the `objects` table continues to store `(offset, size)` pairs. The storage layer decodes which segment file and local seek position to use at read time.
+At read time, one number gives you everything:
+
+```
+segment_id   = global_offset / SEGMENT_SIZE   → which file to open
+local_offset = global_offset % SEGMENT_SIZE   → where to seek inside it
+```
+
+Example: object written at local offset 200 MB inside segment 1 is stored as global offset `736,870,912`. At read time: `736,870,912 / 512MB = 1` → open `0000000001.seg`, seek to `736,870,912 % 512MB = 200,000,000`.
+
+**No schema change required.** The existing `offset_size_list` blob in the `objects` table stores `(global_offset, size)` pairs unchanged.
 
 ### Write Path
 
-1. Append bytes to the active segment
-2. If the write would overflow the segment (i.e. `current_size + write_size > SEGMENT_SIZE`), seal the current segment and open a new one
-3. An object extent is always contained within a single segment — no extent crosses a boundary
-4. Return `global_offset = segment_id * SEGMENT_SIZE + local_offset`
+1. Check if `current_active_size + write_size <= SEGMENT_SIZE`
+2. If it fits: append to active segment, return `global_offset = segment_id * SEGMENT_SIZE + local_offset`
+3. If it overflows: split the write across the current segment and a new one, returning two extents (see below)
+
+### Large Objects — Extent Splitting
+
+Objects larger than `SEGMENT_SIZE`, or writes that overflow the active segment, are split into multiple extents — one per segment. The existing `offset_size_list` already supports multiple extents per object, so no schema change is needed.
+
+Example: writing a 600 MB object when the active segment has 100 MB remaining:
+
+```
+extent 1 → segment N,   local_offset = 412 MB, size = 100 MB
+extent 2 → segment N+1, local_offset = 0,      size = 500 MB
+```
+
+SQLite stores `[(N*512MB + 412MB, 100MB), ((N+1)*512MB, 500MB)]`. At read time, each extent is decoded independently and the bytes are concatenated. Each extent is always contained within a single segment file.
 
 ### Read Path
 
+For each extent in `offset_size_list`:
 1. Decode `segment_id = offset / SEGMENT_SIZE`, `local_offset = offset % SEGMENT_SIZE`
 2. Open `storage/{bucket}/{segment_id:010}.seg`
 3. Seek to `local_offset`, read `size` bytes
+4. Concatenate across extents
 
 ### Bucket Deletion
 
@@ -71,85 +95,75 @@ Delete the entire `storage/{bucket}/` directory. No per-object scan needed.
 
 ## Space Reclamation via Compaction
 
-### Segment Utilization
+### Segment Utilization — Computed On Demand
 
-For any sealed segment, live utilization is computed from SQLite:
-
-```sql
-SELECT SUM(size) FROM objects
-WHERE <extent falls within segment N>
-```
-
-Since extents are stored as blobs, a simpler approach tracks utilization in a `segments` table (see below).
-
-### Segment Registry (New SQLite Table)
+No counter is maintained. At compaction-candidate selection time, live utilization for segment N is computed directly from the `objects` table:
 
 ```sql
-CREATE TABLE segments (
-    bucket        TEXT NOT NULL,
-    segment_id    INTEGER NOT NULL,
-    total_bytes   INTEGER NOT NULL DEFAULT 0,
-    live_bytes    INTEGER NOT NULL DEFAULT 0,
-    sealed        BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at    TEXT NOT NULL,
-    PRIMARY KEY (bucket, segment_id)
-);
+SELECT COALESCE(SUM(
+    MIN(extent_end, segment_end) - MAX(extent_start, segment_start)
+), 0)
+FROM <extents derived from offset_size_list>
+WHERE extent_start < segment_end AND extent_end > segment_start
 ```
 
-- `total_bytes`: how much data was ever written to this segment
-- `live_bytes`: updated on every PUT (increment) and every deletion event (decrement)
-- `utilization = live_bytes / total_bytes`
+Where `segment_start = N * SEGMENT_SIZE` and `segment_end = (N+1) * SEGMENT_SIZE`.
+
+This avoids any counter drift on crash. No reconciliation job needed.
+
+### Segment List
+
+Derived from the filesystem at compaction time: `ls storage/{bucket}/*.seg` sorted numerically. The highest-numbered file is the active segment (excluded from compaction).
 
 ### Hot / Cold Cost Model
 
 A segment is a compaction candidate when:
 
 ```
-utilization < COLD_THRESHOLD   (e.g. 30%)
-AND sealed = TRUE
-AND age > MIN_AGE              (e.g. 1 hour — avoid compacting segments with recent writes)
+sealed = TRUE  (not the active segment)
+AND utilization < COLD_THRESHOLD  (e.g. 30%)
+AND age > MIN_AGE  (e.g. 1 hour)
 ```
 
 Priority score (lower = compact first):
 
 ```
-score = utilization * (1 + recency_factor)
-recency_factor = hours_since_last_write / 24
+score = utilization * (1 + age_hours / 24)
 ```
 
-This means old, mostly-empty segments are compacted first. A segment that was recently active but mostly deleted still scores higher than an ancient near-empty one.
+Old, mostly-empty segments are compacted first. Age is derived from the segment filename (segment_id encodes creation order, mtime from the filesystem).
 
 ### Compaction Process
 
 Run by the existing deletion worker background task:
 
-1. Query `segments` for the lowest-scoring candidate below `COLD_THRESHOLD`
-2. Read all live objects from that segment (look up extents via SQLite for all objects whose offsets fall in that segment)
-3. For each live object extent:
-   - Append bytes to the active segment (new global offset)
-   - Update the object's `offset_size_list` in `objects` table
-   - Update `live_bytes` on old and new segments
-4. Wrap steps 2–3 in a SQLite transaction — readers are unaffected until the commit
+1. List sealed segments for each bucket, compute utilization
+2. Pick the lowest-scoring candidate below `COLD_THRESHOLD`
+3. For each live object whose extents overlap that segment:
+   - Read the bytes from the old segment
+   - Append to the active segment (get new global offsets)
+   - Update `offset_size_list` in the `objects` table
+4. Wrap all SQLite updates in a single transaction
 5. After commit: delete the `.seg` file
-6. Remove the segment row from `segments`
 
-If the process is interrupted mid-compaction, the old `.seg` file still exists and the old offsets are still valid in SQLite (transaction was not committed). Safe to retry.
+**Crash safety**: the old `.seg` file is only deleted after the SQLite transaction commits. If the process crashes mid-compaction, the old offsets are still valid and the old file still exists. Safe to retry on next GC cycle.
+
+**Read safety during compaction**: readers that opened the old segment file before the commit continue reading valid data — the file is not deleted until after the commit. Readers arriving after the commit see the new offsets. No locking needed.
 
 ---
 
 ## Migration from Current Layout
 
-Current layout: one file per bucket at `storage/{bucket}` (a flat file, no extension).
+Current layout: one flat file per bucket at `storage/{bucket}` (no extension, no directory).
 
 Migration on first startup:
 1. Detect if `storage/{bucket}` is a plain file (not a directory)
-2. Rename it to `storage/{bucket}_migrate_tmp`
+2. Rename to `storage/{bucket}_migrate`
 3. Create `storage/{bucket}/` directory
-4. Move `storage/{bucket}_migrate_tmp` → `storage/{bucket}/0000000000.seg`
-5. Insert a row in `segments` with `total_bytes = file_size`, `live_bytes` computed from SQLite, `sealed = TRUE`
-6. Active segment becomes `0000000001.seg`
+4. Move `storage/{bucket}_migrate` → `storage/{bucket}/0000000000.seg`
+5. Set active segment to `0000000001.seg` (empty, ready for new writes)
 
-Existing offsets in SQLite are unchanged — they decode into `segment_id=0` (since all offsets < 512 MB decode to segment 0) assuming the current file is under 512 MB. If the current file exceeds 512 MB, migration must split it into multiple numbered segments and rewrite offsets — a heavier migration handled separately.
+Existing offsets in SQLite decode to `segment_id = 0` as long as the migrated file is under 512 MB. If the file exceeds 512 MB, it must be split at 512 MB boundaries with offsets rewritten — handled as a separate migration step gated on file size.
 
 ---
 
@@ -157,22 +171,10 @@ Existing offsets in SQLite are unchanged — they decode into `segment_id=0` (si
 
 | Constant | Value | Rationale |
 |---|---|---|
-| `SEGMENT_SIZE` | 512 MB | Large enough to amortize metadata overhead, small enough to compact quickly |
+| `SEGMENT_SIZE` | 512 MB | Large enough to amortize overhead; small enough to compact in seconds |
 | `COLD_THRESHOLD` | 30% | Compact when less than 30% of a segment is live |
-| `MIN_AGE` | 1 hour | Avoid compacting segments written to very recently |
-| `COMPACTION_BATCH` | 1 segment per GC cycle | Keeps GC cycle bounded; GC runs every 5 min |
-
----
-
-## Open Questions
-
-1. **Concurrent reads during compaction**: Reads on the old segment file are safe since we don't delete the file until after the SQLite commit. But should we hold a read lock on the segment file during compaction to avoid a race where a reader opens the file just as it's deleted?
-
-2. **Segment size vs object size**: Objects larger than `SEGMENT_SIZE` (e.g. a 1 GB multipart upload part) cannot fit in one segment. Options: (a) raise `SEGMENT_SIZE`, (b) allow multi-segment extents (breaks the no-schema-change guarantee), (c) cap individual part writes at `SEGMENT_SIZE`. Needs resolution before implementation.
-
-3. **live_bytes accounting accuracy**: If the server crashes between writing an object and updating `live_bytes` in `segments`, the counter drifts. A periodic reconciliation job (recompute `live_bytes` from `objects` table) would keep it accurate.
-
-4. **`segments` table bootstrap**: On first startup with an existing database, `live_bytes` for segment 0 must be computed from the `objects` table rather than tracked incrementally.
+| `MIN_AGE` | 1 hour | Avoid compacting recently-sealed segments |
+| `COMPACTION_BATCH` | 1 segment per GC cycle | Keeps each GC cycle bounded; GC runs every 5 min |
 
 ---
 
