@@ -33,8 +33,8 @@ Storage is divided into fixed-size segment files per bucket:
 storage/
   {bucket}/
     0000000000.seg    ← sealed, read-only
-    0000000001.seg    ← sealed, read-only
-    0000000002.seg    ← active, append-only
+    0000000001.seg    ← sealed, has headroom reserved for compaction writes
+    0000000002.seg    ← active, append-only (fresh writes only)
 ```
 
 Each segment has a fixed maximum size `SEGMENT_SIZE` (proposed: 512 MB). The active segment is the highest-numbered one. Only one segment is written to at a time.
@@ -56,36 +56,22 @@ segment_id   = global_offset / SEGMENT_SIZE   → which file to open
 local_offset = global_offset % SEGMENT_SIZE   → where to seek inside it
 ```
 
-Example: object written at local offset 200 MB inside segment 1 is stored as global offset `736,870,912`. At read time: `736,870,912 / 512MB = 1` → open `0000000001.seg`, seek to `736,870,912 % 512MB = 200,000,000`.
+Example: object at local offset 200 MB inside segment 1 → global offset `736,870,912`. Decode: `736,870,912 / 512MB = 1` → open `0000000001.seg`, seek to `200,000,000`.
 
-**No schema change required.** The existing `offset_size_list` blob in the `objects` table stores `(global_offset, size)` pairs unchanged.
+**No schema change.** The existing `offset_size_list` blob stores `(global_offset, size)` pairs unchanged.
 
 ### Write Path
 
-1. Check if `current_active_size + write_size <= SEGMENT_SIZE`
-2. If it fits: append to active segment, return `global_offset = segment_id * SEGMENT_SIZE + local_offset`
-3. If it overflows: split the write across the current segment and a new one, returning two extents (see below)
+A segment is sealed when it reaches `SEGMENT_SIZE - HEADROOM` bytes. The remaining `HEADROOM` is reserved for compaction writes only.
 
-### Large Objects — Extent Splitting
+1. If `active_size + write_size ≤ SEGMENT_SIZE - HEADROOM`: append to active segment
+2. Otherwise: seal active segment, open next segment, write there
 
-Objects larger than `SEGMENT_SIZE`, or writes that overflow the active segment, are split into multiple extents — one per segment. The existing `offset_size_list` already supports multiple extents per object, so no schema change is needed.
-
-Example: writing a 600 MB object when the active segment has 100 MB remaining:
-
-```
-extent 1 → segment N,   local_offset = 412 MB, size = 100 MB
-extent 2 → segment N+1, local_offset = 0,      size = 500 MB
-```
-
-SQLite stores `[(N*512MB + 412MB, 100MB), ((N+1)*512MB, 500MB)]`. At read time, each extent is decoded independently and the bytes are concatenated. Each extent is always contained within a single segment file.
+Large writes that overflow are split into multiple extents (one per segment). The existing `offset_size_list` supports multiple extents per object — no schema change needed.
 
 ### Read Path
 
-For each extent in `offset_size_list`:
-1. Decode `segment_id = offset / SEGMENT_SIZE`, `local_offset = offset % SEGMENT_SIZE`
-2. Open `storage/{bucket}/{segment_id:010}.seg`
-3. Seek to `local_offset`, read `size` bytes
-4. Concatenate across extents
+For each extent: decode `segment_id = offset / SEGMENT_SIZE`, `local_offset = offset % SEGMENT_SIZE`, open the file, seek, read. Concatenate across extents.
 
 ### Bucket Deletion
 
@@ -95,86 +81,146 @@ Delete the entire `storage/{bucket}/` directory. No per-object scan needed.
 
 ## Space Reclamation via Compaction
 
-### Segment Utilization — Computed On Demand
+### Utilization — Computed On Demand
 
-No counter is maintained. At compaction-candidate selection time, live utilization for segment N is computed directly from the `objects` table:
-
-```sql
-SELECT COALESCE(SUM(
-    MIN(extent_end, segment_end) - MAX(extent_start, segment_start)
-), 0)
-FROM <extents derived from offset_size_list>
-WHERE extent_start < segment_end AND extent_end > segment_start
-```
-
-Where `segment_start = N * SEGMENT_SIZE` and `segment_end = (N+1) * SEGMENT_SIZE`.
-
-This avoids any counter drift on crash. No reconciliation job needed.
-
-### Segment List
-
-Derived from the filesystem at compaction time: `ls storage/{bucket}/*.seg` sorted numerically. The highest-numbered file is the active segment (excluded from compaction).
-
-### Hot / Cold Cost Model
-
-A segment is a compaction candidate when:
+For segment N, live bytes come directly from the `objects` table. What is absent from the table is dead.
 
 ```
-sealed = TRUE  (not the active segment)
-AND utilization < COLD_THRESHOLD  (e.g. 30%)
-AND age > MIN_AGE  (e.g. 1 hour)
+live_bytes(N) = SUM of bytes from extents in objects
+                that overlap [N*SEGMENT_SIZE, (N+1)*SEGMENT_SIZE)
 ```
 
-Priority score (lower = compact first):
+No counter maintained. No drift on crash.
+
+### Headroom and Compaction Target
+
+Each sealed segment has `HEADROOM = f * SEGMENT_SIZE` bytes reserved. When compacting a cold segment, survivors are written into the headroom of `active - 1` rather than the active segment. This keeps fresh writes and compaction writes in separate segments.
 
 ```
-score = utilization * (1 + age_hours / 24)
+Segment N-2:  [==live==|--dead--|  headroom  ]  ← cold target
+Segment N-1:  [==live==|--dead--|  headroom  ]  ← compaction destination
+Segment N:    [===fresh writes...            ]  ← active, untouched by compaction
 ```
-
-Old, mostly-empty segments are compacted first. Age is derived from the segment filename (segment_id encodes creation order, mtime from the filesystem).
 
 ### Compaction Process
 
-Run by the existing deletion worker background task:
+1. Compute utilization for all sealed segments except `active - 1`
+2. Pick the lowest-utilization segment below `COLD_THRESHOLD T`
+3. Copy its live bytes into the headroom of `active - 1`
+4. Update `offset_size_list` in `objects` within a single SQLite transaction
+5. After commit: delete the cold `.seg` file
 
-1. List sealed segments for each bucket, compute utilization
-2. Pick the lowest-scoring candidate below `COLD_THRESHOLD`
-3. For each live object whose extents overlap that segment:
-   - Read the bytes from the old segment
-   - Append to the active segment (get new global offsets)
-   - Update `offset_size_list` in the `objects` table
-4. Wrap all SQLite updates in a single transaction
-5. After commit: delete the `.seg` file
+Crash safe: old file deleted only after commit. Readers on the old file before commit continue reading valid data. No locking needed.
 
-**Crash safety**: the old `.seg` file is only deleted after the SQLite transaction commits. If the process crashes mid-compaction, the old offsets are still valid and the old file still exists. Safe to retry on next GC cycle.
+---
 
-**Read safety during compaction**: readers that opened the old segment file before the commit continue reading valid data — the file is not deleted until after the commit. Readers arriving after the commit see the new offsets. No locking needed.
+## Optimization: Finding Optimal Parameters
+
+The analytical tables common in storage RFCs just restate what we already know. Instead, we formulate an optimization to find the best values of `T` (cold threshold) and `f` (headroom fraction) given how much we care about write amplification vs. space amplification.
+
+### Variables and Expressions
+
+Let:
+- `T` ∈ (0, 0.5] — cold threshold (compact segments below this utilization)
+- `f` ∈ [0, 0.5] — headroom fraction of SEGMENT_SIZE
+- `u` — utilization at compaction time; worst case `u = T`
+
+Setting `u = T` (worst case), the key metrics are:
+
+```
+WA = 1 + T                          (write once fresh, copy T fraction during compaction)
+SA = 1 / ((1 - f) * T)              (live fraction of data capacity at threshold)
+```
+
+Headroom feasibility — the headroom in `active - 1` must fit the survivors from one cold segment:
+
+```
+f * S ≥ T * (1 - f) * S
+f ≥ T / (1 + T)                     (minimum headroom to absorb survivors)
+```
+
+Setting `f = T / (1 + T)` (minimum feasible headroom) and substituting into SA:
+
+```
+SA = (1 + T) / T
+```
+
+### Optimization Problem
+
+Minimize a weighted combination of WA and SA:
+
+```
+minimize    α * WA + β * SA
+            = α * (1 + T) + β * (1 + T) / T
+            = (1 + T)(α + β / T)
+
+subject to  0 < T ≤ 0.5
+            α + β = 1,  α ≥ 0,  β ≥ 0
+```
+
+This is a single-variable unconstrained minimization in `T`. Taking the derivative and setting to zero:
+
+```
+d/dT [(1 + T)(α + β/T)]  =  α + β(T - (1+T)) / T²
+                          =  α - β / T²  =  0
+
+T* = sqrt(β / α)
+f* = T* / (1 + T*)
+```
+
+### Closed-Form Solution
+
+| Priority | α | β | T* | f* | WA | SA |
+|---|---|---|---|---|---|---|
+| Only WA | 1.0 | 0.0 | → 0 | → 0 | → 1.0 | → ∞ |
+| WA >> SA | 0.8 | 0.2 | 0.50 | 0.33 | 1.50 | 3.0 |
+| Balanced | 0.5 | 0.5 | 0.50 | 0.33 | 1.50 | 3.0 |
+| SA >> WA | 0.2 | 0.8 | 0.50 | 0.33 | 1.50 | 3.0 |
+| Only SA | 0.0 | 1.0 | → ∞ | → 1 | → ∞ | → 1.0 |
+
+`T*` is capped at 0.5 for any β/α ≥ 1. The solution is insensitive to the α/β ratio across a wide range — `T = 0.5`, `f = 0.33` (33% headroom) is optimal for almost all practical weightings. The pure extremes (only WA or only SA) are degenerate: one gives infinite space usage, the other infinite write work.
+
+This gives us the proposed constants:
+- `COLD_THRESHOLD = 0.30` (slightly conservative vs. T*=0.5, to avoid compacting segments that are temporarily cold)
+- `HEADROOM = 150 MB` on a 512 MB segment = 29% ≈ f*=0.33
+
+### Benchmark Plan
+
+The model will be validated against measured results. For each approach (baseline, segments-B without headroom, segments-C with headroom):
+
+1. **Write throughput** — sequential write of 10 GB at object sizes 1 KB / 1 MB / 100 MB. Measure MB/s.
+2. **Read latency** — random reads after compaction. Measure p50 / p99 latency and MB/s.
+3. **Space reclaimed** — write 10 GB, delete 70%, run one compaction cycle. Measure bytes on disk before/after and wall time.
+4. **Measured WA** — instrument bytes written to storage during workload + compaction. Compare against model prediction `1 + T`.
+5. **Write interference (B only)** — concurrent fresh writes during compaction. Measure throughput drop.
+
+Measured WA and SA will be plotted against the model predictions. If they diverge, the model assumptions (particularly `u = T` worst case) will be revised.
 
 ---
 
 ## Migration from Current Layout
 
-Current layout: one flat file per bucket at `storage/{bucket}` (no extension, no directory).
+Current layout: one flat file per bucket at `storage/{bucket}`.
 
-Migration on first startup:
-1. Detect if `storage/{bucket}` is a plain file (not a directory)
+1. Detect if `storage/{bucket}` is a plain file
 2. Rename to `storage/{bucket}_migrate`
 3. Create `storage/{bucket}/` directory
-4. Move `storage/{bucket}_migrate` → `storage/{bucket}/0000000000.seg`
-5. Set active segment to `0000000001.seg` (empty, ready for new writes)
+4. Move to `storage/{bucket}/0000000000.seg`
+5. Set active segment to `0000000001.seg`
 
-Existing offsets in SQLite decode to `segment_id = 0` as long as the migrated file is under 512 MB. If the file exceeds 512 MB, it must be split at 512 MB boundaries with offsets rewritten — handled as a separate migration step gated on file size.
+Existing offsets decode to `segment_id = 0` for files under 512 MB. Files exceeding 512 MB require a split migration with offset rewrite (separate step).
 
 ---
 
 ## Constants (Proposed)
 
-| Constant | Value | Rationale |
+| Constant | Value | Derivation |
 |---|---|---|
-| `SEGMENT_SIZE` | 512 MB | Large enough to amortize overhead; small enough to compact in seconds |
-| `COLD_THRESHOLD` | 30% | Compact when less than 30% of a segment is live |
+| `SEGMENT_SIZE` | 512 MB | Design choice: amortizes overhead, compacts in seconds |
+| `HEADROOM` | 150 MB (29%) | Near f* = 33% from optimization |
+| `COLD_THRESHOLD` | 30% | Slightly below T* = 50%; conservative to avoid false-cold |
 | `MIN_AGE` | 1 hour | Avoid compacting recently-sealed segments |
-| `COMPACTION_BATCH` | 1 segment per GC cycle | Keeps each GC cycle bounded; GC runs every 5 min |
+| `COMPACTION_BATCH` | 1 segment per GC cycle | Bounds GC cycle duration |
 
 ---
 
