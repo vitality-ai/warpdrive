@@ -13,6 +13,14 @@ There is no compaction, no merging, and no way to shrink disk usage after object
 
 ---
 
+## Goals
+
+- **Writes stay O(1) and append-only** — no seek-before-write, no in-place mutation; write throughput must not regress
+- **Reads stay O(1)** — a read is still a direct seek by offset within a file; no extra indirection
+- **Space is actually reclaimed** — deleted object extents are freed by removing whole segment files
+
+---
+
 ## Design Journey
 
 This section records how each design decision was reached — what we observed, what we tried, why we changed direction. The goal is to make the final design legible: not just what it is, but why it isn't something simpler.
@@ -198,14 +206,6 @@ No mutexes. No read locks. No blocking the writer.
 
 > **Checkpoint 5 — Design complete**
 > We have a full design ready to implement. Segment files give us space reclamation without schema changes. Utilization comes from SQLite for free. The compaction process is crash-safe and lock-free: copy survivors → commit offsets atomically → delete old segment after a grace period. The one open question is whether to implement A or B, which the benchmark resolves by measuring ρ. Everything else — segment size, headroom, cold threshold — has optimal values derived from the cost model and can be tuned after benchmarking.
-
----
-
-- **Writes stay append-only** — no seek-before-write, no in-place mutation
-- **Reads stay O(1)** — direct seek by offset within a segment file
-- **Space is actually reclaimed** — deleted object extents are freed by removing whole segment files
-- **No metadata schema change** — the existing `(offset, size)` extent format is preserved; segment identity is encoded into the global offset
-- **No new SQLite tables** — segment list comes from the filesystem, utilization computed from the existing `objects` table
 
 ---
 
