@@ -321,6 +321,77 @@ def plot_b_vs_c():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Plot 6 — WA ablation: effect of k (object lifetime L) and T
+# ════════════════════════════════════════════════════════════════════════════
+
+def wa(T, L):
+    """WA for objects that live L segment-fill cycles.
+    k = T*(1 - T^L)/(1-T)  →  WA = 1 + k
+    Special cases: L=1 gives WA=1+T, L→∞ gives WA=1/(1-T).
+    """
+    if T <= 0:
+        return 1.0
+    if T >= 1:
+        return float("inf")
+    if L == float("inf"):
+        return 1.0 / (1.0 - T)
+    k = T * (1.0 - T**L) / (1.0 - T)
+    return 1.0 + k
+
+
+def plot_wa_ablation():
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    Ts = np.linspace(0.01, 0.50, 400)
+
+    # ── Left: WA vs T for different object lifetimes L ──────────────────────
+    ax = axes[0]
+
+    L_values = [1, 2, 3, 5, 10, float("inf")]
+    labels    = ["L = 1  (WA = 1+T, short-lived)", "L = 2", "L = 3",
+                 "L = 5", "L = 10", "L → ∞  (WA = 1/(1−T), long-lived)"]
+    palette   = plt.cm.viridis(np.linspace(0.1, 0.9, len(L_values)))
+
+    for L, lbl, col in zip(L_values, labels, palette):
+        was = [wa(T, L) for T in Ts]
+        ls  = "--" if L == float("inf") else "-"
+        lw  = 2.2  if L in (1, float("inf")) else 1.4
+        ax.plot(Ts, was, color=col, lw=lw, ls=ls, label=lbl)
+
+    ax.axvline(0.30, color="red",  lw=1.2, ls=":", label="Proposed T = 0.30")
+    ax.axvline(0.50, color=GRAY,   lw=1.0, ls="--", label="Optimal T = 0.50")
+    ax.set_xlabel("Cold threshold  T")
+    ax.set_ylabel("Write Amplification  (WA)")
+    ax.set_title("WA vs T — Ablation over Object Lifetime L\n(L = segment-fill cycles an object lives)")
+    ax.legend(fontsize=8.5)
+    ax.grid(True, alpha=0.25)
+
+    # ── Right: k vs L for proposed and optimal T ─────────────────────────────
+    ax = axes[1]
+
+    Ls = np.linspace(1, 20, 300)
+    for T_val, col, lbl in [(0.30, "red", "T = 0.30  (proposed)"),
+                             (0.50, BLUE,  "T = 0.50  (optimal)")]:
+        ks = [T_val * (1 - T_val**L) / (1 - T_val) for L in Ls]
+        ax.plot(Ls, ks, color=col, lw=2, label=lbl)
+        # asymptote
+        k_inf = T_val / (1 - T_val)
+        ax.axhline(k_inf, color=col, lw=1, ls="--",
+                   label=f"k → {k_inf:.2f} as L → ∞")
+
+    ax.set_xlabel("Object lifetime  L  (segment-fill cycles)")
+    ax.set_ylabel("Expected compactions per byte  k")
+    ax.set_title("k vs Object Lifetime — How Many Times a Byte Gets Compacted")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig("plot_wa_ablation.png", bbox_inches="tight")
+    plt.close()
+    print("Saved plot_wa_ablation.png")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     plot_address_space()
@@ -328,4 +399,5 @@ if __name__ == "__main__":
     plot_objective_surface()
     plot_pareto_c()
     plot_b_vs_c()
+    plot_wa_ablation()
     print("\nAll plots generated.")

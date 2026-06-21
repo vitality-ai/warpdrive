@@ -303,13 +303,31 @@ Two questions drive this section: what are the optimal values of T and f for App
 
 ### Where WA and SA come from
 
-**Write amplification** is straightforward: every byte is written once as a fresh write, and once more if the segment it lands in gets compacted. The worst case is a segment sitting exactly at the threshold with utilization T, so:
+**Write amplification** is how many times each user byte gets written in total. Every byte is written once fresh. After that, it may be copied again if its segment gets compacted — and then again if the segment it moved to also eventually goes cold.
+
+We model this with two parameters:
+- `T` — the cold threshold, which controls how aggressively we compact
+- `L` — object lifetime measured in "segment-fill cycles" (how many times a fresh segment fills up during the object's life). `L = 1` means the object lives roughly as long as one segment takes to fill; `L = 10` means it survives ten fill cycles.
+
+When a segment is compacted, T fraction of its bytes are still alive and get copied. In the next segment, the same logic applies — with probability T the byte survives to the next compaction. So the expected number of compactions k a byte goes through is:
 
 ```
-WA = 1 + T
+k(T, L) = T × (1 - T^L) / (1 - T)
+
+WA = 1 + k
 ```
 
-A T of 0.5 means every byte is copied at most once during its lifetime (WA = 1.5). A T of 0.1 means compaction barely runs but when it does, less data moves.
+The two limiting cases:
+- `L = 1` (short-lived objects) → `k = T`, so `WA = 1 + T`
+- `L → ∞` (objects live forever) → `k = T/(1-T)`, so `WA = 1/(1-T)`
+
+In practice WA sits somewhere between these depending on how long your objects live relative to your compaction rate.
+
+![WA ablation over object lifetime L and cold threshold T](plot_wa_ablation.png)
+
+Left: each curve is a different object lifetime L. Short-lived objects (L = 1, bottom curve) are mostly deleted before their segment goes cold, so they rarely get compacted more than once — WA is low. Long-lived objects (L → ∞, top dashed curve) keep getting re-compacted every time their segment goes cold, driving WA toward 1/(1-T). The red and gray verticals mark the proposed (T = 0.30) and optimal (T = 0.50) operating points. Right: for a fixed T, k grows and then flattens as L increases — past a certain lifetime the byte almost always sees at least one compaction per cycle, so k converges to its asymptote T/(1-T).
+
+The benchmark measures actual WA directly as total bytes written ÷ total user bytes written, which captures all of this without needing to know L. The model gives us the shape of the relationship; the benchmark pins the exact number.
 
 **Space amplification** is the ratio of disk space occupied to actual live data. The worst case is a segment just above the compaction threshold — it hasn't been compacted yet, so it holds T fraction of live data in (1-f) fraction of the segment:
 
