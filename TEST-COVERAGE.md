@@ -419,6 +419,53 @@ test_object_copy_key_not_found
 
 ---
 
+## feat/batch-6-multipart-upload — Batch 6 complete
+
+**Branch:** `feat/batch-6-multipart-upload`  
+**RFC Batch:** Batch 6 (Multipart Upload Full Correctness)  
+**Newly passing:** 17
+
+Key changes:
+- New SQLite tables `multipart_uploads` (tracks in-flight uploads with status/final_etag) and `multipart_parts` (per-part ETag/size/extents_blob) — replaces fake-key approach
+- `parts_manifest TEXT` column on `objects` table (JSON: `[{"n":1,"sz":5242880,"ext":[[0,5242880]]},...]`)
+- `CreateMultipartUpload`: stores ContentType + x-amz-meta-* headers in `multipart_uploads`
+- `UploadPart`: INSERT OR REPLACE into `multipart_parts` so re-upload of same part number overwrites previous (no UNIQUE constraint violations)
+- `CompleteMultipartUpload`: validates part ETags, enforces 5 MB minimum on non-last parts, computes real S3 multipart ETag (`hex(md5(bytes1||bytes2||...))-N`), idempotent (second call returns stored ETag), deduplicates PartNumbers keeping last occurrence (handles concurrent re-uploads)
+- `AbortMultipartUpload`: validates uploadId is in_progress, queues part extents for GC
+- `ListMultipartUploads`: dispatched from list-objects handler when `?uploads` query param present
+- `GetObjectAttributes`: returns ETag (no quotes), ObjectSize, StorageClass, ObjectParts with `<PartsCount>` (botocore locationName), paginated via `?max-parts&part-number-marker`
+- `GET/HEAD ?partNumber`: streams specific part bytes for multipart objects; 400 InvalidPart for out-of-range on multipart; partNumber=1 OK for single-part objects, >1 → 400 InvalidPart
+
+### Verified Passing
+
+```
+test_multipart_upload_empty
+test_multipart_upload_complete_without_create
+test_multipart_upload_small
+test_multipart_upload
+test_multipart_upload_resend_part
+test_multipart_get_part
+test_multipart_single_get_part
+test_multipart_resend_first_finishes_last
+test_multipart_upload_size_too_small
+test_multipart_upload_missing_part
+test_multipart_upload_incorrect_etag
+test_abort_multipart_upload_not_found
+test_list_multipart_upload
+test_non_multipart_get_part
+test_get_multipart_object_attributes
+test_get_paginated_multipart_object_attributes
+test_get_single_multipart_object_attributes
+```
+
+### Intentionally deferred (1 test)
+
+- `test_list_multipart_upload_owner` — both `s3 main` and `s3 alt` share the same `adminkey`/`admin` user_id; test requires distinct DisplayNames per initiator
+
+**Running total: 232 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

@@ -10,6 +10,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use serde_json;
+
 /// Empty body that reports a custom Content-Length for HEAD responses.
 /// actix-web derives Content-Length from MessageBody::size(); this type
 /// lets us advertise the real object size without sending any bytes.
@@ -252,6 +254,30 @@ fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
     let start = src.find(&open)? + open.len();
     let end = src[start..].find(&close)?;
     Some(src[start..start + end].to_string())
+}
+
+/// Parts manifest entry — stored as JSON in the parts_manifest column.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PartEntry {
+    n: i32,
+    sz: u64,
+    ext: Vec<[u64; 2]>,
+}
+
+/// Parse `<Part><PartNumber>N</PartNumber><ETag>e</ETag></Part>` blocks.
+/// Returns empty vec if no `<Part>` elements found (caller should return MalformedXML).
+fn parse_complete_multipart_xml(body: &str) -> Vec<(i32, String)> {
+    let mut parts = Vec::new();
+    let mut rest = body;
+    while let Some(idx) = rest.find("<Part>") {
+        rest = &rest[idx + 6..];
+        let part_num = extract_xml_tag(rest, "PartNumber").and_then(|s| s.trim().parse::<i32>().ok());
+        let etag = extract_xml_tag(rest, "ETag").map(|s| s.trim().to_string());
+        if let (Some(n), Some(e)) = (part_num, etag) {
+            parts.push((n, e));
+        }
+    }
+    parts
 }
 
 /// Parse an HTTP date string (RFC 2616 / RFC 1123: "Mon, 01 Jan 2024 00:00:00 GMT")
@@ -683,6 +709,22 @@ pub async fn s3_get_object_handler(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
+    // Early dispatch for ?attributes and ?partNumber
+    let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map(|q| q.into_inner()).unwrap_or_default();
+    if qmap.contains_key("attributes") {
+        return s3_get_object_attributes_handler(&bucket, &key, &req).await;
+    }
+    if let Some(pn_str) = qmap.get("partNumber") {
+        let pn: i32 = match pn_str.parse::<i32>() {
+            Ok(n) if n >= 1 => n,
+            _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                    "Part number must be an integer between 1 and 10000",
+                                    &format!("/{}/{}", bucket, key))),
+        };
+        return s3_get_part_handler(&bucket, &key, pn, &req).await;
+    }
+
     if let Err(resp) = validate_object_key(&key, &bucket) { return Ok(resp); }
 
     let auth_result = authenticate_s3_request(&req).await?;
@@ -843,6 +885,19 @@ pub async fn s3_head_object_handler(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
+    // Dispatch ?partNumber
+    let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map(|q| q.into_inner()).unwrap_or_default();
+    if let Some(pn_str) = qmap.get("partNumber") {
+        let pn: i32 = match pn_str.parse::<i32>() {
+            Ok(n) if n >= 1 => n,
+            _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                    "Part number must be an integer between 1 and 10000",
+                                    &format!("/{}/{}", bucket, key))),
+        };
+        return s3_head_part_handler(&bucket, &key, pn, &req).await;
+    }
+
     if let Err(resp) = validate_object_key(&key, &bucket) { return Ok(resp); }
 
     let auth_result = authenticate_s3_request(&req).await?;
@@ -982,6 +1037,11 @@ pub async fn s3_list_objects_handler(
     // Dispatch list-object-versions (?versions query param)
     if query.contains_key("versions") {
         return s3_list_object_versions_handler_inner(&bucket, &req).await;
+    }
+
+    // Dispatch list-multipart-uploads (?uploads query param)
+    if query.contains_key("uploads") {
+        return s3_list_multipart_uploads_handler(&bucket, &req).await;
     }
 
     let auth_result = authenticate_s3_request(&req).await?;
@@ -1618,7 +1678,7 @@ pub async fn s3_copy_object_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Multipart upload handlers (existing logic preserved, bucket-check added)
+// Multipart upload handlers (RFC 2.6 — proper DB tracking)
 // ---------------------------------------------------------------------------
 
 pub async fn s3_create_multipart_upload_handler(
@@ -1627,7 +1687,7 @@ pub async fn s3_create_multipart_upload_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
-    if query.get("uploads").map(|s| s.as_str()) != Some("") {
+    if !query.contains_key("uploads") {
         return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest",
                            "Invalid multipart upload initiation request", &bucket));
     }
@@ -1636,7 +1696,31 @@ pub async fn s3_create_multipart_upload_handler(
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    let upload_id = format!("upload_{}", chrono::Utc::now().timestamp_millis());
+    let content_type = req.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let user_metadata: HashMap<String, String> = req.headers().iter()
+        .filter_map(|(name, value)| {
+            let n = name.as_str().to_lowercase();
+            if n.starts_with("x-amz-meta-") {
+                let k = n.trim_start_matches("x-amz-meta-").to_string();
+                let v = String::from_utf8_lossy(value.as_bytes()).trim().to_string();
+                Some((k, v))
+            } else { None }
+        })
+        .collect();
+    let metadata_json = serde_json::to_string(&user_metadata).unwrap_or_else(|_| "{}".to_string());
+
+    let upload_id = format!("mpu-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let initiated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+
+    db.create_multipart_upload(
+        &upload_id, &bucket, &key,
+        content_type.as_deref(), &metadata_json, &initiated_at,
+    )?;
+
     info!("S3 CreateMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
 
     let xml = format!(
@@ -1649,7 +1733,7 @@ pub async fn s3_create_multipart_upload_handler(
         s3 = S3_XMLNS,
         bucket = xml_escape(&bucket),
         key = xml_escape(&key),
-        uid = upload_id,
+        uid = xml_escape(&upload_id),
     );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
@@ -1660,15 +1744,24 @@ pub async fn s3_upload_part_handler(
     mut payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let (_bucket, key) = path.into_inner();
-    let part_number = query.get("partNumber")
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing partNumber"))?
-        .clone();
+    let (bucket, key) = path.into_inner();
+    let part_number_str = query.get("partNumber")
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing partNumber"))?.clone();
     let upload_id = query.get("uploadId")
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?
-        .clone();
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?.clone();
+
+    let part_number: i32 = part_number_str.parse()
+        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;
 
     let auth_result = authenticate_s3_request(&req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+
+    // Validate upload exists and is in progress
+    match db.get_multipart_upload(&upload_id)? {
+        Some(row) if row.status == "in_progress" => {}
+        _ => return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchUpload",
+                                "The specified upload does not exist", &format!("/{}/{}", bucket, key))),
+    }
 
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
@@ -1679,22 +1772,15 @@ pub async fn s3_upload_part_handler(
         body.extend_from_slice(&chunk);
     }
 
-    if body.is_empty() {
-        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
-                           "Part must not be empty", &key));
-    }
-
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let db = MetadataService::new(&auth_result.user_id)?;
-
     let storage_service = StorageService::new();
     let offset_size_list = storage_service.write_object(&context, &body, StorageMode::S3)?;
-    let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
-
-    let part_key = format!("{}.part.{}.{}", key, part_number, upload_id);
-    db.write_metadata(&auth_result.bucket, &part_key, &offset_size_bytes)?;
+    let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
+    db.upsert_multipart_part(&upload_id, part_number, &etag, body.len() as u64, &extents_blob)?;
+
+    info!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
     Ok(HttpResponse::Ok().insert_header(("ETag", etag)).body(""))
 }
 
@@ -1781,12 +1867,21 @@ pub async fn s3_upload_part_copy_handler(
 
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3)?;
-    let offset_size_bytes = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
-    let part_key = format!("{}.part.{}.{}", key, part_number, upload_id);
-    db.write_metadata(&auth_result.bucket, &part_key, &offset_size_bytes)?;
+    let part_number_i32: i32 = part_number.parse()
+        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;
 
+    // Validate upload exists and is in progress
+    match db.get_multipart_upload(&upload_id)? {
+        Some(row) if row.status == "in_progress" => {}
+        _ => return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchUpload",
+                                "The specified upload does not exist", &format!("/{}/{}", bucket, key))),
+    }
+
+    let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     let etag = format!("\"{}\"", hex::encode(md5::compute(&part_bytes).0));
+    db.upsert_multipart_part(&upload_id, part_number_i32, &etag, part_size, &extents_blob)?;
+
     let last_modified = rfc2616_now();
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1845,63 +1940,137 @@ pub async fn s3_complete_multipart_upload_handler(
         }
     }
 
-    let mut bytes: Vec<u8> = Vec::new();
+    let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
             warn!("CompleteMultipartUpload: read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
-        bytes.extend_from_slice(&chunk);
+        body_bytes.extend_from_slice(&chunk);
+    }
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // 1. Parse requested parts from XML body. Empty list → MalformedXML.
+    //    Deduplicate by PartNumber, keeping the last occurrence (handles concurrent re-uploads).
+    let raw_parts = parse_complete_multipart_xml(&body_str);
+    if raw_parts.is_empty() {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "MalformedXML",
+                           "The XML you provided was not well-formed or did not validate", &bucket));
+    }
+    let mut dedup_map: HashMap<i32, String> = HashMap::new();
+    for (n, e) in &raw_parts { dedup_map.insert(*n, e.clone()); }
+    let mut requested_parts: Vec<(i32, String)> = dedup_map.into_iter().collect();
+    requested_parts.sort_by_key(|(n, _)| *n);
+    if requested_parts.is_empty() {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "MalformedXML",
+                           "The XML you provided was not well-formed or did not validate", &bucket));
     }
 
-    let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+    // 2. Look up the upload record.
+    let upload_row = match db.get_multipart_upload(&upload_id)? {
+        Some(row) if row.status == "completed" => {
+            // Idempotent: return same ETag from first completion.
+            let etag = row.final_etag.unwrap_or_default();
+            return Ok(complete_multipart_xml_response(&bucket, &key, &etag));
+        }
+        Some(row) if row.status == "in_progress" => row,
+        Some(_) | None => {
+            return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchUpload",
+                               "The specified upload does not exist", &format!("/{}/{}", bucket, key)));
+        }
+    };
 
-    // Collect and sort part keys.
-    let all_objects = db.list_objects(&bucket)?;
-    let mut parts: Vec<(i32, String)> = Vec::new();
-    for obj_key in all_objects {
-        if obj_key.starts_with(&format!("{}.part.", key)) && obj_key.ends_with(&format!(".{}", upload_id)) {
-            let part_info = obj_key
-                .strip_prefix(&format!("{}.part.", key))
-                .and_then(|s| s.strip_suffix(&format!(".{}", upload_id)))
-                .and_then(|s| s.parse::<i32>().ok());
-            if let Some(part_number) = part_info {
-                parts.push((part_number, obj_key));
+    // 3. Fetch stored parts and validate.
+    let stored_parts = db.list_multipart_parts(&upload_id)?;
+    let stored_map: HashMap<i32, crate::metadata::sqlite_store::MultipartPartRow> =
+        stored_parts.into_iter().map(|p| (p.part_number, p)).collect();
+
+    for (part_num, xml_etag) in &requested_parts {
+        let stored = match stored_map.get(part_num) {
+            Some(p) => p,
+            None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
+                                       "One or more of the specified parts could not be found",
+                                       &format!("/{}/{}", bucket, key))),
+        };
+        if normalize_etag(xml_etag) != normalize_etag(&stored.etag) {
+            return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
+                               "One or more of the specified parts could not be found",
+                               &format!("/{}/{}", bucket, key)));
+        }
+    }
+
+    // 4. Check minimum part size (all non-last parts must be >= 5 MiB).
+    const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+    let total_parts = requested_parts.len();
+    for (i, (part_num, _)) in requested_parts.iter().enumerate() {
+        if i < total_parts - 1 {
+            let sz = stored_map[part_num].size;
+            if sz < MIN_PART_SIZE {
+                return Ok(s3_error(StatusCode::BAD_REQUEST, "EntityTooSmall",
+                                   "Your proposed upload is smaller than the minimum allowed object size",
+                                   &format!("/{}/{}", bucket, key)));
             }
         }
     }
-    parts.sort_by_key(|(n, _)| *n);
-    if parts.is_empty() {
-        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
-                           "No uploaded parts found for uploadId", &bucket));
-    }
 
-    // Concatenate part extent lists into the final object manifest.
+    // 5. Concatenate extents and build parts manifest.
     let mut final_extents: Vec<(u64, u64)> = Vec::new();
-    for (_, part_key) in &parts {
-        let part_bytes = db.read_metadata(&bucket, part_key)?;
-        let part_extents = deserialize_offset_size(&part_bytes)?;
-        final_extents.extend(part_extents);
+    let mut manifest: Vec<PartEntry> = Vec::new();
+    for (part_num, _) in &requested_parts {
+        let p = &stored_map[part_num];
+        let exts = deserialize_offset_size(&p.extents_blob)?;
+        let ext_arr: Vec<[u64; 2]> = exts.iter().map(|&(o, s)| [o, s]).collect();
+        final_extents.extend_from_slice(&exts);
+        manifest.push(PartEntry { n: *part_num, sz: p.size, ext: ext_arr });
     }
 
+    // 6. Compute multipart ETag: MD5(concat(md5_1_bytes, md5_2_bytes, ..., md5_N_bytes))-N
+    let mut combined_md5_bytes: Vec<u8> = Vec::new();
+    for (part_num, _) in &requested_parts {
+        let etag_hex = normalize_etag(&stored_map[part_num].etag).to_string();
+        if let Ok(raw) = hex::decode(&etag_hex) {
+            combined_md5_bytes.extend_from_slice(&raw);
+        }
+    }
+    let multipart_etag = format!("\"{}-{}\"",
+        hex::encode(md5::compute(&combined_md5_bytes).0),
+        total_parts);
+
+    // 7. Apply content_type and user_metadata from the upload row.
+    let content_type = upload_row.content_type.or_else(|| Some("binary/octet-stream".to_string()));
+    let user_metadata: HashMap<String, String> =
+        serde_json::from_str(&upload_row.metadata_json).unwrap_or_default();
+
+    // 8. Write the final object (overwrite if key exists).
+    let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     if db.check_key(&bucket, &key)? {
-        StorageService::new().delete_object(&context, &key)?;
+        let old_meta = db.get_object_full(&bucket, &key)?;
+        let old_extents = old_meta.to_offset_size_list();
+        db.queue_deletion(&bucket, &key, &old_extents)?;
+        db.delete_metadata(&bucket, &key)?;
     }
+    let _ = context; // context not needed since we inline the delete above
 
-    // Store the final object with a proper ETag so subsequent conditional requests can
-    // check against it. Use put_object_full so the etag field is persisted.
-    let multipart_etag = format!("\"s3-etag-multipart-{}\"", parts.len());
-    let mut final_metadata = Metadata::from_offset_size_list(final_extents.clone());
+    let total_size: u64 = final_extents.iter().map(|(_, s)| s).sum();
+    let mut final_metadata = Metadata::from_offset_size_list(final_extents);
     final_metadata.etag = Some(multipart_etag.clone());
+    final_metadata.size = total_size;
+    final_metadata.content_type = content_type;
     final_metadata.last_modified = Some(rfc2616_now());
+    final_metadata.user_metadata = user_metadata;
     db.put_object_full(&bucket, &key, final_metadata)?;
 
-    for (_, part_key) in &parts {
-        db.delete_metadata(&bucket, part_key)?;
-    }
+    // 9. Store parts manifest and mark upload completed.
+    let manifest_json = serde_json::to_string(&manifest).unwrap_or_else(|_| "[]".to_string());
+    db.set_parts_manifest(&bucket, &key, &manifest_json)?;
+    db.mark_multipart_completed(&upload_id, &multipart_etag)?;
+    db.delete_parts_for_upload(&upload_id)?;
 
-    info!("S3 CompleteMultipartUpload: bucket={} key={} parts={}", bucket, key, parts.len());
+    info!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
+    Ok(complete_multipart_xml_response(&bucket, &key, &multipart_etag))
+}
 
+fn complete_multipart_xml_response(bucket: &str, key: &str, etag: &str) -> HttpResponse {
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CompleteMultipartUploadResult xmlns=\"{s3}\">\n\
@@ -1911,11 +2080,11 @@ pub async fn s3_complete_multipart_upload_handler(
              <ETag>{etag}</ETag>\n\
          </CompleteMultipartUploadResult>",
         s3 = S3_XMLNS,
-        bucket = xml_escape(&bucket),
-        key = xml_escape(&key),
-        etag = xml_escape(&multipart_etag),
+        bucket = xml_escape(bucket),
+        key = xml_escape(key),
+        etag = xml_escape(etag),
     );
-    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+    HttpResponse::Ok().content_type("application/xml").body(xml)
 }
 
 pub async fn s3_abort_multipart_upload_handler(
@@ -1932,13 +2101,22 @@ pub async fn s3_abort_multipart_upload_handler(
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let all_objects = db.list_objects(&bucket)?;
-    for obj_key in all_objects {
-        if obj_key.starts_with(&format!("{}.part.", key)) && obj_key.ends_with(&format!(".{}", upload_id)) {
-            StorageService::new().delete_object(&context, &obj_key)?;
-        }
+    // Validate upload exists and is in progress.
+    match db.get_multipart_upload(&upload_id)? {
+        Some(row) if row.status == "in_progress" => {}
+        _ => return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchUpload",
+                                "The specified upload does not exist",
+                                &format!("/{}/{}", bucket, key))),
     }
+
+    // Queue part extents for background GC, then clean up DB rows.
+    let parts = db.list_multipart_parts(&upload_id)?;
+    for part in &parts {
+        let extents = deserialize_offset_size(&part.extents_blob)?;
+        db.queue_deletion(&bucket, &key, &extents)?;
+    }
+    db.delete_parts_for_upload(&upload_id)?;
+    db.delete_multipart_upload(&upload_id)?;
 
     info!("S3 AbortMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
     Ok(HttpResponse::NoContent()
@@ -1959,4 +2137,265 @@ pub async fn s3_multipart_router(
     } else {
         Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", "Invalid multipart operation", ""))
     }
+}
+
+// ---------------------------------------------------------------------------
+// ListMultipartUploads  GET /s3/{bucket}?uploads
+// ---------------------------------------------------------------------------
+
+async fn s3_list_multipart_uploads_handler(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let uploads = db.list_multipart_uploads_for_bucket(bucket)?;
+
+    let mut uploads_xml = String::new();
+    for upload in &uploads {
+        let uid = xml_escape(&upload.user_id);
+        uploads_xml.push_str(&format!(
+            "<Upload>\
+              <Key>{key}</Key>\
+              <UploadId>{upid}</UploadId>\
+              <Initiator><ID>{uid}</ID><DisplayName>{uid}</DisplayName></Initiator>\
+              <Owner><ID>{uid}</ID><DisplayName>{uid}</DisplayName></Owner>\
+              <StorageClass>STANDARD</StorageClass>\
+              <Initiated>{init}</Initiated>\
+            </Upload>",
+            key   = xml_escape(&upload.key),
+            upid  = xml_escape(&upload.upload_id),
+            uid   = uid,
+            init  = xml_escape(&upload.initiated_at),
+        ));
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListMultipartUploadsResult xmlns=\"{s3}\">\
+           <Bucket>{bucket}</Bucket>\
+           <KeyMarker></KeyMarker>\
+           <UploadIdMarker></UploadIdMarker>\
+           <NextKeyMarker></NextKeyMarker>\
+           <NextUploadIdMarker></NextUploadIdMarker>\
+           <MaxUploads>1000</MaxUploads>\
+           <IsTruncated>false</IsTruncated>\
+           {uploads}\
+         </ListMultipartUploadsResult>",
+        s3 = S3_XMLNS, bucket = xml_escape(bucket), uploads = uploads_xml,
+    );
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+}
+
+// ---------------------------------------------------------------------------
+// GetObjectAttributes  GET /s3/{bucket}/{key}?attributes
+// ---------------------------------------------------------------------------
+
+async fn s3_get_object_attributes_handler(bucket: &str, key: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    if !db.check_key(bucket, key)? {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                           "The specified key does not exist", &format!("/{}/{}", bucket, key)));
+    }
+    let meta = db.get_object_full(bucket, key)?;
+    let etag_raw = meta.etag.as_deref().map(normalize_etag).unwrap_or("").to_string();
+
+    // Parse pagination headers for ObjectParts.
+    let max_parts: usize = req.headers().get("x-amz-max-parts")
+        .and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let part_number_marker: i32 = req.headers().get("x-amz-part-number-marker")
+        .and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let mut object_parts_xml = String::new();
+    if let Some(manifest_json) = db.get_parts_manifest(bucket, key)? {
+        if let Ok(parts) = serde_json::from_str::<Vec<PartEntry>>(&manifest_json) {
+            let total = parts.len();
+            let eligible: Vec<&PartEntry> = parts.iter().filter(|p| p.n > part_number_marker).collect();
+            let page: Vec<&PartEntry> = eligible.iter().copied().take(max_parts).collect();
+            let is_truncated = eligible.len() > max_parts;
+            let next_marker = page.last().map(|p| p.n).unwrap_or(0);
+
+            let mut parts_xml = String::new();
+            for p in &page {
+                parts_xml.push_str(&format!(
+                    "<Part><PartNumber>{}</PartNumber><Size>{}</Size></Part>",
+                    p.n, p.sz
+                ));
+            }
+
+            let pn_marker_xml = if part_number_marker > 0 {
+                format!("<PartNumberMarker>{}</PartNumberMarker>", part_number_marker)
+            } else { String::new() };
+            let max_parts_xml = if max_parts < 1000 {
+                format!("<MaxParts>{}</MaxParts>", max_parts)
+            } else { String::new() };
+            let next_xml = if is_truncated {
+                format!("<NextPartNumberMarker>{}</NextPartNumberMarker>", next_marker)
+            } else { String::new() };
+
+            object_parts_xml = format!(
+                "<ObjectParts>\
+                  <TotalPartsCount>{total}</TotalPartsCount>\
+                  <PartsCount>{total}</PartsCount>\
+                  {pnm}{maxp}<IsTruncated>{trunc}</IsTruncated>\
+                  {next}{parts}\
+                </ObjectParts>",
+                total = total, pnm = pn_marker_xml, maxp = max_parts_xml,
+                trunc = is_truncated, next = next_xml, parts = parts_xml,
+            );
+        }
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <GetObjectAttributesResponse xmlns=\"{s3}\">\
+           <ETag>{etag}</ETag>\
+           <StorageClass>STANDARD</StorageClass>\
+           <ObjectSize>{sz}</ObjectSize>\
+           {parts}\
+         </GetObjectAttributesResponse>",
+        s3 = S3_XMLNS,
+        etag = xml_escape(&etag_raw),
+        sz = meta.size,
+        parts = object_parts_xml,
+    );
+    let mut resp = HttpResponse::Ok();
+    resp.content_type("application/xml");
+    if let Some(lm) = &meta.last_modified { resp.insert_header(("Last-Modified", lm.as_str())); }
+    Ok(resp.body(xml))
+}
+
+// ---------------------------------------------------------------------------
+// GET/HEAD ?partNumber — serve a specific part of a multipart object
+// ---------------------------------------------------------------------------
+
+async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    if !db.check_key(bucket, key)? {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                           "The specified key does not exist", &format!("/{}/{}", bucket, key)));
+    }
+
+    let meta = db.get_object_full(bucket, key)?;
+    let etag = meta.etag.clone().unwrap_or_default();
+    let content_type = meta.content_type.clone().unwrap_or_else(|| "application/octet-stream".into());
+
+    // Try parts manifest for multipart objects.
+    if let Some(manifest_json) = db.get_parts_manifest(bucket, key)? {
+        if let Ok(parts) = serde_json::from_str::<Vec<PartEntry>>(&manifest_json) {
+            let total_parts = parts.len() as i32;
+            let part = match parts.iter().find(|p| p.n == part_num) {
+                Some(p) => p,
+                None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
+                                           "The requested partnumber is not satisfiable",
+                                           &format!("/{}/{}", bucket, key))),
+            };
+            let extents: Vec<(u64, u64)> = part.ext.iter().map(|e| (e[0], e[1])).collect();
+            let part_size = part.sz;
+
+            let slices = Arc::new(stream_slices(&extents));
+            let store = StorageConfig::from_env().create_store();
+            let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+            let byte_stream = stream::try_unfold(0usize, move |idx| {
+                let slices = Arc::clone(&slices);
+                let ctx = context.clone();
+                let store = Arc::clone(&store);
+                async move {
+                    if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
+                    let (off, sz) = slices[idx];
+                    let chunk = web::block(move || store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string()))
+                        .await.map_err(actix_web::error::ErrorInternalServerError)?
+                        .map_err(actix_web::error::ErrorInternalServerError)?;
+                    Ok(Some((Bytes::from(chunk), idx + 1)))
+                }
+            });
+
+            let mut resp = HttpResponse::Ok();
+            resp.content_type(content_type.as_str());
+            resp.insert_header(("Content-Length", part_size.to_string()));
+            resp.insert_header(("ETag", etag));
+            resp.insert_header(("x-amz-mp-parts-count", total_parts.to_string()));
+            return Ok(resp.streaming(byte_stream));
+        }
+    }
+
+    // Non-multipart object: partNumber=1 returns whole object, >1 is InvalidPart.
+    if part_num > 1 {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
+                           "The requested partnumber is not satisfiable",
+                           &format!("/{}/{}", bucket, key)));
+    }
+
+    let total_size = meta.size;
+    let extents = meta.to_offset_size_list();
+    let slices = Arc::new(stream_slices(&extents));
+    let store = StorageConfig::from_env().create_store();
+    let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+    let byte_stream = stream::try_unfold(0usize, move |idx| {
+        let slices = Arc::clone(&slices);
+        let ctx = context.clone();
+        let store = Arc::clone(&store);
+        async move {
+            if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
+            let (off, sz) = slices[idx];
+            let chunk = web::block(move || store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string()))
+                .await.map_err(actix_web::error::ErrorInternalServerError)?
+                .map_err(actix_web::error::ErrorInternalServerError)?;
+            Ok(Some((Bytes::from(chunk), idx + 1)))
+        }
+    });
+
+    let mut resp = HttpResponse::Ok();
+    resp.content_type(content_type.as_str());
+    resp.insert_header(("Content-Length", total_size.to_string()));
+    resp.insert_header(("ETag", etag));
+    Ok(resp.streaming(byte_stream))
+}
+
+async fn s3_head_part_handler(bucket: &str, key: &str, part_num: i32, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    if !db.check_key(bucket, key)? {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                           "The specified key does not exist", &format!("/{}/{}", bucket, key)));
+    }
+
+    let meta = db.get_object_full(bucket, key)?;
+    let etag = meta.etag.clone().unwrap_or_default();
+    let content_type = meta.content_type.clone().unwrap_or_else(|| "application/octet-stream".into());
+
+    if let Some(manifest_json) = db.get_parts_manifest(bucket, key)? {
+        if let Ok(parts) = serde_json::from_str::<Vec<PartEntry>>(&manifest_json) {
+            let total_parts = parts.len() as i32;
+            let part = match parts.iter().find(|p| p.n == part_num) {
+                Some(p) => p,
+                None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
+                                           "The requested partnumber is not satisfiable",
+                                           &format!("/{}/{}", bucket, key))),
+            };
+            let mut resp = HttpResponse::Ok();
+            resp.insert_header(("Content-Type", content_type));
+            resp.insert_header(("ETag", etag));
+            resp.insert_header(("x-amz-mp-parts-count", total_parts.to_string()));
+            return Ok(resp.message_body(HeadBody(part.sz)).unwrap().map_into_boxed_body());
+        }
+    }
+
+    if part_num > 1 {
+        return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidPart",
+                           "The requested partnumber is not satisfiable",
+                           &format!("/{}/{}", bucket, key)));
+    }
+
+    let mut resp = HttpResponse::Ok();
+    resp.insert_header(("Content-Type", content_type));
+    resp.insert_header(("ETag", etag));
+    Ok(resp.message_body(HeadBody(meta.size)).unwrap().map_into_boxed_body())
 }
