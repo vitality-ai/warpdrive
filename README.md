@@ -1,7 +1,7 @@
 <div align="center">
 
-# WarpDrive - Next Generation Object Storage Engine
-## A Workload-Aware Object Store for Disaggregated Architectures
+# WarpDrive 
+## Next Generation Object Storage Engine
 
 <img src="https://github.com/user-attachments/assets/654f3add-74ab-4c34-8b73-234852ea11c7" alt="Storage Service Banner" width="800" height="250">
 
@@ -19,7 +19,7 @@
 
 ## About
 WarpDrive is a purpose-built KV/Object store focused on workloads that demand high throughput. Practical applications driving our development are storage-disaggregated architectures and data-intensive distributed systems.
-Our broader aim is to build storage primitives and interfaces with a deep understanding of the underlying backend architecture, making computational pushdown and storage-centric execution first-class capabilities. By exposing these abstractions cleanly, we aim to simplify how data systems, ML frameworks, and agentic workflows move computation closer to data, reducing unnecessary data movement while enabling efficient large-scale processing, retrieval, and orchestration  Our current implementation of the object store is based on Facebook's 2008 haystack paper and our road map([Technical Roadmap](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Roadmap.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems with a product first design. [ v0.1.0 Technical Architecture](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Architecture.md). 
+Our broader aim is to build storage primitives and interfaces with a deep understanding of the underlying backend architecture, making computational pushdown and storage-centric execution first-class capabilities. By exposing these abstractions cleanly, we aim to simplify how data systems, ML frameworks, and agentic workflows move computation closer to data, reducing unnecessary data movement while enabling efficient large-scale processing, retrieval, and orchestration. Our road map([Technical Roadmap](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Roadmap.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems with a product first design. [ v0.1.0 Technical Architecture](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Architecture.md). 
 
 ## System Offerings that are currently being built. 
 1. Storage - Key/Value, Files and Blobs. 
@@ -27,7 +27,7 @@ Our broader aim is to build storage primitives and interfaces with a deep unders
 3. User Access Management  - [Repo](https://github.com/vitality-ai/Vitality-console)
 4. Search - Seeks contribution for design. -   [Discussion](https://github.com/cia-labs/Storage-service/issues/35)
 5. Availability - Seeks contribution for design. [Discussion]()
-6. Client Library - Client package is currently available for Python only. [Repo](https://github.com/vitality-ai/python-sdk).
+6. Client Library - S3 compatible/ Custom Client package is currently available for Python only. [Repo](https://github.com/vitality-ai/python-sdk).
 7. Compute and Storage Infrastructure Research - [Repo](https://github.com/vitality-ai/NexCSAD).
 
 ---
