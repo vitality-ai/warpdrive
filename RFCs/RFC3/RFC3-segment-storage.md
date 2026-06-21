@@ -112,79 +112,90 @@ Whether this actually hurts performance in practice — i.e., whether I/O interf
 
 ---
 
-### Step 6 — Formulating the optimization: what are the costs?
+### Step 6 — What does compaction actually cost?
 
-Before committing to either approach, we wanted a formal cost model. Two metrics:
+Before choosing between A and B we needed to understand what we were optimising. Two costs matter:
 
-- **WA (write amplification)** — how many times is each user byte written? Once fresh (cost 1), plus once per compaction it lives through. A byte gets compacted every time the segment it's in goes cold before the byte is deleted. The full model is `WA = 1 + k` where k depends on T and how long objects live — see the Analytical Modeling section.
-- **SA (space amplification)** — how much disk does a byte occupy beyond its live size? At worst case utilization T, with headroom fraction f: `SA = 1 / (T * (1 - f))`.
+**SA (space amplification)** is the primary concern — it directly determines how much disk you need to provision. SA = 2 means you need twice the raw disk compared to your live data size. For Option A with no headroom, `SA = 1/T`. To minimise SA you want T as high as possible.
 
-The objective is to minimize `α*WA + β*SA` where α and β express how much you care about each.
+**WA (write amplification)** is a background cost — compaction copies bytes during a GC cycle. If that cycle runs without competing with fresh writes, WA does not affect user-visible write latency. It does consume disk bandwidth and SSD write cycles, so it is not completely free, but it is a second-order concern compared to SA.
 
-**First attempt used CVXPY.** It failed — the product `(1 - f) * T` in the denominator of SA is not DCP-compliant (non-convex in the CVXPY sense when both are decision variables). We had to change the formulation.
+Starting from this: if WA were entirely free, the answer is trivially T → 1 (compact as aggressively as possible, SA → 1). In practice T = 1 means compacting after every single delete, so we cap it at 0.5 as a practical upper bound. At T = 0.5, SA = 2.0 for Option A. That is the baseline.
 
-**Fix**: the headroom feasibility constraint `f * S ≥ T * (1 - f) * S` gives `f ≥ T / (1 + T)`. Setting `f` to its minimum feasible value eliminates it as a free variable. SA becomes `(1 + T) / T` — now a single-variable problem.
-
-The objective `α*(1 + T) + β*(1 + T)/T` is nonlinear because of the `β/T` term (a hyperbola). It is convex (`d²/dT² = 2β/T³ > 0`), so scipy's bounded scalar minimizer finds the global minimum trivially. We also derived a closed-form: `T* = sqrt(β/α)`, capped at 0.5.
+Once we account for WA as a background I/O cost, we introduce weights α and β to express the trade-off. The optimizer then finds the best T — see the Analytical Modeling section for the full derivation.
 
 ![Objective function vs T for different priority weights](plot_objective_surface.png)
 
-Each curve is a different priority weighting. The dot marks where each curve hits its minimum — the optimal T for that weighting. For the balanced and SA-heavy curves the minimum sits at the right boundary (T = 0.5), not in the interior. The optimizer is always pushing toward compacting aggressively — lower T values just waste more space without improving write efficiency. The red dotted line at T = 0.30 (our proposed value) is deliberately conservative: we accepted worse SA in exchange for not compacting segments that might only be temporarily cold.
+Each curve is a different priority weighting. The dots show optimal T for each weighting. SA-heavy and balanced weightings both hit T = 0.5 — the optimizer always pushes toward aggressive compaction because that is the only way to reduce SA. WA-heavy weightings pull T down because background compaction I/O becomes costly. Our proposed T = 0.30 (red line) is conservative — we accepted worse SA to avoid compacting segments that might only be temporarily cold.
 
 ---
 
-> **Checkpoint 3 — Cost model established**
-> We have two knobs: T (cold threshold) and f (headroom fraction). Write amplification is WA = 1 + k, where k is the average number of times a byte gets compacted — it grows with object lifetime and with T. Space amplification is SA = (1+T)/T once headroom is set to its minimum feasible value f = T/(1+T). Both metrics are now functions of T alone. The optimizer finds T* = sqrt(β/α), capped at 0.5 — meaning T = 0.5, f = 0.33 is optimal for almost any weighting that cares about space at all. Our proposed T = 0.30 is intentionally conservative.
+> **Checkpoint 3 — Cost model and Option A baseline established**
+> SA = 1/T for Option A. To minimise SA, set T as high as practically possible — T = 0.5 gives SA = 2.0. WA is a background cost; it does not affect write latency unless it competes with fresh writes on the same file. The optimizer confirms T = 0.5 is optimal for most weightings. Our proposed T = 0.30 is intentionally conservative and should be revisited after benchmarking.
 
 ---
 
 ### Step 7 — What the optimizer told us about T
 
-Running the closed-form across a range of α/β weights:
+Running the cost model across a range of α/β weights:
 
-- For any α/β ratio where SA matters at all (β/α ≥ 1), `T* = 0.5` is optimal.
-- Below that, T* = sqrt(β/α) — it shrinks only when WA is heavily dominant.
-- The proposed `T = 0.30` is intentionally conservative relative to `T* = 0.50`. The gap: WA = 1.30 (vs optimal 1.50), SA = 4.33 (vs optimal 3.00). We are paying 44% worse SA to be conservative about compacting temporarily-cold segments.
+- For any weighting where SA matters at all (β/α ≥ 1), `T* = 0.5` is optimal.
+- WA-heavy weightings pull T* down: T* = sqrt(β/α).
+- The proposed T = 0.30 gives SA = 4.33 vs optimal SA = 3.00 at T = 0.5. We are paying 44% worse SA to be conservative.
 
-**Decision to revisit**: bump the proposed threshold closer to T* = 0.45–0.50 after benchmarking confirms real-world utilization distributions.
+**Decision to revisit**: bump T closer to 0.45–0.50 after benchmarking confirms real-world utilization distributions.
 
 ![WA vs SA Pareto frontier for Approach B](plot_pareto_c.png)
 
-Each point on the frontier is an operating point — a choice of T giving a specific WA/SA trade-off. Moving right means lower T: you compact less aggressively, giving less write amplification but more disk waste. Most of the frontier collapses to the same point (T = 0.5, WA = 1.5, SA = 3.0) because the optimizer hits the cap across most weightings. The proposed point (red) has worse SA than optimal — that is the cost of keeping T conservative at 0.30.
+Each point on the frontier is an operating point — a choice of T giving a specific WA/SA trade-off. The frontier collapses to a single point (T = 0.5, SA = 3.0) for most weightings because the optimizer always hits the cap. The red point (proposed T = 0.30) sits off the frontier with higher SA than optimal.
 
 ---
 
-### Step 8 — Comparing A and B: when does headroom actually pay off?
+### Step 8 — Does WA cause interference? This is when headroom matters.
 
-The optimization above is for Approach B. But B has a cost: headroom is dead space until filled. At equal T, Approach A has strictly lower SA:
+So far we have been treating WA as a pure background cost. But in Option A, compaction writes go into the active segment — the same file fresh writes are landing in. The OS and storage device have to interleave two concurrent write streams on the same file. This can slow fresh write throughput.
 
-```
-SA_A = 1 / T               (no headroom waste)
-SA_B = (1 + T) / T         (headroom overhead)
-
-At T = 0.5:  SA_A = 2.0,  SA_B = 3.0   (B is 50% worse)
-```
-
-WA is identical in both when there is no I/O interference. So at `ρ = 1`, A always wins.
-
-We modeled interference as a multiplier `ρ ≥ 1` on B's effective WA and solved a bi-level program to find the crossover:
+We call this **ρ** — the ratio of write throughput at idle to write throughput while compaction is running:
 
 ```
-α = 0.5, β = 0.5:   ρ_c = 1.67    (A needs to slow writes 67% for B to win)
-α = 0.9, β = 0.1:   ρ_c = 1.08    (WA-heavy: any contention tips to B)
-α = 0.1, β = 0.9:   ρ_c = 7.00    (Space-heavy: B almost never wins)
+ρ  =  throughput_idle / throughput_during_compaction
 ```
 
-This is the decision the benchmark has to resolve: measure actual ρ, compare to ρ_c.
+Concretely: if your server writes at 500 MB/s normally and 300 MB/s while compaction is running, ρ = 500/300 = 1.67. ρ = 1 means compaction has no impact at all. ρ = 2 means fresh write throughput is cut in half every time a compaction cycle runs.
+
+When ρ > 1, WA stops being a background cost and starts being a write latency problem. This is exactly what Option B solves: by routing compaction into the headroom of active-1, the active segment is never touched during compaction. Fresh writes and compaction writes never compete. For Option B, ρ = 1 always.
+
+The trade-off: Option B eliminates the ρ penalty but pays a higher SA (SA_B = (1+T)/T vs SA_A = 1/T — 50% worse at T = 0.5). So the question is: is the SA overhead of B worth paying to eliminate the ρ penalty of A?
+
+```
+α = 0.5, β = 0.5:   ρ_c = 1.67    (compaction must slow writes 67% before B wins)
+α = 0.9, β = 0.1:   ρ_c = 1.08    (write-throughput-critical: any interference tips to B)
+α = 0.1, β = 0.9:   ρ_c = 7.00    (space-critical: B almost never worth the SA overhead)
+```
 
 ![Approach A vs B optimal objective as a function of interference ρ](plot_b_vs_c.png)
 
-Left: as ρ increases from 1 (no interference), Approach A's effective cost rises while B's stays flat. They cross at ρ_c = 1.67 — the point where B's headroom overhead is exactly offset by A's interference cost. Below the crossover A wins; above it B wins. Right: ρ_c shifts significantly by priority weighting. If you care mostly about write throughput (α = 0.9), almost any interference tips you to B (ρ_c = 1.08). If you care mostly about space (α = 0.1), you would need compaction to cause a 7× throughput drop before B is worth the extra headroom overhead. The benchmark's job is to measure actual ρ and place it on this chart.
+Left: as ρ increases from 1, Option A's effective cost rises while B's stays flat. They cross at ρ_c. Below the crossover A wins (lower SA, and ρ hasn't hurt enough). Above it B wins (eliminating ρ outweighs the SA overhead). Right: ρ_c varies sharply by priority — write-throughput-critical workloads tip to B almost immediately; space-critical workloads almost never find B worth it.
+
+**Workload conclusions:**
+
+- **Write-latency-sensitive workloads** (serving live traffic, real-time ingestion): ρ is a real concern. Even moderate contention tips to B. Prefer B.
+- **Batch / archive workloads** (backups, cold storage, periodic ingestion): write latency does not matter. ρ is irrelevant. Prefer A — you get better SA at no cost.
+- **High churn workloads** (many deletes, frequent overwrites): segments go cold fast, compaction runs frequently, ρ compounds over time. Lean toward B.
+- **Low churn workloads** (mostly writes, few deletes): segments stay warm for a long time, compaction is infrequent, ρ rarely occurs. A is fine.
+
+**Tuning T by workload:**
+
+T controls how cold a segment has to be before you compact it. The right T depends on your delete rate:
+- High delete rate: segments go cold quickly regardless. Lower T means fewer false-cold compactions but doesn't change much. T = 0.4–0.5 is reasonable.
+- Low delete rate: segments accumulate dead bytes slowly. A conservative T = 0.2–0.3 avoids compacting segments that are only temporarily cold because of a burst of deletes.
+
+T can be user-configured or made adaptive — the system can observe the rolling delete rate per bucket and adjust T automatically. We start with a static T = 0.30 and revisit once we have production data.
 
 ---
 
 > **Checkpoint 4 — Approach decision deferred to benchmarks**
-> Without headroom (A): lower SA, but compaction and fresh writes share the active segment. With headroom (B): 50% worse SA at T = 0.5, but compaction is fully isolated in active-1. WA is the same in both. The decision reduces to a single measurement: ρ, the throughput slowdown compaction causes in A. If ρ < 1.67 (balanced weights), implement A. If ρ > 1.67, implement B. The benchmark is designed to measure this.
+> Option A (no headroom) has lower SA. ρ determines whether its WA becomes a write latency problem. Option B eliminates ρ at the cost of 50% worse SA. The benchmark measures ρ for the target workload and compares it to ρ_c. Write-latency-sensitive or high-churn workloads favour B; batch and low-churn workloads favour A. T should be tuned to the observed delete rate — higher T for high churn, lower T when deletes are bursty or infrequent.
 
 ---
 
@@ -316,17 +327,32 @@ The one race: a reader fetches old offset from SQLite, compaction commits and un
 
 ## Analytical Modeling
 
-Two questions drive this section: what are the optimal values of T and f for Approach B, and is Approach B actually better than A?
+This section builds the cost model in stages. Each stage adds one constraint, arriving at a decision rule for when to prefer Option B over Option A.
 
-**Symbols used:**
-- `T` — cold threshold (0 to 0.5): compact a segment when its utilization falls below this fraction
+**Symbols:**
+- `T` — cold threshold (0 to 0.5): compact a segment when live utilization falls below this fraction
 - `f` — headroom fraction: what fraction of each segment is reserved for compaction writes
-- `α, β` — how much you care about write amplification vs space amplification (α + β = 1)
-- `ρ` — measured write interference: how much compaction slows concurrent fresh writes in Approach A
+- `S` — segment size (512 MB)
+- `α, β` — priority weights for WA vs SA (α + β = 1)
+- `ρ` — write interference: ratio of idle write throughput to write throughput during compaction
 
 ---
 
-### Where WA and SA come from
+### Stage 1 — SA is the primary concern
+
+If compaction runs in the background without affecting fresh writes, WA does not touch user-visible write latency. The only cost that matters is SA — how much disk you need.
+
+For Option A (no headroom), the worst-case moment for SA is a segment sitting just above the cold threshold — T fraction of it is still live, the rest is dead bytes waiting to be reclaimed:
+
+```
+SA_A  =  1 / T
+```
+
+To minimise SA you maximise T. T = 1 means compact after every single byte dies — constant compaction. The practical cap is T = 0.5: only compact when the majority of a segment is dead. At T = 0.5: `SA_A = 2.0` — the best Option A can achieve, using 2× the disk of your live data size.
+
+---
+
+### Stage 2 — Where WA comes from
 
 **Write amplification** is how many times each user byte gets written in total. Every byte is written once fresh. After that, it may be copied again if its segment gets compacted — and then again if the segment it moved to also eventually goes cold.
 
@@ -354,75 +380,82 @@ Left: each curve is a different object lifetime L. Short-lived objects (L = 1, b
 
 The benchmark measures actual WA directly as total bytes written ÷ total user bytes written, which captures all of this without needing to know L. The model gives us the shape of the relationship; the benchmark pins the exact number.
 
-**Space amplification** is the ratio of total disk used to actual live data. SA = 3 means you are using 3× as much disk as your data actually needs — two thirds of the storage is dead bytes waiting to be reclaimed.
+---
 
-The worst case for SA is a segment sitting just above the cold threshold — it has accumulated the maximum tolerable dead bytes and hasn't been compacted yet. Let's walk through a concrete example.
+### Stage 3 — WA as a real background cost; adding it to the objective
 
-Take a 512 MB segment with T = 0.5 and no headroom (f = 0, Approach A):
-
-```
-Data capacity  = (1 - f) × S  =  (1 - 0) × 512 MB  =  512 MB
-Live bytes     = T × 512 MB   =  0.5 × 512 MB        =  256 MB   ← half is dead
-Disk used      = 512 MB       (the whole file is on disk)
-
-SA  =  disk used / live bytes  =  512 / 256  =  2.0
-```
-
-For every 1 MB of real data you have, you're occupying 2 MB of disk. The other 1 MB is dead bytes that haven't been reclaimed yet.
-
-Now add headroom for Approach B with T = 0.5 and f = 0.33 (headroom takes up 33% of the segment):
+Even when compaction doesn't interfere with fresh writes, it does consume disk bandwidth and SSD write cycles — costs that matter for hardware longevity and peak storage load. We introduce weights α and β to express the trade-off between WA and SA:
 
 ```
-Data capacity  = (1 - 0.33) × 512 MB  =  342 MB
-Live bytes     = T × 342 MB            =  0.5 × 342 MB  =  171 MB
-Disk used      = 512 MB
-
-SA  =  512 / 171  =  3.0
+minimize over T:    α × WA  +  β × SA
 ```
 
-SA went from 2.0 to 3.0 just because of the headroom — 170 MB per segment is now permanently reserved and not counted as live data.
+For Option A with no headroom (f = 0), SA = 1/T and WA = 1 + k(T, L). Using the L = 1 approximation (one compaction per byte lifetime) as a baseline, WA ≈ 1 + T. The optimizer finds T* = sqrt(β/α), capped at 0.5 — see the objective surface plot above. For any weighting that cares at all about space, T = 0.5 is optimal.
 
-The general formula is:
+---
+
+### Stage 4 — Option B: headroom and its SA cost
+
+Option A routes compaction writes into the active segment. Option B separates them by reserving headroom in `active - 1`. The headroom introduces an additional SA overhead.
+
+**SA formula for Option B.** With headroom fraction f:
 
 ```
 SA  =  1 / (T × (1-f))
 ```
 
-**What happens with a lower T?** Say T = 0.3 (Approach A, f = 0):
+**SA for Option A** is just this with f = 0: `SA_A = 1/T`.
+
+**Concrete example.** 512 MB segment, T = 0.5, f = 0 (Option A):
 
 ```
-Live bytes  =  0.3 × 512 MB  =  154 MB   ← only 30% alive, 70% dead
+Live bytes  = 0.5 × 512 MB  =  256 MB
+SA  =  512 / 256  =  2.0
+```
+
+For every 1 MB of real data, you occupy 2 MB of disk — the other 1 MB is dead bytes waiting to be reclaimed.
+
+Now add headroom, T = 0.5, f = 0.33 (Option B):
+
+```
+Data capacity  = (1 - 0.33) × 512 MB  =  342 MB
+Live bytes     = 0.5 × 342 MB          =  171 MB
+SA  =  512 / 171  =  3.0
+```
+
+SA jumped from 2.0 to 3.0 purely because of headroom — 170 MB per segment is permanently reserved for compaction writes.
+
+**What about lower T?** At T = 0.3 (Option A, f = 0):
+
+```
+Live bytes  =  0.3 × 512 MB  =  154 MB
 SA  =  512 / 154  =  3.3
 ```
 
-Lower T means you tolerate more dead bytes before compacting, so SA gets worse. This is the fundamental tension: aggressive compaction (high T) gives better SA but more write overhead.
+Lower T tolerates more dead bytes before compacting, which makes SA worse. This confirms Stage 1: for Option A, always push T as high as practical.
 
-**Tying f to T:** Headroom must be large enough to absorb all survivors when we compact a cold segment. A cold segment has `T×(1-f)×S` live bytes that need to fit into headroom `f×S`:
+**Tying f to T.** Headroom must fit all survivors from one compaction. A cold segment has `T×(1-f)×S` live bytes that need to land in headroom `f×S`:
 
 ```
 f×S  ≥  T×(1-f)×S
   f  ≥  T / (1 + T)
 ```
 
-At T = 0.5: f ≥ 0.5/1.5 = 0.33. That's exactly the 33% we used above — it's the minimum headroom that guarantees survivors always fit.
-
-Substituting f = T/(1+T) back into the SA formula:
+At T = 0.5: f ≥ 0.33. Setting f to its minimum feasible value:
 
 ```
-SA  =  1 / (T × (1 - T/(1+T)))
-    =  1 / (T × 1/(1+T))
-    =  (1 + T) / T
+SA_B  =  1 / (T × (1 - T/(1+T)))  =  (1 + T) / T
 ```
 
-Verified with our examples: at T = 0.5, SA = 1.5/0.5 = 3.0 ✓. At T = 0.3, SA = 1.3/0.3 = 4.3.
+At T = 0.5: SA_B = 1.5/0.5 = 3.0 ✓. At T = 0.3: SA_B = 1.3/0.3 = 4.3.
 
-Now both WA and SA are functions of T alone — one knob controls the whole trade-off.
+Now both WA and SA for both options are functions of T alone.
 
 ---
 
-### Finding the best T for Approach B
+### Finding the best T for Option B
 
-We want to minimize a weighted combination of WA and SA. The optimizer uses the L = 1 approximation for WA (one compaction per byte lifetime) — a reasonable baseline until benchmarks tell us the actual object lifetime distribution:
+We want to minimise the weighted objective for Option B. The optimizer uses the L = 1 approximation for WA as a baseline:
 
 ```
 minimize over T:    α × (1 + T)  +  β × (1 + T) / T
@@ -451,33 +484,69 @@ The pure extremes (only WA or only SA) are degenerate — one wastes all disk, t
 
 ---
 
-### Comparing Approach A vs Approach B
+### Stage 5 — When does WA cause interference? Comparing A vs B.
 
-At equal T, the two approaches have the same WA (both compact the same bytes the same number of times) but differ in SA:
+At equal T, both options produce the same WA. They only differ in SA:
 
 ```
-Approach A (no headroom):   WA = 1 + k,   SA = 1 / T
-Approach B (with headroom): WA = 1 + k,   SA = (1 + T) / T
+Option A (no headroom):   SA = 1 / T
+Option B (with headroom): SA = (1 + T) / T
+
+At T = 0.5:  SA_A = 2.0,  SA_B = 3.0   (B is 50% worse)
 ```
 
-B always has worse SA — headroom is dead space until used. The only thing that makes B worth it is if compaction into the active segment (Approach A) measurably slows fresh writes.
+B always has worse SA. The only reason to choose B is if compaction into the active segment (Option A) measurably slows fresh writes.
 
-We define `ρ` as the throughput ratio: `ρ = throughput_idle / throughput_during_compaction`. A value of 1.5 means compaction makes writes 33% slower. We solve each approach independently for its optimal T, then compare their minimum costs:
+In Option A, compaction writes go to the same file as fresh writes. The OS and storage device interleave two concurrent write streams on the same inode. We measure the interference as:
+
+```
+ρ  =  throughput_idle / throughput_during_compaction
+```
+
+If your server writes at 500 MB/s idle and 300 MB/s during compaction, ρ = 1.67. ρ = 1 means no impact. ρ = 2 means fresh writes are cut in half every compaction cycle.
+
+When ρ > 1, WA stops being a background cost and starts affecting user-visible write latency. Option B eliminates this by routing compaction into `active - 1` — the active segment is never touched, so ρ_B = 1 always.
+
+We solve each option for its optimal T independently and compare their minimum total costs:
 
 ```
 Cost_A(ρ) = minimized over T:  α×(1+T)×ρ  +  β/T
 Cost_B     = minimized over T:  α×(1+T)    +  β×(1+T)/T
 ```
 
-B is worth adopting when `Cost_A(ρ) > Cost_B`, which happens past a crossover value ρ_c:
+B is worth adopting when `Cost_A(ρ) > Cost_B`, which happens past a crossover ρ_c:
 
 | α | β | ρ_c | Plain English |
 |---|---|---|---|
 | 0.9 | 0.1 | 1.08 | Any interference at all tips to B |
 | 0.5 | 0.5 | 1.67 | B wins if compaction slows writes by 67% |
-| 0.1 | 0.9 | 7.00 | B almost never wins — space overhead is too high |
+| 0.1 | 0.9 | 7.00 | B almost never wins — space overhead too high |
 
-At zero interference (ρ = 1), A always wins. The benchmark measures ρ, then this table decides which approach to implement.
+At ρ = 1 (no interference), Option A always wins. The benchmark measures ρ and places it on this table.
+
+---
+
+### Stage 6 — Workload conclusions and tuning T
+
+The model gives us a decision framework, not a fixed answer. The right choice depends on the workload.
+
+**Which option to use:**
+
+| Workload type | ρ expected | Recommendation |
+|---|---|---|
+| Write-latency-sensitive (live traffic, real-time ingestion) | Potentially high | Prefer B — eliminate ρ risk even at SA cost |
+| Batch / archive (backups, cold storage) | Low — writes are not latency-sensitive | Prefer A — better SA, ρ doesn't matter |
+| High churn (frequent deletes, overwrites) | Elevated — compaction runs often | Lean toward B |
+| Low churn (mostly writes, rare deletes) | Low — compaction is infrequent | A is fine |
+
+**How to tune T:**
+
+T controls how dead a segment has to be before you compact it. The right T tracks your delete rate:
+
+- **High delete rate**: segments go cold quickly regardless of T. A higher T (0.4–0.5) gives better SA without compacting segments that are still filling up.
+- **Low delete rate / bursty deletes**: segments may temporarily look cold after a burst then recover. A conservative T (0.2–0.3) avoids unnecessary compaction.
+
+T can be static (user-configured) or dynamic (the system observes the per-bucket delete rate and adjusts T automatically). We start with T = 0.30 as a conservative static value and revisit once we have production data. Bumping to T = 0.45–0.50 after benchmarking is the expected outcome if the utilization distribution is stable.
 
 ---
 
