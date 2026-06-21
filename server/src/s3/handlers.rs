@@ -848,9 +848,21 @@ pub async fn s3_get_object_handler(
         }
     });
 
+    // Response header overrides from presigned URL query params
+    let resp_content_type = qmap.get("response-content-type").cloned()
+        .unwrap_or(content_type);
+    let resp_content_disposition = qmap.get("response-content-disposition").cloned();
+    let resp_content_language = qmap.get("response-content-language").cloned();
+    let resp_expires = qmap.get("response-expires").cloned()
+        .or_else(|| meta.expires.clone());
+    let resp_cache_control = qmap.get("response-cache-control").cloned()
+        .or_else(|| meta.cache_control.clone());
+    let resp_content_encoding = qmap.get("response-content-encoding").cloned()
+        .or_else(|| meta.content_encoding.clone());
+
     let status = if range_header.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
     let mut resp = HttpResponse::build(status);
-    resp.content_type(content_type.as_str());
+    resp.content_type(resp_content_type.as_str());
     resp.insert_header(("Content-Length", response_len.to_string()));
     resp.insert_header(("ETag", etag));
     resp.insert_header(("Accept-Ranges", "bytes"));
@@ -860,14 +872,20 @@ pub async fn s3_get_object_handler(
     if !last_modified.is_empty() {
         resp.insert_header(("Last-Modified", last_modified));
     }
-    if let Some(cc) = &meta.cache_control {
-        resp.insert_header(("Cache-Control", cc.as_str()));
+    if let Some(cc) = resp_cache_control {
+        resp.insert_header(("Cache-Control", cc));
     }
-    if let Some(exp) = &meta.expires {
-        resp.insert_header(("Expires", exp.as_str()));
+    if let Some(exp) = resp_expires {
+        resp.insert_header(("Expires", exp));
     }
-    if let Some(enc) = &meta.content_encoding {
-        resp.insert_header(("Content-Encoding", enc.as_str()));
+    if let Some(enc) = resp_content_encoding {
+        resp.insert_header(("Content-Encoding", enc));
+    }
+    if let Some(cd) = resp_content_disposition {
+        resp.insert_header(("Content-Disposition", cd));
+    }
+    if let Some(cl) = resp_content_language {
+        resp.insert_header(("Content-Language", cl));
     }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
@@ -2398,4 +2416,14 @@ async fn s3_head_part_handler(bucket: &str, key: &str, part_num: i32, req: &Http
     resp.insert_header(("Content-Type", content_type));
     resp.insert_header(("ETag", etag));
     Ok(resp.message_body(HeadBody(meta.size)).unwrap().map_into_boxed_body())
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONS — CORS not configured
+// ---------------------------------------------------------------------------
+
+pub async fn s3_cors_not_configured_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
+    let bucket = req.match_info().get("bucket").unwrap_or("");
+    Ok(s3_error(StatusCode::BAD_REQUEST, "CORSNotEnabled",
+                "CORS is not enabled for this bucket.", bucket))
 }
