@@ -561,6 +561,73 @@ test_delete_tags_obj_public
 
 ---
 
+## feat/batch-11-versioning — Batch 11: Versioning + handler refactor
+
+**Branch:** `feat/batch-11-versioning`  
+**RFC Batch:** Batch 11 (S3 Versioning)  
+**Newly passing:** 27 versioning tests (383 total passing, up from 252)
+
+### Changes
+
+- `put_object_v2` returns `(version_id, old_extents)` — GC responsibility inside metadata layer, handlers no longer check versioning state
+- `put_bucket_versioning` / `get_bucket_versioning` handlers (`?versioning`)
+- `delete_specific_version` / `get_object_version` by VersionId
+- `ListObjectVersions` rewrite: `<Version>` and `<DeleteMarker>` elements, pagination, common prefixes
+- `DeleteObjects` dispatches to `delete_specific_version` when VersionId provided
+- ACL stubs: `get_object_acl`, `get_bucket_acl`, `put_acl` (valid XML, no enforcement)
+- `delete_specific_version` / `get_object_version`: `"null"` VersionId matches both `version_id=''` (never-versioned) and `version_id='null'` (suspended null-version)
+- Suspended versioning `put_object_v2`: also removes `version_id=''` pre-versioning rows when overwriting null-version
+- `x-amz-version-id` only emitted for real UUID version IDs; suppressed for `"null"` (suspended) and `None` (disabled)
+- `CompleteMultipartUpload`: removed pre-emptive `delete_metadata` that was wiping all versions
+
+### Newly Passing (27)
+
+```
+test_bucket_list_return_data_versioning
+test_versioning_concurrent_multi_object_delete
+test_object_copy_versioned_bucket
+test_object_copy_versioned_url_encoding
+test_object_copy_versioning_multipart_upload
+test_versioning_bucket_create_suspend
+test_versioning_obj_create_read_remove
+test_versioning_obj_create_read_remove_head
+test_versioning_stack_delete_merkers
+test_versioning_obj_plain_null_version_removal
+test_versioning_obj_plain_null_version_overwrite
+test_versioning_obj_plain_null_version_overwrite_suspended
+test_versioning_obj_suspend_versions
+test_versioning_obj_suspended_copy
+test_versioning_obj_create_versions_remove_all
+test_versioning_obj_create_versions_remove_special_names
+test_versioning_obj_create_overwrite_multipart
+test_versioning_obj_list_marker
+test_versioning_copy_obj_version
+test_versioning_multi_object_delete
+test_versioning_multi_object_delete_with_marker
+test_versioning_multi_object_delete_with_marker_create
+test_lifecycle_expiration_versioning_enabled
+test_versioning_bucket_atomic_upload_return_version_id
+test_versioning_bucket_multipart_upload_return_version_id
+test_versioned_concurrent_object_create_and_remove
+test_versioned_concurrent_object_create_concurrent_remove
+```
+
+### Intentionally deferred
+
+- `test_object_lock_suspend_versioning` — requires object lock (CreateBucket with `ObjectLockEnabledForBucket=True`); Batch 18
+
+### Note on total count
+
+Full suite passed 374 tests vs 252 previously. The 122-test jump includes the 23 versioning tests plus ~99 previously-passing tests that were blocked by cascade teardown failures (`BucketNotEmpty` when `delete_objects` with `VersionId="null"` wasn't resolving to `version_id=''` rows).
+
+### Also in this branch
+
+- `handlers/` split into 11 focused files (`common.rs`, `cors.rs`, `tagging.rs`, `versioning.rs`, `acl.rs`, `bucket.rs`, `object.rs`, `listing.rs`, `copy.rs`, `multipart.rs`, `mod.rs`) — no new tests, purely structural
+
+**Running total: 383 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

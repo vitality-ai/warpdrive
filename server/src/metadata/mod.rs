@@ -40,6 +40,11 @@ pub struct Metadata {
     pub expires: Option<String>,
     /// `Content-Encoding` header value stored on PUT (e.g. `"gzip"`).
     pub content_encoding: Option<String>,
+    /// Version ID assigned by the store; `None` for non-versioned objects, `Some("")` for
+    /// suspended-versioning null-version objects (stored as `"null"` in the DB).
+    pub version_id: Option<String>,
+    /// True when this row is a delete marker (no data, marks the key as deleted).
+    pub is_delete_marker: bool,
 }
 
 impl Metadata {
@@ -61,6 +66,8 @@ impl Metadata {
             cache_control: None,
             expires: None,
             content_encoding: None,
+            version_id: None,
+            is_delete_marker: false,
         }
     }
 
