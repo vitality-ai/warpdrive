@@ -110,6 +110,16 @@ lazy_static! {
             )",
             [],
         ).expect("Failed to create buckets table");
+        conn.execute("ALTER TABLE buckets ADD COLUMN location TEXT DEFAULT ''", []).ok();
+
+        // CORS configuration per bucket
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bucket_cors (
+                bucket  TEXT PRIMARY KEY,
+                cors_xml TEXT NOT NULL
+            )",
+            [],
+        ).expect("Failed to create bucket_cors table");
 
         Arc::new(Mutex::new(conn))
     };
@@ -427,6 +437,58 @@ impl SQLiteMetadataStore {
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         info!("Cleaned up {} old deletion events", count);
         Ok(count)
+    }
+}
+
+/// CORS and bucket location operations
+impl SQLiteMetadataStore {
+    pub fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bucket_cors (bucket, cors_xml) VALUES (?1, ?2)",
+            params![bucket, cors_xml],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT cors_xml FROM bucket_cors WHERE bucket = ?1")
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![bucket], |row| row.get::<_, String>(0));
+        match result {
+            Ok(xml) => Ok(Some(xml)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute("DELETE FROM bucket_cors WHERE bucket = ?1", params![bucket])
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn set_bucket_location(&self, user_id: &str, bucket: &str, location: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE buckets SET location = ?1 WHERE user = ?2 AND name = ?3",
+            params![location, user_id, bucket],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_bucket_location(&self, user_id: &str, bucket: &str) -> Result<String, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT location FROM buckets WHERE user = ?1 AND name = ?2")
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![user_id, bucket], |row| row.get::<_, Option<String>>(0));
+        match result {
+            Ok(loc) => Ok(loc.unwrap_or_default()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
     }
 }
 

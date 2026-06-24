@@ -256,6 +256,95 @@ fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
     Some(src[start..start + end].to_string())
 }
 
+/// Extract text content of ALL occurrences of `<tag>…</tag>` in `src`.
+fn extract_all_xml_tags(src: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let mut results = Vec::new();
+    let mut remaining = src;
+    while let Some(start) = remaining.find(&open) {
+        let content_start = start + open.len();
+        if let Some(end) = remaining[content_start..].find(&close) {
+            results.push(remaining[content_start..content_start + end].to_string());
+            remaining = &remaining[content_start + end + close.len()..];
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// CORS types and helpers
+// ---------------------------------------------------------------------------
+
+struct CorsRule {
+    allowed_origins: Vec<String>,
+    allowed_methods: Vec<String>,
+    allowed_headers: Vec<String>,
+    expose_headers:  Vec<String>,
+    max_age_seconds: Option<u32>,
+}
+
+fn parse_cors_rules(xml: &str) -> Vec<CorsRule> {
+    extract_all_xml_tags(xml, "CORSRule").into_iter().map(|block| {
+        CorsRule {
+            allowed_origins: extract_all_xml_tags(&block, "AllowedOrigin"),
+            allowed_methods: extract_all_xml_tags(&block, "AllowedMethod"),
+            allowed_headers: extract_all_xml_tags(&block, "AllowedHeader"),
+            expose_headers:  extract_all_xml_tags(&block, "ExposeHeader"),
+            max_age_seconds: extract_xml_tag(&block, "MaxAgeSeconds")
+                .and_then(|s| s.trim().parse().ok()),
+        }
+    }).collect()
+}
+
+/// Glob-match an origin against an S3 AllowedOrigin pattern (single '*' wildcard).
+fn origin_matches_pattern(origin: &str, pattern: &str) -> bool {
+    if pattern == "*" { return true; }
+    match pattern.find('*') {
+        None      => origin == pattern,
+        Some(pos) => {
+            let prefix = &pattern[..pos];
+            let suffix = &pattern[pos + 1..];
+            origin.len() >= prefix.len() + suffix.len()
+                && origin.starts_with(prefix)
+                && origin.ends_with(suffix)
+        }
+    }
+}
+
+/// Find the first CORS rule matching origin + method + requested headers.
+fn find_cors_match<'a>(
+    rules: &'a [CorsRule],
+    origin: &str,
+    method: &str,
+    req_headers: &[&str],
+) -> Option<&'a CorsRule> {
+    for rule in rules {
+        if !rule.allowed_origins.iter().any(|p| origin_matches_pattern(origin, p)) {
+            continue;
+        }
+        if !rule.allowed_methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
+            continue;
+        }
+        // If the preflight specifies headers they must be in AllowedHeaders
+        if !req_headers.is_empty() {
+            let ok = req_headers.iter().all(|rh| {
+                rule.allowed_headers.iter().any(|ah| ah == "*" || ah.eq_ignore_ascii_case(rh))
+            });
+            if !ok { continue; }
+        }
+        return Some(rule);
+    }
+    None
+}
+
+/// The Allow-Origin value to echo back: `*` for wildcard pattern, actual origin otherwise.
+fn cors_allow_origin<'a>(origin: &'a str, matched_pattern: &str) -> &'a str {
+    if matched_pattern == "*" { "*" } else { origin }
+}
+
 /// Parts manifest entry — stored as JSON in the parts_manifest column.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct PartEntry {
@@ -434,17 +523,49 @@ pub async fn s3_list_buckets_handler(
 
 pub async fn s3_create_bucket_handler(
     path: web::Path<String>,
+    mut payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let bucket = path.into_inner();
-    let auth_result = authenticate_s3_request(&req).await?;
 
+    // Collect body for CORS XML or CreateBucketConfiguration
+    let mut body_bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(actix_web::error::ErrorInternalServerError)?;
+        body_bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&body_bytes);
+
+    let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map(|q| q.into_inner()).unwrap_or_default();
+
+    // Dispatch ?cors → store CORS configuration
+    if query.contains_key("cors") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        db.set_bucket_cors(&bucket, body.trim())?;
+        info!("S3 PutBucketCors: bucket={}", bucket);
+        return Ok(HttpResponse::Ok()
+            .insert_header(("Content-Length", "0"))
+            .body(""));
+    }
+
+    let auth_result = authenticate_s3_request(&req).await?;
     if let Err(e) = validate_bucket_name(&bucket) { return Ok(e); }
 
     let db = MetadataService::new(&auth_result.user_id)?;
     db.create_bucket(&bucket)?;
 
-    info!("S3 CreateBucket: bucket={} user={}", bucket, auth_result.user_id);
+    // Parse and store LocationConstraint from CreateBucketConfiguration body
+    let location = extract_xml_tag(&body, "LocationConstraint")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !location.is_empty() {
+        db.set_bucket_location(&bucket, &location)?;
+    }
+
+    info!("S3 CreateBucket: bucket={} user={} location={:?}", bucket, auth_result.user_id, location);
     Ok(HttpResponse::Ok()
         .insert_header(("Location", format!("/{}", bucket)))
         .insert_header(("Content-Length", "0"))
@@ -460,6 +581,20 @@ pub async fn s3_delete_bucket_handler(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let bucket = path.into_inner();
+
+    let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map(|q| q.into_inner()).unwrap_or_default();
+
+    // Dispatch ?cors → delete CORS configuration
+    if query.contains_key("cors") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        db.delete_bucket_cors(&bucket)?;
+        info!("S3 DeleteBucketCors: bucket={}", bucket);
+        return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
+    }
+
     let auth_result = authenticate_s3_request(&req).await?;
     let db = MetadataService::new(&auth_result.user_id)?;
 
@@ -1060,6 +1195,16 @@ pub async fn s3_list_objects_handler(
     // Dispatch list-multipart-uploads (?uploads query param)
     if query.contains_key("uploads") {
         return s3_list_multipart_uploads_handler(&bucket, &req).await;
+    }
+
+    // Dispatch ?location → GetBucketLocation
+    if query.contains_key("location") {
+        return s3_get_bucket_location_inner(&bucket, &req).await;
+    }
+
+    // Dispatch ?cors → GetBucketCors
+    if query.contains_key("cors") {
+        return s3_get_bucket_cors_inner(&bucket, &req).await;
     }
 
     let auth_result = authenticate_s3_request(&req).await?;
@@ -2419,11 +2564,117 @@ async fn s3_head_part_handler(bucket: &str, key: &str, part_num: i32, req: &Http
 }
 
 // ---------------------------------------------------------------------------
-// OPTIONS — CORS not configured
+// GetBucketLocation  GET /s3/{bucket}?location
+// ---------------------------------------------------------------------------
+
+async fn s3_get_bucket_location_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let location = db.get_bucket_location(bucket)?;
+    let loc_xml = if location.is_empty() {
+        "<LocationConstraint/>".to_string()
+    } else {
+        format!("<LocationConstraint>{}</LocationConstraint>", xml_escape(&location))
+    };
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         {loc}",
+        loc = loc_xml,
+    );
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+}
+
+// ---------------------------------------------------------------------------
+// GetBucketCors  GET /s3/{bucket}?cors
+// ---------------------------------------------------------------------------
+
+async fn s3_get_bucket_cors_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    match db.get_bucket_cors(bucket)? {
+        None => Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchCORSConfiguration",
+                            "The CORS configuration does not exist.", bucket)),
+        Some(xml) => Ok(HttpResponse::Ok()
+            .content_type("application/xml")
+            .body(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONS — CORS preflight handler
 // ---------------------------------------------------------------------------
 
 pub async fn s3_cors_not_configured_handler(req: HttpRequest) -> Result<HttpResponse, Error> {
     let bucket = req.match_info().get("bucket").unwrap_or("");
-    Ok(s3_error(StatusCode::BAD_REQUEST, "CORSNotEnabled",
-                "CORS is not enabled for this bucket.", bucket))
+
+    let origin = match req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+        Some(o) => o.to_string(),
+        None => return Ok(s3_error(StatusCode::BAD_REQUEST, "CORSNotEnabled",
+                                   "CORS is not enabled for this bucket.", bucket)),
+    };
+
+    let request_method = match req.headers().get("access-control-request-method")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(m) => m.to_string(),
+        None => return Ok(s3_error(StatusCode::BAD_REQUEST, "CORSNotEnabled",
+                                   "CORS is not enabled for this bucket.", bucket)),
+    };
+
+    let request_headers: Vec<String> = req.headers()
+        .get("access-control-request-headers")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').map(|h| h.trim().to_string()).collect())
+        .unwrap_or_default();
+    let req_header_refs: Vec<&str> = request_headers.iter().map(|s| s.as_str()).collect();
+
+    // A user without auth can trigger OPTIONS; we read CORS without requiring auth.
+    // Try authenticated first (for user context), fall back to direct store read.
+    use crate::metadata::sqlite_store::SQLiteMetadataStore;
+    let cors_xml = SQLiteMetadataStore::new().get_bucket_cors(bucket)?;
+
+    let cors_xml = match cors_xml {
+        None => return Ok(s3_error(StatusCode::BAD_REQUEST, "CORSNotEnabled",
+                                   "CORS is not enabled for this bucket.", bucket)),
+        Some(xml) => xml,
+    };
+
+    let rules = parse_cors_rules(&cors_xml);
+    let matched = find_cors_match(&rules, &origin, &request_method, &req_header_refs);
+
+    match matched {
+        None => Ok(HttpResponse::Forbidden()
+            .insert_header(("Content-Length", "0"))
+            .body("")),
+        Some(rule) => {
+            let matched_pattern = rule.allowed_origins.iter()
+                .find(|p| origin_matches_pattern(&origin, p))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let allow_origin = cors_allow_origin(&origin, matched_pattern);
+            let allow_methods = rule.allowed_methods.join(", ");
+
+            let mut resp = HttpResponse::Ok();
+            resp.insert_header(("Access-Control-Allow-Origin", allow_origin));
+            resp.insert_header(("Access-Control-Allow-Methods", allow_methods.as_str()));
+            if !rule.allowed_headers.is_empty() {
+                resp.insert_header(("Access-Control-Allow-Headers",
+                    rule.allowed_headers.join(", ").as_str()));
+            }
+            if let Some(max_age) = rule.max_age_seconds {
+                resp.insert_header(("Access-Control-Max-Age", max_age.to_string().as_str()));
+            }
+            if !rule.expose_headers.is_empty() {
+                resp.insert_header(("Access-Control-Expose-Headers",
+                    rule.expose_headers.join(", ").as_str()));
+            }
+            resp.insert_header(("Content-Length", "0"));
+            Ok(resp.body(""))
+        }
+    }
 }
