@@ -166,6 +166,53 @@ impl MetadataService {
         SQLiteMetadataStore::new().get_bucket_location(&self.user, bucket)
     }
 
+    // --- Tagging ---
+
+    pub fn set_object_tags(&self, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_object_tags(&self.user, bucket, key, tags)
+    }
+
+    pub fn get_object_tags(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_object_tags(&self.user, bucket, key)
+    }
+
+    pub fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_object_tags(&self.user, bucket, key)
+    }
+
+    pub fn get_object_tag_count(&self, bucket: &str, key: &str) -> Result<i64, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_object_tag_count(&self.user, bucket, key)
+    }
+
+    pub fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_bucket_tags(bucket, tags)
+    }
+
+    pub fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_bucket_tags(bucket)
+    }
+
+    pub fn delete_bucket_tags(&self, bucket: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_bucket_tags(bucket)
+    }
+
+    pub fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_multipart_tagging(upload_id, tagging)
+    }
+
+    pub fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_multipart_tagging(upload_id)
+    }
+
     // --- Multipart upload management ---
 
     pub fn create_multipart_upload(
