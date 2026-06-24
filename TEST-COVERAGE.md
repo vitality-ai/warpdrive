@@ -515,6 +515,52 @@ test_object_raw_put_authenticated_expired
 
 ---
 
+## feat/batch-9-tagging — Batch 9 complete
+
+**Branch:** `feat/batch-9-tagging`
+**RFC Batch:** Batch 9 (Object & Bucket Tagging)
+**Newly passing:** 15
+
+Key changes:
+- `object_tags` and `bucket_tags` SQLite tables; `tagging TEXT` column on `multipart_uploads`
+- Tag CRUD ops in `SQLiteMetadataStore`: `set/get/delete_object_tags`, `set/get/delete_bucket_tags`, `get_object_tag_count`, `set/get_multipart_tagging`
+- `MetadataService` wrappers for all tag operations
+- Handlers: PUT/GET/DELETE `/{bucket}?tagging`, PUT/GET/DELETE `/{bucket}/{key}?tagging`
+- `x-amz-tagging` header on PUT object → stores URL-encoded tags at write time
+- `x-amz-tagging-count` response header on HEAD object when tags exist
+- `x-amz-tagging` header on CreateMultipartUpload stored and applied at CompleteMultipartUpload
+- Tag validation: max 10 tags, key ≤ 128 chars, value ≤ 256 chars → 400 InvalidTag
+- GET `?tagging` on bucket with no tags → 404 NoSuchTagSet
+
+### Newly Passing (15)
+
+```
+test_set_bucket_tagging
+test_get_obj_tagging
+test_get_obj_head_tagging
+test_put_max_tags
+test_put_excess_tags
+test_put_max_kvsize_tags
+test_put_excess_key_tags
+test_put_excess_val_tags
+test_put_modify_tags
+test_put_delete_tags
+test_put_obj_with_tags
+test_set_multipart_tagging
+test_get_tags_acl_public
+test_put_tags_acl_public
+test_delete_tags_obj_public
+```
+
+### Intentionally deferred
+
+- `test_post_object_tags_anonymous_request`, `test_post_object_tags_authenticated_request` — require POST Object (Batch 14)
+- `test_bucket_policy_*` tagging tests — require bucket policies (Batch 13)
+
+**Running total: 252 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

@@ -121,6 +121,33 @@ lazy_static! {
             [],
         ).expect("Failed to create bucket_cors table");
 
+        // Object tags: replace-all semantics (DELETE + INSERT per PUT ?tagging)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS object_tags (
+                user_id   TEXT NOT NULL,
+                bucket    TEXT NOT NULL,
+                key       TEXT NOT NULL,
+                tag_key   TEXT NOT NULL,
+                tag_value TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (user_id, bucket, key, tag_key)
+            )",
+            [],
+        ).expect("Failed to create object_tags table");
+
+        // Bucket tags
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bucket_tags (
+                bucket    TEXT NOT NULL,
+                tag_key   TEXT NOT NULL,
+                tag_value TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (bucket, tag_key)
+            )",
+            [],
+        ).expect("Failed to create bucket_tags table");
+
+        // Tagging column on multipart_uploads (stores x-amz-tagging URL-encoded string)
+        conn.execute("ALTER TABLE multipart_uploads ADD COLUMN tagging TEXT DEFAULT ''", []).ok();
+
         Arc::new(Mutex::new(conn))
     };
 }
@@ -486,6 +513,117 @@ impl SQLiteMetadataStore {
         let result = stmt.query_row(params![user_id, bucket], |row| row.get::<_, Option<String>>(0));
         match result {
             Ok(loc) => Ok(loc.unwrap_or_default()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+}
+
+/// Object + bucket tagging operations
+impl SQLiteMetadataStore {
+    /// Replace all tags for an object (atomic delete-then-insert within one lock).
+    pub fn set_object_tags(&self, user_id: &str, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "DELETE FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3",
+            params![user_id, bucket, key],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        for (k, v) in tags {
+            conn.execute(
+                "INSERT INTO object_tags (user_id, bucket, key, tag_key, tag_value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![user_id, bucket, key, k, v],
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tag_key, tag_value FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3 ORDER BY tag_key",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows = stmt.query_map(params![user_id, bucket, key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        let mut tags = Vec::new();
+        for row in rows {
+            tags.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        Ok(tags)
+    }
+
+    pub fn delete_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "DELETE FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3",
+            params![user_id, bucket, key],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_object_tag_count(&self, user_id: &str, bucket: &str, key: &str) -> Result<i64, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3",
+            params![user_id, bucket, key],
+            |row| row.get(0),
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(count)
+    }
+
+    pub fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute("DELETE FROM bucket_tags WHERE bucket = ?1", params![bucket])
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        for (k, v) in tags {
+            conn.execute(
+                "INSERT INTO bucket_tags (bucket, tag_key, tag_value) VALUES (?1, ?2, ?3)",
+                params![bucket, k, v],
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tag_key, tag_value FROM bucket_tags WHERE bucket = ?1 ORDER BY tag_key",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows = stmt.query_map(params![bucket], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map_err(actix_web::error::ErrorInternalServerError)?;
+        let mut tags = Vec::new();
+        for row in rows {
+            tags.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        Ok(tags)
+    }
+
+    pub fn delete_bucket_tags(&self, bucket: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute("DELETE FROM bucket_tags WHERE bucket = ?1", params![bucket])
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE multipart_uploads SET tagging = ?1 WHERE upload_id = ?2",
+            params![tagging, upload_id],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let result: rusqlite::Result<Option<String>> = conn.query_row(
+            "SELECT tagging FROM multipart_uploads WHERE upload_id = ?1",
+            params![upload_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(t) => Ok(t.unwrap_or_default()),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
             Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
         }

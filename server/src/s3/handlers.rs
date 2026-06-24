@@ -403,6 +403,146 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// ---------------------------------------------------------------------------
+// Tagging helpers
+// ---------------------------------------------------------------------------
+
+/// Parse `key=value&key2=value2` tag string (x-amz-tagging header / form).
+fn parse_url_tags(s: &str) -> Vec<(String, String)> {
+    s.split('&').filter_map(|pair| {
+        if pair.is_empty() { return None; }
+        let mut parts = pair.splitn(2, '=');
+        let k = percent_decode(parts.next().unwrap_or(""));
+        let v = percent_decode(parts.next().unwrap_or(""));
+        if k.is_empty() { None } else { Some((k, v)) }
+    }).collect()
+}
+
+/// Parse `<Tagging><TagSet><Tag><Key>…</Key><Value>…</Value></Tag>…` XML.
+fn parse_tag_xml(xml: &str) -> Vec<(String, String)> {
+    extract_all_xml_tags(xml, "Tag").into_iter().filter_map(|block| {
+        let k = extract_xml_tag(&block, "Key")?;
+        let v = extract_xml_tag(&block, "Value").unwrap_or_default();
+        Some((k.trim().to_string(), v))
+    }).collect()
+}
+
+/// Validate tag list: max 10, key ≤ 128 chars, value ≤ 256 chars.
+fn validate_tags(tags: &[(String, String)], resource: &str) -> Result<(), HttpResponse> {
+    if tags.len() > 10 {
+        return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidTag",
+                            "Object tag count cannot be greater than 10", resource));
+    }
+    for (k, v) in tags {
+        if k.len() > 128 {
+            return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidTag",
+                                "The tag key you have provided is invalid", resource));
+        }
+        if v.len() > 256 {
+            return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidTag",
+                                "The tag value you have provided is invalid", resource));
+        }
+    }
+    Ok(())
+}
+
+/// Render tags as S3 Tagging XML.
+fn tags_to_xml(tags: &[(String, String)]) -> String {
+    let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging><TagSet>".to_string();
+    for (k, v) in tags {
+        xml.push_str(&format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+            xml_escape(k), xml_escape(v)));
+    }
+    xml.push_str("</TagSet></Tagging>");
+    xml
+}
+
+// ---------------------------------------------------------------------------
+// Bucket tagging inner handlers
+// ---------------------------------------------------------------------------
+
+async fn s3_put_bucket_tagging_inner(bucket: &str, body: &[u8], req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let xml = String::from_utf8_lossy(body);
+    let tags = parse_tag_xml(&xml);
+    if let Err(resp) = validate_tags(&tags, bucket) { return Ok(resp); }
+
+    db.set_bucket_tags(bucket, &tags)?;
+    Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
+}
+
+async fn s3_get_bucket_tagging_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let tags = db.get_bucket_tags(bucket)?;
+    if tags.is_empty() {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchTagSet",
+                           "The TagSet does not exist", bucket));
+    }
+    Ok(HttpResponse::Ok().content_type("application/xml").body(tags_to_xml(&tags)))
+}
+
+async fn s3_delete_bucket_tagging_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    db.delete_bucket_tags(bucket)?;
+    Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
+}
+
+// ---------------------------------------------------------------------------
+// Object tagging inner handlers
+// ---------------------------------------------------------------------------
+
+async fn s3_put_object_tagging_inner(bucket: &str, key: &str, body: &[u8], req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let resource = format!("/{}/{}", bucket, key);
+    if !db.check_key(bucket, key)? {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                           "The specified key does not exist.", &resource));
+    }
+
+    let xml = String::from_utf8_lossy(body);
+    let tags = parse_tag_xml(&xml);
+    if let Err(resp) = validate_tags(&tags, &resource) { return Ok(resp); }
+
+    db.set_object_tags(bucket, key, &tags)?;
+    Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+}
+
+async fn s3_get_object_tagging_inner(bucket: &str, key: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let resource = format!("/{}/{}", bucket, key);
+    if !db.check_key(bucket, key)? {
+        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                           "The specified key does not exist.", &resource));
+    }
+
+    let tags = db.get_object_tags(bucket, key)?;
+    Ok(HttpResponse::Ok().content_type("application/xml").body(tags_to_xml(&tags)))
+}
+
+async fn s3_delete_object_tagging_inner(bucket: &str, key: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    let auth_result = authenticate_s3_request(req).await?;
+    let db = MetadataService::new(&auth_result.user_id)?;
+    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    db.delete_object_tags(bucket, key)?;
+    Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
+}
+
 /// Validate S3 bucket name rules.
 fn validate_bucket_name(bucket: &str) -> Result<(), HttpResponse> {
     if bucket.len() < 3 || bucket.len() > 63 {
@@ -528,6 +668,18 @@ pub async fn s3_create_bucket_handler(
 ) -> Result<HttpResponse, Error> {
     let bucket = path.into_inner();
 
+    // Dispatch sub-operations that need the body first (before the shared body collector below)
+    let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .map(|q| q.into_inner()).unwrap_or_default();
+
+    if qmap.contains_key("tagging") {
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = payload.next().await {
+            body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        return s3_put_bucket_tagging_inner(&bucket, &body, &req).await;
+    }
+
     // Collect body for CORS XML or CreateBucketConfiguration
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
@@ -593,6 +745,11 @@ pub async fn s3_delete_bucket_handler(
         db.delete_bucket_cors(&bucket)?;
         info!("S3 DeleteBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
+    }
+
+    // Dispatch ?tagging
+    if query.contains_key("tagging") {
+        return s3_delete_bucket_tagging_inner(&bucket, &req).await;
     }
 
     let auth_result = authenticate_s3_request(&req).await?;
@@ -661,6 +818,14 @@ pub async fn s3_put_object_handler(
         }
         if query.contains_key("partNumber") && query.contains_key("uploadId") {
             return s3_upload_part_handler(path, query, payload, req).await;
+        }
+        if query.contains_key("tagging") {
+            let (bucket, key) = path.into_inner();
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = payload.next().await {
+                body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+            }
+            return s3_put_object_tagging_inner(&bucket, &key, &body, &req).await;
         }
     }
     if req.headers().contains_key("x-amz-copy-source") {
@@ -827,6 +992,14 @@ pub async fn s3_put_object_handler(
 
     db.put_object_full(&bucket, &key, metadata)?;
 
+    // Store x-amz-tagging header tags if present
+    if let Some(tagging_str) = req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()) {
+        let resource = format!("/{}/{}", bucket, key);
+        let tags = parse_url_tags(tagging_str);
+        if let Err(resp) = validate_tags(&tags, &resource) { return Ok(resp); }
+        db.set_object_tags(&bucket, &key, &tags)?;
+    }
+
     debug!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
     Ok(HttpResponse::Ok()
         .insert_header(("ETag", etag))
@@ -844,11 +1017,14 @@ pub async fn s3_get_object_handler(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
-    // Early dispatch for ?attributes and ?partNumber
+    // Early dispatch for ?attributes, ?partNumber, ?tagging
     let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner()).unwrap_or_default();
     if qmap.contains_key("attributes") {
         return s3_get_object_attributes_handler(&bucket, &key, &req).await;
+    }
+    if qmap.contains_key("tagging") {
+        return s3_get_object_tagging_inner(&bucket, &key, &req).await;
     }
     if let Some(pn_str) = qmap.get("partNumber") {
         let pn: i32 = match pn_str.parse::<i32>() {
@@ -1090,6 +1266,12 @@ pub async fn s3_head_object_handler(
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
     }
+    // Add x-amz-tagging-count if object has tags
+    if let Ok(count) = db.get_object_tag_count(&bucket, &key) {
+        if count > 0 {
+            resp.insert_header(("x-amz-tagging-count", count.to_string()));
+        }
+    }
     // Use HeadBody so actix-web derives Content-Length from the real object
     // size (via MessageBody::size) rather than from the zero-byte body.
     Ok(resp.message_body(HeadBody(object_size)).unwrap().map_into_boxed_body())
@@ -1103,10 +1285,14 @@ pub async fn s3_delete_object_handler(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    // Dispatch abort-multipart
+    // Dispatch abort-multipart and ?tagging
     if let Ok(query) = web::Query::<HashMap<String, String>>::from_query(req.query_string()) {
         if query.contains_key("uploadId") {
             return s3_abort_multipart_upload_handler(path, query, req).await;
+        }
+        if query.contains_key("tagging") {
+            let (bucket, key) = path.into_inner();
+            return s3_delete_object_tagging_inner(&bucket, &key, &req).await;
         }
     }
 
@@ -1205,6 +1391,11 @@ pub async fn s3_list_objects_handler(
     // Dispatch ?cors → GetBucketCors
     if query.contains_key("cors") {
         return s3_get_bucket_cors_inner(&bucket, &req).await;
+    }
+
+    // Dispatch ?tagging → GetBucketTagging
+    if query.contains_key("tagging") {
+        return s3_get_bucket_tagging_inner(&bucket, &req).await;
     }
 
     let auth_result = authenticate_s3_request(&req).await?;
@@ -1884,6 +2075,11 @@ pub async fn s3_create_multipart_upload_handler(
         content_type.as_deref(), &metadata_json, &initiated_at,
     )?;
 
+    // Store x-amz-tagging for application at CompleteMultipartUpload time
+    if let Some(tagging_str) = req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()) {
+        db.set_multipart_tagging(&upload_id, tagging_str)?;
+    }
+
     info!("S3 CreateMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
 
     let xml = format!(
@@ -2228,6 +2424,13 @@ pub async fn s3_complete_multipart_upload_handler(
     db.set_parts_manifest(&bucket, &key, &manifest_json)?;
     db.mark_multipart_completed(&upload_id, &multipart_etag)?;
     db.delete_parts_for_upload(&upload_id)?;
+
+    // 10. Apply stored tagging (from x-amz-tagging at CreateMultipartUpload time).
+    let tagging_str = db.get_multipart_tagging(&upload_id).unwrap_or_default();
+    if !tagging_str.is_empty() {
+        let tags = parse_url_tags(&tagging_str);
+        let _ = db.set_object_tags(&bucket, &key, &tags);
+    }
 
     info!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
     Ok(complete_multipart_xml_response(&bucket, &key, &multipart_etag))
