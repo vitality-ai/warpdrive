@@ -535,3 +535,36 @@ test_bar
 **Running total: X / 808**
 
 -->
+
+## feat/batch-8-cors — Batch 8 complete
+
+**Branch:** `feat/batch-8-cors`  
+**RFC Batch:** Batch 8 (Bucket Location + CORS)  
+**Newly passing:** 5
+
+Key changes:
+- `bucket_cors` SQLite table: stores raw CORS XML per bucket
+- `location TEXT` column added to `buckets` table (migration via `ALTER TABLE ... ADD COLUMN`)
+- `GET /{bucket}?location` → parses stored location, returns `<LocationConstraint>` XML
+- `PUT /{bucket}?cors` → stores CORS XML; dispatched from `s3_create_bucket_handler` (payload added)
+- `GET /{bucket}?cors` → returns stored XML; `404 NoSuchCORSConfiguration` if unset
+- `DELETE /{bucket}?cors` → removes row; dispatched from `s3_delete_bucket_handler`
+- `PUT /{bucket}` body with `<CreateBucketConfiguration>` → parses `<LocationConstraint>` and stores it
+- `OPTIONS /{bucket}/{key}` → full CORS preflight: origin glob-matching (`*suffix`, `prefix*`, `prefix*suffix`, exact), method + header matching; `200` with CORS headers on match; `403` for no-match; `400 CORSNotEnabled` if no config or missing `Origin`/`Access-Control-Request-Method`
+
+### Verified Passing
+
+```
+test_bucket_get_location
+test_set_cors
+test_cors_header_option
+test_cors_presigned_get_object
+test_cors_presigned_put_object
+```
+
+### Intentionally deferred (2 tests)
+
+- `test_cors_origin_response` — requires public-read ACL (unauthenticated GET → 403 without Batch 10)
+- `test_cors_origin_wildcard` — same reason
+
+**Running total: 242 / 808**

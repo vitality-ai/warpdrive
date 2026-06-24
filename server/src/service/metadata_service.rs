@@ -137,6 +137,35 @@ impl MetadataService {
         SQLiteMetadataStore::new().cleanup_old_deletions()
     }
 
+    // --- CORS ---
+
+    pub fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_bucket_cors(bucket, cors_xml)
+    }
+
+    pub fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_bucket_cors(bucket)
+    }
+
+    pub fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_bucket_cors(bucket)
+    }
+
+    // --- Bucket location ---
+
+    pub fn set_bucket_location(&self, bucket: &str, location: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_bucket_location(&self.user, bucket, location)
+    }
+
+    pub fn get_bucket_location(&self, bucket: &str) -> Result<String, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_bucket_location(&self.user, bucket)
+    }
+
     // --- Multipart upload management ---
 
     pub fn create_multipart_upload(
