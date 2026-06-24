@@ -484,6 +484,223 @@ fn extract_bucket_from_path(req: &HttpRequest) -> Result<String, Error> {
     Ok(parts[bucket_idx].to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Presigned URL support
+// ---------------------------------------------------------------------------
+
+fn parse_query_map(req: &HttpRequest) -> HashMap<String, String> {
+    req.query_string()
+        .split('&')
+        .filter_map(|p| {
+            let mut it = p.splitn(2, '=');
+            let k = percent_decode(it.next()?);
+            let v = percent_decode(it.next().unwrap_or(""));
+            if k.is_empty() { None } else { Some((k, v)) }
+        })
+        .collect()
+}
+
+struct ParsedPresignedV4 {
+    access_key: String,
+    date: String,
+    region: String,
+    service: String,
+    amz_date: String,
+    expires: u64,
+    signed_headers: Vec<String>,
+    signature: String,
+}
+
+fn parse_presigned_v4(query: &HashMap<String, String>) -> Result<ParsedPresignedV4, Error> {
+    let credential = query.get("X-Amz-Credential")
+        .ok_or_else(|| ErrorUnauthorized("Missing X-Amz-Credential"))?;
+    let (access_key, scope) = credential.split_once('/')
+        .ok_or_else(|| ErrorUnauthorized("Invalid X-Amz-Credential"))?;
+    let scope_parts: Vec<&str> = scope.splitn(4, '/').collect();
+    let date = scope_parts.get(0).ok_or_else(|| ErrorUnauthorized("Invalid credential scope"))?.to_string();
+    let region = scope_parts.get(1).unwrap_or(&"us-east-1").to_string();
+    let service = scope_parts.get(2).unwrap_or(&"s3").to_string();
+
+    let amz_date = query.get("X-Amz-Date")
+        .ok_or_else(|| ErrorUnauthorized("Missing X-Amz-Date"))?.clone();
+
+    let expires_str = query.get("X-Amz-Expires")
+        .ok_or_else(|| s3_access_denied("Missing X-Amz-Expires"))?;
+    let expires: i64 = expires_str.parse()
+        .map_err(|_| s3_access_denied("X-Amz-Expires must be a positive integer"))?;
+    if expires <= 0 || expires > 604800 {
+        return Err(s3_access_denied("X-Amz-Expires must be between 1 and 604800 seconds"));
+    }
+    let expires = expires as u64;
+
+    let signed_headers_str = query.get("X-Amz-SignedHeaders")
+        .ok_or_else(|| ErrorUnauthorized("Missing X-Amz-SignedHeaders"))?;
+    let signed_headers: Vec<String> = signed_headers_str.split(';')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let signature = query.get("X-Amz-Signature")
+        .ok_or_else(|| ErrorUnauthorized("Missing X-Amz-Signature"))?.clone();
+
+    Ok(ParsedPresignedV4 {
+        access_key: access_key.to_string(),
+        date,
+        region,
+        service,
+        amz_date,
+        expires,
+        signed_headers,
+        signature,
+    })
+}
+
+fn check_presigned_expiry(amz_date: &str, expires: u64) -> Result<(), Error> {
+    let dt = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| ErrorUnauthorized("Invalid X-Amz-Date format"))?;
+    let issued_at = dt.and_utc().timestamp() as u64;
+    let expires_at = issued_at + expires;
+    let now = chrono::Utc::now().timestamp() as u64;
+    if now >= expires_at {
+        return Err(s3_access_denied("Request has expired"));
+    }
+    Ok(())
+}
+
+fn verify_sigv4_presigned(req: &HttpRequest, secret_key: &str, parsed: &ParsedPresignedV4) -> Result<(), Error> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let method = req.method().as_str();
+    let canonical_uri = req.path();
+
+    // Canonical query string: all params except X-Amz-Signature, sorted
+    let mut pairs: Vec<(String, String)> = req.query_string()
+        .split('&')
+        .filter_map(|p| {
+            let mut it = p.splitn(2, '=');
+            let k = it.next()?.to_string();
+            let v = it.next().unwrap_or("").to_string();
+            Some((percent_decode(&k), percent_decode(&v)))
+        })
+        .filter(|(k, _)| k != "X-Amz-Signature")
+        .collect();
+    pairs.sort_by(|a, b| {
+        percent_encode_uri(&a.0).cmp(&percent_encode_uri(&b.0))
+    });
+    let canonical_query_string = pairs.iter()
+        .map(|(k, v)| format!("{}={}", percent_encode_uri(k), percent_encode_uri(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    // Canonical headers: only signed headers (typically just host)
+    let mut canonical_headers: Vec<String> = Vec::new();
+    for name in &parsed.signed_headers {
+        let value = req.headers().get(name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        canonical_headers.push(format!("{}:{}", name, value));
+    }
+    canonical_headers.sort_unstable_by(|a, b| {
+        let a_name = a.split(':').next().unwrap_or("");
+        let b_name = b.split(':').next().unwrap_or("");
+        a_name.cmp(b_name)
+    });
+    let canonical_headers_str = canonical_headers.join("\n");
+    let signed_headers_str = parsed.signed_headers.join(";");
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n\n{}\nUNSIGNED-PAYLOAD",
+        method, canonical_uri, canonical_query_string,
+        canonical_headers_str, signed_headers_str,
+    );
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_request.as_bytes());
+    let canonical_request_hash = hex::encode(hasher.finalize());
+
+    let credential_scope = format!("{}/{}/{}/aws4_request", parsed.date, parsed.region, parsed.service);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        parsed.amz_date, credential_scope, canonical_request_hash
+    );
+
+    let k_secret = format!("AWS4{}", secret_key);
+    let mut mac = HmacSha256::new_from_slice(k_secret.as_bytes()).map_err(|_| ErrorUnauthorized("HMAC init"))?;
+    mac.update(parsed.date.as_bytes());
+    let k_date = mac.finalize().into_bytes();
+
+    let mut mac = HmacSha256::new_from_slice(&k_date).map_err(|_| ErrorUnauthorized("HMAC init"))?;
+    mac.update(parsed.region.as_bytes());
+    let k_region = mac.finalize().into_bytes();
+
+    let mut mac = HmacSha256::new_from_slice(&k_region).map_err(|_| ErrorUnauthorized("HMAC init"))?;
+    mac.update(parsed.service.as_bytes());
+    let k_service = mac.finalize().into_bytes();
+
+    let mut mac = HmacSha256::new_from_slice(&k_service).map_err(|_| ErrorUnauthorized("HMAC init"))?;
+    mac.update(b"aws4_request");
+    let k_signing = mac.finalize().into_bytes();
+
+    let mut mac = HmacSha256::new_from_slice(&k_signing).map_err(|_| ErrorUnauthorized("HMAC init"))?;
+    mac.update(string_to_sign.as_bytes());
+
+    let provided_sig = hex::decode(parsed.signature.trim()).map_err(|_| {
+        warn!("Presigned V4 signature is not valid hex");
+        ErrorUnauthorized("Invalid signature format")
+    })?;
+    if mac.verify_slice(&provided_sig).is_err() {
+        warn!("Presigned V4 signature mismatch (uri={}, query_len={})", canonical_uri, canonical_query_string.len());
+        return Err(ErrorUnauthorized("Signature does not match"));
+    }
+    Ok(())
+}
+
+async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, String>) -> Result<S3AuthResult, Error> {
+    let parsed = parse_presigned_v4(query)?;
+    check_presigned_expiry(&parsed.amz_date, parsed.expires)?;
+
+    let bucket = extract_bucket_from_path(req)?;
+    let access_key = parsed.access_key.clone();
+
+    // Admin bypass
+    let admin_access_key = std::env::var("WARPDRIVE_ADMIN_ACCESS_KEY").ok();
+    let admin_secret_key = std::env::var("WARPDRIVE_ADMIN_SECRET_KEY").ok();
+    if let (Some(ref aak), Some(ref ask)) = (&admin_access_key, &admin_secret_key) {
+        if access_key == *aak {
+            verify_sigv4_presigned(req, ask, &parsed)?;
+            debug!("Presigned V4 auth: admin bypass OK bucket={:?}", bucket);
+            return Ok(S3AuthResult {
+                access_key,
+                user_id: "admin".to_string(),
+                bucket,
+                allowed_buckets: vec![],
+                allow_all_buckets: true,
+            });
+        }
+    }
+
+    // Console path
+    let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
+    let base_url = base_url.ok_or_else(|| ErrorUnauthorized("No authentication method configured"))?;
+    let service_secret = service_secret.ok_or_else(|| ErrorUnauthorized("WARPDRIVE_SERVICE_SECRET not set"))?;
+    let (owner_id, secret_key, _, _) =
+        load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
+
+    verify_sigv4_presigned(req, &secret_key, &parsed)?;
+    debug!("Presigned V4 auth: Console OK bucket={:?} user={}", bucket, owner_id);
+    Ok(S3AuthResult {
+        access_key,
+        user_id: owner_id,
+        bucket,
+        allowed_buckets: vec![],
+        allow_all_buckets: false,
+    })
+}
+
 /// Authenticate S3 request (async).
 ///
 /// **Admin bypass:** if `WARPDRIVE_ADMIN_ACCESS_KEY` and `WARPDRIVE_ADMIN_SECRET_KEY` are set and
@@ -513,6 +730,12 @@ fn s3_access_denied(message: &str) -> Error {
 }
 
 pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error> {
+    // Detect presigned requests before looking for Authorization header
+    let query_map = parse_query_map(req);
+    if query_map.contains_key("X-Amz-Algorithm") {
+        return authenticate_presigned_v4(req, &query_map).await;
+    }
+
     let auth_header = req
         .headers()
         .get("Authorization")

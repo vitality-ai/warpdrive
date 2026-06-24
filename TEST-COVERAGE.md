@@ -466,6 +466,55 @@ test_get_single_multipart_object_attributes
 
 ---
 
+## feat/batch-7-presigned-urls — Batch 7 complete
+
+**Branch:** `feat/batch-7-presigned-urls`
+**RFC Batch:** Batch 7 (Presigned URLs)
+**Newly passing:** 5
+
+Key changes:
+- Presigned V4 URL detection: check for `X-Amz-Algorithm` query param before `Authorization` header
+- `parse_presigned_v4`: extract access key, date, region, service, expires, signed headers, signature from query params
+- `verify_sigv4_presigned`: canonical request with `UNSIGNED-PAYLOAD`, canonical query string excludes `X-Amz-Signature`
+- `check_presigned_expiry`: validates `0 < expires <= 604800`, rejects expired URLs with 403
+- `authenticate_presigned_v4`: admin bypass + Console path, same credential resolution as header auth
+- Response header overrides: `response-content-type`, `response-content-disposition`, `response-content-language`, `response-expires`, `response-cache-control`, `response-content-encoding` query params applied to GET response
+- `s3_cors_not_configured_handler`: OPTIONS on bucket/key returns 400 `CORSNotEnabled` when CORS not configured
+
+### Newly Passing (5)
+
+```
+test_object_raw_get_x_amz_expires_not_expired
+test_object_raw_get_x_amz_expires_not_expired_tenant
+test_object_raw_response_headers
+test_object_presigned_put_object_with_acl
+test_object_presigned_put_object_with_acl_tenant
+```
+
+### Already passing before this batch (10)
+
+```
+test_object_raw_authenticated
+test_object_raw_authenticated_bucket_acl
+test_object_raw_authenticated_bucket_gone
+test_object_raw_authenticated_object_acl
+test_object_raw_authenticated_object_gone
+test_object_raw_get_object_acl
+test_object_raw_get_x_amz_expires_out_max_range
+test_object_raw_get_x_amz_expires_out_positive_range
+test_object_raw_get_x_amz_expires_out_range_zero
+test_object_raw_put_authenticated_expired
+```
+
+### Intentionally deferred
+
+- `test_object_raw_get`, `test_object_raw_get_bucket_gone`, `test_object_raw_get_object_gone`, `test_object_raw_get_bucket_acl` — require public-read ACL (Batch 10)
+- `test_cors_presigned_*` (9 tests) — require CORS configuration (Batch 8)
+
+**Running total: 237 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

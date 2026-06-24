@@ -15,6 +15,7 @@ use warp_drive::s3::handlers::{
     s3_delete_bucket_handler,
     s3_delete_objects_handler,
     s3_multipart_router,
+    s3_cors_not_configured_handler,
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
 
@@ -44,6 +45,8 @@ async fn main() -> std::io::Result<()> {
             .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
+            .route("/s3/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
+            .route("/s3/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             // Original native API (registered before root S3 routes to take priority on conflicts)
             .service(put)
             .service(get)
@@ -63,6 +66,8 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
             .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
             .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
+            .route("/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
+            .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
     })
     .bind(("0.0.0.0", 9710))?
     .run()
