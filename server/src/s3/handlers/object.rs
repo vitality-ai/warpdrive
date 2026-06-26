@@ -14,6 +14,7 @@ use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
 use crate::storage::config::StorageConfig;
 
+use super::checksum::{parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use super::common::*;
 use super::tagging::{s3_put_object_tagging_inner, s3_get_object_tagging_inner, s3_delete_object_tagging_inner, parse_url_tags, validate_tags};
 use super::versioning::{s3_get_object_version_handler, s3_delete_specific_version_handler};
@@ -194,6 +195,17 @@ pub async fn s3_put_object_handler(
         }
     }
 
+    // Checksum verification
+    let checksum_result = parse_checksum_headers(&req);
+    if let Some((ref algo, ref client_value)) = checksum_result {
+        if !verify_checksum(algo, &body_buf, client_value) {
+            let resource = format!("/{}/{}", bucket, key);
+            return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
+                               "The Content-MD5 or checksum you specified did not match what we received.",
+                               &resource));
+        }
+    }
+
     let mut metadata = Metadata::from_offset_size_list(offset_size_list);
     metadata.etag = Some(etag.clone());
     metadata.size = size;
@@ -203,6 +215,11 @@ pub async fn s3_put_object_handler(
     metadata.cache_control = cache_control;
     metadata.expires = expires;
     metadata.content_encoding = content_encoding;
+    if let Some((ref algo, ref value)) = checksum_result {
+        metadata.checksum_algorithm = Some(algo.as_str().to_string());
+        metadata.checksum_value = Some(value.clone());
+        // For simple (non-multipart) objects, checksum_type is not set (leave None)
+    }
 
     let (version_id, old_extents) = db.put_object_full(&bucket, &key, metadata)?;
     if !old_extents.is_empty() {
@@ -220,6 +237,11 @@ pub async fn s3_put_object_handler(
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("ETag", etag));
     if let Some(vid) = version_id { if vid != "null" { resp.insert_header(("x-amz-version-id", vid)); } }
+    // Echo checksum header in response
+    if let Some((ref algo, ref value)) = checksum_result {
+        let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+        resp.insert_header((header_name, value.clone()));
+    }
     Ok(resp.insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -418,6 +440,22 @@ pub async fn s3_get_object_handler(
     if let Some(ref vid) = meta.version_id {
         resp.insert_header(("x-amz-version-id", vid.clone()));
     }
+    // Return checksum headers when x-amz-checksum-mode: ENABLED
+    let checksum_mode = req.headers().get("x-amz-checksum-mode")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_uppercase());
+    if checksum_mode.as_deref() == Some("ENABLED") {
+        if let (Some(ref algo_str), Some(ref cksum_val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
+            if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+                let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+                resp.insert_header((header_name, cksum_val.clone()));
+                if let Some(ref cksum_type) = meta.checksum_type {
+                    if !cksum_type.is_empty() {
+                        resp.insert_header(("x-amz-checksum-type", cksum_type.clone()));
+                    }
+                }
+            }
+        }
+    }
     Ok(resp.streaming(byte_stream))
 }
 
@@ -500,6 +538,22 @@ pub async fn s3_head_object_handler(
     }
     if let Some(ref vid) = meta.version_id {
         resp.insert_header(("x-amz-version-id", vid.clone()));
+    }
+    // Return checksum headers when x-amz-checksum-mode: ENABLED
+    let head_checksum_mode = req.headers().get("x-amz-checksum-mode")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_uppercase());
+    if head_checksum_mode.as_deref() == Some("ENABLED") {
+        if let (Some(ref algo_str), Some(ref cksum_val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
+            if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+                let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+                resp.insert_header((header_name, cksum_val.clone()));
+                if let Some(ref cksum_type) = meta.checksum_type {
+                    if !cksum_type.is_empty() {
+                        resp.insert_header(("x-amz-checksum-type", cksum_type.clone()));
+                    }
+                }
+            }
+        }
     }
     Ok(resp.message_body(HeadBody(object_size)).unwrap().map_into_boxed_body())
 }

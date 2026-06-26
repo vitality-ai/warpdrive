@@ -45,6 +45,12 @@ pub struct Metadata {
     pub version_id: Option<String>,
     /// True when this row is a delete marker (no data, marks the key as deleted).
     pub is_delete_marker: bool,
+    /// Checksum algorithm stored on PUT/CompleteMultipartUpload (e.g. "SHA256", "CRC32C").
+    pub checksum_algorithm: Option<String>,
+    /// Base64-encoded checksum value (or composite "value-N" for multipart COMPOSITE type).
+    pub checksum_value: Option<String>,
+    /// Checksum type: "COMPOSITE" or "FULL_OBJECT" (empty for non-checksum objects).
+    pub checksum_type: Option<String>,
 }
 
 impl Metadata {
@@ -68,6 +74,9 @@ impl Metadata {
             content_encoding: None,
             version_id: None,
             is_delete_marker: false,
+            checksum_algorithm: None,
+            checksum_value: None,
+            checksum_type: None,
         }
     }
 

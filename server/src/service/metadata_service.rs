@@ -267,10 +267,12 @@ impl MetadataService {
     pub fn create_multipart_upload(
         &self, upload_id: &str, bucket: &str, key: &str,
         content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
+        checksum_algorithm: &str, checksum_type: &str,
     ) -> Result<(), Error> {
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
         SQLiteMetadataStore::new().create_multipart_upload(
             upload_id, &self.user, bucket, key, content_type, metadata_json, initiated_at,
+            checksum_algorithm, checksum_type,
         )
     }
 
@@ -305,9 +307,10 @@ impl MetadataService {
 
     pub fn upsert_multipart_part(
         &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
+        checksum_value: &str,
     ) -> Result<(), Error> {
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().upsert_multipart_part(upload_id, part_number, etag, size, extents_blob)
+        SQLiteMetadataStore::new().upsert_multipart_part(upload_id, part_number, etag, size, extents_blob, checksum_value)
     }
 
     pub fn list_multipart_parts(&self, upload_id: &str)
