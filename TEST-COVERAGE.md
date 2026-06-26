@@ -628,6 +628,37 @@ Full suite passed 374 tests vs 252 previously. The 122-test jump includes the 23
 
 ---
 
+## feat/batch-12-atomicity — Batch 12: Atomicity & Concurrency (already passing)
+
+**Branch:** `feat/batch-12-atomicity`
+**RFC Batch:** Batch 12 (RFC 2.19 — Atomicity & Concurrency)
+**Newly passing:** 0 (all 14 already passed — no code changes needed)
+
+All atomic/concurrency tests pass out of the box. SQLite WAL mode handles concurrent metadata reads/writes correctly, and actix-web's async runtime provides safe concurrent request handling. Blob storage append-only writes prevent torn reads.
+
+### Verified Passing (already passing before this branch)
+
+```
+test_atomic_read_1mb
+test_atomic_read_4mb
+test_atomic_read_8mb
+test_atomic_write_1mb
+test_atomic_write_4mb
+test_atomic_write_8mb
+test_atomic_dual_write_1mb
+test_atomic_dual_write_4mb
+test_atomic_dual_write_8mb
+test_atomic_conditional_write_1mb
+test_atomic_dual_conditional_write_1mb
+test_atomic_write_bucket_gone
+test_atomic_multipart_upload_write
+test_versioning_bucket_atomic_upload_return_version_id
+```
+
+**Running total: 383 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>
