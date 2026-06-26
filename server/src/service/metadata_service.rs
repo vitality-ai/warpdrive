@@ -40,8 +40,14 @@ impl MetadataService {
     // --- Full-metadata S3 path (includes etag, size, content_type, etc.) ---
 
     /// Write a fully-populated Metadata object (S3 PUT path).
-    pub fn put_object_full(&self, bucket: &str, key: &str, metadata: Metadata) -> Result<(), Error> {
-        METADATA_STORE.put_metadata(&self.user, bucket, key, &metadata)
+    /// Returns (version_id, old_extents_to_gc):
+    ///   - version_id: Some(vid) when versioning enabled/suspended, None when disabled.
+    ///   - old_extents_to_gc: storage extents of the row that was replaced (queue for GC).
+    pub fn put_object_full(
+        &self, bucket: &str, key: &str, metadata: Metadata,
+    ) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().put_object_v2(&self.user, bucket, key, &metadata)
     }
 
     /// Read a fully-populated Metadata object (S3 GET / HEAD path).
@@ -164,6 +170,49 @@ impl MetadataService {
     pub fn get_bucket_location(&self, bucket: &str) -> Result<String, Error> {
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
         SQLiteMetadataStore::new().get_bucket_location(&self.user, bucket)
+    }
+
+    // --- Versioning ---
+
+    pub fn get_versioning_state(&self, bucket: &str) -> Result<String, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_versioning_state(bucket)
+    }
+
+    pub fn set_versioning_state(&self, bucket: &str, state: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_versioning_state(&self.user, bucket, state)
+    }
+
+    pub fn delete_object_v2(&self, bucket: &str, key: &str)
+        -> Result<crate::metadata::sqlite_store::VersioningDeleteResult, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_object_v2(&self.user, bucket, key)
+    }
+
+    pub fn delete_specific_version(&self, bucket: &str, key: &str, version_id: &str)
+        -> Result<crate::metadata::sqlite_store::DeleteSpecificResult, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_specific_version(&self.user, bucket, key, version_id)
+    }
+
+    pub fn get_object_version(&self, bucket: &str, key: &str, version_id: &str)
+        -> Result<crate::metadata::Metadata, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_object_version(&self.user, bucket, key, version_id)
+    }
+
+    pub fn list_object_versions_full(
+        &self, bucket: &str, prefix: &str, key_marker: &str,
+        version_id_marker: &str, max_keys: usize,
+    ) -> Result<(Vec<crate::metadata::sqlite_store::VersionRow>, bool, String, String), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().list_object_versions_full(
+            &self.user, bucket, prefix, key_marker, version_id_marker, max_keys,
+        )
     }
 
     // --- Tagging ---
