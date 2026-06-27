@@ -20,6 +20,10 @@ pub(super) async fn s3_put_bucket_versioning_inner(bucket: &str, body: &[u8], re
         _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "MalformedXML",
                                 "Invalid versioning configuration", bucket)),
     };
+    if state == "suspended" && db.get_bucket_object_lock_enabled(bucket)? {
+        return Ok(s3_error(StatusCode::CONFLICT, "InvalidBucketState",
+                           "Cannot suspend versioning on a bucket with object lock enabled", bucket));
+    }
     db.set_versioning_state(bucket, state)?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
@@ -53,6 +57,18 @@ pub(super) async fn s3_delete_specific_version_handler(bucket: &str, key: &str, 
     let auth_result = authenticate_s3_request(req).await?;
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let bypass_governance = req.headers()
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let (ret_blocked, hold_blocked) = db.check_object_lock_protection(bucket, key, version_id, bypass_governance)?;
+    if ret_blocked || hold_blocked {
+        return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied",
+                           "Object is locked and cannot be deleted", &format!("/{}/{}", bucket, key)));
+    }
 
     if let Ok(ver_meta) = db.get_object_version(bucket, key, version_id) {
         let extents = ver_meta.to_offset_size_list();
@@ -126,7 +142,14 @@ pub(super) async fn s3_get_object_version_handler(bucket: &str, key: &str, versi
     resp.insert_header(("ETag", etag));
     resp.insert_header(("Content-Length", total_size.to_string()));
     if !last_modified.is_empty() { resp.insert_header(("Last-Modified", last_modified)); }
-    if let Some(vid) = &meta.version_id { resp.insert_header(("x-amz-version-id", vid.clone())); }
+    if let Some(vid) = &meta.version_id {
+        resp.insert_header(("x-amz-version-id", vid.clone()));
+        if let Ok(Some(lock)) = db.get_object_lock(bucket, key, vid) {
+            if let Some(ref m) = lock.mode { resp.insert_header(("x-amz-object-lock-mode", m.clone())); }
+            if let Some(ref u) = lock.retain_until_date { resp.insert_header(("x-amz-object-lock-retain-until-date", u.clone())); }
+            if lock.legal_hold == "ON" { resp.insert_header(("x-amz-object-lock-legal-hold", "ON")); }
+        }
+    }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{}", k), metadata_value_header(v)));
     }

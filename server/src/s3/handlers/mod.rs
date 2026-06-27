@@ -5,6 +5,7 @@ pub(super) mod cors;
 pub(super) mod tagging;
 pub(super) mod versioning;
 pub(super) mod acl;
+pub(super) mod object_lock;
 pub(super) mod bucket;
 pub(super) mod listing;
 pub(super) mod object;

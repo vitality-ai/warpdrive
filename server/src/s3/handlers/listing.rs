@@ -14,6 +14,7 @@ use super::versioning::{s3_get_bucket_versioning_inner, s3_list_object_versions_
 use super::cors::{s3_get_bucket_cors_inner, s3_get_bucket_location_inner};
 use super::acl::s3_get_bucket_acl_stub;
 use super::multipart::s3_list_multipart_uploads_handler;
+use super::object_lock::s3_get_bucket_object_lock_inner;
 
 // ---------------------------------------------------------------------------
 // ListObjects  GET /s3/{bucket}
@@ -47,6 +48,9 @@ pub async fn s3_list_objects_handler(
     }
     if query.contains_key("versioning") {
         return s3_get_bucket_versioning_inner(&bucket, &req).await;
+    }
+    if query.contains_key("object-lock") {
+        return s3_get_bucket_object_lock_inner(&bucket, &req).await;
     }
     if query.contains_key("acl") {
         return s3_get_bucket_acl_stub(&bucket, &req).await;
@@ -367,10 +371,28 @@ pub async fn s3_delete_objects_handler(
     let mut deleted_xml = String::new();
     let mut errors_xml = String::new();
 
+    let bypass_governance = req.headers()
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     for obj_req in &objects {
         let key = &obj_req.key;
 
         if let Some(ref vid) = obj_req.version_id {
+            // Check object lock before deleting
+            let (ret_blocked, hold_blocked) = db.check_object_lock_protection(&bucket, key, vid, bypass_governance)?;
+            if ret_blocked || hold_blocked {
+                errors_xml.push_str(&format!(
+                    "    <Error><Key>{k}</Key><VersionId>{v}</VersionId>\
+                     <Code>AccessDenied</Code>\
+                     <Message>Object is locked and cannot be deleted</Message></Error>\n",
+                    k = xml_escape(key), v = xml_escape(vid),
+                ));
+                continue;
+            }
+
             if let Ok(ver_meta) = db.get_object_version(&bucket, key, vid) {
                 let extents = ver_meta.to_offset_size_list();
                 if !extents.is_empty() {
