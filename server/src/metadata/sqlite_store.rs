@@ -77,23 +77,26 @@ lazy_static! {
         // is_latest=1 marks the current visible version for a key.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS objects (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                user             TEXT NOT NULL,
-                bucket           TEXT NOT NULL,
-                key              TEXT NOT NULL,
-                version_id       TEXT NOT NULL DEFAULT '',
-                is_delete_marker INTEGER NOT NULL DEFAULT 0,
-                is_latest        INTEGER NOT NULL DEFAULT 1,
-                offset_size_list BLOB,
-                etag             TEXT,
-                size             INTEGER NOT NULL DEFAULT 0,
-                content_type     TEXT,
-                last_modified    TEXT,
-                user_metadata    TEXT,
-                cache_control    TEXT,
-                expires          TEXT,
-                content_encoding TEXT,
-                parts_manifest   TEXT,
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                user               TEXT NOT NULL,
+                bucket             TEXT NOT NULL,
+                key                TEXT NOT NULL,
+                version_id         TEXT NOT NULL DEFAULT '',
+                is_delete_marker   INTEGER NOT NULL DEFAULT 0,
+                is_latest          INTEGER NOT NULL DEFAULT 1,
+                offset_size_list   BLOB,
+                etag               TEXT,
+                size               INTEGER NOT NULL DEFAULT 0,
+                content_type       TEXT,
+                last_modified      TEXT,
+                user_metadata      TEXT,
+                cache_control      TEXT,
+                expires            TEXT,
+                content_encoding   TEXT,
+                parts_manifest     TEXT,
+                checksum_algorithm TEXT NOT NULL DEFAULT '',
+                checksum_value     TEXT NOT NULL DEFAULT '',
+                checksum_type      TEXT NOT NULL DEFAULT '',
                 UNIQUE(user, bucket, key, version_id)
             )",
             [],
@@ -102,22 +105,26 @@ lazy_static! {
         // Multipart upload tracking tables
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS multipart_uploads (
-                upload_id     TEXT NOT NULL PRIMARY KEY,
-                user_id       TEXT NOT NULL,
-                bucket        TEXT NOT NULL,
-                key           TEXT NOT NULL,
-                content_type  TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                initiated_at  TEXT NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'in_progress',
-                final_etag    TEXT
+                upload_id          TEXT NOT NULL PRIMARY KEY,
+                user_id            TEXT NOT NULL,
+                bucket             TEXT NOT NULL,
+                key                TEXT NOT NULL,
+                content_type       TEXT,
+                metadata_json      TEXT NOT NULL DEFAULT '{}',
+                initiated_at       TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'in_progress',
+                final_etag         TEXT,
+                tagging            TEXT DEFAULT '',
+                checksum_algorithm TEXT NOT NULL DEFAULT '',
+                checksum_type      TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS multipart_parts (
-                upload_id    TEXT NOT NULL,
-                part_number  INTEGER NOT NULL,
-                etag         TEXT NOT NULL,
-                size         INTEGER NOT NULL,
-                extents_blob BLOB NOT NULL,
+                upload_id       TEXT NOT NULL,
+                part_number     INTEGER NOT NULL,
+                etag            TEXT NOT NULL,
+                size            INTEGER NOT NULL,
+                extents_blob    BLOB NOT NULL,
+                checksum_value  TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (upload_id, part_number)
             );"
         ).expect("Failed to create multipart tables");
@@ -143,11 +150,11 @@ lazy_static! {
                 name              TEXT NOT NULL,
                 created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now')),
                 versioning_state  TEXT NOT NULL DEFAULT 'disabled',
+                location          TEXT DEFAULT '',
                 PRIMARY KEY (user, name)
             )",
             [],
         ).expect("Failed to create buckets table");
-        conn.execute("ALTER TABLE buckets ADD COLUMN location TEXT DEFAULT ''", []).ok();
 
         // CORS configuration per bucket
         conn.execute(
@@ -181,21 +188,6 @@ lazy_static! {
             )",
             [],
         ).expect("Failed to create bucket_tags table");
-
-        // Tagging column on multipart_uploads (stores x-amz-tagging URL-encoded string)
-        conn.execute("ALTER TABLE multipart_uploads ADD COLUMN tagging TEXT DEFAULT ''", []).ok();
-
-        // Checksum columns on objects table
-        conn.execute("ALTER TABLE objects ADD COLUMN checksum_algorithm TEXT NOT NULL DEFAULT ''", []).ok();
-        conn.execute("ALTER TABLE objects ADD COLUMN checksum_value TEXT NOT NULL DEFAULT ''", []).ok();
-        conn.execute("ALTER TABLE objects ADD COLUMN checksum_type TEXT NOT NULL DEFAULT ''", []).ok();
-
-        // Checksum columns on multipart_uploads table
-        conn.execute("ALTER TABLE multipart_uploads ADD COLUMN checksum_algorithm TEXT NOT NULL DEFAULT ''", []).ok();
-        conn.execute("ALTER TABLE multipart_uploads ADD COLUMN checksum_type TEXT NOT NULL DEFAULT ''", []).ok();
-
-        // Checksum value column on multipart_parts table
-        conn.execute("ALTER TABLE multipart_parts ADD COLUMN checksum_value TEXT NOT NULL DEFAULT ''", []).ok();
 
         Arc::new(Mutex::new(conn))
     };
