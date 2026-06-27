@@ -268,11 +268,13 @@ impl MetadataService {
         &self, upload_id: &str, bucket: &str, key: &str,
         content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
         checksum_algorithm: &str, checksum_type: &str,
+        object_lock_mode: &str, object_lock_retain_until: &str, object_lock_legal_hold: &str,
     ) -> Result<(), Error> {
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
         SQLiteMetadataStore::new().create_multipart_upload(
             upload_id, &self.user, bucket, key, content_type, metadata_json, initiated_at,
             checksum_algorithm, checksum_type,
+            object_lock_mode, object_lock_retain_until, object_lock_legal_hold,
         )
     }
 
@@ -333,6 +335,60 @@ impl MetadataService {
     pub fn set_parts_manifest(&self, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
         SQLiteMetadataStore::new().set_parts_manifest(&self.user, bucket, key, manifest)
+    }
+
+    // --- Object Lock ---
+
+    pub fn get_bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_bucket_object_lock_enabled(bucket)
+    }
+
+    pub fn set_bucket_object_lock_enabled(&self, bucket: &str, enabled: bool) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_bucket_object_lock_enabled(bucket, enabled)
+    }
+
+    pub fn create_bucket_with_lock(&self, bucket: &str, lock_enabled: bool) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().create_bucket_with_lock(&self.user, bucket, lock_enabled)
+    }
+
+    pub fn get_object_lock_config(&self, bucket: &str) -> Result<Option<(String, Option<i64>, Option<i64>)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_object_lock_config(bucket)
+    }
+
+    pub fn put_object_lock_config(&self, bucket: &str, mode: &str, days: Option<i64>, years: Option<i64>) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().put_object_lock_config(bucket, mode, days, years)
+    }
+
+    pub fn get_object_lock(&self, bucket: &str, key: &str, version_id: &str)
+        -> Result<Option<crate::metadata::sqlite_store::ObjectLockRow>, Error>
+    {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_object_lock(bucket, key, version_id)
+    }
+
+    pub fn put_object_lock(
+        &self, bucket: &str, key: &str, version_id: &str,
+        mode: Option<&str>, retain_until_date: Option<&str>, legal_hold: Option<&str>,
+    ) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().put_object_lock(bucket, key, version_id, mode, retain_until_date, legal_hold)
+    }
+
+    pub fn set_object_legal_hold(&self, bucket: &str, key: &str, version_id: &str, status: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_object_legal_hold(bucket, key, version_id, status)
+    }
+
+    pub fn check_object_lock_protection(
+        &self, bucket: &str, key: &str, version_id: &str, bypass_governance: bool,
+    ) -> Result<(bool, bool), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().check_object_lock_protection(bucket, key, version_id, bypass_governance)
     }
 }
 

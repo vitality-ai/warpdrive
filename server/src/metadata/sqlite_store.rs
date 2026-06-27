@@ -114,9 +114,12 @@ lazy_static! {
                 initiated_at       TEXT NOT NULL,
                 status             TEXT NOT NULL DEFAULT 'in_progress',
                 final_etag         TEXT,
-                tagging            TEXT DEFAULT '',
-                checksum_algorithm TEXT NOT NULL DEFAULT '',
-                checksum_type      TEXT NOT NULL DEFAULT ''
+                tagging                TEXT DEFAULT '',
+                checksum_algorithm     TEXT NOT NULL DEFAULT '',
+                checksum_type          TEXT NOT NULL DEFAULT '',
+                object_lock_mode       TEXT NOT NULL DEFAULT '',
+                object_lock_retain_until TEXT NOT NULL DEFAULT '',
+                object_lock_legal_hold TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS multipart_parts (
                 upload_id       TEXT NOT NULL,
@@ -146,15 +149,41 @@ lazy_static! {
         // Bucket registry — tracks created buckets (including empty ones)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS buckets (
-                user              TEXT NOT NULL,
-                name              TEXT NOT NULL,
-                created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now')),
-                versioning_state  TEXT NOT NULL DEFAULT 'disabled',
-                location          TEXT DEFAULT '',
+                user                TEXT NOT NULL,
+                name                TEXT NOT NULL,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now')),
+                versioning_state    TEXT NOT NULL DEFAULT 'disabled',
+                location            TEXT DEFAULT '',
+                object_lock_enabled INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user, name)
             )",
             [],
         ).expect("Failed to create buckets table");
+
+        // Object lock — bucket-level default retention configuration
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS object_lock_config (
+                bucket TEXT PRIMARY KEY,
+                mode   TEXT NOT NULL,
+                days   INTEGER,
+                years  INTEGER
+            )",
+            [],
+        ).expect("Failed to create object_lock_config table");
+
+        // Object lock — per-version retention and legal hold
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS object_lock (
+                bucket            TEXT NOT NULL,
+                key               TEXT NOT NULL,
+                version_id        TEXT NOT NULL,
+                mode              TEXT,
+                retain_until_date TEXT,
+                legal_hold        TEXT NOT NULL DEFAULT 'OFF',
+                PRIMARY KEY (bucket, key, version_id)
+            )",
+            [],
+        ).expect("Failed to create object_lock table");
 
         // CORS configuration per bucket
         conn.execute(
@@ -1120,6 +1149,9 @@ pub struct MultipartUploadRow {
     pub final_etag: Option<String>,
     pub checksum_algorithm: String,
     pub checksum_type: String,
+    pub object_lock_mode: String,
+    pub object_lock_retain_until: String,
+    pub object_lock_legal_hold: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1131,21 +1163,30 @@ pub struct MultipartPartRow {
     pub checksum_value: String,
 }
 
+pub struct ObjectLockRow {
+    pub mode: Option<String>,
+    pub retain_until_date: Option<String>,
+    pub legal_hold: String,
+}
+
 /// Multipart upload management
 impl SQLiteMetadataStore {
     pub fn create_multipart_upload(
         &self, upload_id: &str, user_id: &str, bucket: &str, key: &str,
         content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
         checksum_algorithm: &str, checksum_type: &str,
+        object_lock_mode: &str, object_lock_retain_until: &str, object_lock_legal_hold: &str,
     ) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO multipart_uploads
              (upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at,
-              checksum_algorithm, checksum_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              checksum_algorithm, checksum_type,
+              object_lock_mode, object_lock_retain_until, object_lock_legal_hold)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at,
-                    checksum_algorithm, checksum_type],
+                    checksum_algorithm, checksum_type,
+                    object_lock_mode, object_lock_retain_until, object_lock_legal_hold],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
     }
@@ -1154,7 +1195,8 @@ impl SQLiteMetadataStore {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
-                    initiated_at, status, final_etag, checksum_algorithm, checksum_type
+                    initiated_at, status, final_etag, checksum_algorithm, checksum_type,
+                    object_lock_mode, object_lock_retain_until, object_lock_legal_hold
              FROM multipart_uploads WHERE upload_id = ?1",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         let result = stmt.query_row(params![upload_id], |row| {
@@ -1170,6 +1212,9 @@ impl SQLiteMetadataStore {
                 final_etag: row.get(8)?,
                 checksum_algorithm: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
                 checksum_type: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                object_lock_mode: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                object_lock_retain_until: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                object_lock_legal_hold: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
             })
         });
         match result {
@@ -1210,7 +1255,8 @@ impl SQLiteMetadataStore {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
-                    initiated_at, status, final_etag, checksum_algorithm, checksum_type
+                    initiated_at, status, final_etag, checksum_algorithm, checksum_type,
+                    object_lock_mode, object_lock_retain_until, object_lock_legal_hold
              FROM multipart_uploads
              WHERE bucket = ?1 AND status = 'in_progress'
              ORDER BY key, initiated_at",
@@ -1228,6 +1274,9 @@ impl SQLiteMetadataStore {
                 final_etag: row.get(8)?,
                 checksum_algorithm: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
                 checksum_type: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                object_lock_mode: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                object_lock_retain_until: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                object_lock_legal_hold: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
             })
         }).map_err(actix_web::error::ErrorInternalServerError)?;
         let mut result = Vec::new();
@@ -1303,6 +1352,147 @@ impl SQLiteMetadataStore {
             params![manifest, user_id, bucket, key],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
+    }
+
+    // --- Object Lock ---
+
+    pub fn get_bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let result: rusqlite::Result<i64> = conn.query_row(
+            "SELECT object_lock_enabled FROM buckets WHERE name = ?1",
+            params![bucket],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(v) => Ok(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn set_bucket_object_lock_enabled(&self, bucket: &str, enabled: bool) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "UPDATE buckets SET object_lock_enabled = ?1 WHERE name = ?2",
+            params![if enabled { 1i64 } else { 0i64 }, bucket],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn create_bucket_with_lock(&self, user_id: &str, bucket: &str, lock_enabled: bool) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let lock_val = if lock_enabled { 1i64 } else { 0i64 };
+        let versioning = if lock_enabled { "enabled" } else { "disabled" };
+        conn.execute(
+            "INSERT OR IGNORE INTO buckets (user, name, object_lock_enabled, versioning_state) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, bucket, lock_val, versioning],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    /// Returns None if no config set; Some((mode, days, years)) otherwise.
+    pub fn get_object_lock_config(&self, bucket: &str) -> Result<Option<(String, Option<i64>, Option<i64>)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT mode, days, years FROM object_lock_config WHERE bucket = ?1",
+            params![bucket],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            )),
+        );
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn put_object_lock_config(&self, bucket: &str, mode: &str, days: Option<i64>, years: Option<i64>) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO object_lock_config (bucket, mode, days, years) VALUES (?1, ?2, ?3, ?4)",
+            params![bucket, mode, days, years],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_object_lock(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<ObjectLockRow>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT mode, retain_until_date, legal_hold FROM object_lock WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+            params![bucket, key, version_id],
+            |row| Ok(ObjectLockRow {
+                mode: row.get(0)?,
+                retain_until_date: row.get(1)?,
+                legal_hold: row.get::<_, String>(2).unwrap_or_else(|_| "OFF".to_string()),
+            }),
+        );
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn put_object_lock(
+        &self, bucket: &str, key: &str, version_id: &str,
+        mode: Option<&str>, retain_until_date: Option<&str>, legal_hold: Option<&str>,
+    ) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        // INSERT uses COALESCE(?6, 'OFF') so a fresh row defaults legal_hold to 'OFF'.
+        // ON CONFLICT uses COALESCE(?6, legal_hold) so None (NULL) preserves the existing value.
+        conn.execute(
+            "INSERT INTO object_lock (bucket, key, version_id, mode, retain_until_date, legal_hold)
+             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, 'OFF'))
+             ON CONFLICT(bucket, key, version_id) DO UPDATE SET
+               mode = COALESCE(?4, mode),
+               retain_until_date = COALESCE(?5, retain_until_date),
+               legal_hold = COALESCE(?6, legal_hold)",
+            params![bucket, key, version_id, mode, retain_until_date, legal_hold],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn set_object_legal_hold(&self, bucket: &str, key: &str, version_id: &str, status: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT INTO object_lock (bucket, key, version_id, legal_hold)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(bucket, key, version_id) DO UPDATE SET legal_hold = ?4",
+            params![bucket, key, version_id, status],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    /// Returns (blocked_by_retention, blocked_by_legal_hold).
+    /// bypass_governance: true allows overriding GOVERNANCE retention.
+    pub fn check_object_lock_protection(
+        &self, bucket: &str, key: &str, version_id: &str, bypass_governance: bool,
+    ) -> Result<(bool, bool), Error> {
+        let row = match self.get_object_lock(bucket, key, version_id)? {
+            Some(r) => r,
+            None => return Ok((false, false)),
+        };
+        let legal_hold_blocked = row.legal_hold == "ON";
+        let retention_blocked = match (&row.mode, &row.retain_until_date) {
+            (Some(mode), Some(until)) => {
+                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                let still_locked = until.as_str() > now.as_str();
+                if still_locked {
+                    match mode.as_str() {
+                        "COMPLIANCE" => true,
+                        "GOVERNANCE" => !bypass_governance,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        Ok((retention_blocked, legal_hold_blocked))
     }
 }
 

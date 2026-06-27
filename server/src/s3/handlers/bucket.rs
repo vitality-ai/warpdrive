@@ -12,6 +12,7 @@ use super::common::*;
 use super::tagging::{s3_put_bucket_tagging_inner, s3_delete_bucket_tagging_inner};
 use super::versioning::s3_put_bucket_versioning_inner;
 use super::acl::{s3_put_acl_stub, validate_bucket_name};
+use super::object_lock::s3_put_bucket_object_lock_inner;
 
 // ---------------------------------------------------------------------------
 // ListBuckets  GET /s3  or  GET /s3/
@@ -107,13 +108,16 @@ pub async fn s3_create_bucket_handler(
     if qmap.contains_key("acl") {
         return s3_put_acl_stub(&req).await;
     }
-    if qmap.contains_key("tagging") || qmap.contains_key("versioning") {
+    if qmap.contains_key("tagging") || qmap.contains_key("versioning") || qmap.contains_key("object-lock") {
         let mut body: Vec<u8> = Vec::new();
         while let Some(chunk) = payload.next().await {
             body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
         }
         if qmap.contains_key("tagging") {
             return s3_put_bucket_tagging_inner(&bucket, &body, &req).await;
+        }
+        if qmap.contains_key("object-lock") {
+            return s3_put_bucket_object_lock_inner(&bucket, &body, &req).await;
         }
         return s3_put_bucket_versioning_inner(&bucket, &body, &req).await;
     }
@@ -143,7 +147,12 @@ pub async fn s3_create_bucket_handler(
     if let Err(e) = validate_bucket_name(&bucket) { return Ok(e); }
 
     let db = MetadataService::new(&auth_result.user_id)?;
-    db.create_bucket(&bucket)?;
+    let lock_enabled = req.headers()
+        .get("x-amz-bucket-object-lock-enabled")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    db.create_bucket_with_lock(&bucket, lock_enabled)?;
 
     let location = extract_xml_tag(&body, "LocationConstraint")
         .map(|s| s.trim().to_string())

@@ -108,10 +108,18 @@ pub async fn s3_create_multipart_upload_handler(
         String::new()
     };
 
+    let mpu_lock_mode = req.headers().get("x-amz-object-lock-mode")
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let mpu_lock_until = req.headers().get("x-amz-object-lock-retain-until-date")
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let mpu_legal_hold = req.headers().get("x-amz-object-lock-legal-hold")
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+
     db.create_multipart_upload(
         &upload_id, &bucket, &key,
         content_type.as_deref(), &metadata_json, &initiated_at,
         &mpu_checksum_algo, &mpu_checksum_type,
+        &mpu_lock_mode, &mpu_lock_until, &mpu_legal_hold,
     )?;
 
     if let Some(tagging_str) = req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()) {
@@ -557,18 +565,32 @@ pub async fn s3_complete_multipart_upload_handler(
         let _ = db.set_object_tags(&bucket, &key, &tags);
     }
 
+    // Apply object lock from multipart upload metadata
+    let lock_mode = &upload_row.object_lock_mode;
+    let lock_until = &upload_row.object_lock_retain_until;
+    let legal_hold = &upload_row.object_lock_legal_hold;
+    if !lock_mode.is_empty() || !legal_hold.is_empty() {
+        let effective_vid = mpu_vid.as_deref().unwrap_or("");
+        let hold_opt = if legal_hold.is_empty() { None } else { Some(legal_hold.as_str()) };
+        let _ = db.put_object_lock(
+            &bucket, &key, effective_vid,
+            if lock_mode.is_empty() { None } else { Some(lock_mode.as_str()) },
+            if lock_until.is_empty() { None } else { Some(lock_until.as_str()) },
+            hold_opt,
+        );
+    }
+
     info!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
     let mut resp = complete_multipart_xml_response(
         &bucket, &key, &multipart_etag,
         final_checksum_algo.as_deref(), final_checksum_value.as_deref(), final_checksum_type.as_deref(),
     );
-    if let Some(vid) = mpu_vid {
-        if vid != "null" {
-            resp.headers_mut().insert(
-                actix_web::http::header::HeaderName::from_static("x-amz-version-id"),
-                actix_web::http::header::HeaderValue::from_str(&vid).unwrap(),
-            );
-        }
+    let resp_vid = mpu_vid.as_deref().unwrap_or("");
+    if !resp_vid.is_empty() && resp_vid != "null" {
+        resp.headers_mut().insert(
+            actix_web::http::header::HeaderName::from_static("x-amz-version-id"),
+            actix_web::http::header::HeaderValue::from_str(resp_vid).unwrap(),
+        );
     }
     Ok(resp)
 }
