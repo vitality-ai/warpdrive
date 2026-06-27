@@ -17,6 +17,7 @@ use crate::storage::config::StorageConfig;
 use crate::util::serializer::deserialize_offset_size;
 use crate::metadata::Metadata;
 
+use super::checksum::{ChecksumAlgorithm, compute_composite_checksum, verify_checksum};
 use super::common::*;
 use super::tagging::parse_url_tags;
 
@@ -30,6 +31,8 @@ pub(super) struct PartEntry {
     pub(super) n: i32,
     pub(super) sz: u64,
     pub(super) ext: Vec<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cksum: Option<String>,
 }
 
 /// Parse `<Part><PartNumber>N</PartNumber><ETag>e</ETag></Part>` blocks.
@@ -86,9 +89,29 @@ pub async fn s3_create_multipart_upload_handler(
     let upload_id = format!("mpu-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let initiated_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
 
+    // Parse checksum algorithm and type from request headers
+    // boto3 sends x-amz-sdk-checksum-algorithm; raw clients use x-amz-checksum-algorithm
+    let mpu_checksum_algo = req.headers().get("x-amz-sdk-checksum-algorithm")
+        .or_else(|| req.headers().get("x-amz-checksum-algorithm"))
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let mpu_checksum_type = if !mpu_checksum_algo.is_empty() {
+        let provided_type = req.headers().get("x-amz-checksum-type")
+            .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        if provided_type.is_empty() {
+            ChecksumAlgorithm::from_str(&mpu_checksum_algo)
+                .map(|a| a.default_type().to_string())
+                .unwrap_or_default()
+        } else {
+            provided_type
+        }
+    } else {
+        String::new()
+    };
+
     db.create_multipart_upload(
         &upload_id, &bucket, &key,
         content_type.as_deref(), &metadata_json, &initiated_at,
+        &mpu_checksum_algo, &mpu_checksum_type,
     )?;
 
     if let Some(tagging_str) = req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()) {
@@ -109,7 +132,13 @@ pub async fn s3_create_multipart_upload_handler(
         key = xml_escape(&key),
         uid = xml_escape(&upload_id),
     );
-    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+    let mut mpu_resp = HttpResponse::Ok();
+    mpu_resp.content_type("application/xml");
+    // Echo checksum algorithm in response header
+    if !mpu_checksum_algo.is_empty() {
+        mpu_resp.insert_header(("x-amz-checksum-algorithm", mpu_checksum_algo.clone()));
+    }
+    Ok(mpu_resp.body(xml))
 }
 
 // ---------------------------------------------------------------------------
@@ -155,10 +184,46 @@ pub async fn s3_upload_part_handler(
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
-    db.upsert_multipart_part(&upload_id, part_number, &etag, body.len() as u64, &extents_blob)?;
+
+    // Parse and verify per-part checksum
+    let part_checksum_algo = req.headers().get("x-amz-sdk-checksum-algorithm")
+        .or_else(|| req.headers().get("x-amz-checksum-algorithm"))
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let part_checksum_value = if !part_checksum_algo.is_empty() {
+        if let Some(algo) = ChecksumAlgorithm::from_str(&part_checksum_algo) {
+            let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+            if let Some(client_value) = req.headers().get(header_name.as_str())
+                .and_then(|v| v.to_str().ok())
+            {
+                if !verify_checksum(&algo, &body, client_value) {
+                    return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
+                        "The Content-MD5 or checksum you specified did not match what we received.",
+                        &format!("/{}/{}", bucket, key)));
+                }
+                client_value.to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    db.upsert_multipart_part(&upload_id, part_number, &etag, body.len() as u64, &extents_blob, &part_checksum_value)?;
 
     info!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
-    Ok(HttpResponse::Ok().insert_header(("ETag", etag)).body(""))
+    let mut part_resp = HttpResponse::Ok();
+    part_resp.insert_header(("ETag", etag));
+    // Echo per-part checksum in response
+    if !part_checksum_value.is_empty() {
+        if let Some(algo) = ChecksumAlgorithm::from_str(&part_checksum_algo) {
+            let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+            part_resp.insert_header((header_name, part_checksum_value));
+        }
+    }
+    Ok(part_resp.body(""))
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +316,7 @@ pub async fn s3_upload_part_copy_handler(
 
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     let etag = format!("\"{}\"", hex::encode(md5::compute(&part_bytes).0));
-    db.upsert_multipart_part(&upload_id, part_number_i32, &etag, part_size, &extents_blob)?;
+    db.upsert_multipart_part(&upload_id, part_number_i32, &etag, part_size, &extents_blob, "")?;
 
     let last_modified = rfc2616_now();
     let xml = format!(
@@ -341,7 +406,17 @@ pub async fn s3_complete_multipart_upload_handler(
     let upload_row = match db.get_multipart_upload(&upload_id)? {
         Some(row) if row.status == "completed" => {
             let etag = row.final_etag.unwrap_or_default();
-            return Ok(complete_multipart_xml_response(&bucket, &key, &etag));
+            // For idempotent re-completion, look up stored checksum from current object metadata
+            let (idem_algo, idem_val, idem_type) = if let Ok(obj_meta) = db.get_object_full(&bucket, &key) {
+                (obj_meta.checksum_algorithm, obj_meta.checksum_value, obj_meta.checksum_type)
+            } else {
+                (None, None, None)
+            };
+            let idem_resp = complete_multipart_xml_response(
+                &bucket, &key, &etag,
+                idem_algo.as_deref(), idem_val.as_deref(), idem_type.as_deref(),
+            );
+            return Ok(idem_resp);
         }
         Some(row) if row.status == "in_progress" => row,
         Some(_) | None => {
@@ -388,7 +463,8 @@ pub async fn s3_complete_multipart_upload_handler(
         let exts = deserialize_offset_size(&p.extents_blob)?;
         let ext_arr: Vec<[u64; 2]> = exts.iter().map(|&(o, s)| [o, s]).collect();
         final_extents.extend_from_slice(&exts);
-        manifest.push(PartEntry { n: *part_num, sz: p.size, ext: ext_arr });
+        let part_cksum = if p.checksum_value.is_empty() { None } else { Some(p.checksum_value.clone()) };
+        manifest.push(PartEntry { n: *part_num, sz: p.size, ext: ext_arr, cksum: part_cksum });
     }
 
     let mut combined_md5_bytes: Vec<u8> = Vec::new();
@@ -406,6 +482,55 @@ pub async fn s3_complete_multipart_upload_handler(
     let user_metadata: HashMap<String, String> =
         serde_json::from_str(&upload_row.metadata_json).unwrap_or_default();
 
+    // Compute or validate composite checksum
+    let stored_algo_str = upload_row.checksum_algorithm.clone();
+    let stored_type = upload_row.checksum_type.clone();
+    let final_checksum_value: Option<String>;
+    let final_checksum_algo: Option<String>;
+    let final_checksum_type: Option<String>;
+
+    if !stored_algo_str.is_empty() {
+        if let Some(algo) = ChecksumAlgorithm::from_str(&stored_algo_str) {
+            // Get client-provided composite checksum from request header
+            let cksum_header = format!("x-amz-checksum-{}", algo.header_suffix());
+            let client_provided = req.headers().get(cksum_header.as_str())
+                .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+            let computed_value = if stored_type == "FULL_OBJECT" {
+                // Trust client-provided FULL_OBJECT checksum, no recomputation
+                client_provided.clone()
+            } else {
+                // COMPOSITE: compute from stored per-part checksums
+                let part_checksums: Vec<String> = requested_parts.iter()
+                    .map(|(n, _)| stored_map.get(n).map(|p| p.checksum_value.clone()).unwrap_or_default())
+                    .collect();
+                let computed = compute_composite_checksum(&algo, &part_checksums);
+
+                // If client provided a composite, validate it
+                if let Some(ref provided) = client_provided {
+                    if provided != &computed {
+                        return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
+                            "The Content-MD5 or checksum you specified did not match what we received.",
+                            &format!("/{}/{}", bucket, key)));
+                    }
+                }
+                Some(computed)
+            };
+
+            final_checksum_value = computed_value;
+            final_checksum_algo = Some(algo.as_str().to_string());
+            final_checksum_type = if stored_type.is_empty() { None } else { Some(stored_type.clone()) };
+        } else {
+            final_checksum_value = None;
+            final_checksum_algo = None;
+            final_checksum_type = None;
+        }
+    } else {
+        final_checksum_value = None;
+        final_checksum_algo = None;
+        final_checksum_type = None;
+    }
+
     let total_size: u64 = final_extents.iter().map(|(_, s)| s).sum();
     let mut final_metadata = Metadata::from_offset_size_list(final_extents);
     final_metadata.etag = Some(multipart_etag.clone());
@@ -413,6 +538,9 @@ pub async fn s3_complete_multipart_upload_handler(
     final_metadata.content_type = content_type;
     final_metadata.last_modified = Some(rfc2616_now());
     final_metadata.user_metadata = user_metadata;
+    final_metadata.checksum_algorithm = final_checksum_algo.clone();
+    final_metadata.checksum_value = final_checksum_value.clone();
+    final_metadata.checksum_type = final_checksum_type.clone();
     let (mpu_vid, mpu_old_extents) = db.put_object_full(&bucket, &key, final_metadata)?;
     if !mpu_old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &mpu_old_extents).ok();
@@ -430,7 +558,10 @@ pub async fn s3_complete_multipart_upload_handler(
     }
 
     info!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
-    let mut resp = complete_multipart_xml_response(&bucket, &key, &multipart_etag);
+    let mut resp = complete_multipart_xml_response(
+        &bucket, &key, &multipart_etag,
+        final_checksum_algo.as_deref(), final_checksum_value.as_deref(), final_checksum_type.as_deref(),
+    );
     if let Some(vid) = mpu_vid {
         if vid != "null" {
             resp.headers_mut().insert(
@@ -442,7 +573,26 @@ pub async fn s3_complete_multipart_upload_handler(
     Ok(resp)
 }
 
-pub(super) fn complete_multipart_xml_response(bucket: &str, key: &str, etag: &str) -> HttpResponse {
+pub(super) fn complete_multipart_xml_response(
+    bucket: &str, key: &str, etag: &str,
+    checksum_algo: Option<&str>, checksum_value: Option<&str>, checksum_type: Option<&str>,
+) -> HttpResponse {
+    // Checksum elements go inside the XML body for CompleteMultipartUpload
+    let checksum_xml = match (checksum_algo, checksum_value) {
+        (Some(algo_str), Some(val)) => {
+            if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+                let elem = algo.response_key();
+                let type_xml = checksum_type
+                    .filter(|t| !t.is_empty())
+                    .map(|t| format!("    <ChecksumType>{}</ChecksumType>\n", xml_escape(t)))
+                    .unwrap_or_default();
+                format!("    <{elem}>{val}</{elem}>\n{type_xml}", elem = elem, val = xml_escape(val))
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CompleteMultipartUploadResult xmlns=\"{s3}\">\n\
@@ -450,11 +600,12 @@ pub(super) fn complete_multipart_xml_response(bucket: &str, key: &str, etag: &st
              <Bucket>{bucket}</Bucket>\n\
              <Key>{key}</Key>\n\
              <ETag>{etag}</ETag>\n\
-         </CompleteMultipartUploadResult>",
+         {cksum}</CompleteMultipartUploadResult>",
         s3 = S3_XMLNS,
         bucket = xml_escape(bucket),
         key = xml_escape(key),
         etag = xml_escape(etag),
+        cksum = checksum_xml,
     );
     HttpResponse::Ok().content_type("application/xml").body(xml)
 }
@@ -585,6 +736,10 @@ pub(super) async fn s3_get_object_attributes_handler(bucket: &str, key: &str, re
     let part_number_marker: i32 = req.headers().get("x-amz-part-number-marker")
         .and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
 
+    // Pre-compute checksum algo for parts XML building
+    let checksum_algo_for_parts = meta.checksum_algorithm.as_deref()
+        .and_then(|s| ChecksumAlgorithm::from_str(s));
+
     let mut object_parts_xml = String::new();
     if let Some(manifest_json) = db.get_parts_manifest(bucket, key)? {
         if let Ok(parts) = serde_json::from_str::<Vec<PartEntry>>(&manifest_json) {
@@ -596,9 +751,14 @@ pub(super) async fn s3_get_object_attributes_handler(bucket: &str, key: &str, re
 
             let mut parts_xml = String::new();
             for p in &page {
+                let part_cksum_xml = if let (Some(ref algo), Some(ref cksum)) = (&checksum_algo_for_parts, &p.cksum) {
+                    format!("<{key}>{val}</{key}>", key = algo.response_key(), val = xml_escape(cksum))
+                } else {
+                    String::new()
+                };
                 parts_xml.push_str(&format!(
-                    "<Part><PartNumber>{}</PartNumber><Size>{}</Size></Part>",
-                    p.n, p.sz
+                    "<Part><PartNumber>{}</PartNumber><Size>{}</Size>{}</Part>",
+                    p.n, p.sz, part_cksum_xml
                 ));
             }
 
@@ -625,17 +785,41 @@ pub(super) async fn s3_get_object_attributes_handler(bucket: &str, key: &str, re
         }
     }
 
+    // Build checksum XML if object has a stored checksum
+    let mut checksum_xml = String::new();
+    if let (Some(ref algo_str), Some(ref cksum_val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
+        if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+            let cksum_type_xml = if let Some(ref ct) = meta.checksum_type {
+                if !ct.is_empty() {
+                    format!("<ChecksumType>{}</ChecksumType>", xml_escape(ct))
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            checksum_xml = format!(
+                "<Checksum><{key}>{val}</{key}>{ct}</Checksum>",
+                key = algo.response_key(),
+                val = xml_escape(cksum_val),
+                ct = cksum_type_xml,
+            );
+        }
+    }
+
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <GetObjectAttributesResponse xmlns=\"{s3}\">\
            <ETag>{etag}</ETag>\
            <StorageClass>STANDARD</StorageClass>\
            <ObjectSize>{sz}</ObjectSize>\
+           {checksum}\
            {parts}\
          </GetObjectAttributesResponse>",
         s3 = S3_XMLNS,
         etag = xml_escape(&etag_raw),
         sz = meta.size,
+        checksum = checksum_xml,
         parts = object_parts_xml,
     );
     let mut resp = HttpResponse::Ok();
@@ -696,6 +880,20 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
             resp.insert_header(("Content-Length", part_size.to_string()));
             resp.insert_header(("ETag", etag));
             resp.insert_header(("x-amz-mp-parts-count", total_parts.to_string()));
+            // Return checksum headers for this part if available
+            if let (Some(ref algo_str), Some(ref ct)) = (&meta.checksum_algorithm, &meta.checksum_type) {
+                if !algo_str.is_empty() && !ct.is_empty() {
+                    resp.insert_header(("x-amz-checksum-type", ct.clone()));
+                }
+            }
+            if let Some(ref algo_str) = &meta.checksum_algorithm {
+                if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+                    if let Some(ref part_cksum) = part.cksum {
+                        let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+                        resp.insert_header((header_name, part_cksum.clone()));
+                    }
+                }
+            }
             return Ok(resp.streaming(byte_stream));
         }
     }

@@ -659,6 +659,45 @@ test_versioning_bucket_atomic_upload_return_version_id
 
 ---
 
+## feat/batch-13-checksums — Batch 13: S3 Checksums
+
+**Branch:** `feat/batch-13-checksums`
+**RFC Batch:** Batch 13 (RFC 2.18 — Checksums)
+**Newly passing:** 11
+
+Key changes:
+- `checksum_algorithm`, `checksum_value`, `checksum_type` columns added to `objects`, `multipart_uploads`, and `multipart_parts` tables (SQLite migrations)
+- `checksum.rs`: `ChecksumAlgorithm` enum (SHA256, SHA1, CRC32, CRC32C, CRC64NVME); `compute_checksum`, `verify_checksum`, `compute_composite_checksum`
+- CRC64NVME: custom polynomial `0xad93d23594c93659` via `crc` v3 crate
+- PutObject: parse `x-amz-sdk-checksum-algorithm` (boto3) or `x-amz-checksum-algorithm` (raw), verify client checksum, store in metadata, echo `x-amz-checksum-{algo}` in response
+- GET/HEAD with `x-amz-checksum-mode: ENABLED`: returns stored `x-amz-checksum-{algo}` header
+- CreateMultipartUpload: stores checksum algorithm + type; returns in response headers
+- UploadPart: verifies per-part checksum, stores in `multipart_parts`, echoes in response header
+- CompleteMultipartUpload: validates COMPOSITE (recomputes hash of part checksums) or trusts FULL_OBJECT; stores composite value on final object; returns checksum fields in XML body (not headers)
+- GetObjectAttributes: returns `<Checksum>` element with algorithm and value
+
+Deferred: `test_post_object_upload_checksum` — requires POST Object (RFC 2.14, HTML form upload).
+
+### Verified Passing (11 in isolation; 4 net-new in full suite — others cascade-shadowed)
+
+```
+test_object_checksum_sha256
+test_object_checksum_crc64nvme
+test_multipart_checksum_sha256
+test_multipart_reupload_checksum_and_etag
+test_multipart_use_cksum_helper_sha256
+test_multipart_use_cksum_helper_crc64nvme
+test_multipart_use_cksum_helper_crc32
+test_multipart_use_cksum_helper_crc32c
+test_multipart_use_cksum_helper_sha1
+test_get_multipart_checksum_object_attributes
+test_get_checksum_object_attributes
+```
+
+**Running total: 394 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

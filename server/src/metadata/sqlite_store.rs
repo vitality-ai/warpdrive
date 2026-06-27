@@ -77,23 +77,26 @@ lazy_static! {
         // is_latest=1 marks the current visible version for a key.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS objects (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                user             TEXT NOT NULL,
-                bucket           TEXT NOT NULL,
-                key              TEXT NOT NULL,
-                version_id       TEXT NOT NULL DEFAULT '',
-                is_delete_marker INTEGER NOT NULL DEFAULT 0,
-                is_latest        INTEGER NOT NULL DEFAULT 1,
-                offset_size_list BLOB,
-                etag             TEXT,
-                size             INTEGER NOT NULL DEFAULT 0,
-                content_type     TEXT,
-                last_modified    TEXT,
-                user_metadata    TEXT,
-                cache_control    TEXT,
-                expires          TEXT,
-                content_encoding TEXT,
-                parts_manifest   TEXT,
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                user               TEXT NOT NULL,
+                bucket             TEXT NOT NULL,
+                key                TEXT NOT NULL,
+                version_id         TEXT NOT NULL DEFAULT '',
+                is_delete_marker   INTEGER NOT NULL DEFAULT 0,
+                is_latest          INTEGER NOT NULL DEFAULT 1,
+                offset_size_list   BLOB,
+                etag               TEXT,
+                size               INTEGER NOT NULL DEFAULT 0,
+                content_type       TEXT,
+                last_modified      TEXT,
+                user_metadata      TEXT,
+                cache_control      TEXT,
+                expires            TEXT,
+                content_encoding   TEXT,
+                parts_manifest     TEXT,
+                checksum_algorithm TEXT NOT NULL DEFAULT '',
+                checksum_value     TEXT NOT NULL DEFAULT '',
+                checksum_type      TEXT NOT NULL DEFAULT '',
                 UNIQUE(user, bucket, key, version_id)
             )",
             [],
@@ -102,22 +105,26 @@ lazy_static! {
         // Multipart upload tracking tables
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS multipart_uploads (
-                upload_id     TEXT NOT NULL PRIMARY KEY,
-                user_id       TEXT NOT NULL,
-                bucket        TEXT NOT NULL,
-                key           TEXT NOT NULL,
-                content_type  TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                initiated_at  TEXT NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'in_progress',
-                final_etag    TEXT
+                upload_id          TEXT NOT NULL PRIMARY KEY,
+                user_id            TEXT NOT NULL,
+                bucket             TEXT NOT NULL,
+                key                TEXT NOT NULL,
+                content_type       TEXT,
+                metadata_json      TEXT NOT NULL DEFAULT '{}',
+                initiated_at       TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'in_progress',
+                final_etag         TEXT,
+                tagging            TEXT DEFAULT '',
+                checksum_algorithm TEXT NOT NULL DEFAULT '',
+                checksum_type      TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS multipart_parts (
-                upload_id    TEXT NOT NULL,
-                part_number  INTEGER NOT NULL,
-                etag         TEXT NOT NULL,
-                size         INTEGER NOT NULL,
-                extents_blob BLOB NOT NULL,
+                upload_id       TEXT NOT NULL,
+                part_number     INTEGER NOT NULL,
+                etag            TEXT NOT NULL,
+                size            INTEGER NOT NULL,
+                extents_blob    BLOB NOT NULL,
+                checksum_value  TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (upload_id, part_number)
             );"
         ).expect("Failed to create multipart tables");
@@ -143,11 +150,11 @@ lazy_static! {
                 name              TEXT NOT NULL,
                 created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S.000Z', 'now')),
                 versioning_state  TEXT NOT NULL DEFAULT 'disabled',
+                location          TEXT DEFAULT '',
                 PRIMARY KEY (user, name)
             )",
             [],
         ).expect("Failed to create buckets table");
-        conn.execute("ALTER TABLE buckets ADD COLUMN location TEXT DEFAULT ''", []).ok();
 
         // CORS configuration per bucket
         conn.execute(
@@ -181,9 +188,6 @@ lazy_static! {
             )",
             [],
         ).expect("Failed to create bucket_tags table");
-
-        // Tagging column on multipart_uploads (stores x-amz-tagging URL-encoded string)
-        conn.execute("ALTER TABLE multipart_uploads ADD COLUMN tagging TEXT DEFAULT ''", []).ok();
 
         Arc::new(Mutex::new(conn))
     };
@@ -245,7 +249,8 @@ impl MetadataStorage for SQLiteMetadataStore {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT offset_size_list, etag, size, content_type, last_modified, user_metadata,
-                    cache_control, expires, content_encoding, version_id, is_delete_marker
+                    cache_control, expires, content_encoding, version_id, is_delete_marker,
+                    checksum_algorithm, checksum_value, checksum_type
              FROM objects
              WHERE user = ?1 AND bucket = ?2 AND key = ?3 AND is_latest = 1",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -263,6 +268,9 @@ impl MetadataStorage for SQLiteMetadataStore {
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
             ))
         }).map_err(|e| {
             warn!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
@@ -272,7 +280,8 @@ impl MetadataStorage for SQLiteMetadataStore {
         })?;
 
         let (offset_size_bytes, etag, size, content_type, last_modified, user_metadata_json,
-             cache_control, expires, content_encoding, version_id, is_delete_marker) = row;
+             cache_control, expires, content_encoding, version_id, is_delete_marker,
+             checksum_algorithm, checksum_value, checksum_type) = row;
 
         if is_delete_marker != 0 {
             return Err(actix_web::error::ErrorNotFound(format!(
@@ -300,6 +309,9 @@ impl MetadataStorage for SQLiteMetadataStore {
         metadata.expires = expires;
         metadata.content_encoding = content_encoding;
         metadata.version_id = if version_id.is_empty() { None } else { Some(version_id) };
+        metadata.checksum_algorithm = if checksum_algorithm.is_empty() { None } else { Some(checksum_algorithm) };
+        metadata.checksum_value = if checksum_value.is_empty() { None } else { Some(checksum_value) };
+        metadata.checksum_type = if checksum_type.is_empty() { None } else { Some(checksum_type) };
         Ok(metadata)
     }
 
@@ -763,12 +775,16 @@ impl SQLiteMetadataStore {
                     "INSERT INTO objects
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
-                         user_metadata,cache_control,expires,content_encoding,parts_manifest)
-                     VALUES(?1,?2,?3,'',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                         user_metadata,cache_control,expires,content_encoding,parts_manifest,
+                         checksum_algorithm,checksum_value,checksum_type)
+                     VALUES(?1,?2,?3,'',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     params![user_id,bucket,key,offset_size_bytes,metadata.etag,
                             metadata.size as i64,metadata.content_type,metadata.last_modified,
                             user_metadata_json,metadata.cache_control,metadata.expires,
-                            metadata.content_encoding,metadata.properties.get("parts_manifest")],
+                            metadata.content_encoding,metadata.properties.get("parts_manifest"),
+                            metadata.checksum_algorithm.as_deref().unwrap_or(""),
+                            metadata.checksum_value.as_deref().unwrap_or(""),
+                            metadata.checksum_type.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
                 Ok((None, old_extents))
             }
@@ -783,12 +799,16 @@ impl SQLiteMetadataStore {
                     "INSERT INTO objects
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
-                         user_metadata,cache_control,expires,content_encoding,parts_manifest)
-                     VALUES(?1,?2,?3,?4,1,0,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                         user_metadata,cache_control,expires,content_encoding,parts_manifest,
+                         checksum_algorithm,checksum_value,checksum_type)
+                     VALUES(?1,?2,?3,?4,1,0,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![user_id,bucket,key,vid,offset_size_bytes,metadata.etag,
                             metadata.size as i64,metadata.content_type,metadata.last_modified,
                             user_metadata_json,metadata.cache_control,metadata.expires,
-                            metadata.content_encoding,metadata.properties.get("parts_manifest")],
+                            metadata.content_encoding,metadata.properties.get("parts_manifest"),
+                            metadata.checksum_algorithm.as_deref().unwrap_or(""),
+                            metadata.checksum_value.as_deref().unwrap_or(""),
+                            metadata.checksum_type.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
                 Ok((Some(vid), vec![]))
             }
@@ -826,12 +846,16 @@ impl SQLiteMetadataStore {
                     "INSERT INTO objects
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
-                         user_metadata,cache_control,expires,content_encoding,parts_manifest)
-                     VALUES(?1,?2,?3,'null',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                         user_metadata,cache_control,expires,content_encoding,parts_manifest,
+                         checksum_algorithm,checksum_value,checksum_type)
+                     VALUES(?1,?2,?3,'null',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     params![user_id,bucket,key,offset_size_bytes,metadata.etag,
                             metadata.size as i64,metadata.content_type,metadata.last_modified,
                             user_metadata_json,metadata.cache_control,metadata.expires,
-                            metadata.content_encoding,metadata.properties.get("parts_manifest")],
+                            metadata.content_encoding,metadata.properties.get("parts_manifest"),
+                            metadata.checksum_algorithm.as_deref().unwrap_or(""),
+                            metadata.checksum_value.as_deref().unwrap_or(""),
+                            metadata.checksum_type.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
                 Ok((Some("null".to_string()), old_extents))
             }
@@ -958,7 +982,8 @@ impl SQLiteMetadataStore {
         };
         let row = conn.query_row(
             "SELECT offset_size_list,etag,size,content_type,last_modified,user_metadata,
-                    cache_control,expires,content_encoding,version_id,is_delete_marker
+                    cache_control,expires,content_encoding,version_id,is_delete_marker,
+                    checksum_algorithm,checksum_value,checksum_type
              FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id=?4",
             params![user_id, bucket, key, effective_vid],
             |row| Ok((
@@ -973,6 +998,9 @@ impl SQLiteMetadataStore {
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
             )),
         ).map_err(|e| {
             if e == rusqlite::Error::QueryReturnedNoRows {
@@ -983,7 +1011,8 @@ impl SQLiteMetadataStore {
         })?;
 
         let (offset_size_bytes, etag, size, content_type, last_modified, user_metadata_json,
-             cache_control, expires, content_encoding, vid, is_delete_marker) = row;
+             cache_control, expires, content_encoding, vid, is_delete_marker,
+             checksum_algorithm, checksum_value, checksum_type) = row;
 
         let offset_size_list = if let Some(bytes) = offset_size_bytes {
             crate::util::serializer::deserialize_offset_size(&bytes)?
@@ -1006,6 +1035,9 @@ impl SQLiteMetadataStore {
         metadata.content_encoding = content_encoding;
         metadata.version_id = if vid.is_empty() { None } else { Some(vid) };
         metadata.is_delete_marker = is_delete_marker != 0;
+        metadata.checksum_algorithm = if checksum_algorithm.is_empty() { None } else { Some(checksum_algorithm) };
+        metadata.checksum_value = if checksum_value.is_empty() { None } else { Some(checksum_value) };
+        metadata.checksum_type = if checksum_type.is_empty() { None } else { Some(checksum_type) };
         Ok(metadata)
     }
 
@@ -1086,6 +1118,8 @@ pub struct MultipartUploadRow {
     pub initiated_at: String,
     pub status: String,
     pub final_etag: Option<String>,
+    pub checksum_algorithm: String,
+    pub checksum_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1094,6 +1128,7 @@ pub struct MultipartPartRow {
     pub etag: String,
     pub size: u64,
     pub extents_blob: Vec<u8>,
+    pub checksum_value: String,
 }
 
 /// Multipart upload management
@@ -1101,13 +1136,16 @@ impl SQLiteMetadataStore {
     pub fn create_multipart_upload(
         &self, upload_id: &str, user_id: &str, bucket: &str, key: &str,
         content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
+        checksum_algorithm: &str, checksum_type: &str,
     ) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO multipart_uploads
-             (upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at],
+             (upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at,
+              checksum_algorithm, checksum_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at,
+                    checksum_algorithm, checksum_type],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
     }
@@ -1116,7 +1154,7 @@ impl SQLiteMetadataStore {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
-                    initiated_at, status, final_etag
+                    initiated_at, status, final_etag, checksum_algorithm, checksum_type
              FROM multipart_uploads WHERE upload_id = ?1",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         let result = stmt.query_row(params![upload_id], |row| {
@@ -1130,6 +1168,8 @@ impl SQLiteMetadataStore {
                 initiated_at: row.get(6)?,
                 status: row.get::<_, String>(7)?,
                 final_etag: row.get(8)?,
+                checksum_algorithm: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                checksum_type: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
             })
         });
         match result {
@@ -1170,7 +1210,7 @@ impl SQLiteMetadataStore {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
-                    initiated_at, status, final_etag
+                    initiated_at, status, final_etag, checksum_algorithm, checksum_type
              FROM multipart_uploads
              WHERE bucket = ?1 AND status = 'in_progress'
              ORDER BY key, initiated_at",
@@ -1186,6 +1226,8 @@ impl SQLiteMetadataStore {
                 initiated_at: row.get(6)?,
                 status: row.get::<_, String>(7)?,
                 final_etag: row.get(8)?,
+                checksum_algorithm: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                checksum_type: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
             })
         }).map_err(actix_web::error::ErrorInternalServerError)?;
         let mut result = Vec::new();
@@ -1197,12 +1239,13 @@ impl SQLiteMetadataStore {
 
     pub fn upsert_multipart_part(
         &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
+        checksum_value: &str,
     ) -> Result<(), Error> {
         let conn = DB_CONN.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO multipart_parts (upload_id, part_number, etag, size, extents_blob)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![upload_id, part_number, etag, size as i64, extents_blob],
+            "INSERT OR REPLACE INTO multipart_parts (upload_id, part_number, etag, size, extents_blob, checksum_value)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![upload_id, part_number, etag, size as i64, extents_blob, checksum_value],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
     }
@@ -1210,7 +1253,7 @@ impl SQLiteMetadataStore {
     pub fn list_multipart_parts(&self, upload_id: &str) -> Result<Vec<MultipartPartRow>, Error> {
         let conn = DB_CONN.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT part_number, etag, size, extents_blob
+            "SELECT part_number, etag, size, extents_blob, checksum_value
              FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         let rows = stmt.query_map(params![upload_id], |row| {
@@ -1219,6 +1262,7 @@ impl SQLiteMetadataStore {
                 etag: row.get(1)?,
                 size: row.get::<_, i64>(2)? as u64,
                 extents_blob: row.get(3)?,
+                checksum_value: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
             })
         }).map_err(actix_web::error::ErrorInternalServerError)?;
         let mut result = Vec::new();
