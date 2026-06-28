@@ -74,9 +74,9 @@ AWS_DEFAULT_REGION=us-east-1 \
 
 ## Example
 
-The example below is in Rust using the [tidesdb Rust crate](https://tidesdb.com/reference/rust/). Because Warpdrive exposes a standard S3 HTTP interface, the same approach works with any language that TidesDB supports — the S3 endpoint, credentials, and config flags are identical regardless of which binding you use.
+For this guide I've been working in Rust, so the example below uses the [tidesdb Rust crate](https://tidesdb.com/reference/rust/). That said, TidesDB has bindings for many languages and since Warpdrive is just an S3-compatible HTTP interface, please feel free to set this up in whichever language works best for you — the S3 endpoint, credentials, and config flags are the same regardless.
 
-A runnable version of this demo is in [`demo/tidesdb/`](../demo/tidesdb/).
+A runnable version of this demo is in [`demo/tidesdb/`](../demo/tidesdb) in this repository.
 
 ```rust
 use tidesdb::{TidesDB, Config, ColumnFamilyConfig, LogLevel, ObjectStoreConfig, S3Config};
