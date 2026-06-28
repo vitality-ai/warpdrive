@@ -25,20 +25,29 @@ When TidesDB is opened in object store mode it:
 
 ## Prerequisites
 
-**System packages:**
+**TidesDB** — refer to the [official TidesDB documentation](https://tidesdb.com/reference/rust/) for full setup instructions for your language and platform.
+
+For object store mode specifically, TidesDB's S3 connector requires libcurl and openssl in addition to the standard build dependencies. On Ubuntu/Debian:
 
 ```bash
-sudo apt-get install -y cmake pkg-config \
-  libzstd-dev liblz4-dev libsnappy-dev \
-  libcurl4-openssl-dev libssl-dev build-essential
+# Base build tools + compression libs (required for all TidesDB builds)
+sudo apt-get install -y cmake pkg-config build-essential \
+  libzstd-dev liblz4-dev libsnappy-dev
+
+# S3 object store support (required for Warpdrive integration)
+sudo apt-get install -y libcurl4-openssl-dev libssl-dev
 ```
 
-> The `cmake` bundled with Ubuntu 22.04 (3.22) is too old — TidesDB requires 3.25+. Install a newer one via pip:
->
-> ```bash
-> pip3 install cmake        # installs cmake 4.x into your virtualenv
-> export PATH="$VENV/bin:$PATH"   # put it first on PATH before building
-> ```
+> **cmake version:** Ubuntu 22.04 ships cmake 3.22 but TidesDB requires 3.25+. We worked around this by installing a newer cmake via pip (`pip3 install cmake`) and putting the venv bin directory first on `PATH` before building.
+
+In `Cargo.toml`, enable the `objectstore` feature — this activates the S3 connector and pulls in the libcurl/openssl bindings:
+
+```toml
+[dependencies]
+tidesdb = { version = "0.11", features = ["objectstore"] }
+```
+
+On first `cargo build`, the TidesDB C library is automatically downloaded and compiled from source.
 
 **Warpdrive running:**
 
@@ -50,15 +59,6 @@ WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
 ```
 
 Listens on port **9710**.
-
-## Cargo.toml
-
-```toml
-[dependencies]
-tidesdb = { version = "0.11", features = ["objectstore"] }
-```
-
-The `objectstore` feature enables the S3 connector and links against libcurl/openssl. On first build, cargo automatically downloads and compiles the TidesDB C library from source.
 
 ## Creating the bucket
 
@@ -72,7 +72,9 @@ AWS_DEFAULT_REGION=us-east-1 \
     --endpoint-url http://localhost:9710
 ```
 
-## Rust code
+## Example
+
+> The example below is in Rust using the [tidesdb crate](https://tidesdb.com/reference/rust/). Because Warpdrive is a standard HTTP/S3 interface, the same approach works with any language that TidesDB supports — the S3 endpoint, credentials, and config flags are identical regardless of which binding you use.
 
 ```rust
 use tidesdb::{TidesDB, Config, ColumnFamilyConfig, LogLevel, ObjectStoreConfig, S3Config};
@@ -142,13 +144,3 @@ AWS_DEFAULT_REGION=us-east-1 \
 
 TidesDB can fully recover from the bucket alone. Delete the local cache directory and reopen with the same config — TidesDB will download the MANIFEST and SSTables from Warpdrive and resume from where it left off.
 
-## Working example
-
-A self-contained runnable demo is in [`tidesdb-demo/`](../../tidesdb-demo/) at the repo root.
-
-```bash
-cd tidesdb-demo
-PATH="$VENV/bin:$PATH" cargo run
-```
-
-It creates the bucket, writes 100 KV pairs, flushes them to Warpdrive, reads them back, and lists the objects stored in the bucket.
