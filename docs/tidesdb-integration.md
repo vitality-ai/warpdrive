@@ -12,7 +12,7 @@ Your Application
       ▼
    TidesDB  (embedded, in-process)
       │
-      │  S3 API  (SigV4-signed, HTTP)
+      │  S3 API  (HTTP)
       ▼
    Warpdrive  (localhost:9710)
 ```
@@ -25,7 +25,7 @@ When TidesDB is opened in object store mode it:
 
 ## Prerequisites
 
-**TidesDB** — refer to the [official TidesDB documentation](https://tidesdb.com/reference/rust/) for full setup instructions for your language and platform.
+**TidesDB** — refer to the [official TidesDB documentation](https://tidesdb.com) for full setup instructions for your language and platform. The language-specific API references (Rust, Go, Python, Java, etc.) are at [tidesdb.com/reference](https://tidesdb.com/reference/rust/).
 
 For object store mode specifically, TidesDB's S3 connector requires libcurl and openssl in addition to the standard build dependencies. On Ubuntu/Debian:
 
@@ -62,7 +62,7 @@ Listens on port **9710**.
 
 ## Creating the bucket
 
-Warpdrive requires requests to be SigV4-signed. Use the AWS CLI:
+Since Warpdrive is S3-compatible, use the AWS CLI to create the bucket:
 
 ```bash
 AWS_ACCESS_KEY_ID=adminkey \
@@ -74,7 +74,9 @@ AWS_DEFAULT_REGION=us-east-1 \
 
 ## Example
 
-> The example below is in Rust using the [tidesdb crate](https://tidesdb.com/reference/rust/). Because Warpdrive is a standard HTTP/S3 interface, the same approach works with any language that TidesDB supports — the S3 endpoint, credentials, and config flags are identical regardless of which binding you use.
+The example below is in Rust using the [tidesdb Rust crate](https://tidesdb.com/reference/rust/). Because Warpdrive exposes a standard S3 HTTP interface, the same approach works with any language that TidesDB supports — the S3 endpoint, credentials, and config flags are identical regardless of which binding you use.
+
+A runnable version of this demo is in [`demo/tidesdb/`](../demo/tidesdb/).
 
 ```rust
 use tidesdb::{TidesDB, Config, ColumnFamilyConfig, LogLevel, ObjectStoreConfig, S3Config};
@@ -106,6 +108,13 @@ let val = txn.get(&cf, b"hello")?;
 println!("{}", String::from_utf8_lossy(&val)); // "world"
 ```
 
+To run the full demo (creates bucket, writes 100 pairs, flushes, reads back, lists bucket contents):
+
+```bash
+cd demo/tidesdb
+PATH="$VENV/bin:$PATH" cargo run
+```
+
 ## Critical config flags
 
 Both flags must be set explicitly — the defaults do not work with Warpdrive:
@@ -115,7 +124,7 @@ Both flags must be set explicitly — the defaults do not work with Warpdrive:
 | `use_path_style(true)` | `false` | Yes | Default is virtual-hosted style (`bucket.host/key`); Warpdrive uses path-style (`host/bucket/key`) |
 | `use_ssl(false)` | `false` | Yes (already correct) | Warpdrive listens on plain HTTP |
 
-Without `use_path_style(true)` TidesDB constructs URLs like `http://my-tidesdb-bucket.localhost:9710/UNIMAP` which Warpdrive cannot route, and all uploads silently fail.
+Without `use_path_style(true)` TidesDB constructs URLs like `http://my-tidesdb-bucket.localhost:9710/UNIMAP` which Warpdrive cannot route, and all uploads silently fail after 3 retries.
 
 ## What gets stored in Warpdrive
 
@@ -143,4 +152,3 @@ AWS_DEFAULT_REGION=us-east-1 \
 ## Recovery
 
 TidesDB can fully recover from the bucket alone. Delete the local cache directory and reopen with the same config — TidesDB will download the MANIFEST and SSTables from Warpdrive and resume from where it left off.
-

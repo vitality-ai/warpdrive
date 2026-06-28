@@ -1,0 +1,7 @@
+[package]
+name = "tidesdb-warpdrive-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tidesdb = { version = "0.11", features = ["objectstore"] }
