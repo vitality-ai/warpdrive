@@ -278,3 +278,9 @@ pub(super) fn percent_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+pub(super) fn req_query_map(req: &HttpRequest) -> std::collections::HashMap<String, String> {
+    actix_web::web::Query::<std::collections::HashMap<String, String>>::from_query(req.query_string())
+        .map(|q| q.into_inner())
+        .unwrap_or_default()
+}

@@ -698,6 +698,77 @@ test_get_checksum_object_attributes
 
 ---
 
+## feat/batch-14-object-lock — Batch 14: S3 Object Lock (WORM)
+
+**Branch:** `feat/batch-14-object-lock`
+**RFC Batch:** Batch 14 (RFC 2.6 — Object Lock)
+**Newly passing:** 39
+
+Key changes:
+- `object_lock` SQLite table: `(bucket, key, version_id, mode, retain_until_date, legal_hold)` with COALESCE upsert
+- `object_lock_config` table: bucket-level default retention `(bucket, mode, days, years)`
+- `buckets` table: `object_lock_enabled INTEGER` column; `create_bucket_with_lock` sets versioning=enabled automatically
+- `object_lock.rs`: 6 handlers — PUT/GET `?object-lock` (bucket config), PUT/GET `?retention`, PUT/GET `?legal-hold`
+- COMPLIANCE mode: blocks shortening retain_until_date or changing mode (no bypass possible)
+- GOVERNANCE mode: shortening or mode change requires `x-amz-bypass-governance-retention: true`; extending date freely allowed
+- `check_object_lock_protection`: called before every versioned delete (single and multi-delete)
+- Legal hold ON blocks delete regardless of retention; stored separately from retention via COALESCE
+- PutObject: reads `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date`, `x-amz-object-lock-legal-hold` headers; falls back to bucket default retention config
+- HEAD/GET object: returns `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date`, `x-amz-object-lock-legal-hold` headers
+- CreateMultipartUpload: stores lock headers; CompleteMultipartUpload applies them to final object
+- Legal hold header fix: boto3 uses `x-amz-object-lock-legal-hold` (not `-legal-hold-status`) for both request and response
+- GET routing: `?retention` and `?legal-hold` dispatch before `?versionId` (boto3 sends both params together)
+- Suspend versioning on object-lock bucket returns 409 InvalidBucketState
+- `multipart_uploads` table: added `object_lock_mode`, `object_lock_retain_until`, `object_lock_legal_hold` columns
+
+### Verified Passing (39)
+
+```
+test_object_lock_put_obj_lock
+test_object_lock_put_obj_lock_invalid_bucket
+test_object_lock_put_obj_lock_enable_after_create
+test_object_lock_put_obj_lock_with_days_and_years
+test_object_lock_put_obj_lock_invalid_days
+test_object_lock_put_obj_lock_invalid_years
+test_object_lock_put_obj_lock_invalid_mode
+test_object_lock_put_obj_lock_invalid_status
+test_object_lock_suspend_versioning
+test_object_lock_get_obj_lock
+test_object_lock_get_obj_lock_invalid_bucket
+test_object_lock_put_obj_retention
+test_object_lock_put_obj_retention_invalid_bucket
+test_object_lock_put_obj_retention_invalid_mode
+test_object_lock_get_obj_retention
+test_object_lock_get_obj_retention_iso8601
+test_object_lock_get_obj_retention_invalid_bucket
+test_object_lock_put_obj_retention_versionid
+test_object_lock_put_obj_retention_override_default_retention
+test_object_lock_put_obj_retention_increase_period
+test_object_lock_put_obj_retention_shorten_period
+test_object_lock_put_obj_retention_shorten_period_bypass
+test_object_lock_delete_object_with_retention
+test_object_lock_delete_multipart_object_with_retention
+test_object_lock_delete_object_with_retention_and_marker
+test_object_lock_multi_delete_object_with_retention
+test_object_lock_put_legal_hold
+test_object_lock_put_legal_hold_invalid_bucket
+test_object_lock_put_legal_hold_invalid_status
+test_object_lock_get_legal_hold
+test_object_lock_get_legal_hold_invalid_bucket
+test_object_lock_delete_object_with_legal_hold_on
+test_object_lock_delete_multipart_object_with_legal_hold_on
+test_object_lock_delete_object_with_legal_hold_off
+test_object_lock_get_obj_metadata
+test_object_lock_uploading_obj
+test_object_lock_changing_mode_from_governance_with_bypass
+test_object_lock_changing_mode_from_governance_without_bypass
+test_object_lock_changing_mode_from_compliance
+```
+
+**Running total: 433 / 808**
+
+---
+
 <!-- Template for next entry — copy and fill in before each push:
 
 ## <branch-name> — <short description>

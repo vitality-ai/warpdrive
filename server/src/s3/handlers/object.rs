@@ -21,6 +21,7 @@ use super::versioning::{s3_get_object_version_handler, s3_delete_specific_versio
 use super::acl::{s3_put_acl_stub, s3_get_object_acl_stub, validate_object_key};
 use super::copy::s3_copy_object_handler;
 use super::multipart::{s3_upload_part_handler, s3_upload_part_copy_handler, s3_abort_multipart_upload_handler, s3_get_object_attributes_handler, s3_get_part_handler, s3_head_part_handler};
+use super::object_lock::{s3_put_object_retention_inner, s3_get_object_retention_inner, s3_put_object_legal_hold_inner, s3_get_object_legal_hold_inner, compute_retain_until};
 
 // ---------------------------------------------------------------------------
 // PutObject  PUT /s3/{bucket}/{key}
@@ -51,6 +52,17 @@ pub async fn s3_put_object_handler(
         }
         if query.contains_key("acl") {
             return s3_put_acl_stub(&req).await;
+        }
+        if query.contains_key("retention") || query.contains_key("legal-hold") {
+            let (bucket, key) = path.into_inner();
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = payload.next().await {
+                body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+            }
+            if query.contains_key("retention") {
+                return s3_put_object_retention_inner(&bucket, &key, &body, &req).await;
+            }
+            return s3_put_object_legal_hold_inner(&bucket, &key, &body, &req).await;
         }
     }
     if req.headers().contains_key("x-amz-copy-source") {
@@ -233,10 +245,46 @@ pub async fn s3_put_object_handler(
         db.set_object_tags(&bucket, &key, &tags)?;
     }
 
+    // Apply object lock — from per-object headers or bucket default retention
+    let obj_lock_mode = req.headers().get("x-amz-object-lock-mode")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let obj_lock_until = req.headers().get("x-amz-object-lock-retain-until-date")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let obj_legal_hold = req.headers().get("x-amz-object-lock-legal-hold")
+        .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+    let effective_vid = version_id.as_deref().unwrap_or("");
+    let lock_mode: Option<String>;
+    let lock_until: Option<String>;
+
+    if obj_lock_mode.is_some() && obj_lock_until.is_some() {
+        lock_mode = obj_lock_mode;
+        lock_until = obj_lock_until;
+    } else if let Ok(Some((def_mode, def_days, def_years))) = db.get_object_lock_config(&bucket) {
+        lock_mode = Some(def_mode);
+        lock_until = Some(compute_retain_until(def_days, def_years));
+    } else {
+        lock_mode = None;
+        lock_until = None;
+    }
+
+    if lock_mode.is_some() || obj_legal_hold.is_some() {
+        let _ = db.put_object_lock(
+            &bucket, &key, effective_vid,
+            lock_mode.as_deref(), lock_until.as_deref(),
+            obj_legal_hold.as_deref(),
+        );
+    }
+
     debug!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("ETag", etag));
-    if let Some(vid) = version_id { if vid != "null" { resp.insert_header(("x-amz-version-id", vid)); } }
+    let resp_vid = version_id.as_deref().unwrap_or("");
+    if !resp_vid.is_empty() && resp_vid != "null" {
+        resp.insert_header(("x-amz-version-id", resp_vid.to_string()));
+    }
+    if let Some(ref m) = lock_mode { resp.insert_header(("x-amz-object-lock-mode", m.clone())); }
+    if let Some(ref u) = lock_until { resp.insert_header(("x-amz-object-lock-retain-until-date", u.clone())); }
     // Echo checksum header in response
     if let Some((ref algo, ref value)) = checksum_result {
         let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
@@ -262,6 +310,13 @@ pub async fn s3_get_object_handler(
     }
     if qmap.contains_key("tagging") {
         return s3_get_object_tagging_inner(&bucket, &key, &req).await;
+    }
+    // retention/legal-hold come before versionId — boto3 sends both params together
+    if qmap.contains_key("retention") {
+        return s3_get_object_retention_inner(&bucket, &key, &req).await;
+    }
+    if qmap.contains_key("legal-hold") {
+        return s3_get_object_legal_hold_inner(&bucket, &key, &req).await;
     }
     if let Some(vid) = qmap.get("versionId") {
         return s3_get_object_version_handler(&bucket, &key, vid, &req).await;
@@ -456,6 +511,14 @@ pub async fn s3_get_object_handler(
             }
         }
     }
+    // Return object lock headers if present
+    if let Some(ref vid) = meta.version_id {
+        if let Ok(Some(lock)) = db.get_object_lock(&bucket, &key, vid) {
+            if let Some(ref m) = lock.mode { resp.insert_header(("x-amz-object-lock-mode", m.clone())); }
+            if let Some(ref u) = lock.retain_until_date { resp.insert_header(("x-amz-object-lock-retain-until-date", u.clone())); }
+            if lock.legal_hold == "ON" { resp.insert_header(("x-amz-object-lock-legal-hold", "ON")); }
+        }
+    }
     Ok(resp.streaming(byte_stream))
 }
 
@@ -553,6 +616,15 @@ pub async fn s3_head_object_handler(
                     }
                 }
             }
+        }
+    }
+    // Return object lock headers if present
+    let vid_for_lock = meta.version_id.as_deref().unwrap_or("");
+    if !vid_for_lock.is_empty() {
+        if let Ok(Some(lock)) = db.get_object_lock(&bucket, &key, vid_for_lock) {
+            if let Some(ref m) = lock.mode { resp.insert_header(("x-amz-object-lock-mode", m.clone())); }
+            if let Some(ref u) = lock.retain_until_date { resp.insert_header(("x-amz-object-lock-retain-until-date", u.clone())); }
+            if lock.legal_hold == "ON" { resp.insert_header(("x-amz-object-lock-legal-hold", "ON")); }
         }
     }
     Ok(resp.message_body(HeadBody(object_size)).unwrap().map_into_boxed_body())
