@@ -122,7 +122,7 @@ Both flags must be set explicitly — the defaults do not work with Warpdrive:
 | Flag | Default | Required | Reason |
 |------|---------|----------|--------|
 | `use_path_style(true)` | `false` | Yes | Default is virtual-hosted style (`bucket.host/key`); Warpdrive uses path-style (`host/bucket/key`) |
-| `use_ssl(false)` | `false` | Yes (already correct) | Warpdrive listens on plain HTTP |
+| `use_ssl(false)` | `false` | Yes | Warpdrive listens on plain HTTP |
 
 Without `use_path_style(true)` TidesDB constructs URLs like `http://my-tidesdb-bucket.localhost:9710/UNIMAP` which Warpdrive cannot route, and all uploads silently fail after 3 retries.
 
