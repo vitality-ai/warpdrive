@@ -152,3 +152,50 @@ AWS_DEFAULT_REGION=us-east-1 \
 ## Recovery
 
 TidesDB can fully recover from the bucket alone. Delete the local cache directory and reopen with the same config — TidesDB will download the MANIFEST and SSTables from Warpdrive and resume from where it left off.
+
+## Running TidesDB's own test suite against Warpdrive
+
+TidesDB ships an object store test suite (`objstore__tests.c`) that its CI runs against MinIO. We ran the same suite against a locally running Warpdrive instance — all 17 tests pass.
+
+**Clone and build TidesDB with S3 support:**
+
+```bash
+git clone https://github.com/tidesdb/tidesdb.git tidesdb-c
+cd tidesdb-c
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDESDB_WITH_S3=ON -DTIDESDB_WITH_SANITIZER=OFF
+cmake --build build -j$(nproc)
+```
+
+> **cmake version:** Ubuntu 22.04 ships cmake 3.22 but TidesDB requires 3.25+. Install a newer one with `pip3 install cmake` and prepend the venv bin to `PATH` before running cmake.
+
+**Create the test bucket in Warpdrive:**
+
+```bash
+AWS_ACCESS_KEY_ID=adminkey \
+AWS_SECRET_ACCESS_KEY=adminsecretkey123456 \
+AWS_DEFAULT_REGION=us-east-1 \
+  aws s3api create-bucket --bucket tidesdb-test \
+    --endpoint-url http://localhost:9710
+```
+
+**Run the objstore test suite:**
+
+```bash
+cd tidesdb-c/build
+LD_LIBRARY_PATH=. \
+  TIDESDB_S3_ENDPOINT=localhost:9710 \
+  TIDESDB_S3_BUCKET=tidesdb-test \
+  TIDESDB_S3_ACCESS_KEY=adminkey \
+  TIDESDB_S3_SECRET_KEY=adminsecretkey123456 \
+  ./objstore_tests
+```
+
+Expected output:
+
+```
+Test Results:
+  PASSED: 17
+  FAILED: 0
+```
+
+The S3-specific test (`test_objstore_s3_minio`) exercises put, exists, get, range_get, list, and delete against Warpdrive. The remaining 16 tests cover the filesystem objstore backend and run without network calls.
