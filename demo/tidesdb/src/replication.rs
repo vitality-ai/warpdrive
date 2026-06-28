@@ -1,114 +1,181 @@
-use tidesdb::{TidesDB, Config, LogLevel, ObjectStoreConfig};
-use crate::{aws, s3_config};
+// This is a simple happy-case path demo. It shows primary and replica running
+// concurrently against the same Warpdrive bucket, a fault being injected to
+// drop the primary, and the replica promoting itself to take over. It does not
+// cover split-brain scenarios, network partitions, or multi-replica topologies.
+
+use tidesdb::{TidesDB, Config, ColumnFamilyConfig, LogLevel, ObjectStoreConfig, S3Config};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+const ENDPOINT: &str = "localhost:9710";
+const BUCKET: &str = "tidesdb-replication";
+const ACCESS_KEY: &str = "adminkey";
+const SECRET_KEY: &str = "adminsecretkey123456";
+
+const PRIMARY_LOCAL: &str = "./repl-primary";
+const REPLICA_LOCAL: &str = "./repl-replica";
+const CF: &str = "repl-cf";
+
+fn aws(args: &[&str]) -> std::process::Output {
+    Command::new("aws")
+        .args(args)
+        .args(["--endpoint-url", &format!("http://{}", ENDPOINT)])
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output()
+        .expect("aws cli not found")
+}
+
+fn s3() -> S3Config {
+    S3Config::new(ENDPOINT, BUCKET, ACCESS_KEY, SECRET_KEY)
+        .region("us-east-1")
+        .use_path_style(true)
+        .use_ssl(false)
+}
+
+fn rm_local(path: &str) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // TidesDB replication is object-store-based: both primary and replica
-    // point at the same Warpdrive bucket. No direct network link between
-    // them — the bucket is the replication channel.
+    // Clean slate
+    rm_local(PRIMARY_LOCAL);
+    rm_local(REPLICA_LOCAL);
+    aws(&["s3", "rb", &format!("s3://{}", BUCKET), "--force"]);
+    aws(&["s3api", "create-bucket", "--bucket", BUCKET]);
+    println!("==> Bucket '{}' ready", BUCKET);
+
+    // Shared flag — main thread flips this to inject the fault
+    let fault = Arc::new(AtomicBool::new(false));
+    let primary_fault = fault.clone();
+    let replica_fault = fault.clone();
 
     // ---------------------------------------------------------------
-    // Phase 1: primary — open against Warpdrive, write, flush, close
+    // Primary thread — writes continuously until fault is injected
     // ---------------------------------------------------------------
-    println!("--- Phase 1: Primary ---");
-    println!("    Opening TidesDB as primary...");
+    let primary_thread = thread::spawn(move || {
+        let db = TidesDB::open(
+            Config::new(PRIMARY_LOCAL)
+                .object_store_s3(s3())
+                .object_store_config(
+                    ObjectStoreConfig::new()
+                        .wal_sync_on_commit(true), // upload WAL on every commit so replica sees writes fast
+                )
+                .log_level(LogLevel::Info),
+        )
+        .expect("primary open failed");
 
-    let primary = TidesDB::open(
-        Config::new("./tidesdb-primary")
-            .object_store_s3(s3_config())
-            .object_store_config(
-                ObjectStoreConfig::new()
-                    .wal_sync_on_commit(true), // upload WAL after every commit so replica sees it fast
-            )
-            .log_level(LogLevel::Info),
-    )?;
+        db.create_column_family(CF, ColumnFamilyConfig::default())
+            .expect("create cf failed");
+        let cf = db.get_column_family(CF).expect("get cf failed");
 
-    // column family already exists from the sanity run; just get the handle
-    let cf = primary.get_column_family("demo")?;
+        let mut i = 0u32;
+        loop {
+            if primary_fault.load(Ordering::Relaxed) {
+                println!("[primary] fault injected — dropping database handle (simulated crash)");
+                break; // DB drops here, releasing the lease in Warpdrive
+            }
+            // Batch 10 keys per transaction — one WAL upload per commit
+            let mut txn = db.begin_transaction().expect("txn failed");
+            for j in 0..10 {
+                let key = format!("key-{:04}", i + j).into_bytes();
+                let val = format!("value-{:04}", i + j).into_bytes();
+                txn.put(&cf, &key, &val, -1).expect("put failed");
+            }
+            txn.commit().expect("commit failed");
+            println!("[primary] wrote keys {}-{}", i, i + 9);
+            i += 10;
+            thread::sleep(Duration::from_millis(100));
+        }
 
-    for i in 100u32..150 {
-        let key = format!("key-{:04}", i).into_bytes();
-        let val = format!("value-{:04} written by primary", i).into_bytes();
-        let mut txn = primary.begin_transaction()?;
-        txn.put(&cf, &key, &val, -1)?;
-        txn.commit()?;
-    }
-    println!("    Wrote 50 more keys.");
+        i // return how many keys were written before crash
+    });
 
-    cf.flush_memtable()?;
-    drop(cf);
-    drop(primary);
-    println!("    Primary flushed and closed. Data is in Warpdrive.\n");
-
-    // ---------------------------------------------------------------
-    // Phase 2: replica — fresh local dir, same bucket, read-only
-    // ---------------------------------------------------------------
-    println!("--- Phase 2: Replica (read-only) ---");
-    println!("    Opening replica against the same Warpdrive bucket...");
-
-    let replica = TidesDB::open(
-        Config::new("./tidesdb-replica")
-            .object_store_s3(s3_config())
-            .object_store_config(
-                ObjectStoreConfig::new()
-                    .replica_mode(true)
-                    .replica_replay_wal(true)
-                    .replica_sync_interval_us(200_000), // poll bucket every 200ms
-            )
-            .log_level(LogLevel::Info),
-    )?;
-
-    // Give the replica sync thread time to download SSTables from Warpdrive
+    // Give primary a moment to start up and write a few keys
     thread::sleep(Duration::from_millis(800));
 
-    let rcf = replica.get_column_family("demo")?;
+    // ---------------------------------------------------------------
+    // Replica thread — reads while primary is live, promotes on fault
+    // ---------------------------------------------------------------
+    let replica_thread = thread::spawn(move || {
+        let db = TidesDB::open(
+            Config::new(REPLICA_LOCAL)
+                .object_store_s3(s3())
+                .object_store_config(
+                    ObjectStoreConfig::new()
+                        .replica_mode(true)
+                        .replica_replay_wal(true)
+                        .replica_sync_interval_us(200_000), // poll Warpdrive every 200ms
+                )
+                .log_level(LogLevel::Info),
+        )
+        .expect("replica open failed");
 
-    let mut found = 0u32;
-    for i in 0u32..150 {
-        let key = format!("key-{:04}", i).into_bytes();
-        let txn = replica.begin_transaction()?;
-        if txn.get(&rcf, &key).is_ok() {
-            found += 1;
+        // Poll while primary is healthy — count visible keys each tick
+        loop {
+            thread::sleep(Duration::from_millis(500));
+
+            if let Ok(cf) = db.get_column_family(CF) {
+                let mut visible = 0u32;
+                for i in 0u32..1000 {
+                    let key = format!("key-{:04}", i).into_bytes();
+                    let txn = db.begin_transaction().expect("txn failed");
+                    if txn.get(&cf, &key).is_ok() { visible += 1; }
+                }
+                println!("[replica] visible keys: {}", visible);
+            }
+
+            if replica_fault.load(Ordering::Relaxed) {
+                break;
+            }
         }
-    }
-    println!("    Read back {}/150 keys from Warpdrive via replica", found);
 
-    let wtxn = replica.begin_transaction()?;
-    match wtxn.put(&rcf, b"blocked", b"nope", -1) {
-        Err(e) => println!("    Write rejected (correct): {}", e),
-        Ok(_)  => println!("    Write unexpectedly succeeded!"),
-    }
-    println!();
+        // Primary is gone — wait briefly for the lease to clear, then promote
+        println!("[replica] primary fault detected — waiting for lease to clear...");
+        thread::sleep(Duration::from_secs(1));
+
+        println!("[replica] promoting to primary...");
+        db.promote_to_primary().expect("promotion failed");
+        println!("[replica] promoted! now accepting writes");
+
+        let cf = db.get_column_family(CF).expect("get cf after promote failed");
+
+        // Write new keys as the promoted primary
+        for i in 0u32..5 {
+            let key = format!("promoted-key-{:04}", i).into_bytes();
+            let val = b"written by promoted replica".to_vec();
+            let mut txn = db.begin_transaction().expect("txn failed");
+            txn.put(&cf, &key, &val, -1).expect("put after promote failed");
+            txn.commit().expect("commit after promote failed");
+            println!("[replica] wrote promoted-key-{:04}", i);
+        }
+
+        // Read back a promoted key to confirm
+        let txn = db.begin_transaction().expect("txn");
+        match txn.get(&cf, b"promoted-key-0002") {
+            Ok(v)  => println!("[replica] read back promoted-key-0002 = {}", String::from_utf8_lossy(&v)),
+            Err(e) => println!("[replica] read err: {}", e),
+        }
+    });
 
     // ---------------------------------------------------------------
-    // Phase 3: promote replica to primary
+    // Fault injection — kill the primary after 3 seconds
     // ---------------------------------------------------------------
-    println!("--- Phase 3: Promote replica to primary ---");
-    replica.promote_to_primary()?;
-    println!("    Promoted.");
+    thread::sleep(Duration::from_secs(10));
+    println!("\n[fault injection] killing primary after 10 seconds\n");
+    fault.store(true, Ordering::Relaxed);
 
-    let pcf = replica.get_column_family("demo")?;
-    for i in 0u32..10 {
-        let key = format!("promoted-key-{:04}", i).into_bytes();
-        let val = b"written after promotion".to_vec();
-        let mut txn = replica.begin_transaction()?;
-        txn.put(&pcf, &key, &val, -1)?;
-        txn.commit()?;
-    }
-    println!("    Wrote 10 new keys as promoted primary.");
+    let keys_written = primary_thread.join().expect("primary thread panicked");
+    replica_thread.join().expect("replica thread panicked");
 
-    let txn = replica.begin_transaction()?;
-    match txn.get(&pcf, b"promoted-key-0003") {
-        Ok(val) => println!("    promoted-key-0003 = {}", String::from_utf8_lossy(&val)),
-        Err(e)  => println!("    read err: {}", e),
-    }
+    println!("\n==> Done. Primary wrote {} keys before fault. Replica took over and wrote 5 more.", keys_written);
+    println!("    Warpdrive bucket '{}' was the replication channel throughout.\n", BUCKET);
 
-    println!("\n==> Warpdrive bucket '{}' served as the replication channel.", crate::BUCKET);
-
-    // list final bucket state
-    let out = aws(&["s3api", "list-objects-v2", "--bucket", crate::BUCKET]);
-    println!("{}", String::from_utf8_lossy(&out.stdout));
-
+    rm_local(PRIMARY_LOCAL);
+    rm_local(REPLICA_LOCAL);
     Ok(())
 }

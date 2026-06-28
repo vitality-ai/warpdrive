@@ -153,41 +153,6 @@ AWS_DEFAULT_REGION=us-east-1 \
 
 TidesDB can fully recover from the bucket alone. Delete the local cache directory and reopen with the same config — TidesDB will download the MANIFEST and SSTables from Warpdrive and resume from where it left off.
 
-## Replication
-
-TidesDB follows a simple yet effective model for replication and availability. Both primary and replica point at the same Warpdrive bucket — the bucket is the replication channel with no direct network link between nodes.
-
-- **Primary** writes SSTables, WAL segments, and the MANIFEST to Warpdrive as it flushes and compacts.
-- **Replica** (`replica_mode=true`) runs a background thread that polls the MANIFEST on a configurable interval, downloads new SSTables and WAL segments, and applies them locally for reads. Writes are rejected with `TDB_ERR_READONLY`.
-- **Promotion** — call `promote_to_primary()` on the replica to do a final WAL replay and flip it to write mode.
-- **WAL sync** — set `wal_sync_on_commit(true)` on the primary to upload the WAL after every commit, keeping replica lag near zero.
-
-```rust
-// Primary
-let primary = TidesDB::open(
-    Config::new("./primary-local")
-        .object_store_s3(s3_config())
-        .object_store_config(ObjectStoreConfig::new().wal_sync_on_commit(true)),
-)?;
-
-// Replica — same bucket, different local dir
-let replica = TidesDB::open(
-    Config::new("./replica-local")
-        .object_store_s3(s3_config())
-        .object_store_config(
-            ObjectStoreConfig::new()
-                .replica_mode(true)
-                .replica_replay_wal(true)
-                .replica_sync_interval_us(200_000),
-        ),
-)?;
-
-// Promote when ready
-replica.promote_to_primary()?;
-```
-
-A runnable three-phase demo (primary writes → replica reads → promote) is in [`demo/tidesdb/src/replication.rs`](../demo/tidesdb/src/replication.rs).
-
 ## Running TidesDB's own test suite against Warpdrive
 
 TidesDB ships an object store test suite (`objstore__tests.c`) that its CI runs against MinIO. We ran the same suite against a locally running Warpdrive instance — all 17 tests pass.
@@ -234,3 +199,38 @@ Test Results:
 ```
 
 The S3-specific test (`test_objstore_s3_minio`) exercises put, exists, get, range_get, list, and delete against Warpdrive. The remaining 16 tests cover the filesystem objstore backend and run without network calls.
+
+## Replication
+
+TidesDB follows a simple yet effective model for replication and availability. Both primary and replica point at the same Warpdrive bucket — the bucket is the replication channel with no direct network link between nodes.
+
+- **Primary** writes SSTables, WAL segments, and the MANIFEST to Warpdrive as it flushes and compacts.
+- **Replica** (`replica_mode=true`) runs a background thread that polls the MANIFEST on a configurable interval, downloads new SSTables and WAL segments, and applies them locally for reads. Writes are rejected with `TDB_ERR_READONLY`.
+- **Promotion** — call `promote_to_primary()` on the replica to do a final WAL replay and flip it to write mode.
+- **WAL sync** — set `wal_sync_on_commit(true)` on the primary to upload the WAL after every commit, keeping replica lag near zero.
+
+```rust
+// Primary
+let primary = TidesDB::open(
+    Config::new("./primary-local")
+        .object_store_s3(s3_config())
+        .object_store_config(ObjectStoreConfig::new().wal_sync_on_commit(true)),
+)?;
+
+// Replica — same bucket, different local dir
+let replica = TidesDB::open(
+    Config::new("./replica-local")
+        .object_store_s3(s3_config())
+        .object_store_config(
+            ObjectStoreConfig::new()
+                .replica_mode(true)
+                .replica_replay_wal(true)
+                .replica_sync_interval_us(200_000),
+        ),
+)?;
+
+// Promote when ready
+replica.promote_to_primary()?;
+```
+
+The runnable demo in [`demo/tidesdb/src/replication.rs`](../demo/tidesdb/src/replication.rs) shows a happy-case path: primary and replica run concurrently, primary writes batches of keys to Warpdrive, replica tracks them in real time, a fault is injected to drop the primary, and the replica promotes itself and continues writing.
