@@ -43,7 +43,7 @@ Warpdrive is tested against real-world storage clients and databases to validate
 | System | Type | Version Tested | Status | Notes |
 |--------|------|---------------|--------|-------|
 | [TidesDB](https://tidesdb.com) | Embedded LSM KV store | C library v9.3.6 / Rust crate 0.11.1 | ✅ Passing | [Full report](docs/compatibility_tests/tidesdb.md) — object store mode, replication, 17/17 CI tests pass |
-| [SlateDB](https://slatedb.io) | Embedded LSM KV store | — | 🚧 WIP | — |
+| [SlateDB](https://slatedb.io) | Embedded LSM KV store | slatedb 0.14 / object_store 0.14 | ✅ Passing | [Full report](docs/compatibility_tests/slatedb.md) — 1000-key write/flush/read/range-scan/delete, ISO 8601 LastModified required |
 | [Neon](https://neon.tech) | Serverless Postgres | — | 🚧 WIP | — |
 
 **In pipeline:**
