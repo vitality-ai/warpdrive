@@ -163,7 +163,6 @@ cython_debug/
 server/app/crud/db_name.db
 server/storage
 server/metadata
-server/Cargo.lock
 
 # Test data files
 server/*.json

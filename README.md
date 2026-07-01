@@ -36,5 +36,24 @@ Our broader aim is to build storage primitives and interfaces with a deep unders
 
 See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
 
+## Compatibility Tests
+
+Warpdrive is tested against real-world storage clients and databases to validate S3 compatibility. Results are documented in [`docs/compatibility_tests/`](docs/compatibility_tests/).
+
+| System | Type | Version Tested | Status | Notes |
+|--------|------|---------------|--------|-------|
+| [TidesDB](https://tidesdb.com) | Embedded LSM KV store | C library v9.3.6 / Rust crate 0.11.1 | ✅ Passing | [Full report](docs/compatibility_tests/tidesdb.md) — object store mode, replication, 17/17 CI tests pass |
+| [SlateDB](https://slatedb.io) | Embedded LSM KV store | — | 🚧 WIP | — |
+| [Neon](https://neon.tech) | Serverless Postgres | — | 🚧 WIP | — |
+
+**In pipeline:**
+
+| System | Type |
+|--------|------|
+| [LangGraph](https://langchain-ai.github.io/langgraph/) | Agentic workflow orchestration |
+| [LlamaIndex](https://www.llamaindex.ai) | RAG / agentic data framework |
+| [Ray](https://ray.io) | Distributed ML training & serving |
+| [PyTorch Lightning](https://lightning.ai) | ML training checkpointing |
+
 ## Developer's Corner
 For more advanced usage and development details, visit the [Developer's Documentation](https://github.com/cia-labs/Storage-service/blob/main/docs/setup.md).

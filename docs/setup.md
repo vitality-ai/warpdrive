@@ -1,42 +1,26 @@
 # Developer's Guide
 
-## 🚀 Local Setup
-
-Follow these steps to set up and run the storage server locally:
+## Local Setup
 
 ---
 
 ### 1. Prerequisites
 
-Install the required dependencies first:
-
-- **Rust**  
-  [Install Rust](https://rustup.rs/) with:
+- **Rust** — [install via rustup](https://rustup.rs/):
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
 
-- **libsqlite3-dev** & **FlatBuffers Compiler (`flatc`)**
+- **libsqlite3-dev** and **FlatBuffers compiler (`flatc`)**
 
-  **For Ubuntu/Debian:**
+  Ubuntu/Debian:
   ```bash
   sudo apt-get update && sudo apt-get install -y libsqlite3-dev flatbuffers-compiler
   ```
 
-  **For macOS (with Homebrew):**
+  macOS (Homebrew):
   ```bash
   brew install sqlite3 flatbuffers
-  ```
-
-  **Manual FlatBuffers install (if needed):**
-  ```bash
-  git clone https://github.com/google/flatbuffers.git
-  cd flatbuffers
-  cmake .
-  make
-  sudo make install
-  sudo ldconfig
-  flatc --version
   ```
 
 ---
@@ -44,90 +28,81 @@ Install the required dependencies first:
 ### 2. Clone the Repository
 
 ```bash
-git clone --recurse-submodules https://github.com/vitality-ai/warpdrive.git
+git clone https://github.com/vitality-ai/warpdrive.git
+cd warpdrive
+```
+
+---
+
+### 3. Build
+
+```bash
 cd warpdrive/server
+cargo build --release
 ```
 
 ---
 
-### 3. Build the Rust Server
+### 4. Run
+
+Warpdrive must be started from the `server/` directory (it looks for `server_log.yaml` and needs writable `logs/` and `storage/` subdirectories).
 
 ```bash
-cargo build
+cd warpdrive/server
+WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  ./target/release/warp_drive
 ```
+
+Listens on **port 9710**. Logs go to `logs/` and object data to `storage/`.
+
+Replace the key values with credentials of your choice — these become the admin access key and secret used for S3 SigV4 authentication.
 
 ---
 
-### 4. Run the Application
+### 5. Verify with boto3
 
 ```bash
-cargo run
+pip install boto3
 ```
 
-**S3 authentication:** Add a `.env` file in the `server/` directory (see `server/.env.example`). Set `VITALITY_CONSOLE_URL` to your Vitality Console base URL and `WARPDRIVE_SERVICE_SECRET` to the same value as in Console's `.env`. Warpdrive calls `POST .../api/auth/s3-credentials` on cache miss and verifies each request's SigV4 signature locally. S3 credentials are generated in the Vitality Console UI.
+```python
+import boto3
 
----
- 
-### 5. Test the Application Locally with the Demo Client App
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9710',
+    aws_access_key_id='adminkey',
+    aws_secret_access_key='adminsecretkey123456',
+    region_name='us-east-1',
+    config=boto3.session.Config(s3={'addressing_style': 'path'}),
+)
 
-You can verify your setup by running a demo client. Currently, a demo client is available for Python. In order to the run the demo client you need to install our client package by following the below steps.
-
-1. **Navigate to the Python SDK directory:**  
-   (Use your local path)
-   ```bash
-   cd warpdrive/client/python-sdk
-   ```
-
-2. **Clone and initialize submodules (if not already done):**
-   ```bash
-   git submodule update --init --recursive
-   ```
-
-3. **Install the SDK in editable mode:**
-   ```bash
-   pip install -e .
-   ```
-
-4. **Navigate to the demo directory:**
-   ```bash
-   cd warpdrive/demo
-   ```
-
-5. **Run the test client:**
-   ```bash
-   python3 pythonTestClient.py
-   ```
-
-   This script will interact with your running server and perform basic upload, download, update, and delete operations.
-   Check the outputs to confirm all functionalities are working as expected.
+s3.create_bucket(Bucket='test-bucket')
+s3.put_object(Bucket='test-bucket', Key='hello.txt', Body=b'Hello, Warpdrive!')
+print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
+```
 
 ---
 
-## 🐳 Docker (Optional)
+## Docker (Optional)
 
-Deploy the storage service in a Docker container:
-
-**Build the Docker image:**
+**Build:**
 ```bash
 docker build -t warpdrive .
 ```
 
-**(Optional) Change the exposed port:**
-- Update the port in `server/src/main.rs` (e.g., `9710`)
-- Update the `EXPOSE` line in the Dockerfile (e.g., `EXPOSE 9710`)
-
-**Run the Docker container:**
+**Run:**
 ```bash
-docker run -p 9710:9710 warpdrive
+docker run -p 9710:9710 \
+  -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+  -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  warpdrive
 ```
 
 ---
 
-## 💡 Troubleshooting
+## Troubleshooting
 
 - Ensure all prerequisites are installed and available in your PATH.
 - For advanced help, see [Rust docs](https://doc.rust-lang.org/book/) or [FlatBuffers docs](https://google.github.io/flatbuffers/).
-
----
-
-Happy Hacking! 🚀
