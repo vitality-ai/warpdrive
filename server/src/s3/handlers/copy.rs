@@ -134,7 +134,7 @@ pub async fn s3_copy_object_handler(
     };
 
     let etag = md5_etag(&src_data);
-    let last_modified = rfc2616_now();
+    let last_modified = last_modified_now();
 
     if db.check_key(&dst_bucket, &dst_key)? {
         storage_service.delete_object(&dst_context, &dst_key)?;

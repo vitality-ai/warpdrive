@@ -1,0 +1,14 @@
+[package]
+name = "slatedb-warpdrive-demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "slatedb-warpdrive-demo"
+path = "src/main.rs"
+
+[dependencies]
+slatedb = { version = "0.14", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"

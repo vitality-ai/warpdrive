@@ -394,6 +394,19 @@ pub async fn s3_delete_objects_handler(
             }
 
             if let Ok(ver_meta) = db.get_object_version(&bucket, key, vid) {
+                if let Some(ref req_mtime) = obj_req.last_modified_time {
+                    let req_ts = parse_http_date(req_mtime);
+                    let stored_ts = ver_meta.last_modified.as_deref().and_then(parse_http_date);
+                    if req_ts.is_none() || req_ts != stored_ts {
+                        errors_xml.push_str(&format!(
+                            "    <Error><Key>{k}</Key><VersionId>{v}</VersionId>\
+                             <Code>PreconditionFailed</Code>\
+                             <Message>At least one of the pre-conditions you specified did not hold</Message></Error>\n",
+                            k = xml_escape(key), v = xml_escape(vid),
+                        ));
+                        continue;
+                    }
+                }
                 let extents = ver_meta.to_offset_size_list();
                 if !extents.is_empty() {
                     let _ = storage_service.delete_object(&context, key);
@@ -439,7 +452,9 @@ pub async fn s3_delete_objects_handler(
             }
             if !failed {
                 if let Some(ref req_mtime) = obj_req.last_modified_time {
-                    if req_mtime != meta.last_modified.as_deref().unwrap_or("") {
+                    let req_ts = parse_http_date(req_mtime);
+                    let stored_ts = meta.last_modified.as_deref().and_then(parse_http_date);
+                    if req_ts.is_none() || req_ts != stored_ts {
                         failed = true;
                     }
                 }
@@ -459,6 +474,22 @@ pub async fn s3_delete_objects_handler(
                     xml_escape(key),
                 ));
                 continue;
+            }
+        } else if has_cond {
+            // Current version is a delete marker — still evaluate mtime condition against it.
+            if let Some(ref req_mtime) = obj_req.last_modified_time {
+                if let Some(stored_lm) = db.get_latest_last_modified(&bucket, key)? {
+                    let req_ts = parse_http_date(req_mtime);
+                    let stored_ts = parse_http_date(&stored_lm);
+                    if req_ts.is_none() || req_ts != stored_ts {
+                        errors_xml.push_str(&format!(
+                            "    <Error><Key>{}</Key><Code>PreconditionFailed</Code>\
+                             <Message>At least one of the pre-conditions you specified did not hold</Message></Error>\n",
+                            xml_escape(key),
+                        ));
+                        continue;
+                    }
+                }
             }
         }
 

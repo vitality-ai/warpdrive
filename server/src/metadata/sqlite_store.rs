@@ -996,6 +996,20 @@ impl SQLiteMetadataStore {
         })
     }
 
+    /// Returns the `last_modified` of the `is_latest=1` row for a key, including delete markers.
+    pub fn get_latest_last_modified(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        match conn.query_row(
+            "SELECT last_modified FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND is_latest=1",
+            params![user_id, bucket, key],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(lm) => Ok(lm),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
     /// Fetch a specific version of an object.
     pub fn get_object_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<Metadata, Error> {
         let conn = DB_CONN.lock().unwrap();
