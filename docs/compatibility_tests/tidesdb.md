@@ -76,7 +76,7 @@ AWS_DEFAULT_REGION=us-east-1 \
 
 For this guide I've been working in Rust, so the example below uses the [tidesdb Rust crate](https://tidesdb.com/reference/rust/). That said, TidesDB has bindings for many languages and since Warpdrive is just an S3-compatible HTTP interface, please feel free to set this up in whichever language works best for you — the S3 endpoint, credentials, and config flags are the same regardless.
 
-A runnable version of this demo is in [`demo/tidesdb/`](../demo/tidesdb) in this repository.
+A runnable version of this demo is in [`demo/tidesdb/`](../../demo/tidesdb) in this repository.
 
 ```rust
 use tidesdb::{TidesDB, Config, ColumnFamilyConfig, LogLevel, ObjectStoreConfig, S3Config};
@@ -233,4 +233,4 @@ let replica = TidesDB::open(
 replica.promote_to_primary()?;
 ```
 
-The runnable demo in [`demo/tidesdb/src/replication.rs`](../demo/tidesdb/src/replication.rs) shows a happy-case path: primary and replica run concurrently, primary writes batches of keys to Warpdrive, replica tracks them in real time, a fault is injected to drop the primary, and the replica promotes itself and continues writing.
+The runnable demo in [`demo/tidesdb/src/replication.rs`](../../demo/tidesdb/src/replication.rs) shows a happy-case path: primary and replica run concurrently, primary writes batches of keys to Warpdrive, replica tracks them in real time, a fault is injected to drop the primary, and the replica promotes itself and continues writing.
