@@ -141,7 +141,7 @@ pub(super) async fn s3_get_object_version_handler(bucket: &str, key: &str, versi
     resp.insert_header(("Content-Type", content_type));
     resp.insert_header(("ETag", etag));
     resp.insert_header(("Content-Length", total_size.to_string()));
-    if !last_modified.is_empty() { resp.insert_header(("Last-Modified", last_modified)); }
+    if !last_modified.is_empty() { resp.insert_header(("Last-Modified", last_modified_for_header(&last_modified))); }
     if let Some(vid) = &meta.version_id {
         resp.insert_header(("x-amz-version-id", vid.clone()));
         if let Ok(Some(lock)) = db.get_object_lock(bucket, key, vid) {

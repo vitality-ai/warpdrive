@@ -205,6 +205,12 @@ impl MetadataService {
         SQLiteMetadataStore::new().get_object_version(&self.user, bucket, key, version_id)
     }
 
+    /// Returns the last_modified of the is_latest=1 row, including delete markers.
+    pub fn get_latest_last_modified(&self, bucket: &str, key: &str) -> Result<Option<String>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_latest_last_modified(&self.user, bucket, key)
+    }
+
     pub fn list_object_versions_full(
         &self, bucket: &str, prefix: &str, key_marker: &str,
         version_id_marker: &str, max_keys: usize,

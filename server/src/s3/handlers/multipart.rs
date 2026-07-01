@@ -326,7 +326,7 @@ pub async fn s3_upload_part_copy_handler(
     let etag = format!("\"{}\"", hex::encode(md5::compute(&part_bytes).0));
     db.upsert_multipart_part(&upload_id, part_number_i32, &etag, part_size, &extents_blob, "")?;
 
-    let last_modified = rfc2616_now();
+    let last_modified = last_modified_now();
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CopyPartResult xmlns=\"{s3}\">\n\
@@ -544,7 +544,7 @@ pub async fn s3_complete_multipart_upload_handler(
     final_metadata.etag = Some(multipart_etag.clone());
     final_metadata.size = total_size;
     final_metadata.content_type = content_type;
-    final_metadata.last_modified = Some(rfc2616_now());
+    final_metadata.last_modified = Some(last_modified_now());
     final_metadata.user_metadata = user_metadata;
     final_metadata.checksum_algorithm = final_checksum_algo.clone();
     final_metadata.checksum_value = final_checksum_value.clone();
@@ -846,7 +846,7 @@ pub(super) async fn s3_get_object_attributes_handler(bucket: &str, key: &str, re
     );
     let mut resp = HttpResponse::Ok();
     resp.content_type("application/xml");
-    if let Some(lm) = &meta.last_modified { resp.insert_header(("Last-Modified", lm.as_str())); }
+    if let Some(lm) = &meta.last_modified { resp.insert_header(("Last-Modified", last_modified_for_header(lm))); }
     Ok(resp.body(xml))
 }
 

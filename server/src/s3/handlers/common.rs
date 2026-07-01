@@ -197,9 +197,17 @@ pub(super) fn range_slices(chunks: &[(u64, u64)], range_start: u64, range_end: u
     out
 }
 
-/// Compute RFC 2616 date string from now.
-pub(super) fn rfc2616_now() -> String {
-    chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+/// Returns the current timestamp as the canonical last_modified string stored in metadata
+/// and emitted in S3 XML bodies. Format: ISO 8601 (`2026-07-01T12:00:00.000Z`).
+pub(super) fn last_modified_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string()
+}
+
+/// Converts a stored last_modified value to the RFC 2616 format required by HTTP headers.
+pub(super) fn last_modified_for_header(s: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 /// Compute MD5 ETag (double-quoted) from accumulated bytes.
@@ -248,8 +256,11 @@ pub(super) fn extract_all_xml_tags(src: &str, tag: &str) -> Vec<String> {
     results
 }
 
-/// Parse an HTTP date string into Unix seconds.
+/// Parse a date string (ISO 8601 or RFC 2616) into Unix seconds.
 pub(super) fn parse_http_date(s: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT") {
         return Some(dt.and_utc().timestamp());
     }

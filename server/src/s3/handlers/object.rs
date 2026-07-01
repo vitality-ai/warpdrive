@@ -180,7 +180,7 @@ pub async fn s3_put_object_handler(
 
     let size = body_buf.len() as u64;
     let etag = md5_etag(&body_buf);
-    let last_modified = rfc2616_now();
+    let last_modified = last_modified_now();
 
     if let Some(raw) = req.headers().get("content-md5").and_then(|v| v.to_str().ok()) {
         let raw = raw.trim();
@@ -472,7 +472,7 @@ pub async fn s3_get_object_handler(
         resp.insert_header(("Content-Range", cr));
     }
     if !last_modified.is_empty() {
-        resp.insert_header(("Last-Modified", last_modified));
+        resp.insert_header(("Last-Modified", last_modified_for_header(&last_modified)));
     }
     if let Some(cc) = resp_cache_control {
         resp.insert_header(("Cache-Control", cc));
@@ -580,7 +580,7 @@ pub async fn s3_head_object_handler(
     resp.insert_header(("ETag", etag));
     resp.insert_header(("Accept-Ranges", "bytes"));
     if !last_modified.is_empty() {
-        resp.insert_header(("Last-Modified", last_modified));
+        resp.insert_header(("Last-Modified", last_modified_for_header(&last_modified)));
     }
     if let Some(cc) = &meta.cache_control {
         resp.insert_header(("Cache-Control", cc.as_str()));
@@ -648,6 +648,19 @@ pub async fn s3_delete_object_handler(
         }
         if let Some(vid) = query.get("versionId").cloned() {
             let (bucket, key) = path.into_inner();
+            if let Some(mtime_hdr) = req.headers().get("x-amz-if-match-last-modified-time")
+                .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string())
+            {
+                let auth_result = authenticate_s3_request(&req).await?;
+                let db = MetadataService::new(&auth_result.user_id)?;
+                if let Ok(ver_meta) = db.get_object_version(&bucket, &key, &vid) {
+                    let req_ts = parse_http_date(&mtime_hdr);
+                    let stored_ts = ver_meta.last_modified.as_deref().and_then(parse_http_date);
+                    if req_ts.is_none() || req_ts != stored_ts {
+                        return Ok(s3_precondition_failed(&format!("/{}/{}", bucket, key)));
+                    }
+                }
+            }
             return s3_delete_specific_version_handler(&bucket, &key, &vid, &req).await;
         }
     }
@@ -679,23 +692,34 @@ pub async fn s3_delete_object_handler(
         .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
     let if_size_del = req.headers().get("x-amz-if-match-size")
         .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+    let resource = format!("/{}/{}", bucket, key);
     if (if_match_del.is_some() || if_mtime_del.is_some() || if_size_del.is_some())
         && db.check_key(&bucket, &key)?
     {
         let meta = db.get_object_full(&bucket, &key)?;
-        let resource = format!("/{}/{}", bucket, key);
         if let Some(ref im) = if_match_del {
             if im != "*" && normalize_etag(im) != normalize_etag(meta.etag.as_deref().unwrap_or("")) {
                 return Ok(s3_precondition_failed(&resource));
             }
         }
         if let Some(ref mtime) = if_mtime_del {
-            if mtime != meta.last_modified.as_deref().unwrap_or("") {
+            let req_ts = parse_http_date(mtime);
+            let stored_ts = meta.last_modified.as_deref().and_then(parse_http_date);
+            if req_ts.is_none() || req_ts != stored_ts {
                 return Ok(s3_precondition_failed(&resource));
             }
         }
         if let Some(ref sz) = if_size_del {
             if sz.parse::<u64>().map(|expected| expected != meta.size).unwrap_or(false) {
+                return Ok(s3_precondition_failed(&resource));
+            }
+        }
+    } else if let Some(ref mtime) = if_mtime_del {
+        // Current version is a delete marker — still evaluate mtime condition against it.
+        if let Some(stored_lm) = db.get_latest_last_modified(&bucket, &key)? {
+            let req_ts = parse_http_date(mtime);
+            let stored_ts = parse_http_date(&stored_lm);
+            if req_ts.is_none() || req_ts != stored_ts {
                 return Ok(s3_precondition_failed(&resource));
             }
         }
