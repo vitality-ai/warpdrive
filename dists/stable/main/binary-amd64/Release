@@ -1,0 +1,5 @@
+Component: main
+Origin: Vitality AI
+Label: Warpdrive
+Architecture: amd64
+Description: Warpdrive S3-compatible object storage
