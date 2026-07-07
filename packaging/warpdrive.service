@@ -1,0 +1,16 @@
+[Unit]
+Description=Warpdrive S3-compatible object storage
+After=network.target
+
+[Service]
+Type=simple
+User=warpdrive
+Group=warpdrive
+EnvironmentFile=/etc/warpdrive/warpdrive.env
+ExecStart=/usr/bin/warpdrive
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/warpdrive
+
+[Install]
+WantedBy=multi-user.target

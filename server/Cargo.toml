@@ -32,3 +32,22 @@ base64 = "0.22"
 
 [dev-dependencies]
 actix-web = "4.11.0"
+
+[package.metadata.deb]
+name = "warpdrive"
+maintainer = "Tejas ChandraShekarRaju <tchandrashekar@acm.org>"
+license-file = ["../LICENSE"]
+extended-description = """\
+Warpdrive is a self-hosted S3-compatible object storage server.
+Drop-in replacement for AWS S3 — works with any S3 SDK out of the box."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+  ["target/release/warp_drive", "usr/bin/warpdrive", "755"],
+  ["../packaging/warpdrive.service", "lib/systemd/system/warpdrive.service", "644"],
+  ["../packaging/warpdrive.env",     "etc/warpdrive/warpdrive.env",           "640"],
+  ["../packaging/server_log.yaml",   "etc/warpdrive/warpdrive.yaml",          "644"],
+]
+maintainer-scripts = "../packaging/debian/"
+systemd-units = { unit-name = "warpdrive", enable = true }
