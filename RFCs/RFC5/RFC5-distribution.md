@@ -1,7 +1,8 @@
 # RFC 5: Warpdrive Distribution — APT Packaging & User Onboarding
 
-**Status:** Draft  
-**Date:** June 2026
+**Status:** Implemented  
+**Date:** June 2026  
+**Implemented:** July 2026
 
 ---
 
@@ -394,15 +395,44 @@ Before tagging a release:
 
 ## 6. Open Questions
 
-- **APT repo host choice**: Option B (GitHub Pages) is recommended — no
-  vendor dependency, no download limits. Option A (Fury.io) is simpler to
-  set up but caps at 250 MB / 10k downloads/month on the free tier and
-  requires migration if volume grows.
+- **APT repo host choice**: Resolved — went with Option B (GitHub Pages).
+  No vendor dependency, no download limits, everything stays within GitHub.
 - **ARM64 builds**: GitHub Actions `ubuntu-22.04` is x86_64. A separate
   `ubuntu-22.04-arm` runner (or cross-compilation via `cross`) is needed
   for Raspberry Pi / Ampere installs. Defer until there is demand.
 - **`/etc/warpdrive/warpdrive.env` default credentials**: Shipping
   known-default admin credentials is a deliberate developer-experience
-  tradeoff. The postinst script should print a prominent warning if the
-  server is reachable on a non-loopback interface and the credentials have
-  not been changed.
+  tradeoff. The postinst script prints a prominent warning on install if
+  credentials have not been changed.
+
+---
+
+## 7. Conclusion
+
+We went with **Option B — GitHub Pages** as the APT repository host.
+
+The release pipeline is fully implemented and verified end-to-end:
+
+- `cargo-deb` packages the binary, systemd service, and config into a `.deb`
+- A `v*` git tag triggers the GitHub Actions workflow, which builds the binary,
+  signs the apt repo with a GPG key stored as an Actions secret, and publishes
+  the repo structure to the `gh-pages` branch
+- `WARPDRIVE_LOG_CONFIG` env var was introduced so the binary resolves the log
+  config correctly both when installed as a package (`/etc/warpdrive/warpdrive.yaml`)
+  and during local development (`server_log.yaml`)
+- GPG pinentry loopback mode is configured in CI so `reprepro` can sign packages
+  headlessly without a TTY
+- The `postinst` script creates a `warpdrive` system user, sets up data and log
+  directories with correct permissions, and prints a warning if default credentials
+  are still in use
+
+First release tagged `v0.1.0-alpha` and successfully installed via:
+
+```bash
+curl -fsSL https://vitality-ai.github.io/warpdrive/gpg.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/warpdrive.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/warpdrive.gpg] \
+  https://vitality-ai.github.io/warpdrive stable main" \
+  | sudo tee /etc/apt/sources.list.d/warpdrive.list
+sudo apt update && sudo apt install warpdrive
+```
