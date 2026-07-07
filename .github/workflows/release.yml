@@ -38,7 +38,7 @@ jobs:
 
       - name: Import GPG signing key
         run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import
           echo "${{ secrets.GPG_KEY_ID }}:6:" | gpg --import-ownertrust
 
       - name: Export GPG public key
@@ -47,6 +47,8 @@ jobs:
           gpg --armor --export "${{ secrets.GPG_KEY_ID }}" > apt-repo/gpg.key
 
       - name: Build apt repo structure
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           mkdir -p apt-repo/conf
           cat > apt-repo/conf/distributions <<EOF
@@ -58,6 +60,7 @@ jobs:
           Description: Warpdrive S3-compatible object storage
           SignWith: ${{ secrets.GPG_KEY_ID }}
           EOF
+          echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --no-tty -q --yes 2>/dev/null || true
           reprepro -b apt-repo includedeb stable server/target/debian/warpdrive_*.deb
 
       - name: Publish apt repo to gh-pages
