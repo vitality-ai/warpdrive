@@ -37,10 +37,23 @@ jobs:
         run: sudo apt-get install -y reprepro
 
       - name: Import GPG signing key
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import
+          # Configure GPG agent to allow loopback pinentry (no TTY needed in CI)
+          mkdir -p ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          chmod 700 ~/.gnupg
+          gpgconf --kill gpg-agent
+
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
           FINGERPRINT=$(gpg --with-colons --fingerprint "${{ secrets.GPG_KEY_ID }}" | awk -F: '$1 == "fpr" {print $10; exit}')
           echo "$FINGERPRINT:6:" | gpg --import-ownertrust
+
+          # Pre-cache the passphrase in the agent so reprepro can sign without a prompt
+          echo "test" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --clearsign --default-key "${{ secrets.GPG_KEY_ID }}" > /dev/null
 
       - name: Export GPG public key
         run: |
@@ -48,8 +61,6 @@ jobs:
           gpg --armor --export "${{ secrets.GPG_KEY_ID }}" > apt-repo/gpg.key
 
       - name: Build apt repo structure
-        env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           mkdir -p apt-repo/conf
           cat > apt-repo/conf/distributions <<EOF
@@ -61,7 +72,6 @@ jobs:
           Description: Warpdrive S3-compatible object storage
           SignWith: ${{ secrets.GPG_KEY_ID }}
           EOF
-          echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --no-tty -q --yes 2>/dev/null || true
           reprepro -b apt-repo includedeb stable server/target/debian/warpdrive_*.deb
 
       - name: Publish apt repo to gh-pages
