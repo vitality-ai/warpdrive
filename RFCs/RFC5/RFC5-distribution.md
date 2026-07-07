@@ -72,7 +72,7 @@ maintainer-scripts = "packaging/debian/"
 systemd-units = { unit-name = "warpdrive", enable = true }
 ```
 
-### APT repository
+### APT repository — Option A: Fury.io
 
 Hosted on **Fury.io** (free tier, no infrastructure to maintain).
 
@@ -93,6 +93,78 @@ The CI upload step:
 curl -F package=@warpdrive_*.deb \
      https://${{ secrets.FURY_TOKEN }}@push.fury.io/vitality-ai/
 ```
+
+**Limits:** 250 MB storage, 10k downloads/month on the free tier.
+
+---
+
+### APT repository — Option B: GitHub Pages (no vendor dependency)
+
+The repo structure (`dists/`, `pool/`, `Packages.gz`, `Release`, `InRelease`)
+is generated in CI using `reprepro` and pushed to the `gh-pages` branch,
+served at `https://vitality-ai.github.io/warpdrive/`. The signing key is
+stored as a GitHub Actions secret — no third-party account required.
+
+#### CI steps (added to `release.yml`)
+
+```yaml
+- name: Install reprepro
+  run: sudo apt-get install -y reprepro
+
+- name: Import GPG signing key
+  run: echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+- name: Build apt repo structure
+  run: |
+    mkdir -p apt-repo/conf
+    cat > apt-repo/conf/distributions <<EOF
+    Origin: Vitality AI
+    Label: Warpdrive
+    Codename: stable
+    Architectures: amd64
+    Components: main
+    Description: Warpdrive S3-compatible object storage
+    SignWith: ${{ secrets.GPG_KEY_ID }}
+    EOF
+    reprepro -b apt-repo includedeb stable warpdrive_*.deb
+
+- name: Publish to gh-pages
+  uses: peaceiris/actions-gh-pages@v4
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    publish_dir: apt-repo
+    keep_files: true          # accumulate releases across runs
+```
+
+#### User setup
+
+```bash
+curl -fsSL https://vitality-ai.github.io/warpdrive/gpg.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/warpdrive.gpg
+echo "deb [signed-by=/etc/apt/keyrings/warpdrive.gpg] \
+  https://vitality-ai.github.io/warpdrive stable main" \
+  | sudo tee /etc/apt/sources.list.d/warpdrive.list
+sudo apt update && sudo apt install warpdrive
+```
+
+**Limits:** None beyond GitHub Pages bandwidth (100 GB/month soft limit,
+effectively unlimited for a server binary).
+
+---
+
+### Option comparison
+
+| | Fury.io (A) | GitHub Pages (B) |
+|---|---|---|
+| Setup effort | Minimal — just `curl` upload | Moderate — `reprepro` + GPG in CI |
+| Vendor dependency | Yes (Fury account) | No (GitHub only) |
+| Free tier limits | 250 MB / 10k downloads | 100 GB bandwidth |
+| Scales past free | Paid Fury plan or migrate | Already unlimited |
+| GPG signing | Fury handles it | You own the key |
+
+**Recommendation:** Start with Option B (GitHub Pages). The setup cost is
+one CI job and one GPG key secret. There is no migration needed when
+download volume grows, and all infrastructure stays within GitHub.
 
 ---
 
@@ -316,15 +388,16 @@ Before tagging a release:
 2. `TEST-COVERAGE.md` updated with newly-passing tests and running total
 3. `Cargo.toml` version bumped (follows semver)
 4. Tag pushed: `git tag v0.X.Y && git push origin v0.X.Y`
-5. CI builds `.deb`, publishes to Fury, creates GitHub Release automatically
+5. CI builds `.deb`, publishes to apt repo (Option A or B), creates GitHub Release automatically
 
 ---
 
 ## 6. Open Questions
 
-- **Fury.io free tier limit**: 250 MB storage, 10k downloads/month. If
-  download volume exceeds this, migrate to self-hosted (S3 bucket +
-  CloudFront) or a paid Fury plan.
+- **APT repo host choice**: Option B (GitHub Pages) is recommended — no
+  vendor dependency, no download limits. Option A (Fury.io) is simpler to
+  set up but caps at 250 MB / 10k downloads/month on the free tier and
+  requires migration if volume grows.
 - **ARM64 builds**: GitHub Actions `ubuntu-22.04` is x86_64. A separate
   `ubuntu-22.04-arm` runner (or cross-compilation via `cross`) is needed
   for Raspberry Pi / Ampere installs. Defer until there is demand.
