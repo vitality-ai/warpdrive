@@ -45,9 +45,9 @@ depends = "$auto"
 section = "utils"
 priority = "optional"
 assets = [
-  ["target/release/warp_drive", "usr/bin/warpdrive", "755"],
-  ["../packaging/warpdrive.env", "etc/warpdrive/warpdrive.env", "640"],
-  ["server_log.yaml",            "etc/warpdrive/warpdrive.yaml", "644"],
+  ["target/release/warp_drive",      "usr/bin/warpdrive",                        "755"],
+  ["../packaging/warpdrive.service", "lib/systemd/system/warpdrive.service",     "644"],
+  ["../packaging/warpdrive.env",     "etc/warpdrive/warpdrive.env",              "640"],
+  ["server_log.yaml",                "etc/warpdrive/warpdrive.yaml",             "644"],
 ]
 maintainer-scripts = "../packaging/debian/"
-systemd-units = { unit-name = "warpdrive", enable = true }
