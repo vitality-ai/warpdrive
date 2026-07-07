@@ -1,5 +1,6 @@
 #!/bin/sh
 set -e
+#DEBHELPER#
 
 # Create warpdrive system user if it doesn't exist
 if ! id -u warpdrive > /dev/null 2>&1; then
