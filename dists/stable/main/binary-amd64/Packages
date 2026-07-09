@@ -1,0 +1,18 @@
+Package: warpdrive
+Version: 0.1.0-1
+Architecture: amd64
+Maintainer: Tejas ChandraShekarRaju <tchandrashekar@acm.org>
+Installed-Size: 9658
+Depends: libc6 (>= 2.34), libsqlite3-0 (>= 3.5.9)
+Priority: optional
+Section: utils
+Filename: pool/main/w/warpdrive/warpdrive_0.1.0-1_amd64.deb
+Size: 2827856
+SHA256: 23ce472083ef85eca853c137b564ed02b761f7919606b83f85a9f1ad20d50be5
+SHA1: 46e5a967594a0dd02387892d0f749a4f2c4f575e
+MD5sum: 96e08da7fa394d6ce74ddc31d71a3e91
+Description: WarpDrive is an S3-ish rocket engine optimised for ML/Database workloads but
+ also general purpose
+ Warpdrive is a self-hosted S3-compatible object storage server.
+ Drop-in replacement for AWS S3 — works with any S3 SDK out of the box.
+
