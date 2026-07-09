@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Warpdrive — Next-Generation Object Storage</title>
+  <meta name="description" content="S3-compatible object storage engine built in Rust for storage-disaggregated architectures and high-throughput workloads.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    /* ── tokens ─────────────────────────────────────────────── */
+    :root {
+      --bg:          #07090F;
+      --surface:     #0D1018;
+      --surface2:    #121722;
+      --border:      #1D2638;
+      --text:        #D6E0EE;
+      --muted:       #5A6A82;
+      --accent:      #00C8A8;
+      --accent-dim:  #007F6C;
+      --accent-bg:   rgba(0, 200, 168, 0.08);
+      --rust:        #E8590C;
+      --green:       #1FBC7A;
+      --red:         #E05252;
+      --sans:        'Inter', system-ui, -apple-system, sans-serif;
+      --mono:        'JetBrains Mono', 'Cascadia Code', ui-monospace, monospace;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg:          #F4F7FB;
+        --surface:     #FFFFFF;
+        --surface2:    #EEF2F8;
+        --border:      #D1DAE8;
+        --text:        #0F1A2E;
+        --muted:       #607090;
+        --accent:      #007A66;
+        --accent-dim:  #004D43;
+        --accent-bg:   rgba(0, 122, 102, 0.07);
+        --rust:        #C4480B;
+        --green:       #15874F;
+        --red:         #B83C3C;
+      }
+    }
+    :root[data-theme="dark"] {
+      --bg:#07090F;--surface:#0D1018;--surface2:#121722;--border:#1D2638;
+      --text:#D6E0EE;--muted:#5A6A82;--accent:#00C8A8;--accent-dim:#007F6C;
+      --accent-bg:rgba(0,200,168,0.08);--rust:#E8590C;--green:#1FBC7A;--red:#E05252;
+    }
+    :root[data-theme="light"] {
+      --bg:#F4F7FB;--surface:#FFFFFF;--surface2:#EEF2F8;--border:#D1DAE8;
+      --text:#0F1A2E;--muted:#607090;--accent:#007A66;--accent-dim:#004D43;
+      --accent-bg:rgba(0,122,102,0.07);--rust:#C4480B;--green:#15874F;--red:#B83C3C;
+    }
+
+    /* ── reset ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre { font-family: var(--mono); }
+
+    /* ── layout ─────────────────────────────────────────────── */
+    .wrap {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 0 28px;
+    }
+
+    /* ── nav ─────────────────────────────────────────────────── */
+    nav {
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 100;
+      background: var(--bg);
+    }
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 52px;
+    }
+    .wordmark {
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .wordmark span { color: var(--accent); }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .nav-links a {
+      font-size: 13px;
+      color: var(--muted);
+      padding: 5px 10px;
+      border-radius: 5px;
+      transition: color .15s, background .15s;
+    }
+    .nav-links a:hover { color: var(--text); background: var(--surface2); text-decoration: none; }
+    .btn-github {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text) !important;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 12px;
+      transition: border-color .15s, background .15s;
+    }
+    .btn-github:hover { border-color: var(--accent); background: var(--accent-bg); text-decoration: none !important; }
+    .btn-github svg { width: 14px; height: 14px; fill: currentColor; }
+
+    /* ── hero ────────────────────────────────────────────────── */
+    .hero {
+      padding: 72px 0 60px;
+      border-bottom: 1px solid var(--border);
+    }
+    .eyebrow {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 18px;
+    }
+    h1 {
+      font-size: clamp(32px, 5vw, 52px);
+      font-weight: 700;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      max-width: 700px;
+      text-wrap: balance;
+      margin-bottom: 22px;
+    }
+    .hero-lead {
+      font-size: 17px;
+      line-height: 1.7;
+      color: var(--muted);
+      max-width: 580px;
+      margin-bottom: 36px;
+    }
+    .hero-lead strong { color: var(--text); font-weight: 500; }
+    .hero-ctas {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 52px;
+    }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: var(--accent);
+      color: #07090F !important;
+      font-size: 14px;
+      font-weight: 600;
+      padding: 9px 20px;
+      border-radius: 7px;
+      transition: opacity .15s;
+    }
+    .btn-primary:hover { opacity: .85; text-decoration: none; }
+    .btn-outline {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: transparent;
+      color: var(--text) !important;
+      font-size: 14px;
+      font-weight: 500;
+      padding: 9px 20px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      transition: border-color .15s, background .15s;
+    }
+    .btn-outline:hover { border-color: var(--accent); background: var(--accent-bg); text-decoration: none; }
+
+    .hero-stats {
+      display: flex;
+      gap: 40px;
+      flex-wrap: wrap;
+    }
+    .stat { display: flex; flex-direction: column; gap: 3px; }
+    .stat-value {
+      font-family: var(--mono);
+      font-size: 28px;
+      font-weight: 600;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+    .stat-label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+
+    /* ── section ─────────────────────────────────────────────── */
+    section { padding: 64px 0; border-bottom: 1px solid var(--border); }
+    section:last-child { border-bottom: none; }
+    h2 {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+    }
+    .section-sub {
+      font-size: 14px;
+      color: var(--muted);
+      margin-bottom: 40px;
+    }
+
+    /* ── feature grid ────────────────────────────────────────── */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+    }
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+    }
+    .feature-icon {
+      width: 36px;
+      height: 36px;
+      background: var(--accent-bg);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 14px;
+    }
+    .feature-icon svg { width: 18px; height: 18px; stroke: var(--accent); fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .feature h3 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .feature p { font-size: 13px; color: var(--muted); line-height: 1.6; }
+
+    /* ── install ─────────────────────────────────────────────── */
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 8px 8px 0 0;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .tab-btn {
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 10px 18px;
+      cursor: pointer;
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      transition: color .15s, border-color .15s, background .15s;
+      white-space: nowrap;
+    }
+    .tab-btn:hover { color: var(--text); background: var(--surface2); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); background: var(--surface2); }
+    .tab-panel {
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 8px 8px;
+    }
+    .tab-panel.active { display: block; }
+    .code-block {
+      background: var(--bg);
+      border-top: 1px solid var(--border);
+      padding: 20px 22px;
+      overflow-x: auto;
+    }
+    .code-block pre {
+      font-size: 13px;
+      line-height: 1.75;
+      color: var(--text);
+    }
+    .code-block .cm { color: var(--muted); }
+    .code-block .kw { color: var(--accent); }
+    .platform-note {
+      padding: 12px 22px;
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .badge-green { background: rgba(31,188,122,.12); color: var(--green); }
+    .badge-muted { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+    .badge-rust  { background: rgba(232,89,12,.10); color: var(--rust); }
+
+    .platform-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0 22px 16px;
+    }
+
+    /* ── compatibility ───────────────────────────────────────── */
+    .compat-grid {
+      display: grid;
+      gap: 14px;
+    }
+    .compat-card {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: start;
+      gap: 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 22px;
+    }
+    .compat-card:hover { border-color: var(--accent-dim); }
+    .compat-name {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 3px;
+    }
+    .compat-desc { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .compat-pills {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+    }
+    .pill-pass {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 20px;
+      background: rgba(31,188,122,.12);
+      color: var(--green);
+      white-space: nowrap;
+    }
+    .pill-count {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    /* ── s3 coverage ─────────────────────────────────────────── */
+    .coverage-header {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 10px;
+    }
+    .coverage-count {
+      font-family: var(--mono);
+      font-size: 38px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+    }
+    .coverage-total {
+      font-family: var(--mono);
+      font-size: 20px;
+      color: var(--muted);
+    }
+    .progress-bar {
+      height: 6px;
+      background: var(--surface2);
+      border-radius: 3px;
+      margin-bottom: 28px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 1s ease;
+    }
+    .batch-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .batch-table th {
+      text-align: left;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 0 10px 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .batch-table td {
+      padding: 10px 10px 10px 0;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    .batch-table tr:last-child td { border-bottom: none; }
+    .batch-table td:last-child { text-align: right; }
+    .mini-bar {
+      display: inline-block;
+      height: 3px;
+      background: var(--accent);
+      border-radius: 2px;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+
+    /* ── benchmarks ──────────────────────────────────────────── */
+    .bench-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+    .bench-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .bench-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .bench-value {
+      font-family: var(--mono);
+      font-size: 26px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+    }
+    .bench-unit {
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--muted);
+      margin-left: 3px;
+    }
+    .bench-sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+    .bench-note {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+      padding: 16px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .bench-note strong { color: var(--text); }
+
+    /* ── footer ──────────────────────────────────────────────── */
+    footer {
+      padding: 36px 0;
+      border-top: 1px solid var(--border);
+    }
+    .footer-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .footer-copy {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .footer-links {
+      display: flex;
+      gap: 20px;
+    }
+    .footer-links a {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .footer-links a:hover { color: var(--text); }
+
+    /* ── theme toggle ────────────────────────────────────────── */
+    #theme-toggle {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      transition: border-color .15s, color .15s;
+    }
+    #theme-toggle:hover { border-color: var(--accent); color: var(--text); }
+    #theme-toggle svg { width: 14px; height: 14px; fill: currentColor; }
+    .icon-sun { display: none; }
+    [data-theme="dark"] .icon-sun, .icon-sun-default { display: block; }
+    [data-theme="dark"] .icon-moon { display: none; }
+    [data-theme="light"] .icon-sun { display: none; }
+    [data-theme="light"] .icon-moon { display: block; }
+    @media (prefers-color-scheme: light) {
+      .icon-sun-default { display: none; }
+      .icon-moon-default { display: block; }
+    }
+    @media (prefers-color-scheme: dark) {
+      .icon-sun-default { display: block; }
+      .icon-moon-default { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <!-- nav -->
+  <nav>
+    <div class="wrap nav-inner">
+      <span class="wordmark">Vitality <span>AI</span></span>
+      <div class="nav-links">
+        <a href="#motivation">Why Warpdrive</a>
+        <a href="#install">Install</a>
+        <a href="#compat">Integrations</a>
+        <a href="#characterization">Characterization</a>
+        <button id="theme-toggle" aria-label="Toggle theme">
+          <svg class="icon-sun icon-sun-default" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          <svg class="icon-moon icon-moon-default" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <a class="btn-github" href="https://github.com/vitality-ai/warpdrive" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- hero -->
+  <div class="wrap">
+    <div class="hero">
+      <div class="eyebrow">Object Storage · S3-Compatible · Rust</div>
+      <h1>WarpDrive</h1>
+      <p style="font-size:20px;color:var(--muted);margin-top:-12px;margin-bottom:22px;font-weight:500;letter-spacing:-0.01em;">Object storage built for disaggregated systems</p>
+      <p class="hero-lead">
+        Warpdrive is a purpose-built <strong>S3-compatible object store</strong> focused on workloads that demand high throughput — storage-disaggregated databases, ML training pipelines, and agentic workflows that move computation close to data.
+      </p>
+      <div class="hero-ctas">
+        <a class="btn-primary" href="#install">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Get started
+        </a>
+        <a class="btn-outline" href="characterization/neon_tpcc_results.html">
+          View characterization study
+        </a>
+      </div>
+    </div>
+
+    <!-- motivation -->
+    <section id="motivation">
+      <h2>An S3ish rocket store</h2>
+      <p class="section-sub">Modern databases, agents, and training systems are building on top of object stores. But historically, high-efficiency systems have never benefited from an opaque storage layer. Object stores were designed for archival and customer file uploads, and that opacity was fine for those use cases. Now latency-sensitive systems are building on the same interface. Through our characterization work we have identified a few early parameters that capture how disaggregated workloads actually use storage, and we expose these so developers can tune them analytically from their own workload behavior. We think both sides benefit when the storage layer is legible and you can reason about its internals, develop against its behavior, and work together toward a system that is genuinely cost-efficient.</p>
+      <div class="features">
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          </div>
+          <h3>Disaggregated databases</h3>
+          <p>Modern databases like Neon, SlateDB, and TidesDB separate their storage layer from compute. They ship their WAL segments, SSTables, and layer files to object storage — and expect it to keep up.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          </div>
+          <h3>Agentic workloads</h3>
+          <p>Agents manage state, memory, and tool outputs at runtime. They need fast, consistent object storage with predictable latency — not the eventual consistency and cold-start penalties of cloud S3.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          </div>
+          <h3>Training &amp; checkpointing</h3>
+          <p>ML training jobs checkpoint model state to object storage continuously. Warpdrive provides the throughput and S3 compatibility to serve as a local or rack-local checkpoint store without changing a line of training code.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- what it is -->
+    <section>
+      <h2>What Warpdrive provides</h2>
+      <p class="section-sub">A storage layer designed for the systems that need it most.</p>
+      <div class="features">
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+          </div>
+          <h3>S3-compatible API</h3>
+          <p>Drop-in replacement for AWS S3. Any client or library that speaks S3 works without modification — boto3, aws-sdk-rust, the official CLIs.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </div>
+          <h3>High throughput</h3>
+          <p>Built for workloads where throughput and low latency matter: serverless databases, ML checkpointing, and distributed system state storage.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          </div>
+          <h3>Compute-storage separation</h3>
+          <p>First-class support for storage-disaggregated architectures. Run storage and compute independently, scale them separately, attach either to S3 clients.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- install -->
+    <section id="install">
+      <h2>Installation</h2>
+      <p class="section-sub">Warpdrive ships as a single native binary. Choose your install method below.</p>
+
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(event,'apt')">apt (Linux)</button>
+        <button class="tab-btn" onclick="switchTab(event,'cargo')">Build from source</button>
+        <button class="tab-btn" onclick="switchTab(event,'docker')">Docker</button>
+      </div>
+
+      <!-- apt -->
+      <div class="tab-panel active" id="tab-apt">
+        <div class="platform-row">
+          <span class="badge badge-green">amd64 / x86_64</span>
+          <span class="badge badge-muted">arm64 — coming soon</span>
+          <span class="badge badge-muted">macOS — coming soon</span>
+          <span class="badge badge-muted">Windows — coming soon</span>
+        </div>
+        <div class="code-block">
+          <pre><span class="cm"># Add the Warpdrive apt repository</span>
+curl -fsSL https://releases.warpdrive.dev/gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/warpdrive.gpg
+
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/warpdrive.gpg] \
+  https://releases.warpdrive.dev/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/warpdrive.list
+
+sudo apt-get update &amp;&amp; sudo apt-get install -y warpdrive</pre>
+        </div>
+        <div class="platform-note">
+          Requires Ubuntu 20.04+ or Debian 11+. The binary is <code>warp_drive</code> after install.
+        </div>
+      </div>
+
+      <!-- cargo -->
+      <div class="tab-panel" id="tab-cargo">
+        <div class="platform-row">
+          <span class="badge badge-rust">Rust 1.75+</span>
+          <span class="badge badge-green">Linux</span>
+          <span class="badge badge-green">macOS</span>
+          <span class="badge badge-muted">Windows — coming soon</span>
+        </div>
+        <div class="code-block">
+          <pre><span class="cm"># Clone and build</span>
+git clone https://github.com/vitality-ai/warpdrive
+<span class="kw">cd</span> warpdrive/server
+cargo build --release
+
+<span class="cm"># Run (must be executed from warpdrive/server/)</span>
+WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
+WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
+  ./target/release/warp_drive</pre>
+        </div>
+        <div class="platform-note">
+          The server needs a writable <code>storage/</code> and <code>logs/</code> directory in the working directory. It listens on port <code>9710</code> by default.
+        </div>
+      </div>
+
+      <!-- docker -->
+      <div class="tab-panel" id="tab-docker">
+        <div class="platform-row">
+          <span class="badge badge-green">amd64</span>
+          <span class="badge badge-green">arm64</span>
+        </div>
+        <div class="code-block">
+          <pre><span class="cm"># Run with Docker</span>
+docker run -d \
+  -p 9710:9710 \
+  -e WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
+  -e WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
+  -v $(pwd)/data:/data \
+  ghcr.io/vitality-ai/warpdrive:latest</pre>
+        </div>
+        <div class="platform-note">
+          A <code>docker-compose.yml</code> is available in the repo for local development.
+        </div>
+      </div>
+
+      <div style="margin-top:28px">
+        <p style="font-size:13px;color:var(--muted);margin-bottom:14px">Quick smoke-test with boto3 after the server is running:</p>
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <div class="code-block" style="border-top:none">
+            <pre>pip install boto3
+
+python3 - &lt;&lt;EOF
+import boto3
+s3 = boto3.client('s3', endpoint_url='http://localhost:9710',
+    aws_access_key_id='mykey', aws_secret_access_key='mysecret',
+    region_name='us-east-1',
+    config=boto3.session.Config(s3={'addressing_style': 'path'}))
+s3.create_bucket(Bucket='test')
+s3.put_object(Bucket='test', Key='hello', Body=b'world')
+print(s3.get_object(Bucket='test', Key='hello')['Body'].read())
+EOF</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- integrations -->
+    <section id="compat">
+      <h2>Verified integrations</h2>
+      <p class="section-sub">Tested against real production systems using their native S3 clients — no shims, no compatibility layers.</p>
+      <div class="compat-grid">
+        <a class="compat-card" href="https://github.com/vitality-ai/warpdrive/blob/main/docs/compatibility_tests/neon.md" target="_blank" rel="noopener">
+          <div>
+            <div class="compat-name">Neon — Serverless Postgres</div>
+            <div class="compat-desc">
+              Pageserver and safekeeper both back by Warpdrive. Tested with sysbench TPC-C at 1T / 4T / 8T scale including cold-start layer rehydration from S3. Full Postgres write/read verified.
+            </div>
+          </div>
+          <div class="compat-pills">
+            <span class="pill-pass">✓ Passing</span>
+            <span class="pill-count">aws-sdk-rust 1.3.3</span>
+          </div>
+        </a>
+        <a class="compat-card" href="https://github.com/vitality-ai/warpdrive/blob/main/docs/compatibility_tests/tidesdb.md" target="_blank" rel="noopener">
+          <div>
+            <div class="compat-name">TidesDB — Embedded LSM KV store</div>
+            <div class="compat-desc">
+              Object store mode + replication tested via the Rust crate (wrapping the C library). 17/17 CI integration tests pass covering put, get, delete, flush, and merge.
+            </div>
+          </div>
+          <div class="compat-pills">
+            <span class="pill-pass">✓ 17/17 CI tests</span>
+            <span class="pill-count">v9.3.6 / crate 0.11.1</span>
+          </div>
+        </a>
+        <a class="compat-card" href="https://github.com/vitality-ai/warpdrive/blob/main/docs/compatibility_tests/slatedb.md" target="_blank" rel="noopener">
+          <div>
+            <div class="compat-name">SlateDB — Embedded LSM KV store</div>
+            <div class="compat-desc">
+              1000-key write / flush / read / range-scan / delete pipeline. Uses the <code>object_store</code> crate (0.14) as the S3 abstraction layer. ISO 8601 <code>LastModified</code> required.
+            </div>
+          </div>
+          <div class="compat-pills">
+            <span class="pill-pass">✓ Passing</span>
+            <span class="pill-count">slatedb 0.14</span>
+          </div>
+        </a>
+      </div>
+      <p style="margin-top:20px;font-size:12px;color:var(--muted)">
+        In pipeline: LangGraph · LlamaIndex · Ray · PyTorch Lightning
+      </p>
+    </section>
+
+    <!-- characterization -->
+    <section id="characterization">
+      <h2>S3 operation characterization</h2>
+      <p class="section-sub">A characterization study of S3 API usage in storage-disaggregated Postgres. Using sysbench TPC-C (scale=10) against Neon backed by Warpdrive, we measure how S3 op counts scale with tenant count under warm-cache and cold-start conditions.</p>
+
+      <div class="bench-note">
+        <strong>Finding:</strong> In steady state with a warm pageserver cache, S3 GET operations approach zero — Neon's page cache absorbs all reads. GETs occur only during cold starts when the pageserver rehydrates layer files from Warpdrive. The GET count scales super-linearly with tenant count (4T → 11 GETs, 8T → 48 GETs), consistent with increased page cache pressure, but absolute cost remains negligible: <strong>$0.0000392</strong> for an 8-tenant cold start.
+      </div>
+
+      <div class="bench-grid">
+        <div class="bench-card">
+          <div class="bench-label">1 tenant · warm</div>
+          <div class="bench-value">38.6<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">0 S3 GETs · 4,641 txns</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">4 tenants · warm</div>
+          <div class="bench-value">51.0<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">0 S3 GETs · 6,126 txns</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">4 tenants · cold</div>
+          <div class="bench-value">11<span class="bench-unit">GETs</span></div>
+          <div class="bench-sub">4,737 txns · $0.000234</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">8 tenants · warm</div>
+          <div class="bench-value">56.0<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">0 S3 GETs · 6,770 txns</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">8 tenants · cold</div>
+          <div class="bench-value">48<span class="bench-unit">GETs</span></div>
+          <div class="bench-sub">2,901 txns · $0.0000392</div>
+        </div>
+      </div>
+
+      <a class="btn-outline" href="characterization/neon_tpcc_results.html">
+        Full characterization report with charts →
+      </a>
+    </section>
+  </div>
+
+  <footer>
+    <div class="wrap footer-inner">
+      <span class="footer-copy">© 2026 Vitality AI · Warpdrive is open source</span>
+      <div class="footer-links">
+        <a href="https://github.com/vitality-ai/warpdrive">GitHub</a>
+        <a href="LICENSE">License</a>
+        <a href="https://github.com/vitality-ai/warpdrive/blob/main/docs/Technical-Architecture.md" target="_blank" rel="noopener">Architecture</a>
+        <a href="https://github.com/vitality-ai/warpdrive/blob/main/docs/Technical-Roadmap.md" target="_blank" rel="noopener">Roadmap</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // tabs
+    function switchTab(e, id) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      e.target.classList.add('active');
+      document.getElementById('tab-' + id).classList.add('active');
+    }
+
+    // theme toggle
+    const root = document.documentElement;
+    const btn = document.getElementById('theme-toggle');
+    function getSystemTheme() {
+      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    let currentTheme = localStorage.getItem('theme') || getSystemTheme();
+    root.setAttribute('data-theme', currentTheme);
+    btn.addEventListener('click', () => {
+      currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', currentTheme);
+      localStorage.setItem('theme', currentTheme);
+    });
+  </script>
+</body>
+</html>
