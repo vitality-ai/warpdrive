@@ -757,7 +757,7 @@ EOF</pre>
           <div>
             <div class="compat-name">Neon — Serverless Postgres</div>
             <div class="compat-desc">
-              Pageserver and safekeeper both back by Warpdrive. Tested with sysbench TPC-C at 1T / 4T / 8T scale including cold-start layer rehydration from S3. Full Postgres write/read verified.
+              Pageserver and safekeeper both backed by Warpdrive. Tested with sysbench TPC-C at 1T / 4T / 8T / 16T scale including cold-start layer rehydration from S3. Full Postgres write/read verified.
             </div>
           </div>
           <div class="compat-pills">
@@ -801,34 +801,29 @@ EOF</pre>
       <p class="section-sub">A characterization study of S3 API usage in storage-disaggregated Postgres. Using sysbench TPC-C (scale=10) against Neon backed by Warpdrive, we measure how S3 op counts scale with tenant count under warm-cache and cold-start conditions.</p>
 
       <div class="bench-note">
-        <strong>Finding:</strong> In steady state with a warm pageserver cache, S3 GET operations approach zero — Neon's page cache absorbs all reads. GETs occur only during cold starts when the pageserver rehydrates layer files from Warpdrive. The GET count scales super-linearly with tenant count (4T → 11 GETs, 8T → 48 GETs), consistent with increased page cache pressure, but absolute cost remains negligible: <strong>$0.0000392</strong> for an 8-tenant cold start.
+        <strong>Finding:</strong> GETs scale super-linearly with tenant count under cold-start conditions — 68 at T=1, rising to 2,981 at T=16 (44×). The single pageserver becomes the bottleneck: at T=16 four tenants need more than 120s just to warm up, and total TPS collapses from ~39 (T=8) to 4.1 (T=16). The GET:PUT ratio grows from 0.23 at T=1 to 3.51 at T=16 — the system spends 3.5× more on reads than writes under full multi-tenant cold-start load.
       </div>
 
       <div class="bench-grid">
         <div class="bench-card">
-          <div class="bench-label">1 tenant · warm</div>
-          <div class="bench-value">38.6<span class="bench-unit">TPS</span></div>
-          <div class="bench-sub">0 S3 GETs · 4,641 txns</div>
-        </div>
-        <div class="bench-card">
-          <div class="bench-label">4 tenants · warm</div>
-          <div class="bench-value">51.0<span class="bench-unit">TPS</span></div>
-          <div class="bench-sub">0 S3 GETs · 6,126 txns</div>
+          <div class="bench-label">1 tenant · cold</div>
+          <div class="bench-value">35.4<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">68 GETs · 301 PUTs · $0.0016</div>
         </div>
         <div class="bench-card">
           <div class="bench-label">4 tenants · cold</div>
-          <div class="bench-value">11<span class="bench-unit">GETs</span></div>
-          <div class="bench-sub">4,737 txns · $0.000234</div>
-        </div>
-        <div class="bench-card">
-          <div class="bench-label">8 tenants · warm</div>
-          <div class="bench-value">56.0<span class="bench-unit">TPS</span></div>
-          <div class="bench-sub">0 S3 GETs · 6,770 txns</div>
+          <div class="bench-value">35.6<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">109 GETs · 1,123 PUTs · $0.0057</div>
         </div>
         <div class="bench-card">
           <div class="bench-label">8 tenants · cold</div>
-          <div class="bench-value">48<span class="bench-unit">GETs</span></div>
-          <div class="bench-sub">2,901 txns · $0.0000392</div>
+          <div class="bench-value">38.9<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">954 GETs · 773 PUTs · $0.0043</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">16 tenants · cold</div>
+          <div class="bench-value">4.1<span class="bench-unit">TPS</span></div>
+          <div class="bench-sub">2,981 GETs · 849 PUTs · $0.0055</div>
         </div>
       </div>
 
