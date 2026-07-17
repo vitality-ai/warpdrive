@@ -4,14 +4,17 @@
 
 pub mod local_store;
 pub mod mock_store;
+pub mod slab_store;
 pub mod config;
 
 use actix_web::Error;
 
 /// Trait defining the minimal binary storage interface
 pub trait Storage: Send + Sync {
-    /// Write `data` for a `user_id` and `bucket`, returning (offset, size)
-    fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error>;
+    /// Write `data` for a `user_id` and `bucket`, returning (offset, size).
+    /// `slab_hint` is an opaque caller-supplied string (e.g. from the `x-warpd-slab` header)
+    /// that slab-aware backends use to co-locate related objects; flat backends ignore it.
+    fn write(&self, user_id: &str, bucket: &str, data: &[u8], slab_hint: Option<&str>) -> Result<(u64, u64), Error>;
 
     /// Read `size` bytes from `offset` for a `user_id` and `bucket`
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error>;

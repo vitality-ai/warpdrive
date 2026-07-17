@@ -1,6 +1,6 @@
 // PutObject, GetObject, HeadObject, DeleteObject handlers.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
-use crate::{count, metrics};
+use crate::count;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 use log::{debug, error, info, warn};
@@ -150,6 +150,13 @@ pub async fn s3_put_object_handler(
             if stripped.is_empty() { None } else { Some(stripped.join(", ")) }
         });
 
+    // Optional co-location hint supplied by the client (e.g. Neon pageserver passes
+    // the timeline id so all delta layers for the same checkpoint land in one slab).
+    let slab_hint: Option<String> = req.headers()
+        .get("x-warpd-slab")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let store = StorageConfig::from_env().create_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
     let mut body_buf: Vec<u8> = Vec::new();
@@ -166,8 +173,9 @@ pub async fn s3_put_object_handler(
         let ctx = context.clone();
         let store_c = Arc::clone(&store);
         let buf = chunk.to_vec();
+        let hint = slab_hint.clone();
         let pair = web::block(move || {
-            store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string())
+            store_c.write(&ctx.user_id, &ctx.bucket, &buf, hint.as_deref()).map_err(|e| e.to_string())
         }).await
         .map_err(|e| {
             error!("PutObject: blocking write failed bucket={} key={}: {:?}", bucket, key, e);

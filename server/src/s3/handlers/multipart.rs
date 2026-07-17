@@ -1,6 +1,6 @@
 // All multipart handlers + GetObjectAttributes + GetPart + HeadPart + complete_multipart_xml_response.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
-use crate::{count, metrics};
+use crate::count;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 use log::{info, warn};
@@ -188,8 +188,11 @@ pub async fn s3_upload_part_handler(
     }
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+    let slab_hint = req.headers().get("x-warpd-slab")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &body, StorageMode::S3)?;
+    let offset_size_list = storage_service.write_object(&context, &body, StorageMode::S3, slab_hint.as_deref())?;
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
@@ -312,7 +315,8 @@ pub async fn s3_upload_part_copy_handler(
     let part_bytes = storage_service.read_object(&src_context, &read_extents, StorageMode::S3)?;
 
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3)?;
+    // Copy-part carries no x-warpd-slab hint; slab stores fall back to default placement.
+    let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3, None)?;
 
     let part_number_i32: i32 = part_number.parse()
         .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;

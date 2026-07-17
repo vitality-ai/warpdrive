@@ -1,6 +1,6 @@
 //! Configuration for binary storage backends
 
-use crate::storage::{Storage, local_store::LocalXFSBinaryStore, mock_store::MockBinaryStore};
+use crate::storage::{Storage, local_store::LocalXFSBinaryStore, mock_store::MockBinaryStore, slab_store::LocalXFSSlabStore};
 use std::sync::Arc;
 use std::env;
 use log::{debug, warn};
@@ -9,6 +9,7 @@ use log::{debug, warn};
 #[derive(Debug, Clone, PartialEq)]
 pub enum StorageBackend {
     LocalXFS,
+    Slab,
     Mock,
 }
 
@@ -20,12 +21,13 @@ impl Default for StorageBackend {
 
 impl std::str::FromStr for StorageBackend {
     type Err = String;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "localxfs" | "local" | "xfs" => Ok(StorageBackend::LocalXFS),
+            "slab" => Ok(StorageBackend::Slab),
             "mock" => Ok(StorageBackend::Mock),
-            _ => Err(format!("Unknown storage backend: {}", s))
+            _ => Err(format!("Unknown storage backend: {}", s)),
         }
     }
 }
@@ -73,6 +75,7 @@ impl StorageConfig {
     pub fn create_store(&self) -> Arc<dyn Storage> {
         match self.backend {
             StorageBackend::LocalXFS => Arc::new(LocalXFSBinaryStore::new()),
+            StorageBackend::Slab => Arc::new(LocalXFSSlabStore::new()),
             StorageBackend::Mock => Arc::new(MockBinaryStore::new()),
         }
     }

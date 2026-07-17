@@ -21,8 +21,10 @@ impl StorageService {
         StorageConfig::from_env().create_store()
     }
 
-    // Unified write: handles Native (FlatBuffers) and S3 (raw bytes)
-    pub fn write_object(&self, context: &UserContext, body: &[u8], mode: StorageMode) -> Result<Vec<(u64, u64)>, Error> {
+    // Unified write: handles Native (FlatBuffers) and S3 (raw bytes).
+    // `slab_hint` comes from the `x-warpd-slab` request header; None falls back to
+    // flat (round-robin) placement, which is what LocalXFSBinaryStore always does.
+    pub fn write_object(&self, context: &UserContext, body: &[u8], mode: StorageMode, slab_hint: Option<&str>) -> Result<Vec<(u64, u64)>, Error> {
         match mode {
             StorageMode::Native => {
                 let file_data_list = root::<FileDataList>(&body)
@@ -33,7 +35,7 @@ impl StorageService {
                 let mut out: Vec<(u64, u64)> = Vec::new();
                 for file_data in files.iter() {
                     if let Some(data) = file_data.data() {
-                        let (o, s) = store.write(&context.user_id, &context.bucket, data.bytes())?;
+                        let (o, s) = store.write(&context.user_id, &context.bucket, data.bytes(), slab_hint)?;
                         out.push((o, s));
                     }
                 }
@@ -41,7 +43,7 @@ impl StorageService {
             }
             StorageMode::S3 => {
                 let store = self.store();
-                let (o, s) = store.write(&context.user_id, &context.bucket, body)?;
+                let (o, s) = store.write(&context.user_id, &context.bucket, body, slab_hint)?;
                 Ok(vec![(o, s)])
             }
         }

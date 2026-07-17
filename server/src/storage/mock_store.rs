@@ -60,7 +60,7 @@ impl Default for MockBinaryStore {
 }
 
 impl Storage for MockBinaryStore {
-    fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+    fn write(&self, user_id: &str, bucket: &str, data: &[u8], _slab_hint: Option<&str>) -> Result<(u64, u64), Error> {
         let mut store = self.data.lock().unwrap();
         let user_entry = store.entry(user_id.to_string()).or_insert_with(HashMap::new);
         let bucket_entry = user_entry.entry(bucket.to_string()).or_insert_with(HashMap::new);

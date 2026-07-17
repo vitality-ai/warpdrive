@@ -82,7 +82,7 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     // Write incoming FlatBuffers payload to storage and collect (offset, size)
     let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
+    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native, None)?;
 
 
     if offset_size_list.is_empty()  {
@@ -158,7 +158,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
 
     // Write additional FlatBuffers payload chunks to storage
     let storage_service = StorageService::new();
-    let mut offset_size_list_append = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
+    let mut offset_size_list_append = storage_service.write_object(&context, &bytes, StorageMode::Native, None)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -236,7 +236,7 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     
     // Rewrite with provided FlatBuffers payload
     let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
+    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native, None)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);

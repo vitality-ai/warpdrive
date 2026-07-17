@@ -1,6 +1,6 @@
 // CopyObject handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
-use crate::{count, metrics};
+use crate::count;
 use log::info;
 
 use std::collections::HashMap;
@@ -102,7 +102,7 @@ pub async fn s3_copy_object_handler(
 
     let storage_service = StorageService::new();
     let src_data = storage_service.read_object(&src_context, &src_meta.to_offset_size_list(), StorageMode::S3)?;
-    let new_offset_size_list = storage_service.write_object(&dst_context, &src_data, StorageMode::S3)?;
+    let new_offset_size_list = storage_service.write_object(&dst_context, &src_data, StorageMode::S3, None)?;
 
     let directive = req.headers().get("x-amz-metadata-directive")
         .and_then(|v| v.to_str().ok())

@@ -79,7 +79,7 @@ impl LocalXFSBinaryStore {
 }
 
 impl Storage for LocalXFSBinaryStore {
-    fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+    fn write(&self, user_id: &str, bucket: &str, data: &[u8], _slab_hint: Option<&str>) -> Result<(u64, u64), Error> {
         // Acquire global lock to synchronize concurrent writes
         let _lock = STORAGE_WRITE_LOCK.lock().unwrap();
         
