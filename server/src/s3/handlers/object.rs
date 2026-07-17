@@ -1,5 +1,6 @@
 // PutObject, GetObject, HeadObject, DeleteObject handlers.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
+use crate::{count, metrics};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 use log::{debug, error, info, warn};
@@ -32,6 +33,7 @@ pub async fn s3_put_object_handler(
     mut payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::PUT);
     if let Ok(query) = web::Query::<HashMap<String, String>>::from_query(req.query_string()) {
         if req.headers().contains_key("x-amz-copy-source")
             && query.contains_key("partNumber")
@@ -301,6 +303,7 @@ pub async fn s3_get_object_handler(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::GET);
     let (bucket, key) = path.into_inner();
 
     let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
@@ -530,6 +533,7 @@ pub async fn s3_head_object_handler(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::HEAD);
     let (bucket, key) = path.into_inner();
 
     let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
@@ -638,6 +642,7 @@ pub async fn s3_delete_object_handler(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::DELETE);
     if let Ok(query) = web::Query::<HashMap<String, String>>::from_query(req.query_string()) {
         if query.contains_key("uploadId") {
             return s3_abort_multipart_upload_handler(path, query, req).await;

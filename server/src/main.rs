@@ -1,8 +1,9 @@
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, HttpServer, web, HttpResponse};
 use log::info;
 use log4rs;
 
 use warp_drive::api::{put, get, append, delete, update_key, update};
+use warp_drive::metrics;
 use warp_drive::s3::handlers::{
     s3_put_object_handler,
     s3_get_object_handler,
@@ -19,6 +20,26 @@ use warp_drive::s3::handlers::{
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
 
+async fn admin_metrics_handler() -> HttpResponse {
+    #[cfg(feature = "op-counters")]
+    {
+        let counts = metrics::capture();
+        let cost = counts.estimated_cost_usd();
+        return HttpResponse::Ok().json(serde_json::json!({
+            "ops": counts,
+            "estimated_cost_usd": cost,
+        }));
+    }
+    #[cfg(not(feature = "op-counters"))]
+    HttpResponse::Ok().body("op-counters feature not enabled; rebuild with --features op-counters\n")
+}
+
+async fn admin_metrics_reset_handler() -> HttpResponse {
+    #[cfg(feature = "op-counters")]
+    metrics::reset();
+    HttpResponse::NoContent().finish()
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
@@ -32,6 +53,9 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(actix_web::middleware::Logger::default())
             .app_data(web::PayloadConfig::default().limit(5 * 1024 * 1024 * 1024))
+            // Admin endpoints
+            .route("/_admin/metrics",       web::get().to(admin_metrics_handler))
+            .route("/_admin/metrics/reset", web::post().to(admin_metrics_reset_handler))
             // S3-compatible API — prefixed form (/s3/...)
             .route("/s3",               web::get().to(s3_list_buckets_handler))
             .route("/s3/",              web::get().to(s3_list_buckets_handler))

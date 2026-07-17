@@ -1,5 +1,6 @@
 // s3_list_objects_handler, s3_delete_objects_handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
+use crate::{count, metrics};
 use futures::StreamExt as _;
 use log::{info, warn};
 
@@ -25,6 +26,7 @@ pub async fn s3_list_objects_handler(
     query: web::Query<HashMap<String, String>>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::LIST);
     let bucket = path.into_inner();
 
     if query.contains_key("versions") {
@@ -308,6 +310,7 @@ pub async fn s3_delete_objects_handler(
     mut payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::DELETE_OBJECTS);
     if !query.contains_key("delete") {
         return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest",
                            "Missing ?delete parameter for multi-object delete", ""));

@@ -1,5 +1,6 @@
 // CopyObject handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
+use crate::{count, metrics};
 use log::info;
 
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub async fn s3_copy_object_handler(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::COPY);
     let (dst_bucket, dst_key) = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
 

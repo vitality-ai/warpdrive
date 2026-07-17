@@ -1,5 +1,6 @@
 // All multipart handlers + GetObjectAttributes + GetPart + HeadPart + complete_multipart_xml_response.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
+use crate::{count, metrics};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 use log::{info, warn};
@@ -681,6 +682,7 @@ pub async fn s3_multipart_router(
     payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    count!(metrics::MULTIPART);
     if query.contains_key("uploads") {
         s3_create_multipart_upload_handler(path, query, req).await
     } else if query.contains_key("uploadId") {
