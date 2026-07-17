@@ -1,0 +1,105 @@
+{
+  "timestamp": "2026-07-17T11:26:44.873166+00:00",
+  "T": 1,
+  "endpoints": [
+    {
+      "name": "main",
+      "port": 55432
+    }
+  ],
+  "config": {
+    "checkpoint_distance": 4194304,
+    "checkpoint_timeout": "5s",
+    "eviction_policy": {
+      "kind": "LayerAccessThreshold",
+      "period": "5s",
+      "threshold": "10s"
+    }
+  },
+  "sysbench": {
+    "time_s": 120,
+    "scale": 10,
+    "tables": 1,
+    "threads_per_endpoint": 4,
+    "total_tps": 51.82,
+    "total_txn": 6224,
+    "avg_lat_ms": 77.2,
+    "p95_lat_ms": 215.4,
+    "per_endpoint": [
+      {
+        "endpoint": "main",
+        "port": 55432,
+        "tps": 51.82,
+        "lat_avg": 77.16,
+        "lat_p95": 215.44,
+        "txn": 6224,
+        "queries": 180801,
+        "errors": 205
+      }
+    ]
+  },
+  "warpdrive": {
+    "startup": {
+      "ops": {
+        "copy": 0,
+        "delete": 0,
+        "delete_objects": 0,
+        "get": 0,
+        "head": 0,
+        "list": 0,
+        "multipart": 0,
+        "put": 0
+      },
+      "get_delta": 0,
+      "get_image": 0
+    },
+    "benchmark": {
+      "ops": {
+        "copy": 0,
+        "delete": 0,
+        "delete_objects": 6,
+        "get": 6,
+        "head": 0,
+        "list": 0,
+        "multipart": 0,
+        "put": 369
+      },
+      "get_delta": 1,
+      "get_image": 5
+    },
+    "total": {
+      "put": 369,
+      "get": 6,
+      "get_delta": 1,
+      "get_image": 5,
+      "delete_objects": 6,
+      "estimated_cost_usd": 0.0018774
+    }
+  },
+  "layer_events": [
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040DB0100000000-000000067F00000005000040DD0000004000__00000001091D3889"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040EF0100000000-000000067F00000005000040F10000004000__00000001091D3889"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040F40100000000-000000067F00000005000040F60000004000__00000001091D3889"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040F60000004000-000000067F00000005000040F60000008000__00000001091D3889"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040F10000004000-000000067F00000005000040F10000008000__00000001091D3889"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000108E67D29-00000001091D3889"
+    }
+  ]
+}

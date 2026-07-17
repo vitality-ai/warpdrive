@@ -49,14 +49,14 @@ body {
 .site-nav {
   position:sticky; top:0; z-index:100;
   background:var(--bg); border-bottom:1px solid var(--border);
-  padding:0 28px; display:flex; align-items:center; height:44px; gap:16px;
+  padding:0 40px; display:flex; align-items:center; height:44px; gap:16px;
 }
 .site-nav a { font-family:var(--mono); font-size:12px; color:var(--muted); text-decoration:none; display:flex; align-items:center; gap:5px; }
 .site-nav a:hover { color:var(--text); }
 .site-nav .sep { color:var(--border); }
 .site-nav .wm { color:var(--text); font-weight:600; }
 
-.page { max-width:1000px; margin:0 auto; padding:0 28px; }
+.page { max-width:1800px; margin:0 auto; padding:0 40px; }
 
 header { padding:32px 0 20px; border-bottom:1px solid var(--border); margin-bottom:28px; }
 .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--warm); margin-bottom:8px; }
@@ -99,8 +99,8 @@ h1 { font-family:var(--mono); font-size:19px; font-weight:600; color:var(--text)
 .config-pill { font-family:var(--mono); font-size:11px; background:var(--surface2); border:1px solid var(--border); border-radius:20px; padding:3px 10px; color:var(--muted); }
 .config-pill strong { color:var(--text); }
 
-.chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px; }
-.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 18px; }
+.chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px; }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
 .card h2 { font-size:10px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:14px; }
 canvas { display:block; width:100%; }
 .chart-note { font-size:12px; color:var(--muted); line-height:1.65; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
@@ -172,6 +172,7 @@ tr:last-child td { border-bottom:none; }
     <span class="badge badge-cold">● GET — layer download</span>
     <span class="badge badge-purp">● DELETE_OBJECTS — compaction GC</span>
     <span class="badge badge-amber">● delta vs image GET breakdown</span>
+    <span class="badge badge-warm" style="border-style:dashed">◈ Slab 4MB cold (co-located)</span>
   </div>
 </header>
 
@@ -216,70 +217,45 @@ tr:last-child td { border-bottom:none; }
     <span class="config-pill"><strong>protocol</strong> wipe layers → restart pageserver → reset metrics → start T endpoints → sysbench</span>
   </div>
 
-  <div class="stat-row">
-    <div class="stat-card">
-      <div class="stat-label">Peak GETs (T=16)</div>
-      <div class="stat-value val-cold">2,981</div>
-      <div class="stat-sub">2583 delta + 398 image<br>44× growth vs T=1</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Peak PUTs (T=4)</div>
-      <div class="stat-value val-warm">1,123</div>
-      <div class="stat-sub">~3.7× vs T=1 (301)<br>saturates by T=4</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">TPS / tenant drop</div>
-      <div class="stat-value val-amber">118×</div>
-      <div class="stat-sub">35.4 → 0.3 TPS/tenant<br>T=1 → T=16</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Peak DELETE_OBJECTS</div>
-      <div class="stat-value val-purp">12</div>
-      <div class="stat-sub">T=16 · compaction GC<br>write-tier billed</div>
-    </div>
-  </div>
-
   <div class="chart-grid">
     <div class="card">
       <h2>TPS — Total &amp; Per-Tenant vs Tenant Count</h2>
-      <canvas id="scalingTpsChart" height="210"></canvas>
+      <canvas id="scalingTpsChart" height="160"></canvas>
       <p class="chart-note">
-        All T endpoints run sysbench in parallel, so total TPS should ideally grow linearly with T.
-        It doesn't — all endpoints share <strong>one pageserver</strong>, which simultaneously handles cold-start layer downloads, 4MB checkpoints, and eviction for every timeline at once.
-        TPS/tenant drops 7× from T=1 to T=8 as the pageserver saturates.
-        At T=16 the system collapses entirely: 4 of the 16 endpoints require more than 120s just to warm up their first page (192s avg latency), contributing zero transactions. Total TPS falls from 38.9 (T=8) to 4.1 (T=16) — a single pageserver simply cannot absorb the cold-start download pressure of 16 concurrent timelines.
+        Baseline total TPS stalls at ~35–39 across T=1–8 then <strong>collapses to 4.1 at T=16</strong> as the pageserver drowns in cold-start GET amplification (2,981 GETs).
+        Slab 4MB sustains <strong>41.8 TPS at T=16</strong> — a 10× improvement — because co-located layer storage cuts startup GETs and frees pageserver capacity.
+        At T=1–4 slab also runs faster: 51.8 and 55.7 TPS vs 35.4 and 35.6, benefiting from a dramatically lighter cold-start read path.
+        TPS/tenant falls steeply in both variants as the single pageserver saturates, but the slab curve degrades far more gracefully.
       </p>
     </div>
     <div class="card">
       <h2>GET Amplification — Delta vs Image vs Tenant Count</h2>
-      <canvas id="scalingGetsChart" height="210"></canvas>
+      <canvas id="scalingGetsChart" height="160"></canvas>
       <p class="chart-note">
-        GETs grow super-linearly: 68 → 109 → 954 → 2,981 (44× from T=1 to T=16).
-        Two sources: <strong>startup GETs</strong> scale roughly linearly (each timeline re-downloads its working set on cold start)
-        and <strong>eviction GETs</strong> grow much faster (more tenants → more I/O competition → higher eviction rate → more on-demand re-fetches mid-run).
-        Delta GETs account for ~85% across all T — each delta GET requires k sequential round-trips to WarpDrive to reconstruct a page from the delta chain.
-        This is the dominant read cost that WarpDrive's co-located slabs are designed to eliminate.
+        Baseline GETs spiral super-linearly: 68 → 109 → 954 → <strong>2,981 at T=16</strong> (44×), driven by eviction thrashing as timelines compete for pageserver memory.
+        Slab cuts GETs to <strong>6 at T=1</strong> (11× fewer) — cold-start delta reads nearly disappear.
+        At T=4 slab generates more GETs than baseline (220 vs 109), suggesting the 4 MB window is too small to fully co-locate concurrent timelines.
+        At T=8–16 slab's eviction pressure is far lower: 287 and 231 GETs vs 954 and 2,981 — <strong>3–13× fewer reads</strong> at scale.
       </p>
     </div>
   </div>
   <div class="chart-grid">
     <div class="card">
       <h2>PUTs &amp; DELETE_OBJECTS vs Tenant Count</h2>
-      <canvas id="scalingPutsChart" height="210"></canvas>
+      <canvas id="scalingPutsChart" height="160"></canvas>
       <p class="chart-note">
-        PUTs peak at T=4 (1,123), then drop at T=8 and T=16 — not because fewer checkpoints fire, but because lower TPS means less WAL generated per unit time, so fewer 4MB thresholds are reached in 120s.
-        At T=16 the system is so congested that most endpoints produce nearly no new WAL.
-        DELETE_OBJECTS grows with T — compaction GC sweeps batch-delete superseded delta layers.
-        Both are billed at the write tier ($0.005/1k), making DELETE_OBJECTS disproportionately expensive relative to the work done.
+        PUTs track WAL throughput, not storage layout, so both variants follow similar shapes.
+        Baseline peaks at T=4 (1,123 PUTs) when TPS is highest; slab peaks later at T=16 (789) because it sustains throughput longer.
+        DELETE_OBJECTS (compaction GC) is minimal in both — billed at write-tier rates ($0.005/1k) despite doing no user-visible work.
       </p>
     </div>
     <div class="card">
       <h2>Latency (avg &amp; p95) vs Tenant Count</h2>
-      <canvas id="scalingLatChart" height="210"></canvas>
+      <canvas id="scalingLatChart" height="160"></canvas>
       <p class="chart-note">
-        Average latency rises sharply with tenant count as the pageserver becomes congested.
-        The p95 at T=8 (≈5s) reflects worst-case cold-start download blocking: a transaction stalls while the pageserver fetches a delta chain from WarpDrive before it can serve the page.
-        At T=16, p95 hits the 100s cap — 4 of the 16 endpoints couldn't complete a single transaction within the 120s window, spending the entire run waiting on page downloads from an overloaded pageserver.
+        The gap is starkest at T=16: baseline avg latency hits <strong>63,692 ms</strong> (endpoints blocked waiting for delta chain downloads) vs slab's <strong>603 ms</strong> — a 105× difference.
+        Baseline p95 hits the 100s cap at T=16 with several endpoints unable to complete a single transaction; slab p95 is 5.9s at the same point.
+        At T=1–8 profiles are broadly similar, reflecting that startup GET pressure — not slab co-location per se — is the primary bottleneck at lower concurrency.
       </p>
     </div>
   </div>
@@ -382,17 +358,83 @@ const SCALING = [
   { T:8,  tps:38.89, tpsPer:4.9,  latAvg:828,   latP95:5125,   puts:773,  gets:954,  getD:764,  getI:190, del:6,  cost:0.004277 },
   { T:16, tps:4.10,  tpsPer:0.3,  latAvg:63692, latP95:100000, puts:849,  gets:2981, getD:2583, getI:398, del:12, cost:0.005497 },
 ];
+const SLAB = [
+  { T:1,  tps:51.8,  tpsPer:51.8, latAvg:77,  latP95:215,  puts:369, gets:6,   getD:1,   getI:5,  del:0, cost:0.0019 },
+  { T:4,  tps:55.7,  tpsPer:13.9, latAvg:288, latP95:1014, puts:620, gets:220, getD:188, getI:32, del:6, cost:0.0032 },
+  { T:8,  tps:40.3,  tpsPer:5.0,  latAvg:794, latP95:3706, puts:674, gets:287, getD:228, getI:59, del:5, cost:0.0035 },
+  { T:16, tps:41.8,  tpsPer:2.6,  latAvg:603, latP95:5919, puts:789, gets:231, getD:156, getI:75, del:5, cost:0.0041 },
+];
 
 function cv(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function drawLegend(ctx, datasets, pad, W, mono, sans, muted) {
+  const font = `10px ${sans}`;
+  ctx.font = font;
+  const maxW = W - pad.left - pad.right;
+  // layout into rows
+  const rows = [];
+  let row = [], rowW = 0;
+  datasets.forEach(ds => {
+    const tw = ctx.measureText(ds.label).width;
+    const itemW = tw + 36;
+    if (row.length && rowW + itemW > maxW) { rows.push(row); row = []; rowW = 0; }
+    row.push({ ds, tw }); rowW += itemW;
+  });
+  if (row.length) rows.push(row);
+  const rowH = 16, startY = pad.top - rows.length * rowH - 4;
+  rows.forEach((items, ri) => {
+    let lx = pad.left;
+    items.forEach(({ ds, tw }) => {
+      ctx.strokeStyle = ds.color; ctx.lineWidth = 2;
+      ctx.setLineDash(ds.dashed ? [5,4] : []);
+      ctx.beginPath(); ctx.moveTo(lx, startY + ri * rowH); ctx.lineTo(lx + 18, startY + ri * rowH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = ds.color;
+      ctx.beginPath(); ctx.arc(lx + 9, startY + ri * rowH, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = muted; ctx.font = font; ctx.textAlign = 'left';
+      ctx.fillText(ds.label, lx + 22, startY + ri * rowH + 4);
+      lx += tw + 36;
+    });
+  });
+}
+
+function drawBarLegend(ctx, datasets, pad, W, mono, sans, muted) {
+  const font = `10px ${sans}`;
+  ctx.font = font;
+  const maxW = W - pad.left - pad.right;
+  const rows = [];
+  let row = [], rowW = 0;
+  datasets.forEach(ds => {
+    const tw = ctx.measureText(ds.label).width;
+    const itemW = tw + 24;
+    if (row.length && rowW + itemW > maxW) { rows.push(row); row = []; rowW = 0; }
+    row.push({ ds, tw }); rowW += itemW;
+  });
+  if (row.length) rows.push(row);
+  const rowH = 16, startY = pad.top - rows.length * rowH - 4;
+  rows.forEach((items, ri) => {
+    let lx = pad.left;
+    items.forEach(({ ds, tw }) => {
+      ctx.fillStyle = ds.color; ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(lx, startY + ri * rowH - 8, 9, 9, 2);
+      else ctx.fillRect(lx, startY + ri * rowH - 8, 9, 9);
+      ctx.fill(); ctx.globalAlpha = 1;
+      ctx.fillStyle = muted; ctx.font = font; ctx.textAlign = 'left';
+      ctx.fillText(ds.label, lx + 12, startY + ri * rowH + 3);
+      lx += tw + 24;
+    });
+  });
+}
 
 function drawLine(id, labels, datasets, opts={}) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 400, H = canvas.offsetHeight || 210;
+  const W = canvas.offsetWidth || 400, H = canvas.offsetHeight || 360;
   canvas.width = W * dpr; canvas.height = H * dpr;
   const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
-  const pad = { top:32, right:20, bottom:36, left:56 };
+  const pad = { top:36, right:10, bottom:22, left:46 };
   const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
   const allVals = datasets.flatMap(d => d.data.filter(v => v !== null && v !== undefined));
   const maxV = Math.max(...allVals, 1) * (opts.maxMult || 1.22);
@@ -400,17 +442,35 @@ function drawLine(id, labels, datasets, opts={}) {
   const mono = cv('--mono'), sans = cv('--sans');
   const n = labels.length;
   const xp = i => pad.left + (i / (n - 1)) * cw;
-  const yp = v => pad.top + ch - (v / maxV) * ch;
-
-  [0, 0.25, 0.5, 0.75, 1].forEach(f => {
-    const y = pad.top + ch * (1 - f);
-    ctx.strokeStyle = border; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
-    const val = maxV * f;
-    const label = opts.fmt ? opts.fmt(val) : (val >= 1000 ? (val/1000).toFixed(1)+'k' : Math.round(val));
-    ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
-    ctx.fillText(label, pad.left - 6, y + 3);
-  });
+  let yp;
+  if (opts.logScale) {
+    const posVals = allVals.filter(v => v > 0);
+    const logMin = Math.log10(Math.max(Math.min(...posVals), 1));
+    const logMax = Math.log10(maxV);
+    yp = v => pad.top + ch - (Math.log10(Math.max(v, 1)) - logMin) / (logMax - logMin) * ch;
+    const minPow = Math.floor(logMin), maxPow = Math.ceil(logMax);
+    for (let p = minPow; p <= maxPow; p++) {
+      const val = Math.pow(10, p);
+      const y = yp(val);
+      if (y < pad.top || y > pad.top + ch) continue;
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const label = opts.fmt ? opts.fmt(val) : (val >= 1000 ? (val/1000).toFixed(0)+'k' : val);
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    }
+  } else {
+    yp = v => pad.top + ch - (v / maxV) * ch;
+    [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+      const y = pad.top + ch * (1 - f);
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const val = maxV * f;
+      const label = opts.fmt ? opts.fmt(val) : (val >= 1000 ? (val/1000).toFixed(1)+'k' : Math.round(val));
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    });
+  }
 
   labels.forEach((lbl, i) => {
     ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'center';
@@ -441,45 +501,56 @@ function drawLine(id, labels, datasets, opts={}) {
       const label = opts.fmt ? opts.fmt(pt.v) : pt.v;
       ctx.font = `bold 9px ${mono}`; ctx.textAlign = 'center';
       ctx.fillStyle = ds.color;
-      ctx.fillText(label, pt.x, pt.y - 9);
+      const labelY = Math.max(pt.y - 9, pad.top + 10);
+      ctx.fillText(label, pt.x, labelY);
     });
   });
 
-  let lx = pad.left;
-  datasets.forEach(ds => {
-    ctx.strokeStyle = ds.color; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(lx, pad.top - 16); ctx.lineTo(lx + 18, pad.top - 16); ctx.stroke();
-    ctx.fillStyle = ds.color;
-    ctx.beginPath(); ctx.arc(lx + 9, pad.top - 16, 3, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'left';
-    ctx.fillText(ds.label, lx + 22, pad.top - 12);
-    lx += ctx.measureText(ds.label).width + 40;
-  });
+  drawLegend(ctx, datasets, pad, W, mono, sans, muted);
 }
 
 function drawBars(id, labels, datasets, opts={}) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 600, H = canvas.offsetHeight || 210;
+  const W = canvas.offsetWidth || 600, H = canvas.offsetHeight || 360;
   canvas.width = W * dpr; canvas.height = H * dpr;
   const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
-  const pad = { top:32, right:16, bottom:36, left:56 };
+  const pad = { top:36, right:8, bottom:22, left:46 };
   const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
   const allVals = datasets.flatMap(d => d.data.filter(v => v != null && v > 0));
   const maxV = Math.max(...allVals, 1) * 1.28;
   const muted = cv('--muted'), border = cv('--border');
   const mono = cv('--mono'), sans = cv('--sans');
-
-  [0, 0.25, 0.5, 0.75, 1].forEach(f => {
-    const y = pad.top + ch * (1 - f);
-    ctx.strokeStyle = border; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
-    const val = maxV * f;
-    const label = val >= 1000 ? (val/1000).toFixed(1)+'k' : Math.round(val);
-    ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
-    ctx.fillText(label, pad.left - 6, y + 3);
-  });
+  let yTop, barH;
+  if (opts.logScale) {
+    const logMin = 0, logMax = Math.log10(maxV);
+    yTop = v => v > 0 ? pad.top + ch - (Math.log10(v) - logMin) / (logMax - logMin) * ch : pad.top + ch;
+    barH = v => v > 0 ? (Math.log10(v) - logMin) / (logMax - logMin) * ch : 0;
+    const maxPow = Math.ceil(logMax);
+    for (let p = 0; p <= maxPow; p++) {
+      const val = Math.pow(10, p);
+      const y = yTop(val);
+      if (y < pad.top || y > pad.top + ch + 1) continue;
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const label = val >= 1000 ? (val/1000).toFixed(0)+'k' : val;
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    }
+  } else {
+    yTop = v => pad.top + ch - (v / maxV) * ch;
+    barH = v => Math.max((v / maxV) * ch, v > 0 ? 1 : 0);
+    [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+      const y = pad.top + ch * (1 - f);
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const val = maxV * f;
+      const label = val >= 1000 ? (val/1000).toFixed(1)+'k' : Math.round(val);
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    });
+  }
 
   const n = labels.length, nb = datasets.length;
   const slotW = cw / n;
@@ -490,8 +561,8 @@ function drawBars(id, labels, datasets, opts={}) {
     ds.data.forEach((val, gi) => {
       if (val == null) return;
       const x = pad.left + gi * slotW + slotW * 0.16 + di * bw;
-      const bh = Math.max((val / maxV) * ch, val > 0 ? 1 : 0);
-      const y = pad.top + ch - bh;
+      const bh = Math.max(barH(val), val > 0 ? 1 : 0);
+      const y = yTop(val);
       ctx.fillStyle = ds.color; ctx.globalAlpha = val === 0 ? 0.12 : 0.82;
       ctx.beginPath();
       if (ctx.roundRect) ctx.roundRect(x, y, bw - 2, bh, [2,2,0,0]);
@@ -509,122 +580,174 @@ function drawBars(id, labels, datasets, opts={}) {
     ctx.fillText(lbl, pad.left + i * slotW + slotW / 2, H - 8);
   });
 
-  let lx = pad.left;
-  datasets.forEach(ds => {
-    ctx.fillStyle = ds.color; ctx.globalAlpha = 0.85;
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(lx, pad.top - 20, 9, 9, 2);
-    else ctx.fillRect(lx, pad.top - 20, 9, 9);
-    ctx.fill(); ctx.globalAlpha = 1;
-    ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'left';
-    ctx.fillText(ds.label, lx + 12, pad.top - 12);
-    lx += ctx.measureText(ds.label).width + 26;
-  });
+  drawBarLegend(ctx, datasets, pad, W, mono, sans, muted);
 }
 
-function drawStackedBars(id, labels, stackedDatasets) {
+function drawStackedBars(id, labels, stackedDatasets, opts={}) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 400, H = canvas.offsetHeight || 210;
+  const W = canvas.offsetWidth || 400, H = canvas.offsetHeight || 360;
   canvas.width = W * dpr; canvas.height = H * dpr;
   const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
-  const pad = { top:32, right:16, bottom:36, left:56 };
+  const pad = { top:36, right:8, bottom:22, left:46 };
   const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
   const muted = cv('--muted'), border = cv('--border');
   const mono = cv('--mono'), sans = cv('--sans');
   const n = labels.length;
   const totals = labels.map((_, i) => stackedDatasets.reduce((s, d) => s + (d.data[i] || 0), 0));
   const maxV = Math.max(...totals, 1) * 1.28;
+  let yOfVal;
+  if (opts.logScale) {
+    const logMax = Math.log10(maxV), logMin = 0;
+    yOfVal = v => v > 0 ? pad.top + ch - (Math.log10(v) - logMin) / (logMax - logMin) * ch : pad.top + ch;
+    const maxPow = Math.ceil(logMax);
+    for (let p = 0; p <= maxPow; p++) {
+      const val = Math.pow(10, p);
+      const y = yOfVal(val);
+      if (y < pad.top || y > pad.top + ch + 1) continue;
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const label = val >= 1000 ? (val/1000).toFixed(0)+'k' : val;
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    }
+  } else {
+    yOfVal = v => pad.top + ch - (v / maxV) * ch;
+    [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+      const y = pad.top + ch * (1 - f);
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const val = maxV * f;
+      const label = val >= 1000 ? (val/1000).toFixed(1)+'k' : Math.round(val);
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    });
+  }
 
-  [0, 0.25, 0.5, 0.75, 1].forEach(f => {
-    const y = pad.top + ch * (1 - f);
-    ctx.strokeStyle = border; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
-    const val = maxV * f;
-    const label = val >= 1000 ? (val/1000).toFixed(1)+'k' : Math.round(val);
-    ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
-    ctx.fillText(label, pad.left - 6, y + 3);
-  });
-
-  const slotW = cw / n;
-  const bw = slotW * 0.45;
+  const nGroups = opts.grouped ? n / 2 : n;
+  const groupW = cw / nGroups;
+  const bwSingle = opts.grouped ? groupW * 0.36 : groupW * 0.45;
+  const bw = bwSingle;
+  const getX = i => {
+    if (!opts.grouped) return pad.left + i * groupW + (groupW - bw) / 2;
+    const g = Math.floor(i / 2), pair = i % 2;
+    return pad.left + g * groupW + groupW * 0.12 + pair * (bw + 3);
+  };
+  const getLblX = i => {
+    if (!opts.grouped) return pad.left + i * groupW + groupW / 2;
+    const g = Math.floor(i / 2), pair = i % 2;
+    return pad.left + g * groupW + groupW * 0.12 + pair * (bw + 3) + bw / 2;
+  };
   labels.forEach((lbl, i) => {
-    let yBase = pad.top + ch, cumH = 0;
+    let cumV = 0, cumH = 0;
     stackedDatasets.forEach(ds => {
       const val = ds.data[i] || 0;
       if (val === 0) return;
-      const bh = (val / maxV) * ch;
-      yBase -= bh;
+      const yTop = opts.logScale ? yOfVal(cumV + val) : pad.top + ch - ((cumV + val) / maxV) * ch;
+      const yBot = opts.logScale ? yOfVal(Math.max(cumV, 0.5)) : pad.top + ch - (cumV / maxV) * ch;
+      const bh = Math.max(yBot - yTop, 1);
+      const yBase = yTop;
       ctx.fillStyle = ds.color; ctx.globalAlpha = 0.82;
-      const x = pad.left + i * slotW + (slotW - bw) / 2;
+      const x = getX(i);
       ctx.beginPath();
       if (ctx.roundRect) ctx.roundRect(x, yBase, bw, bh, cumH === 0 ? [2,2,0,0] : 0);
       else ctx.fillRect(x, yBase, bw, bh);
       ctx.fill(); ctx.globalAlpha = 1;
       ctx.fillStyle = cv('--bg'); ctx.font = `bold 9px ${mono}`; ctx.textAlign = 'center';
       if (bh > 14) ctx.fillText(val, x + bw / 2, yBase + bh / 2 + 4);
-      cumH += bh;
+      cumV += val; cumH += bh;
     });
     if (totals[i] > 0) {
+      const topY = opts.logScale ? yOfVal(totals[i]) : pad.top + ch - (totals[i] / maxV) * ch;
       ctx.fillStyle = muted; ctx.font = `bold 9px ${mono}`; ctx.textAlign = 'center';
-      ctx.fillText(totals[i], pad.left + i * slotW + slotW / 2, pad.top + ch - cumH - 5);
+      ctx.fillText(totals[i], getLblX(i), topY - 5);
     }
     ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'center';
-    ctx.fillText(lbl, pad.left + i * slotW + slotW / 2, H - 8);
+    ctx.fillText(lbl, getLblX(i), H - 8);
   });
 
-  let lx = pad.left;
-  stackedDatasets.forEach(ds => {
-    ctx.fillStyle = ds.color; ctx.globalAlpha = 0.85;
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(lx, pad.top - 20, 9, 9, 2);
-    else ctx.fillRect(lx, pad.top - 20, 9, 9);
-    ctx.fill(); ctx.globalAlpha = 1;
-    ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'left';
-    ctx.fillText(ds.label, lx + 12, pad.top - 12);
-    lx += ctx.measureText(ds.label).width + 26;
-  });
+  drawBarLegend(ctx, stackedDatasets, pad, W, mono, sans, muted);
 }
 
 function renderAll() {
   const warm = cv('--warm'), cold = cv('--cold'), purple = cv('--purple'), amber = cv('--amber');
+  const green = cv('--green');
   const Ts = SCALING.map(d => `T=${d.T}`);
+  // Interleaved labels: T=1, T=1s, T=4, T=4s, ... for bar charts
+  const TsInterleaved = Ts.flatMap(t => [t, t.replace('T=','T=')+'⬡']);
 
+  // ── TPS chart: add slab lines ──────────────────────────────────────────────
   drawLine('scalingTpsChart', Ts, [
-    { label:'Total TPS',  color:warm,  data:SCALING.map(d => Math.round(d.tps * 10) / 10) },
-    { label:'TPS/tenant', color:amber, data:SCALING.map(d => d.tpsPer), dashed:true },
+    { label:'Total TPS (baseline)',  color:amber, data:SCALING.map(d => Math.round(d.tps * 10) / 10) },
+    { label:'TPS/tenant (baseline)', color:amber, data:SCALING.map(d => d.tpsPer), dashed:true },
+    { label:'Total TPS (slab 4MB)', color:green, data:SLAB.map(d => d.tps) },
+    { label:'TPS/tenant (slab)',    color:green, data:SLAB.map(d => d.tpsPer), dashed:true },
   ]);
 
-  drawStackedBars('scalingGetsChart', Ts, [
-    { label:'delta GETs', color:cold,  data:SCALING.map(d => d.getD) },
-    { label:'image GETs', color:amber, data:SCALING.map(d => d.getI) },
-  ]);
+  // ── GETs chart: interleaved stacked bars (baseline | slab) per T ───────────
+  drawStackedBars('scalingGetsChart', TsInterleaved, [
+    { label:'delta GETs (baseline)', color:cold,
+      data:SCALING.flatMap((d,i) => [d.getD, null]) },
+    { label:'image GETs (baseline)', color:amber,
+      data:SCALING.flatMap((d,i) => [d.getI, null]) },
+    { label:'delta GETs (slab ⬡)',   color:green,
+      data:SLAB.flatMap((d,i) => [null, d.getD]) },
+    { label:'image GETs (slab ⬡)',   color:purple,
+      data:SLAB.flatMap((d,i) => [null, d.getI]) },
+  ], { logScale: true });
 
-  drawBars('scalingPutsChart', Ts, [
-    { label:'PUTs',          color:warm,   data:SCALING.map(d => d.puts) },
-    { label:'DELETE_OBJECTS',color:purple, data:SCALING.map(d => d.del)  },
-  ]);
+  // ── PUTs chart: stacked bars (PUTs + DELETE_OBJECTS) ─────────────────────
+  drawStackedBars('scalingPutsChart', TsInterleaved, [
+    { label:'PUTs (baseline)',          color:warm,
+      data:SCALING.flatMap((d,i) => [d.puts, null]) },
+    { label:'DELETE_OBJECTS (baseline)',color:purple,
+      data:SCALING.flatMap((d,i) => [d.del, null]) },
+    { label:'PUTs (slab ⬡)',           color:green,
+      data:SLAB.flatMap((d,i) => [null, d.puts]) },
+    { label:'DELETE_OBJECTS (slab ⬡)', color:amber,
+      data:SLAB.flatMap((d,i) => [null, d.del]) },
+  ], { logScale: true, grouped: true });
 
+  // ── Latency chart: add slab lines ─────────────────────────────────────────
   drawLine('scalingLatChart', Ts, [
-    { label:'avg lat (ms)', color:warm,  data:SCALING.map(d => d.latAvg) },
-    { label:'p95 lat (ms)', color:cold,  data:SCALING.map(d => d.latP95), dashed:true },
-  ]);
+    { label:'avg lat (baseline)', color:warm,  data:SCALING.map(d => d.latAvg) },
+    { label:'p95 lat (baseline)', color:cold,  data:SCALING.map(d => d.latP95), dashed:true },
+    { label:'avg lat (slab 4MB)', color:green, data:SLAB.map(d => d.latAvg) },
+    { label:'p95 lat (slab)',     color:green, data:SLAB.map(d => d.latP95), dashed:true },
+  ], { logScale: true });
 
+  // ── Table: baseline rows then slab rows ────────────────────────────────────
   const tbody = document.getElementById('scalingBody');
   tbody.innerHTML = '';
   SCALING.forEach(d => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="c-warm">${d.T}</td>
-      <td>${d.tps.toFixed(1)}</td>
-      <td>${d.tpsPer.toFixed(1)}</td>
-      <td>${d.latAvg.toLocaleString()}ms</td>
-      <td>${d.latP95.toLocaleString()}ms</td>
+      <td>${d.tps.toFixed(1)}</td><td>${d.tpsPer.toFixed(1)}</td>
+      <td>${d.latAvg.toLocaleString()}ms</td><td>${d.latP95.toLocaleString()}ms</td>
       <td class="c-put">${d.puts.toLocaleString()}</td>
       <td class="c-get">${d.gets}</td>
-      <td class="c-getd">${d.getD}</td>
-      <td class="c-geti">${d.getI}</td>
+      <td class="c-getd">${d.getD}</td><td class="c-geti">${d.getI}</td>
+      <td class="c-del">${d.del}</td>
+      <td>$${d.cost.toFixed(6)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+  // separator row
+  const sep = document.createElement('tr');
+  sep.innerHTML = `<td colspan="11" style="background:color-mix(in srgb,var(--green) 8%,transparent);color:var(--green);font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:5px 10px">◈ Slab 4MB — co-located cold start (feat/slab-collocation)</td>`;
+  tbody.appendChild(sep);
+  SLAB.forEach(d => {
+    const tr = document.createElement('tr');
+    const tLabel = d.T === 16 ? '16*' : d.T;
+    tr.innerHTML = `
+      <td style="color:var(--green)">${tLabel}</td>
+      <td>${d.tps.toFixed(1)}</td><td>${d.tpsPer.toFixed(1)}</td>
+      <td>${d.latAvg.toLocaleString()}ms</td><td>${d.latP95.toLocaleString()}ms</td>
+      <td class="c-put">${d.puts.toLocaleString()}</td>
+      <td class="c-get">${d.gets}</td>
+      <td class="c-getd">${d.getD}</td><td class="c-geti">${d.getI}</td>
       <td class="c-del">${d.del}</td>
       <td>$${d.cost.toFixed(6)}</td>
     `;
