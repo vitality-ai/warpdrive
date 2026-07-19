@@ -1,6 +1,7 @@
 // s3_list_objects_handler, s3_delete_objects_handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use crate::count;
+use crate::metrics;
 use futures::StreamExt as _;
 use log::{info, warn};
 

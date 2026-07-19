@@ -1,6 +1,7 @@
 // All multipart handlers + GetObjectAttributes + GetPart + HeadPart + complete_multipart_xml_response.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use crate::count;
+use crate::metrics;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 use log::{info, warn};
@@ -189,7 +190,9 @@ pub async fn s3_upload_part_handler(
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let slab_hint = req.headers().get("x-warpd-slab")
+        .or_else(|| req.headers().get("x-amz-meta-warpd-slab-hint"))
         .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let storage_service = StorageService::new();
     let offset_size_list = storage_service.write_object(&context, &body, StorageMode::S3, slab_hint.as_deref())?;
@@ -554,6 +557,11 @@ pub async fn s3_complete_multipart_upload_handler(
     final_metadata.checksum_algorithm = final_checksum_algo.clone();
     final_metadata.checksum_value = final_checksum_value.clone();
     final_metadata.checksum_type = final_checksum_type.clone();
+    final_metadata.slab_hint = req.headers().get("x-warpd-slab")
+        .or_else(|| req.headers().get("x-amz-meta-warpd-slab-hint"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let (mpu_vid, mpu_old_extents) = db.put_object_full(&bucket, &key, final_metadata)?;
     if !mpu_old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &mpu_old_extents).ok();

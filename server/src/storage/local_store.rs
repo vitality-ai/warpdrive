@@ -24,7 +24,7 @@ fn get_storage_directory() -> PathBuf {
             PathBuf::from(dir)
         }
         Err(_) => {
-            warn!("Storage directory not defined in environment");
+            debug!("Storage directory not defined in environment, using ./storage");
             // Use default directory "./storage"            
             let default_path = PathBuf::from("storage");
             if !default_path.exists() {
@@ -161,7 +161,7 @@ mod tests {
         let test_data = b"Hello, Local XFS Storage!";
         
         // Test write
-        let (offset, size) = store.write(user_id, bucket, test_data).unwrap();
+        let (offset, size) = store.write(user_id, bucket, test_data, None).unwrap();
         
         // Test read
         let retrieved_data = store.read(user_id, bucket, offset, size).unwrap();

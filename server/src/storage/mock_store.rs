@@ -136,7 +136,7 @@ mod tests {
         assert!(!store.user_exists(user_id));
         
         // Test write
-        let (offset, size) = store.write(user_id, bucket, test_data).unwrap();
+        let (offset, size) = store.write(user_id, bucket, test_data, None).unwrap();
         
         // Verify counts and existence
         assert_eq!(store.user_count(), 1);
@@ -172,7 +172,7 @@ mod tests {
         assert!(!store.user_exists(user_id));
         
         // Clear test
-        let _ = store.write(user_id, bucket, test_data).unwrap();
+        let _ = store.write(user_id, bucket, test_data, None).unwrap();
         assert_eq!(store.user_count(), 1);
         store.clear();
         assert_eq!(store.user_count(), 0);
@@ -208,9 +208,9 @@ mod tests {
         let data2 = b"data for bucket 2";
         
         // Store chunks for different users/buckets
-        let _ = store.write(user1, bucket1, data1).unwrap();
-        let _ = store.write(user1, bucket2, data2).unwrap();
-        let _ = store.write(user2, bucket1, data1).unwrap();
+        let _ = store.write(user1, bucket1, data1, None).unwrap();
+        let _ = store.write(user1, bucket2, data2, None).unwrap();
+        let _ = store.write(user2, bucket1, data1, None).unwrap();
         
         // Verify counts
         assert_eq!(store.user_count(), 2);
@@ -219,7 +219,7 @@ mod tests {
         
         // Basic reads work
         // (We don't track exact offsets here; just ensure write/read pairs work)
-        let (o1, s1) = store.write(user1, bucket1, data1).unwrap();
+        let (o1, s1) = store.write(user1, bucket1, data1, None).unwrap();
         assert_eq!(store.read(user1, bucket1, o1, s1).unwrap(), data1);
     }
 }

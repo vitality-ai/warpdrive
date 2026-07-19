@@ -51,6 +51,9 @@ pub struct Metadata {
     pub checksum_value: Option<String>,
     /// Checksum type: "COMPOSITE" or "FULL_OBJECT" (empty for non-checksum objects).
     pub checksum_type: Option<String>,
+    /// Co-location hint from `x-warpd-slab` header. Non-empty only when the object was
+    /// written to a SlabStore; used to serve batch slab GET responses.
+    pub slab_hint: Option<String>,
 }
 
 impl Metadata {
@@ -77,6 +80,7 @@ impl Metadata {
             checksum_algorithm: None,
             checksum_value: None,
             checksum_type: None,
+            slab_hint: None,
         }
     }
 

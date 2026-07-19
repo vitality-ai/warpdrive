@@ -19,6 +19,7 @@ use warp_drive::s3::handlers::{
     s3_cors_not_configured_handler,
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
+use warp_drive::warpd::warpd_slab_batch_get;
 
 async fn admin_metrics_handler() -> HttpResponse {
     #[cfg(feature = "op-counters")]
@@ -56,6 +57,8 @@ async fn main() -> std::io::Result<()> {
             // Admin endpoints
             .route("/_admin/metrics",       web::get().to(admin_metrics_handler))
             .route("/_admin/metrics/reset", web::post().to(admin_metrics_reset_handler))
+            // WarpDrive-native: batch slab GET (1 round trip for all k delta layers)
+            .route("/_warpd/slab/{bucket}", web::get().to(warpd_slab_batch_get))
             // S3-compatible API — prefixed form (/s3/...)
             .route("/s3",               web::get().to(s3_list_buckets_handler))
             .route("/s3/",              web::get().to(s3_list_buckets_handler))

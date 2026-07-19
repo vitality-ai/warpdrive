@@ -1,6 +1,7 @@
 // PutObject, GetObject, HeadObject, DeleteObject handlers.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use crate::count;
+use crate::metrics;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
 use log::{debug, error, info, warn};
@@ -150,11 +151,14 @@ pub async fn s3_put_object_handler(
             if stripped.is_empty() { None } else { Some(stripped.join(", ")) }
         });
 
-    // Optional co-location hint supplied by the client (e.g. Neon pageserver passes
-    // the timeline id so all delta layers for the same checkpoint land in one slab).
+    // Optional co-location hint. Prefer the native x-warpd-slab header; also accept
+    // x-amz-meta-warpd-slab-hint which is how the AWS SDK forwards StorageMetadata keys
+    // (prefixed with x-amz-meta-) — used by the Neon pageserver AWS S3 backend.
     let slab_hint: Option<String> = req.headers()
         .get("x-warpd-slab")
+        .or_else(|| req.headers().get("x-amz-meta-warpd-slab-hint"))
         .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     let store = StorageConfig::from_env().create_store();
@@ -242,6 +246,7 @@ pub async fn s3_put_object_handler(
         metadata.checksum_value = Some(value.clone());
         // For simple (non-multipart) objects, checksum_type is not set (leave None)
     }
+    metadata.slab_hint = slab_hint.filter(|s| !s.is_empty());
 
     let (version_id, old_extents) = db.put_object_full(&bucket, &key, metadata)?;
     if !old_extents.is_empty() {

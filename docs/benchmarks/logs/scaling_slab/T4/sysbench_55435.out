@@ -1,0 +1,21 @@
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 55435 failed: received invalid response to SSL negotiation: H
+
+(last message repeated 1 times)
+FATAL: `thread_init' function failed: ./tpcc_common.lua:76: connection creation failed
+(last message repeated 1 times)
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 55435 failed: received invalid response to SSL negotiation: H
+
+FATAL: `thread_init' function failed: ./tpcc_common.lua:76: connection creation failed
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 55435 failed: received invalid response to SSL negotiation: H
+
+FATAL: `thread_init' function failed: ./tpcc_common.lua:76: connection creation failed
+FATAL: Thread initialization failed!

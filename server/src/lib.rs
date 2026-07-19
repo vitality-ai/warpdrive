@@ -7,3 +7,4 @@ pub mod api;
 pub mod service;
 pub mod s3;
 pub mod metrics;
+pub mod warpd;

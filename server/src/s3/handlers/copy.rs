@@ -1,6 +1,7 @@
 // CopyObject handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use crate::count;
+use crate::metrics;
 use log::info;
 
 use std::collections::HashMap;

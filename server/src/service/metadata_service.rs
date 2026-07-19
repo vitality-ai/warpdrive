@@ -112,6 +112,12 @@ impl MetadataService {
         METADATA_STORE.list_all_buckets_for_user(&self.user)
     }
 
+    /// Return all live objects in a slab (for the batch GET endpoint).
+    pub fn get_objects_by_slab(&self, bucket: &str, hint: Option<&str>) -> Result<Vec<(String, Vec<(u64, u64)>)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_objects_by_slab(&self.user, bucket, hint)
+    }
+
     // --- Stats ---
 
     pub fn list_buckets_with_stats(&self) -> Result<Vec<BucketStats>, Error> {

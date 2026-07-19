@@ -2,6 +2,7 @@
 
 use crate::metadata::{MetadataStorage, Metadata, ObjectId, BucketStats};
 use crate::util::serializer::serialize_offset_size;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{params, Connection};
@@ -97,10 +98,18 @@ lazy_static! {
                 checksum_algorithm TEXT NOT NULL DEFAULT '',
                 checksum_value     TEXT NOT NULL DEFAULT '',
                 checksum_type      TEXT NOT NULL DEFAULT '',
+                slab_hint          TEXT NOT NULL DEFAULT '',
                 UNIQUE(user, bucket, key, version_id)
             )",
             [],
         ).expect("Failed to create objects table");
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_objects_slab
+             ON objects(user, bucket, slab_hint)
+             WHERE slab_hint != ''",
+            [],
+        ).expect("Failed to create slab index");
 
         // Multipart upload tracking tables
         conn.execute_batch(
@@ -805,15 +814,16 @@ impl SQLiteMetadataStore {
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
                          user_metadata,cache_control,expires,content_encoding,parts_manifest,
-                         checksum_algorithm,checksum_value,checksum_type)
-                     VALUES(?1,?2,?3,'',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                         checksum_algorithm,checksum_value,checksum_type,slab_hint)
+                     VALUES(?1,?2,?3,'',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![user_id,bucket,key,offset_size_bytes,metadata.etag,
                             metadata.size as i64,metadata.content_type,metadata.last_modified,
                             user_metadata_json,metadata.cache_control,metadata.expires,
                             metadata.content_encoding,metadata.properties.get("parts_manifest"),
                             metadata.checksum_algorithm.as_deref().unwrap_or(""),
                             metadata.checksum_value.as_deref().unwrap_or(""),
-                            metadata.checksum_type.as_deref().unwrap_or("")],
+                            metadata.checksum_type.as_deref().unwrap_or(""),
+                            metadata.slab_hint.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
                 Ok((None, old_extents))
             }
@@ -829,15 +839,16 @@ impl SQLiteMetadataStore {
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
                          user_metadata,cache_control,expires,content_encoding,parts_manifest,
-                         checksum_algorithm,checksum_value,checksum_type)
-                     VALUES(?1,?2,?3,?4,1,0,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                         checksum_algorithm,checksum_value,checksum_type,slab_hint)
+                     VALUES(?1,?2,?3,?4,1,0,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                     params![user_id,bucket,key,vid,offset_size_bytes,metadata.etag,
                             metadata.size as i64,metadata.content_type,metadata.last_modified,
                             user_metadata_json,metadata.cache_control,metadata.expires,
                             metadata.content_encoding,metadata.properties.get("parts_manifest"),
                             metadata.checksum_algorithm.as_deref().unwrap_or(""),
                             metadata.checksum_value.as_deref().unwrap_or(""),
-                            metadata.checksum_type.as_deref().unwrap_or("")],
+                            metadata.checksum_type.as_deref().unwrap_or(""),
+                            metadata.slab_hint.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
                 Ok((Some(vid), vec![]))
             }
@@ -876,19 +887,122 @@ impl SQLiteMetadataStore {
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
                          user_metadata,cache_control,expires,content_encoding,parts_manifest,
-                         checksum_algorithm,checksum_value,checksum_type)
-                     VALUES(?1,?2,?3,'null',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                         checksum_algorithm,checksum_value,checksum_type,slab_hint)
+                     VALUES(?1,?2,?3,'null',1,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![user_id,bucket,key,offset_size_bytes,metadata.etag,
                             metadata.size as i64,metadata.content_type,metadata.last_modified,
                             user_metadata_json,metadata.cache_control,metadata.expires,
                             metadata.content_encoding,metadata.properties.get("parts_manifest"),
                             metadata.checksum_algorithm.as_deref().unwrap_or(""),
                             metadata.checksum_value.as_deref().unwrap_or(""),
-                            metadata.checksum_type.as_deref().unwrap_or("")],
+                            metadata.checksum_type.as_deref().unwrap_or(""),
+                            metadata.slab_hint.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
                 Ok((Some("null".to_string()), old_extents))
             }
         }
+    }
+
+    /// Return live objects filtered by slab hint, ordered by insertion.
+    /// When `hint` is `Some(h)`, returns only objects with that hint.
+    /// When `hint` is `None`, returns all objects that have any slab hint.
+    pub fn get_objects_by_slab(
+        &self, user_id: &str, bucket: &str, hint: Option<&str>,
+    ) -> Result<Vec<(String, Vec<(u64, u64)>)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+
+        let rows: Vec<(String, Vec<u8>)> = if let Some(h) = hint {
+            let mut stmt = conn.prepare(
+                "SELECT key, offset_size_list FROM objects
+                 WHERE user=?1 AND bucket=?2 AND slab_hint=?3
+                   AND is_latest=1 AND is_delete_marker=0
+                 ORDER BY id",
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+            let mapped = stmt.query_map(params![user_id, bucket, h], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            }).map_err(actix_web::error::ErrorInternalServerError)?;
+            mapped.collect::<Result<Vec<_>, _>>()
+                .map_err(actix_web::error::ErrorInternalServerError)?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT key, offset_size_list FROM objects
+                 WHERE user=?1 AND bucket=?2 AND slab_hint != ''
+                   AND is_latest=1 AND is_delete_marker=0
+                 ORDER BY id",
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+            let mapped = stmt.query_map(params![user_id, bucket], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            }).map_err(actix_web::error::ErrorInternalServerError)?;
+            mapped.collect::<Result<Vec<_>, _>>()
+                .map_err(actix_web::error::ErrorInternalServerError)?
+        };
+
+        let out = rows.into_iter().map(|(key, blob)| {
+            let extents = crate::util::serializer::deserialize_offset_size(&blob)
+                .unwrap_or_default();
+            (key, extents)
+        }).collect();
+        Ok(out)
+    }
+
+    /// For each distinct slab_hint in this bucket, return the maximum offset
+    /// seen across all of its extents. Used by the slab allocator on startup
+    /// to resume filling partially-used slots rather than opening new ones.
+    pub fn max_offset_per_hint(&self, user_id: &str, bucket: &str) -> Result<Vec<(String, u64)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT slab_hint, offset_size_list FROM objects
+             WHERE user=?1 AND bucket=?2 AND slab_hint != ''
+               AND is_latest=1 AND is_delete_marker=0",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows: Vec<(String, Vec<u8>)> = stmt.query_map(params![user_id, bucket], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        }).map_err(actix_web::error::ErrorInternalServerError)?
+          .collect::<Result<Vec<_>, _>>()
+          .map_err(actix_web::error::ErrorInternalServerError)?;
+
+        let mut max_per_hint: HashMap<String, u64> = HashMap::new();
+        for (hint, blob) in rows {
+            if let Ok(extents) = crate::util::serializer::deserialize_offset_size(&blob) {
+                for (off, _) in extents {
+                    let e = max_per_hint.entry(hint.clone()).or_insert(0);
+                    if off > *e { *e = off; }
+                }
+            }
+        }
+        Ok(max_per_hint.into_iter().collect())
+    }
+
+    /// Return the total bytes already written to `slot_id` for `hint`,
+    /// scanning all extents for objects with that hint whose offsets fall
+    /// within `[slot_id * window, (slot_id+1) * window)`.
+    pub fn bytes_used_in_slot(&self, user_id: &str, bucket: &str, hint: &str, slot_id: u64, window: u64) -> Result<u64, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT offset_size_list FROM objects
+             WHERE user=?1 AND bucket=?2 AND slab_hint=?3
+               AND is_latest=1 AND is_delete_marker=0",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows: Vec<Vec<u8>> = stmt.query_map(params![user_id, bucket, hint], |row| {
+            row.get::<_, Vec<u8>>(0)
+        }).map_err(actix_web::error::ErrorInternalServerError)?
+          .collect::<Result<Vec<_>, _>>()
+          .map_err(actix_web::error::ErrorInternalServerError)?;
+
+        let slot_start = slot_id * window;
+        let slot_end   = slot_start + window;
+        let mut used = 0u64;
+        for blob in rows {
+            if let Ok(extents) = crate::util::serializer::deserialize_offset_size(&blob) {
+                for (off, sz) in extents {
+                    if off >= slot_start && off < slot_end {
+                        let end = off + sz;
+                        if end > used + slot_start { used = end - slot_start; }
+                    }
+                }
+            }
+        }
+        Ok(used)
     }
 
     /// Versioning-aware DELETE (no explicit versionId).

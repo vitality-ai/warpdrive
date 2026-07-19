@@ -11,6 +11,7 @@
 //! uses pwrite/pread (FileExt::write_at / read_at) which are safe for non-overlapping
 //! concurrent access without a global write lock.
 
+use crate::metadata::sqlite_store::SQLiteMetadataStore;
 use crate::storage::Storage;
 use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
@@ -28,7 +29,7 @@ use std::sync::Mutex;
 /// Default slab window: 4 MB (matches Neon checkpoint_distance for the baseline
 /// experiment).  For a Neon workload with k deltas of average size d, set
 /// SLAB_WINDOW = k * d so all deltas for a page fit in one slot.
-const DEFAULT_SLAB_WINDOW: u64 = 4 * 1024 * 1024;
+const DEFAULT_SLAB_WINDOW: u64 = 128 * 1024 * 1024;
 
 fn slab_window() -> u64 {
     env::var("SLAB_WINDOW")
@@ -86,21 +87,50 @@ impl LocalXFSSlabStore {
             .unwrap_or(0)
     }
 
+    /// Warm the in-memory slot map from the metadata DB so restarts resume
+    /// filling partially-used slots rather than always starting a new one.
+    fn warm_from_db(slots: &mut BucketSlots, user_id: &str, bucket: &str, window: u64) {
+        let db = SQLiteMetadataStore::new();
+        // For each hint, find the highest offset written so far. If that slot
+        // still has room, resume filling it; otherwise we leave active empty and
+        // a fresh slot will be opened on the next write.
+        let per_hint = match db.max_offset_per_hint(user_id, bucket) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        for (hint, max_off) in per_hint {
+            let slot_id = max_off / window;
+            // Scan all objects with this hint in this slot to find how many bytes
+            // are already used so we know where to write next.
+            let used = match db.bytes_used_in_slot(user_id, bucket, &hint, slot_id, window) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if used < window {
+                slots.active.insert(hint, (slot_id, used));
+            }
+        }
+    }
+
     /// Reserve `data_len` bytes for `hint` and return the file offset to write at.
     fn allocate(&self, user_id: &str, bucket: &str, hint: &str, data_len: u64) -> u64 {
         let window = slab_window();
         let key = format!("{}/{}", user_id, bucket);
 
-        // Compute restart-safe initial next_slot before acquiring the lock.
-        // Two racing threads may both compute this, but or_insert_with only
-        // runs the closure once, so the result is consistent.
         let init_next = self.next_slot_from_disk(user_id, bucket, window);
 
         let mut idx = SLOT_INDEX.lock().unwrap();
+        let is_new = !idx.contains_key(&key);
         let slots = idx.entry(key).or_insert_with(|| BucketSlots {
             active: HashMap::new(),
             next_slot: init_next,
         });
+
+        // On first access after startup, rebuild active slot map from the DB
+        // so we resume partially-filled slots instead of always opening new ones.
+        if is_new {
+            Self::warm_from_db(slots, user_id, bucket, window);
+        }
 
         if let Some((slot_id, used)) = slots.active.get_mut(hint) {
             if *used + data_len <= window {
