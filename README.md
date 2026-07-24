@@ -7,7 +7,7 @@
 
 <br><br>
 
-[![Website](https://img.shields.io/badge/website-vitality--ai.github.io%2Fwarpdrive-1a1a1a?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=1a1a1a)](https://vitality-ai.github.io/warpdrive/site/)
+[![Website](https://img.shields.io/badge/Website-1a1a1a?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=1a1a1a)](https://vitality-ai.github.io/warpdrive/site/)
 [![Stars](https://img.shields.io/github/stars/vitality-ai/Storage-service?style=for-the-badge&logo=star&color=FFD700&logoColor=000000&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/stargazers) 
 [![Forks](https://img.shields.io/github/forks/vitality-ai/Storage-service?style=for-the-badge&logo=git-fork&color=4A90E2&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/network/members) 
 [![Issues](https://img.shields.io/github/issues/vitality-ai/Storage-service?style=for-the-badge&logo=bug&color=FF4444&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/issues)
