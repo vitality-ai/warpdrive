@@ -7,6 +7,7 @@
 
 <br><br>
 
+[![Website](https://img.shields.io/badge/website-vitality--ai.github.io%2Fwarpdrive-1a1a1a?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=1a1a1a)](https://vitality-ai.github.io/warpdrive/site/)
 [![Stars](https://img.shields.io/github/stars/vitality-ai/Storage-service?style=for-the-badge&logo=star&color=FFD700&logoColor=000000&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/stargazers) 
 [![Forks](https://img.shields.io/github/forks/vitality-ai/Storage-service?style=for-the-badge&logo=git-fork&color=4A90E2&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/network/members) 
 [![Issues](https://img.shields.io/github/issues/vitality-ai/Storage-service?style=for-the-badge&logo=bug&color=FF4444&logoColor=white&labelColor=1a1a1a)](https://github.com/vitality-ai/Storage-service/issues)
@@ -19,16 +20,9 @@
 
 ## About
 WarpDrive is a purpose-built KV/Object store focused on workloads that demand high throughput. Practical applications driving our development are storage-disaggregated architectures and data-intensive distributed systems.
-Our broader aim is to build storage primitives and interfaces with a deep understanding of the underlying backend architecture, making computational pushdown and storage-centric execution first-class capabilities. By exposing these abstractions cleanly, we aim to simplify how data systems, ML frameworks, and agentic workflows move computation closer to data, reducing unnecessary data movement while enabling efficient large-scale processing, retrieval, and orchestration. Our road map([Technical Roadmap](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Roadmap.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems with a product first design. [ v0.1.0 Technical Architecture](https://github.com/vitality-ai/Storage-service/blob/main/docs/Technical-Architecture.md). 
+Our broader aim is to build storage primitives and interfaces with a deep understanding of the underlying backend architecture, making computational pushdown and storage-centric execution first-class capabilities. By exposing these abstractions cleanly, we aim to simplify how data systems, ML frameworks, and agentic workflows move computation closer to data, reducing unnecessary data movement while enabling efficient large-scale processing, retrieval, and orchestration. Our road map ([Technical Roadmap](docs/Technical-Roadmap.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems with a product first design. [v0.1.0 Technical Architecture](docs/Technical-Architecture.md).
 
-## System Offerings that are currently being built. 
-1. Storage - Key/Value, Files and Blobs. 
-2. Fault Tolerance - Uses Erasure Coding to Optimise Data replication - Seeks contribution for design - [Discussion](https://github.com/cia-labs/Storage-service/issues/72)
-3. User Access Management  - [Repo](https://github.com/vitality-ai/Vitality-console)
-4. Search - Seeks contribution for design. -   [Discussion](https://github.com/cia-labs/Storage-service/issues/35)
-5. Availability - Seeks contribution for design. [Discussion]()
-6. Client Library - S3 compatible/ Custom Client package is currently available for Python only. [Repo](https://github.com/vitality-ai/python-sdk).
-7. Compute and Storage Infrastructure Research - [Repo](https://github.com/vitality-ai/NexCSAD).
+📄 **Paper:** *WarpDrive: A Composable Storage Substrate for Disaggregated Data Systems*, accepted as a **lightning talk at CMDS (Composable Data Management Systems), the VLDB 2026 workshop**. Camera-ready preprint and the reasoning behind it live in the [Technical Roadmap](docs/Technical-Roadmap.md); the official VLDB proceedings link will be added here once published.
 
 ---
 

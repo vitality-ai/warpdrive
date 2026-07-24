@@ -1,6 +1,6 @@
 # RFC 2.1: Core Object CRUD — Fix What's Broken
 
-**Status:** Complete — see [TEST-COVERAGE.md](../../TEST-COVERAGE.md) for verified passing tests.  
+**Status:** Complete — see [TEST-COVERAGE.md](../../docs/TEST-COVERAGE.md) for verified passing tests.  
 **Parent RFC:** [RFC 2 Overview](RFC2-s3-compatibility-plan.md)  
 **Date:** June 2026
 
