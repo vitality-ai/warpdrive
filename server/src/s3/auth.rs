@@ -39,16 +39,37 @@ struct S3CredentialsResponse {
     registered_buckets: Vec<String>,
 }
 
+/// The single static admin identity's canonical user ID. Every bucket/object in
+/// admin-only mode is owned by this ID — resource-owner lookups use this constant
+/// rather than a literal so the one place that assumes "single owner" is easy to
+/// find and replace once Vitality Console (UAM) can resolve real per-bucket owners.
+pub const ADMIN_USER_ID: &str = "admin";
+
 /// S3 Authentication result
 #[derive(Debug)]
 pub struct S3AuthResult {
     pub access_key: String,
     pub user_id: String,
+    /// Owner display name for ACL/Owner XML elements (e.g. "Warpdrive Admin").
+    /// Empty for anonymous requests.
+    pub owner_display_name: String,
     pub bucket: String,
     /// Snapshot of Console-registered buckets for this key (from credential cache at refresh time).
     pub allowed_buckets: Vec<String>,
     /// True for the hardcoded admin user — skips bucket membership checks so any bucket is reachable.
     pub allow_all_buckets: bool,
+    /// True when the request had no Authorization header and no presigned query params.
+    /// Anonymous requests are gated by stored bucket/object ACL, not auto-denied.
+    pub is_anonymous: bool,
+}
+
+/// Static admin display name, e.g. for `<Owner><DisplayName>` in ACL XML.
+/// Defaults to match `s3-tests.conf`'s `[s3 main] display_name`.
+pub fn admin_display_name() -> String {
+    std::env::var("WARPDRIVE_ADMIN_DISPLAY_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Warpdrive Admin".to_string())
 }
 
 /// Returns (base_url, service_secret, cache_ttl_secs).
@@ -420,7 +441,7 @@ fn verify_sigv4(
             canonical_uri,
             canonical_query_string.len()
         );
-        return Err(ErrorUnauthorized("Signature does not match"));
+        return Err(s3_access_denied("Signature does not match"));
     }
     Ok(())
 }
@@ -654,7 +675,7 @@ fn verify_sigv4_presigned(req: &HttpRequest, secret_key: &str, parsed: &ParsedPr
     })?;
     if mac.verify_slice(&provided_sig).is_err() {
         warn!("Presigned V4 signature mismatch (uri={}, query_len={})", canonical_uri, canonical_query_string.len());
-        return Err(ErrorUnauthorized("Signature does not match"));
+        return Err(s3_access_denied("Signature does not match"));
     }
     Ok(())
 }
@@ -675,18 +696,20 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
             debug!("Presigned V4 auth: admin bypass OK bucket={:?}", bucket);
             return Ok(S3AuthResult {
                 access_key,
-                user_id: "admin".to_string(),
+                user_id: ADMIN_USER_ID.to_string(),
+                owner_display_name: admin_display_name(),
                 bucket,
                 allowed_buckets: vec![],
                 allow_all_buckets: true,
+                is_anonymous: false,
             });
         }
     }
 
     // Console path
     let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
-    let base_url = base_url.ok_or_else(|| ErrorUnauthorized("No authentication method configured"))?;
-    let service_secret = service_secret.ok_or_else(|| ErrorUnauthorized("WARPDRIVE_SERVICE_SECRET not set"))?;
+    let base_url = base_url.ok_or_else(|| s3_access_denied("No authentication method configured"))?;
+    let service_secret = service_secret.ok_or_else(|| s3_access_denied("WARPDRIVE_SERVICE_SECRET not set"))?;
     let (owner_id, secret_key, _, _) =
         load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
 
@@ -694,10 +717,12 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
     debug!("Presigned V4 auth: Console OK bucket={:?} user={}", bucket, owner_id);
     Ok(S3AuthResult {
         access_key,
+        owner_display_name: owner_id.clone(),
         user_id: owner_id,
         bucket,
         allowed_buckets: vec![],
         allow_all_buckets: false,
+        is_anonymous: false,
     })
 }
 
@@ -729,28 +754,32 @@ fn s3_access_denied(message: &str) -> Error {
     ).into()
 }
 
+/// Authenticate an S3 request, requiring valid credentials — a missing Authorization
+/// header is always a 403, exactly like before ACL support existed. This is what the
+/// vast majority of handlers should keep using unchanged.
 pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error> {
+    authenticate_s3_request_inner(req, false).await
+}
+
+/// Same as `authenticate_s3_request`, but a missing Authorization header returns an
+/// `Ok(S3AuthResult { is_anonymous: true, .. })` instead of erroring, so the caller can
+/// gate the request against the resource's stored ACL (public-read/public-read-write/
+/// authenticated-read) instead of rejecting it outright. Only handlers that actually
+/// implement an ACL check for anonymous access should call this — everything else
+/// should keep using `authenticate_s3_request`.
+pub async fn authenticate_s3_request_allow_anonymous(req: &HttpRequest) -> Result<S3AuthResult, Error> {
+    authenticate_s3_request_inner(req, true).await
+}
+
+async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool) -> Result<S3AuthResult, Error> {
     // Detect presigned requests before looking for Authorization header
     let query_map = parse_query_map(req);
     if query_map.contains_key("X-Amz-Algorithm") {
         return authenticate_presigned_v4(req, &query_map).await;
     }
 
-    let auth_header = req
-        .headers()
-        .get("Authorization")
-        .ok_or_else(|| {
-            warn!("Missing Authorization header");
-            s3_access_denied("Access Denied")
-        })?
-        .to_str()
-        .map_err(|_| {
-            warn!("Invalid Authorization header format");
-            s3_access_denied("Access Denied")
-        })?;
+    let auth_header_opt = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
 
-    let parsed = parse_authorization_header_full(auth_header)?;
-    let access_key = parsed.access_key.clone();
     let bucket = extract_bucket_from_path(req)?;
 
     if !is_list_buckets_request(req) && bucket.is_empty() {
@@ -763,6 +792,32 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
             "S3 path must be /s3/{bucket}/... for this operation (use path-style addressing in your S3 client)",
         ));
     }
+
+    let auth_header = match auth_header_opt {
+        Some(h) => h,
+        None => {
+            if allow_anonymous {
+                // S3 never rejects this outright (e.g. anonymous ListBuckets returns 200
+                // with an empty list) — the caller gates on `is_anonymous` against the
+                // resource's stored ACL.
+                debug!("S3 auth: anonymous request path_bucket={:?}", bucket);
+                return Ok(S3AuthResult {
+                    access_key: String::new(),
+                    user_id: String::new(),
+                    owner_display_name: String::new(),
+                    bucket,
+                    allowed_buckets: vec![],
+                    allow_all_buckets: false,
+                    is_anonymous: true,
+                });
+            }
+            warn!("Missing Authorization header");
+            return Err(s3_access_denied("Access Denied"));
+        }
+    };
+
+    let parsed = parse_authorization_header_full(auth_header)?;
+    let access_key = parsed.access_key.clone();
 
     debug!(
         "S3 auth: request_path={} extracted_bucket={:?} list_buckets={}",
@@ -779,10 +834,12 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
             debug!("S3 auth: admin bypass OK path_bucket={:?}", bucket);
             return Ok(S3AuthResult {
                 access_key,
-                user_id: "admin".to_string(),
+                user_id: ADMIN_USER_ID.to_string(),
+                owner_display_name: admin_display_name(),
                 bucket,
                 allowed_buckets: vec![],
                 allow_all_buckets: true,
+                is_anonymous: false,
             });
         }
     }
@@ -792,11 +849,11 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
 
     let base_url = base_url.ok_or_else(|| {
         warn!("VITALITY_CONSOLE_URL not set and no admin credentials configured");
-        ErrorUnauthorized("No authentication method configured (set WARPDRIVE_ADMIN_ACCESS_KEY or VITALITY_CONSOLE_URL)")
+        s3_access_denied("No authentication method configured (set WARPDRIVE_ADMIN_ACCESS_KEY or VITALITY_CONSOLE_URL)")
     })?;
     let service_secret = service_secret.ok_or_else(|| {
         warn!("WARPDRIVE_SERVICE_SECRET not set");
-        ErrorUnauthorized("WARPDRIVE_SERVICE_SECRET must be set when using Vitality Console")
+        s3_access_denied("WARPDRIVE_SERVICE_SECRET must be set when using Vitality Console")
     })?;
 
     let (mut owner_id, mut secret_key, mut allowed_buckets, cache_hit) =
@@ -835,10 +892,12 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
     );
     Ok(S3AuthResult {
         access_key,
+        owner_display_name: owner_id.clone(),
         user_id: owner_id,
         bucket,
         allowed_buckets: allowed_buckets_vec,
         allow_all_buckets: false,
+        is_anonymous: false,
     })
 }
 
