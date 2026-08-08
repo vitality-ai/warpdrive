@@ -268,6 +268,43 @@ impl MetadataService {
         SQLiteMetadataStore::new().get_multipart_tagging(upload_id)
     }
 
+    // --- ACL ---
+
+    pub fn set_bucket_acl(&self, bucket: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_bucket_acl(bucket, owner_id, grants_json)
+    }
+
+    pub fn get_bucket_acl(&self, bucket: &str) -> Result<Option<(String, String)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_bucket_acl(bucket)
+    }
+
+    pub fn set_object_acl(&self, bucket: &str, key: &str, version_id: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_object_acl(bucket, key, version_id, owner_id, grants_json)
+    }
+
+    pub fn get_object_acl(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<(String, String)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_object_acl(bucket, key, version_id)
+    }
+
+    pub fn set_public_access_block(&self, bucket: &str, block_public_acls: bool, ignore_public_acls: bool, block_public_policy: bool, restrict_public_buckets: bool) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().set_public_access_block(bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets)
+    }
+
+    pub fn get_public_access_block(&self, bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().get_public_access_block(bucket)
+    }
+
+    pub fn delete_public_access_block(&self, bucket: &str) -> Result<(), Error> {
+        use crate::metadata::sqlite_store::SQLiteMetadataStore;
+        SQLiteMetadataStore::new().delete_public_access_block(bucket)
+    }
+
     // --- Multipart upload management ---
 
     pub fn create_multipart_upload(

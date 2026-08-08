@@ -5,13 +5,13 @@ use log::info;
 
 use std::collections::HashMap;
 
-use crate::s3::auth::authenticate_s3_request;
+use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous};
 use crate::service::metadata_service::MetadataService;
 
 use super::common::*;
 use super::tagging::{s3_put_bucket_tagging_inner, s3_delete_bucket_tagging_inner};
 use super::versioning::s3_put_bucket_versioning_inner;
-use super::acl::{s3_put_acl_stub, validate_bucket_name};
+use super::acl::{s3_put_bucket_acl_inner, s3_put_public_access_block_inner, s3_delete_public_access_block_inner, resolve_effective_grants, grants_to_json, validate_bucket_name};
 use super::object_lock::s3_put_bucket_object_lock_inner;
 
 // ---------------------------------------------------------------------------
@@ -22,10 +22,23 @@ pub async fn s3_list_buckets_handler(
     query: web::Query<HashMap<String, String>>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let auth_result = authenticate_s3_request(&req).await?;
+    let auth_result = authenticate_s3_request_allow_anonymous(&req).await?;
     if !auth_result.bucket.is_empty() {
         return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidRequest",
                            "Unexpected bucket in path for list-buckets", "/"));
+    }
+    if auth_result.is_anonymous {
+        // S3 doesn't reject anonymous ListBuckets — the anonymous principal just owns
+        // no buckets, so the response is a valid, empty list.
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <ListAllMyBucketsResult xmlns=\"{s3}\">\n\
+                 <Owner><ID></ID><DisplayName></DisplayName></Owner>\n\
+                 <Buckets></Buckets>\n\
+             </ListAllMyBucketsResult>",
+            s3 = S3_XMLNS,
+        );
+        return Ok(HttpResponse::Ok().content_type("application/xml").body(xml));
     }
     info!("S3 ListBuckets: user={}", auth_result.user_id);
 
@@ -78,14 +91,15 @@ pub async fn s3_list_buckets_handler(
     };
 
     let owner_id = xml_escape(&auth_result.user_id);
+    let owner_display = xml_escape(&auth_result.owner_display_name);
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListAllMyBucketsResult xmlns=\"{s3}\">\n\
-             <Owner><ID>{owner}</ID><DisplayName>{owner}</DisplayName></Owner>\n\
+             <Owner><ID>{owner}</ID><DisplayName>{owner_dn}</DisplayName></Owner>\n\
              <Buckets>\n{buckets}</Buckets>\n\
              {continuation}\
          </ListAllMyBucketsResult>",
-        s3 = S3_XMLNS, owner = owner_id, buckets = buckets_xml,
+        s3 = S3_XMLNS, owner = owner_id, owner_dn = owner_display, buckets = buckets_xml,
         continuation = continuation_xml,
     );
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
@@ -105,13 +119,18 @@ pub async fn s3_create_bucket_handler(
     let qmap: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner()).unwrap_or_default();
 
-    if qmap.contains_key("acl") {
-        return s3_put_acl_stub(&req).await;
-    }
-    if qmap.contains_key("tagging") || qmap.contains_key("versioning") || qmap.contains_key("object-lock") {
+    if qmap.contains_key("acl") || qmap.contains_key("tagging") || qmap.contains_key("versioning")
+        || qmap.contains_key("object-lock") || qmap.contains_key("publicAccessBlock")
+    {
         let mut body: Vec<u8> = Vec::new();
         while let Some(chunk) = payload.next().await {
             body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        if qmap.contains_key("acl") {
+            return s3_put_bucket_acl_inner(&bucket, &body, &req).await;
+        }
+        if qmap.contains_key("publicAccessBlock") {
+            return s3_put_public_access_block_inner(&bucket, &body, &req).await;
         }
         if qmap.contains_key("tagging") {
             return s3_put_bucket_tagging_inner(&bucket, &body, &req).await;
@@ -161,6 +180,18 @@ pub async fn s3_create_bucket_handler(
         db.set_bucket_location(&bucket, &location)?;
     }
 
+    // Only store an ACL row when the request actually specifies one — otherwise the
+    // ACL handlers synthesize the private-owner-only default at read time.
+    let has_acl_header = req.headers().contains_key("x-amz-acl")
+        || ["x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp", "x-amz-grant-write-acp", "x-amz-grant-full-control"]
+            .iter().any(|h| req.headers().contains_key(*h));
+    if has_acl_header {
+        match resolve_effective_grants(&req, None, &auth_result.user_id, &auth_result.owner_display_name) {
+            Ok(grants) => db.set_bucket_acl(&bucket, &auth_result.user_id, &grants_to_json(&grants))?,
+            Err(resp) => return Ok(resp),
+        }
+    }
+
     info!("S3 CreateBucket: bucket={} user={} location={:?}", bucket, auth_result.user_id, location);
     Ok(HttpResponse::Ok()
         .insert_header(("Location", format!("/{}", bucket)))
@@ -192,6 +223,10 @@ pub async fn s3_delete_bucket_handler(
 
     if query.contains_key("tagging") {
         return s3_delete_bucket_tagging_inner(&bucket, &req).await;
+    }
+
+    if query.contains_key("publicAccessBlock") {
+        return s3_delete_public_access_block_inner(&bucket, &req).await;
     }
 
     let auth_result = authenticate_s3_request(&req).await?;

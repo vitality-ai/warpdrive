@@ -104,6 +104,18 @@ pub(super) fn require_bucket(db: &MetadataService, bucket: &str) -> Result<(), H
     }
 }
 
+/// If `x-amz-expected-bucket-owner` is present, reject with 403 unless it matches the
+/// bucket's actual owner. AWS enforces this independently of ACL/permission grants —
+/// notably it still applies to a publicly-readable/writable bucket.
+pub(super) fn check_expected_bucket_owner(req: &HttpRequest, actual_owner: &str, resource: &str) -> Result<(), HttpResponse> {
+    if let Some(expected) = req.headers().get("x-amz-expected-bucket-owner").and_then(|v| v.to_str().ok()) {
+        if expected != actual_owner {
+            return Err(s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", resource));
+        }
+    }
+    Ok(())
+}
+
 /// Split extent list into ≤ S3_GET_STREAM_CHUNK slices for streaming.
 pub(super) fn stream_slices(chunks: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();

@@ -218,6 +218,42 @@ lazy_static! {
             [],
         ).expect("Failed to create bucket_tags table");
 
+        // Bucket ACL — canned/header/XML-resolved grant list, JSON-serialized.
+        // No row = default private (owner-only FULL_CONTROL), synthesized at read time.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bucket_acl (
+                bucket      TEXT PRIMARY KEY,
+                owner_id    TEXT NOT NULL,
+                grants_json TEXT NOT NULL
+            )",
+            [],
+        ).expect("Failed to create bucket_acl table");
+
+        // Object ACL — same shape as bucket_acl, keyed per version.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS object_acl (
+                bucket      TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                version_id  TEXT NOT NULL DEFAULT '',
+                owner_id    TEXT NOT NULL,
+                grants_json TEXT NOT NULL,
+                PRIMARY KEY (bucket, key, version_id)
+            )",
+            [],
+        ).expect("Failed to create object_acl table");
+
+        // Block Public Access — four flags per bucket
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS public_access_block (
+                bucket                  TEXT PRIMARY KEY,
+                block_public_acls       INTEGER NOT NULL DEFAULT 0,
+                ignore_public_acls      INTEGER NOT NULL DEFAULT 0,
+                block_public_policy     INTEGER NOT NULL DEFAULT 0,
+                restrict_public_buckets INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        ).expect("Failed to create public_access_block table");
+
         Arc::new(Mutex::new(conn))
     };
 }
@@ -740,6 +776,91 @@ impl SQLiteMetadataStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
             Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
         }
+    }
+}
+
+/// ACL: bucket/object grant storage + Block Public Access flags
+impl SQLiteMetadataStore {
+    pub fn set_bucket_acl(&self, bucket: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bucket_acl (bucket, owner_id, grants_json) VALUES (?1, ?2, ?3)",
+            params![bucket, owner_id, grants_json],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_bucket_acl(&self, bucket: &str) -> Result<Option<(String, String)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT owner_id, grants_json FROM bucket_acl WHERE bucket = ?1")
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![bucket], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn set_object_acl(&self, bucket: &str, key: &str, version_id: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO object_acl (bucket, key, version_id, owner_id, grants_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![bucket, key, version_id, owner_id, grants_json],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    pub fn get_object_acl(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<(String, String)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT owner_id, grants_json FROM object_acl WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![bucket, key, version_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn set_public_access_block(&self, bucket: &str, block_public_acls: bool, ignore_public_acls: bool, block_public_policy: bool, restrict_public_buckets: bool) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO public_access_block
+                (bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets],
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    /// Returns (block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets).
+    pub fn get_public_access_block(&self, bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets
+             FROM public_access_block WHERE bucket = ?1",
+        ).map_err(actix_web::error::ErrorInternalServerError)?;
+        let result = stmt.query_row(params![bucket], |row| {
+            Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?, row.get::<_, bool>(3)?))
+        });
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn delete_public_access_block(&self, bucket: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock().unwrap();
+        conn.execute("DELETE FROM public_access_block WHERE bucket = ?1", params![bucket])
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
     }
 }
 

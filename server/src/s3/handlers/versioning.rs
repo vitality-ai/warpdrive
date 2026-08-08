@@ -180,6 +180,7 @@ pub(super) async fn s3_list_object_versions_handler_inner(bucket: &str, req: &Ht
     let prefix           = query.get("prefix").cloned().unwrap_or_default();
     let delimiter        = query.get("delimiter").cloned().unwrap_or_default();
     let owner_id         = xml_escape(&auth_result.user_id);
+    let owner_display    = xml_escape(&auth_result.owner_display_name);
 
     log::info!("S3 ListObjectVersions: bucket={}", bucket);
 
@@ -210,13 +211,14 @@ pub(super) async fn s3_list_object_versions_handler_inner(bucket: &str, req: &Ht
                  \t<VersionId>{vid}</VersionId>\n\
                  \t<IsLatest>{latest}</IsLatest>\n\
                  \t<LastModified>{lm}</LastModified>\n\
-                 \t<Owner><ID>{owner}</ID><DisplayName>{owner}</DisplayName></Owner>\n\
+                 \t<Owner><ID>{owner}</ID><DisplayName>{owner_dn}</DisplayName></Owner>\n\
                  \t</DeleteMarker>\n",
-                key    = xml_escape(&row.key),
-                vid    = xml_escape(display_vid),
-                latest = row.is_latest,
-                lm     = xml_escape(&row.last_modified),
-                owner  = owner_id,
+                key      = xml_escape(&row.key),
+                vid      = xml_escape(display_vid),
+                latest   = row.is_latest,
+                lm       = xml_escape(&row.last_modified),
+                owner    = owner_id,
+                owner_dn = owner_display,
             ));
         } else {
             versions_xml.push_str(&format!(
@@ -228,15 +230,16 @@ pub(super) async fn s3_list_object_versions_handler_inner(bucket: &str, req: &Ht
                  \t<ETag>&quot;{etag}&quot;</ETag>\n\
                  \t<Size>{size}</Size>\n\
                  \t<StorageClass>STANDARD</StorageClass>\n\
-                 \t<Owner><ID>{owner}</ID><DisplayName>{owner}</DisplayName></Owner>\n\
+                 \t<Owner><ID>{owner}</ID><DisplayName>{owner_dn}</DisplayName></Owner>\n\
                  \t</Version>\n",
-                key    = xml_escape(&row.key),
-                vid    = xml_escape(display_vid),
-                latest = row.is_latest,
-                lm     = xml_escape(&row.last_modified),
-                etag   = etag_bare,
-                size   = row.size,
-                owner  = owner_id,
+                key      = xml_escape(&row.key),
+                vid      = xml_escape(display_vid),
+                latest   = row.is_latest,
+                lm       = xml_escape(&row.last_modified),
+                etag     = etag_bare,
+                size     = row.size,
+                owner    = owner_id,
+                owner_dn = owner_display,
             ));
         }
     }

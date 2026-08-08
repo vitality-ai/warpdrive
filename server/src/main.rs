@@ -76,7 +76,10 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
     })
-    .bind(("0.0.0.0", 9710))?
+    .bind((
+        "0.0.0.0",
+        std::env::var("WARPDRIVE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9710u16),
+    ))?
     .run()
     .await
 }
