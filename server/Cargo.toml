@@ -1,7 +1,8 @@
 [package]
 name = "warp_drive"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
+description = "WarpDrive is an S3-ish rocket engine optimised for ML/Database workloads but also general purpose"
 
 [dependencies]
 actix-web = "4.11.0"
@@ -32,3 +33,21 @@ base64 = "0.22"
 
 [dev-dependencies]
 actix-web = "4.11.0"
+
+[package.metadata.deb]
+name = "warpdrive"
+maintainer = "Tejas ChandraShekarRaju <tchandrashekar@acm.org>"
+license-file = ["../LICENSE"]
+extended-description = """\
+Warpdrive is a self-hosted S3-compatible object storage server.
+Drop-in replacement for AWS S3 — works with any S3 SDK out of the box."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+  ["target/release/warp_drive",      "usr/bin/warpdrive",                        "755"],
+  ["../packaging/warpdrive.service", "lib/systemd/system/warpdrive.service",     "644"],
+  ["../packaging/warpdrive.env",     "etc/warpdrive/warpdrive.env",              "640"],
+  ["server_log.yaml",                "etc/warpdrive/warpdrive.yaml",             "644"],
+]
+maintainer-scripts = "../packaging/debian/"

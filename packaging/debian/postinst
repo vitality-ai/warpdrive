@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+#DEBHELPER#
+
+# Create warpdrive system user if it doesn't exist
+if ! id -u warpdrive > /dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin warpdrive
+fi
+
+# Create data and log directories
+install -d -m 750 -o warpdrive -g warpdrive /var/lib/warpdrive
+install -d -m 750 -o warpdrive -g warpdrive /var/log/warpdrive
+
+# Lock down the env file
+chown root:warpdrive /etc/warpdrive/warpdrive.env
+chmod 640 /etc/warpdrive/warpdrive.env
+
+# Warn if default credentials are in use and port is not loopback
+if grep -q "adminkey" /etc/warpdrive/warpdrive.env 2>/dev/null; then
+    echo ""
+    echo "WARNING: Warpdrive is using default admin credentials."
+    echo "Edit /etc/warpdrive/warpdrive.env and restart the service:"
+    echo "  sudo systemctl restart warpdrive"
+    echo ""
+fi
+
+if command -v systemctl > /dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable warpdrive
+    systemctl start warpdrive
+fi

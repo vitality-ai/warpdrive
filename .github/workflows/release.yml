@@ -1,0 +1,88 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build release binary
+        working-directory: server
+        run: cargo build --release
+
+      - name: Build .deb package
+        working-directory: server
+        run: cargo deb --no-build
+
+      - name: Install reprepro
+        run: sudo apt-get install -y reprepro
+
+      - name: Import GPG signing key
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          # Configure GPG agent to allow loopback pinentry (no TTY needed in CI)
+          mkdir -p ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          chmod 700 ~/.gnupg
+          gpgconf --kill gpg-agent
+
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
+          FINGERPRINT=$(gpg --with-colons --fingerprint "${{ secrets.GPG_KEY_ID }}" | awk -F: '$1 == "fpr" {print $10; exit}')
+          echo "$FINGERPRINT:6:" | gpg --import-ownertrust
+
+          # Pre-cache the passphrase in the agent so reprepro can sign without a prompt
+          echo "test" | gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --clearsign --default-key "${{ secrets.GPG_KEY_ID }}" > /dev/null
+
+      - name: Export GPG public key
+        run: |
+          mkdir -p apt-repo
+          gpg --armor --export "${{ secrets.GPG_KEY_ID }}" > apt-repo/gpg.key
+
+      - name: Build apt repo structure
+        run: |
+          mkdir -p apt-repo/conf
+          cat > apt-repo/conf/distributions <<EOF
+          Origin: Vitality AI
+          Label: Warpdrive
+          Codename: stable
+          Architectures: amd64
+          Components: main
+          Description: Warpdrive S3-compatible object storage
+          SignWith: ${{ secrets.GPG_KEY_ID }}
+          EOF
+          reprepro -b apt-repo includedeb stable server/target/debian/warpdrive_*.deb
+
+      - name: Publish apt repo to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apt-repo
+          keep_files: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: server/target/debian/warpdrive_*.deb
+          generate_release_notes: true

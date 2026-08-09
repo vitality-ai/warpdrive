@@ -22,7 +22,8 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
-    log4rs::init_file("server_log.yaml", Default::default()).unwrap();
+    let log_config = std::env::var("WARPDRIVE_LOG_CONFIG").unwrap_or_else(|_| "server_log.yaml".to_owned());
+    log4rs::init_file(&log_config, Default::default()).unwrap();
     info!("Starting HTTP server on 0.0.0.0:9710 (S3 under /s3/...)");
 
     let _deletion_worker_handle = start_deletion_worker();
