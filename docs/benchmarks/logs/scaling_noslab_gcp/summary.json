@@ -1,0 +1,374 @@
+[
+  {
+    "timestamp": "2026-08-24T09:10:50.736259+00:00",
+    "T": 16,
+    "bench_start_epoch": 1787562528.2519786,
+    "bench_end_epoch": 1787562650.7322514,
+    "cold_start": {
+      "startup_wall_s": 22.39,
+      "endpoint_start_wall_s": 6.14,
+      "layer_files_wiped": 22
+    },
+    "endpoints": [
+      {
+        "name": "main",
+        "port": 55432
+      },
+      {
+        "name": "ep-2",
+        "port": 55451
+      },
+      {
+        "name": "ep-5",
+        "port": 55465
+      },
+      {
+        "name": "ep-6",
+        "port": 55466
+      },
+      {
+        "name": "ep-a",
+        "port": 55480
+      },
+      {
+        "name": "ep-b",
+        "port": 55481
+      },
+      {
+        "name": "ep-e",
+        "port": 55484
+      },
+      {
+        "name": "ep-f",
+        "port": 55485
+      },
+      {
+        "name": "ep-g",
+        "port": 55486
+      },
+      {
+        "name": "ep-h",
+        "port": 55487
+      },
+      {
+        "name": "ep-k",
+        "port": 55490
+      },
+      {
+        "name": "ep-l",
+        "port": 55492
+      },
+      {
+        "name": "ep-m",
+        "port": 55494
+      },
+      {
+        "name": "ep-n",
+        "port": 55496
+      },
+      {
+        "name": "ep-o",
+        "port": 55498
+      },
+      {
+        "name": "ep-p",
+        "port": 55500
+      }
+    ],
+    "config": {
+      "checkpoint_distance": 4194304,
+      "checkpoint_timeout": "5s",
+      "eviction_policy": {
+        "kind": "LayerAccessThreshold",
+        "period": "5s",
+        "threshold": "10s"
+      }
+    },
+    "sysbench": {
+      "time_s": 120,
+      "scale": 10,
+      "tables": 1,
+      "threads_per_endpoint": 4,
+      "total_tps": 28.3,
+      "total_txn": 3434,
+      "avg_lat_ms": 2256.4,
+      "p95_lat_ms": 9118.5,
+      "per_endpoint": [
+        {
+          "endpoint": "ep-k",
+          "port": 55490,
+          "tps": 1.81,
+          "lat_avg": 2209.25,
+          "lat_p95": 7754.26,
+          "txn": 218,
+          "queries": 5688,
+          "errors": 6
+        },
+        {
+          "endpoint": "ep-a",
+          "port": 55480,
+          "tps": 1.83,
+          "lat_avg": 2181.15,
+          "lat_p95": 8184.67,
+          "txn": 221,
+          "queries": 5765,
+          "errors": 6
+        },
+        {
+          "endpoint": "main",
+          "port": 55432,
+          "tps": 1.53,
+          "lat_avg": 2608.79,
+          "lat_p95": 9118.47,
+          "txn": 185,
+          "queries": 4794,
+          "errors": 4
+        },
+        {
+          "endpoint": "ep-n",
+          "port": 55496,
+          "tps": 1.78,
+          "lat_avg": 2228.51,
+          "lat_p95": 8333.38,
+          "txn": 216,
+          "queries": 5601,
+          "errors": 5
+        },
+        {
+          "endpoint": "ep-f",
+          "port": 55485,
+          "tps": 1.8,
+          "lat_avg": 2216.18,
+          "lat_p95": 8038.61,
+          "txn": 218,
+          "queries": 5936,
+          "errors": 7
+        },
+        {
+          "endpoint": "ep-p",
+          "port": 55500,
+          "tps": 1.84,
+          "lat_avg": 2162.75,
+          "lat_p95": 8038.61,
+          "txn": 223,
+          "queries": 5950,
+          "errors": 6
+        },
+        {
+          "endpoint": "ep-6",
+          "port": 55466,
+          "tps": 1.92,
+          "lat_avg": 2070.22,
+          "lat_p95": 7086.63,
+          "txn": 233,
+          "queries": 5940,
+          "errors": 7
+        },
+        {
+          "endpoint": "ep-2",
+          "port": 55451,
+          "tps": 1.79,
+          "lat_avg": 2224.96,
+          "lat_p95": 8184.67,
+          "txn": 217,
+          "queries": 5918,
+          "errors": 5
+        },
+        {
+          "endpoint": "ep-b",
+          "port": 55481,
+          "tps": 1.67,
+          "lat_avg": 2383.29,
+          "lat_p95": 8955.74,
+          "txn": 203,
+          "queries": 5469,
+          "errors": 4
+        },
+        {
+          "endpoint": "ep-l",
+          "port": 55492,
+          "tps": 1.72,
+          "lat_avg": 2314.75,
+          "lat_p95": 8484.79,
+          "txn": 209,
+          "queries": 5613,
+          "errors": 5
+        },
+        {
+          "endpoint": "ep-m",
+          "port": 55494,
+          "tps": 1.87,
+          "lat_avg": 2126.54,
+          "lat_p95": 7479.98,
+          "txn": 227,
+          "queries": 6059,
+          "errors": 7
+        },
+        {
+          "endpoint": "ep-5",
+          "port": 55465,
+          "tps": 1.66,
+          "lat_avg": 2404.25,
+          "lat_p95": 8638.96,
+          "txn": 201,
+          "queries": 5834,
+          "errors": 5
+        },
+        {
+          "endpoint": "ep-g",
+          "port": 55486,
+          "tps": 1.79,
+          "lat_avg": 2214.44,
+          "lat_p95": 8184.67,
+          "txn": 218,
+          "queries": 5606,
+          "errors": 4
+        },
+        {
+          "endpoint": "ep-e",
+          "port": 55484,
+          "tps": 1.73,
+          "lat_avg": 2301.9,
+          "lat_p95": 8333.38,
+          "txn": 210,
+          "queries": 5626,
+          "errors": 4
+        },
+        {
+          "endpoint": "ep-o",
+          "port": 55498,
+          "tps": 1.79,
+          "lat_avg": 2221.9,
+          "lat_p95": 8038.61,
+          "txn": 218,
+          "queries": 5577,
+          "errors": 5
+        },
+        {
+          "endpoint": "ep-h",
+          "port": 55487,
+          "tps": 1.77,
+          "lat_avg": 2232.79,
+          "lat_p95": 8484.79,
+          "txn": 217,
+          "queries": 5686,
+          "errors": 4
+        }
+      ]
+    },
+    "warpdrive": {
+      "startup": {
+        "ops": {
+          "copy": 0,
+          "delete": 0,
+          "delete_objects": 0,
+          "get": 0,
+          "head": 0,
+          "list": 0,
+          "multipart": 0,
+          "put": 0
+        },
+        "get_delta": 0,
+        "get_image": 0
+      },
+      "benchmark": {
+        "ops": {
+          "copy": 0,
+          "delete": 0,
+          "delete_objects": 4,
+          "get": 13,
+          "head": 0,
+          "list": 0,
+          "multipart": 0,
+          "put": 794
+        },
+        "get_delta": 8,
+        "get_image": 5
+      },
+      "total": {
+        "put": 794,
+        "get": 13,
+        "get_delta": 8,
+        "get_image": 5,
+        "delete_objects": 4,
+        "estimated_cost_usd": 0.003995200000000001,
+        "latencies": {
+          "delete": {
+            "avg_ms": 0.0,
+            "count": 0,
+            "max_ms": 0.0
+          },
+          "get": {
+            "avg_ms": 0.44150992307692305,
+            "count": 13,
+            "max_ms": 0.67574
+          },
+          "head": {
+            "avg_ms": 0.0,
+            "count": 0,
+            "max_ms": 0.0
+          },
+          "put": {
+            "avg_ms": 72.88525987657431,
+            "count": 794,
+            "max_ms": 467.734002
+          }
+        }
+      }
+    },
+    "layer_events": [
+      {
+        "kind": "image",
+        "layer": "000000067F00000005000040080100000000-000000067F000000050000400A0000004000__0000000345E074D1"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F0000000500004023000000448D-000000067F00000005000040230000006FB5__0000000347245B39-0000000349C0A299"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F00000005000040230000004243-000000067F00000005000040230000007DD3__00000003457A41C9-0000000347245B39"
+      },
+      {
+        "kind": "image",
+        "layer": "000000067F00000005000040230000004000-000000067F00000005000040230000008000__0000000345A9FFF1"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F00000005000040230000000015-000000067F00000005000040230000004463__0000000347245B39-0000000349C0A299"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F00000005000040230000006FD2-000000067F00000005000040230000008CF3__0000000347245B39-0000000349C0A299"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F00000005000040230000007DD6-000000067F00000005000040230100000000__00000003457A41C9-0000000347245B39"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F00000005000040230000000054-000000067F00000005000040230000004176__00000003457A41C9-0000000347245B39"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F000000050000403000000001FE-000000067F00000005000040300000000DFA__0000000347245B39-0000000349C0A299"
+      },
+      {
+        "kind": "image",
+        "layer": "000000067F00000005000040230000000000-000000067F00000005000040230000004000__0000000345A9FFF1"
+      },
+      {
+        "kind": "image",
+        "layer": "000000067F000000050000401C0100000000-000000067F000000050000401E0000004000__0000000345E074D1"
+      },
+      {
+        "kind": "delta",
+        "layer": "000000067F00000005000040230000000054-000000067F00000005000040230000004176__00000003457A41C9-0000000347245B39"
+      },
+      {
+        "kind": "image",
+        "layer": "000000067F000000050000401E0000004000-000000067F000000050000401E0000008000__0000000349D87AE9"
+      }
+    ]
+  }
+]

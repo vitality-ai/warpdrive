@@ -16,7 +16,7 @@ use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
 use crate::storage::config::StorageConfig;
 
-use super::checksum::{parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
+use super::checksum::{parse_checksum_headers, ChecksumAlgorithm, ChecksumHasher};
 use super::common::*;
 use super::tagging::{s3_put_object_tagging_inner, s3_get_object_tagging_inner, s3_delete_object_tagging_inner, parse_url_tags, validate_tags};
 use super::versioning::{s3_get_object_version_handler, s3_delete_specific_version_handler};
@@ -30,6 +30,18 @@ use super::object_lock::{s3_put_object_retention_inner, s3_get_object_retention_
 // ---------------------------------------------------------------------------
 
 pub async fn s3_put_object_handler(
+    path: web::Path<(String, String)>,
+    payload: web::Payload,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let __t0 = std::time::Instant::now();
+    let result = s3_put_object_handler_inner(path, payload, req).await;
+    #[cfg(feature = "op-counters")]
+    metrics::record_duration(&metrics::PUT_DURATION_NANOS, &metrics::PUT_MAX_NANOS, __t0.elapsed());
+    result
+}
+
+async fn s3_put_object_handler_inner(
     path: web::Path<(String, String)>,
     mut payload: web::Payload,
     req: HttpRequest,
@@ -163,22 +175,40 @@ pub async fn s3_put_object_handler(
 
     let store = StorageConfig::from_env().create_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
+
+    // Checksum: computed incrementally as chunks arrive (cheap, and lets us
+    // avoid ever needing the full body in memory for objects above
+    // STREAM_THRESHOLD -- see below).
+    let checksum_result = parse_checksum_headers(&req);
+    let mut checksum_hasher = checksum_result.as_ref().map(|(algo, _)| ChecksumHasher::new(algo));
+    let mut md5_ctx = md5::Context::new();
+    let mut total_size: u64 = 0;
+
+    // Objects up to STREAM_THRESHOLD are buffered in memory and written to
+    // disk in a single call -- avoids paying a disk open+seek+write+flush
+    // (under a process-wide write lock) per network-read chunk, which is
+    // what a naive per-chunk write does and is dramatically slower for no
+    // benefit (the body was already being fully buffered for the etag
+    // computation regardless). Above the threshold we fall back to writing
+    // each chunk as it arrives so memory use stays bounded -- slower per
+    // object, but only pays that cost for objects large enough that
+    // buffering the whole thing in RAM would itself be a problem.
+    const STREAM_THRESHOLD: usize = 512 * 1024 * 1024; // 512MB
     let mut body_buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
 
-    while let Some(chunk_result) = payload.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            warn!("PutObject: payload read error: {}", e);
-            actix_web::error::ErrorInternalServerError("Error reading payload")
-        })?;
-        if chunk.is_empty() { continue; }
-
-        body_buf.extend_from_slice(&chunk);
-
-        let ctx = context.clone();
-        let store_c = Arc::clone(&store);
-        let buf = chunk.to_vec();
-        let hint = slab_hint.clone();
-        let pair = web::block(move || {
+    async fn flush_chunk(
+        store: &Arc<dyn crate::storage::Storage>,
+        ctx: &UserContext,
+        hint: &Option<String>,
+        buf: Vec<u8>,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(u64, u64), Error> {
+        let ctx = ctx.clone();
+        let store_c = Arc::clone(store);
+        let hint = hint.clone();
+        web::block(move || {
             store_c.write(&ctx.user_id, &ctx.bucket, &buf, hint.as_deref()).map_err(|e| e.to_string())
         }).await
         .map_err(|e| {
@@ -188,12 +218,43 @@ pub async fn s3_put_object_handler(
         .map_err(|msg| {
             error!("PutObject: write error bucket={} key={}: {}", bucket, key, msg);
             actix_web::error::ErrorInternalServerError(msg)
+        })
+    }
+
+    while let Some(chunk_result) = payload.next().await {
+        let chunk = chunk_result.map_err(|e| {
+            warn!("PutObject: payload read error: {}", e);
+            actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
+        if chunk.is_empty() { continue; }
+
+        md5_ctx.consume(&chunk);
+        if let Some(h) = checksum_hasher.as_mut() { h.update(&chunk); }
+        total_size += chunk.len() as u64;
+
+        if !overflowed {
+            body_buf.extend_from_slice(&chunk);
+            if body_buf.len() > STREAM_THRESHOLD {
+                let buf = std::mem::take(&mut body_buf);
+                let pair = flush_chunk(&store, &context, &slab_hint, buf, &bucket, &key).await?;
+                offset_size_list.push(pair);
+                overflowed = true;
+            }
+        } else {
+            let pair = flush_chunk(&store, &context, &slab_hint, chunk.to_vec(), &bucket, &key).await?;
+            offset_size_list.push(pair);
+        }
+    }
+
+    if !overflowed && !body_buf.is_empty() {
+        let buf = std::mem::take(&mut body_buf);
+        let pair = flush_chunk(&store, &context, &slab_hint, buf, &bucket, &key).await?;
         offset_size_list.push(pair);
     }
 
-    let size = body_buf.len() as u64;
-    let etag = md5_etag(&body_buf);
+    let size = total_size;
+    let body_md5_digest = md5_ctx.compute();
+    let etag = format!("\"{}\"", hex::encode(body_md5_digest.0));
     let last_modified = last_modified_now();
 
     if let Some(raw) = req.headers().get("content-md5").and_then(|v| v.to_str().ok()) {
@@ -206,8 +267,7 @@ pub async fn s3_put_object_handler(
         use base64::Engine as _;
         match base64::engine::general_purpose::STANDARD.decode(raw) {
             Ok(decoded) if decoded.len() == 16 => {
-                let body_md5 = md5::compute(&body_buf).0;
-                if decoded.as_slice() != &body_md5 {
+                if decoded.as_slice() != &body_md5_digest.0 {
                     return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
                                        "The Content-MD5 you specified did not match what we received.",
                                        &format!("/{}/{}", bucket, key)));
@@ -221,10 +281,10 @@ pub async fn s3_put_object_handler(
         }
     }
 
-    // Checksum verification
-    let checksum_result = parse_checksum_headers(&req);
-    if let Some((ref algo, ref client_value)) = checksum_result {
-        if !verify_checksum(algo, &body_buf, client_value) {
+    // Checksum verification (against the incrementally-computed hash)
+    if let Some((_, ref client_value)) = checksum_result {
+        let computed_b64 = checksum_hasher.take().unwrap().finalize_b64();
+        if &computed_b64 != client_value {
             let resource = format!("/{}/{}", bucket, key);
             return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
                                "The Content-MD5 or checksum you specified did not match what we received.",
@@ -313,6 +373,17 @@ pub async fn s3_put_object_handler(
 // ---------------------------------------------------------------------------
 
 pub async fn s3_get_object_handler(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let __t0 = std::time::Instant::now();
+    let result = s3_get_object_handler_inner(path, req).await;
+    #[cfg(feature = "op-counters")]
+    metrics::record_duration(&metrics::GET_DURATION_NANOS, &metrics::GET_MAX_NANOS, __t0.elapsed());
+    result
+}
+
+async fn s3_get_object_handler_inner(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
@@ -546,6 +617,17 @@ pub async fn s3_head_object_handler(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    let __t0 = std::time::Instant::now();
+    let result = s3_head_object_handler_inner(path, req).await;
+    #[cfg(feature = "op-counters")]
+    metrics::record_duration(&metrics::HEAD_DURATION_NANOS, &metrics::HEAD_MAX_NANOS, __t0.elapsed());
+    result
+}
+
+async fn s3_head_object_handler_inner(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
     count!(metrics::HEAD);
     let (bucket, key) = path.into_inner();
 
@@ -652,6 +734,17 @@ pub async fn s3_head_object_handler(
 // ---------------------------------------------------------------------------
 
 pub async fn s3_delete_object_handler(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let __t0 = std::time::Instant::now();
+    let result = s3_delete_object_handler_inner(path, req).await;
+    #[cfg(feature = "op-counters")]
+    metrics::record_duration(&metrics::DELETE_DURATION_NANOS, &metrics::DELETE_MAX_NANOS, __t0.elapsed());
+    result
+}
+
+async fn s3_delete_object_handler_inner(
     path: web::Path<(String, String)>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {

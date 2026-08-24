@@ -197,7 +197,7 @@ def wipe_local_layers(dry_run=False):
     log("Wiping local layer files...")
     if dry_run:
         log("  [dry-run] would delete layer files under " + str(TENANT_DIR))
-        return
+        return 0
     deleted = 0
     for timeline_dir in (TENANT_DIR / "timelines").glob("*/"):
         for f in timeline_dir.glob("*"):
@@ -206,6 +206,7 @@ def wipe_local_layers(dry_run=False):
                     f.unlink()
                     deleted += 1
     log(f"  Deleted {deleted} local layer files")
+    return deleted
 
 def restart_pageserver(dry_run=False):
     log("Restarting pageserver...")
@@ -327,8 +328,9 @@ def run_one(T, dry_run=False):
     log(f"  Output: {out_dir}")
     log(f"{'='*60}")
 
+    run_start_epoch = time.time()
     stop_all_endpoints(dry_run)
-    wipe_local_layers(dry_run)
+    layer_files_wiped = wipe_local_layers(dry_run)
     restart_pageserver(dry_run)
 
     if not dry_run:
@@ -340,7 +342,9 @@ def run_one(T, dry_run=False):
 
     log_pos_before_start = pageserver_log_pos()
 
+    endpoint_start_begin_epoch = time.time()
     start_endpoints(endpoints, dry_run)
+    endpoint_start_end_epoch = time.time()
 
     if not dry_run:
         log(f"Waiting {WARMUP_WAIT}s for endpoints to settle...")
@@ -354,6 +358,7 @@ def run_one(T, dry_run=False):
         f"(delta={startup_downloads['delta']} image={startup_downloads['image']})")
 
     log(f"Running sysbench {SYSBENCH_TIME}s across {T} endpoint(s)...")
+    bench_start_epoch = time.time()
     sysbench_results = []
     with ThreadPoolExecutor(max_workers=T) as ex:
         futs = {
@@ -364,6 +369,7 @@ def run_one(T, dry_run=False):
             r = fut.result()
             sysbench_results.append(r)
             log(f"  {r['endpoint']}:{r['port']}  {r['tps']:.1f} TPS  {r['lat_avg']:.0f}ms avg")
+    bench_end_epoch = time.time()
 
     final_metrics = get_ps_metrics() if not dry_run else metrics_before
     bench_ops = metrics_delta(startup_metrics_after, final_metrics)
@@ -381,6 +387,13 @@ def run_one(T, dry_run=False):
     result = {
         "timestamp":  datetime.now(timezone.utc).isoformat(),
         "T":          T,
+        "bench_start_epoch": bench_start_epoch,
+        "bench_end_epoch":   bench_end_epoch,
+        "cold_start": {
+            "startup_wall_s": round(bench_start_epoch - run_start_epoch, 2),
+            "endpoint_start_wall_s": round(endpoint_start_end_epoch - endpoint_start_begin_epoch, 2),
+            "layer_files_wiped": layer_files_wiped,
+        },
         "endpoints":  [{"name": ep, "port": port} for ep, port in endpoints],
         "config":     PHASE9_CONF,
         "sysbench": {

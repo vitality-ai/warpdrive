@@ -1,0 +1,174 @@
+{
+  "timestamp": "2026-08-24T08:35:36.768792+00:00",
+  "T": 4,
+  "bench_start_epoch": 1787560415.3512974,
+  "bench_end_epoch": 1787560536.7655177,
+  "cold_start": {
+    "startup_wall_s": 17.48,
+    "endpoint_start_wall_s": 1.29,
+    "layer_files_wiped": 17
+  },
+  "endpoints": [
+    {
+      "name": "main",
+      "port": 55432
+    },
+    {
+      "name": "ep-2",
+      "port": 55451
+    },
+    {
+      "name": "ep-5",
+      "port": 55465
+    },
+    {
+      "name": "ep-6",
+      "port": 55466
+    }
+  ],
+  "config": {
+    "checkpoint_distance": 4194304,
+    "checkpoint_timeout": "5s",
+    "eviction_policy": {
+      "kind": "LayerAccessThreshold",
+      "period": "5s",
+      "threshold": "10s"
+    }
+  },
+  "sysbench": {
+    "time_s": 120,
+    "scale": 10,
+    "tables": 1,
+    "threads_per_endpoint": 4,
+    "total_tps": 30.2,
+    "total_txn": 3657,
+    "avg_lat_ms": 528.0,
+    "p95_lat_ms": 1708.6,
+    "per_endpoint": [
+      {
+        "endpoint": "ep-2",
+        "port": 55451,
+        "tps": 7.55,
+        "lat_avg": 529.27,
+        "lat_p95": 1479.41,
+        "txn": 910,
+        "queries": 26106,
+        "errors": 29
+      },
+      {
+        "endpoint": "main",
+        "port": 55432,
+        "tps": 7.35,
+        "lat_avg": 541.71,
+        "lat_p95": 1708.63,
+        "txn": 891,
+        "queries": 25624,
+        "errors": 36
+      },
+      {
+        "endpoint": "ep-6",
+        "port": 55466,
+        "tps": 7.51,
+        "lat_avg": 529.68,
+        "lat_p95": 1506.29,
+        "txn": 911,
+        "queries": 26590,
+        "errors": 35
+      },
+      {
+        "endpoint": "ep-5",
+        "port": 55465,
+        "tps": 7.79,
+        "lat_avg": 511.18,
+        "lat_p95": 1453.01,
+        "txn": 945,
+        "queries": 25482,
+        "errors": 33
+      }
+    ]
+  },
+  "warpdrive": {
+    "startup": {
+      "ops": {
+        "copy": 0,
+        "delete": 0,
+        "delete_objects": 0,
+        "get": 1,
+        "head": 0,
+        "list": 0,
+        "multipart": 0,
+        "put": 0
+      },
+      "get_delta": 1,
+      "get_image": 0
+    },
+    "benchmark": {
+      "ops": {
+        "copy": 0,
+        "delete": 0,
+        "delete_objects": 5,
+        "get": 11,
+        "head": 0,
+        "list": 0,
+        "multipart": 0,
+        "put": 397
+      },
+      "get_delta": 5,
+      "get_image": 5
+    },
+    "total": {
+      "put": 397,
+      "get": 11,
+      "get_delta": 6,
+      "get_image": 5,
+      "delete_objects": 5,
+      "estimated_cost_usd": 0.0020144
+    }
+  },
+  "layer_events": [
+    {
+      "kind": "delta",
+      "layer": "000000067F000000050000402F00000004CC-000000067F00000005000040300000000BDC__000000033C1B6AC9-000000033E91EEE9"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F0000000500004026000000002F-000000067F00000005000040260000000ABD__000000033C1B6AC9-000000033E91EEE9"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040080100000000-000000067F000000050000400A0000004000__000000033E91EEE9"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F000000050000401E0000004000-000000067F000000050000401E0000008000__000000033AE6C749"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F00000005000040230000001FC6-000000067F00000005000040230000005179__000000033C1B6AC9-000000033E91EEE9"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F0000000500004023000000517E-000000067F0000000500004023000000815C__000000033C1B6AC9-000000033E91EEE9"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F00000005000040300000000BE0-000000067F00000005000040300000001A82__000000033C1B6AC9-000000033E91EEE9"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040230000004000-000000067F00000005000040230000008000__000000033C97F089"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F00000005000040230000000003-000000067F00000005000040230000001FBB__000000033C1B6AC9-000000033E91EEE9"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040230000000000-000000067F00000005000040230000004000__000000033C97F089"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F000000050000401C0100000000-000000067F000000050000401E0000004000__000000033E91EEE9"
+    }
+  ]
+}

@@ -2,18 +2,31 @@
 
 use crate::storage::Storage;
 use std::fs::{OpenOptions, File};
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::env;
 use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
 use log::{debug, trace, warn};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 
-// Global mutex to synchronize concurrent writes to storage files
+// Per-bucket-file append offset, reserved atomically so concurrent writers
+// never need to hold a lock across the actual disk I/O: each writer does a
+// single fetch_add to claim a non-overlapping byte range, then writes into
+// it with a positioned write (`write_at`, i.e. pwrite) rather than
+// seek+write on a shared cursor. POSIX guarantees pwrite to non-overlapping
+// regions of the same file from different threads is safe, so this replaces
+// what used to be a single global mutex serializing every write server-wide
+// (measured: PUT avg ballooned to ~70ms, max ~926ms under T=4 concurrent
+// load, vs ~6ms uncontended -- see FIXES_LOG.md #7).
+// The map's own mutex is only held for a fast HashMap lookup/insert, never
+// across I/O.
 lazy_static! {
-    static ref STORAGE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+    static ref BUCKET_FILE_LEN: Mutex<HashMap<PathBuf, Arc<AtomicU64>>> = Mutex::new(HashMap::new());
 }
 
 fn get_storage_directory() -> PathBuf {
@@ -76,34 +89,45 @@ impl LocalXFSBinaryStore {
             .read(true)
             .open(&file_path)
     }
+
+    /// Get (creating on first access) the atomic append-offset counter for a
+    /// bucket file. The map lock is only held for this lookup/insert, never
+    /// across any disk I/O.
+    fn length_counter(&self, file_path: &PathBuf) -> io::Result<Arc<AtomicU64>> {
+        let mut map = BUCKET_FILE_LEN.lock().unwrap();
+        if let Some(counter) = map.get(file_path) {
+            return Ok(Arc::clone(counter));
+        }
+        let initial_len = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+        let counter = Arc::new(AtomicU64::new(initial_len));
+        map.insert(file_path.clone(), Arc::clone(&counter));
+        Ok(counter)
+    }
 }
 
 impl Storage for LocalXFSBinaryStore {
     fn write(&self, user_id: &str, bucket: &str, data: &[u8], _slab_hint: Option<&str>) -> Result<(u64, u64), Error> {
-        // Acquire global lock to synchronize concurrent writes
-        let _lock = STORAGE_WRITE_LOCK.lock().unwrap();
-        
-        // Write data to the bucket binary file and return real offset/size
-        let mut file = self.open_bucket_file_for_write(user_id, bucket)
+        // Reserve a non-overlapping byte range atomically, then write into it
+        // with a positioned write (pwrite) instead of seek+write on a shared
+        // cursor -- no lock is held across the actual disk I/O, so concurrent
+        // writers to the same bucket file no longer serialize behind each
+        // other. See the BUCKET_FILE_LEN doc comment above.
+        let file_path = self.get_bucket_file_path(user_id, bucket);
+        let counter = self.length_counter(&file_path)
             .map_err(ErrorInternalServerError)?;
-        
-        let offset = file.seek(SeekFrom::End(0))
-            .map_err(ErrorInternalServerError)?;
-        
-        
-        file.write_all(data)
-            .map_err(ErrorInternalServerError)?;
-        
-        // Flush to ensure data is written
-        file.flush()
-            .map_err(ErrorInternalServerError)?;
-        
+
         let size = data.len() as u64;
-        
-        debug!("Wrote data for user {} bucket {} at offset {} with size {}", 
+        let offset = counter.fetch_add(size, Ordering::SeqCst);
+
+        let file = self.open_bucket_file_for_write(user_id, bucket)
+            .map_err(ErrorInternalServerError)?;
+
+        file.write_all_at(data, offset)
+            .map_err(ErrorInternalServerError)?;
+
+        debug!("Wrote data for user {} bucket {} at offset {} with size {}",
               user_id, bucket, offset, size);
-        
-        // Lock is automatically released when _lock goes out of scope
+
         Ok((offset, size))
     }
     

@@ -1,0 +1,35 @@
+{
+  "estimated_cost_usd": 0.0,
+  "latencies": {
+    "delete": {
+      "avg_ms": 0.0,
+      "count": 0,
+      "max_ms": 0.0
+    },
+    "get": {
+      "avg_ms": 0.0,
+      "count": 0,
+      "max_ms": 0.0
+    },
+    "head": {
+      "avg_ms": 0.0,
+      "count": 0,
+      "max_ms": 0.0
+    },
+    "put": {
+      "avg_ms": 0.0,
+      "count": 0,
+      "max_ms": 0.0
+    }
+  },
+  "ops": {
+    "copy": 0,
+    "delete": 0,
+    "delete_objects": 0,
+    "get": 0,
+    "head": 0,
+    "list": 0,
+    "multipart": 0,
+    "put": 0
+  }
+}

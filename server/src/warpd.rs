@@ -75,14 +75,19 @@ pub async fn warpd_slab_batch_get(
                     return stream::iter(vec![]);
                 }
             };
+            // Content-Disposition's filename is a bare filename, not a path --
+            // the client joins it onto its own local timeline directory
+            // (timeline_path.join(&filename)). Sending the full S3 key here
+            // produced a doubled, nonexistent nested path on the client side.
+            let basename = key.rsplit('/').next().unwrap_or(&key);
             let part_header = format!(
                 "--{boundary}\r\n\
-                 Content-Disposition: attachment; filename=\"{key}\"\r\n\
+                 Content-Disposition: attachment; filename=\"{basename}\"\r\n\
                  Content-Type: application/octet-stream\r\n\
                  Content-Length: {len}\r\n\
                  \r\n",
                 boundary = boundary,
-                key = key,
+                basename = basename,
                 len = data.len(),
             );
             let mut chunks: Vec<Result<web::Bytes, Error>> = Vec::with_capacity(3);

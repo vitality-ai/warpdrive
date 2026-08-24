@@ -1,0 +1,244 @@
+{
+  "timestamp": "2026-08-24T08:53:12.184584+00:00",
+  "T": 8,
+  "bench_start_epoch": 1787561471.0901434,
+  "bench_end_epoch": 1787561592.1814003,
+  "cold_start": {
+    "startup_wall_s": 18.14,
+    "endpoint_start_wall_s": 1.94,
+    "layer_files_wiped": 9
+  },
+  "endpoints": [
+    {
+      "name": "main",
+      "port": 55432
+    },
+    {
+      "name": "ep-2",
+      "port": 55451
+    },
+    {
+      "name": "ep-5",
+      "port": 55465
+    },
+    {
+      "name": "ep-6",
+      "port": 55466
+    },
+    {
+      "name": "ep-a",
+      "port": 55480
+    },
+    {
+      "name": "ep-b",
+      "port": 55481
+    },
+    {
+      "name": "ep-e",
+      "port": 55484
+    },
+    {
+      "name": "ep-f",
+      "port": 55485
+    }
+  ],
+  "config": {
+    "checkpoint_distance": 4194304,
+    "checkpoint_timeout": "5s",
+    "eviction_policy": {
+      "kind": "LayerAccessThreshold",
+      "period": "5s",
+      "threshold": "10s"
+    }
+  },
+  "sysbench": {
+    "time_s": 120,
+    "scale": 10,
+    "tables": 1,
+    "threads_per_endpoint": 4,
+    "total_tps": 29.9,
+    "total_txn": 3608,
+    "avg_lat_ms": 1070.0,
+    "p95_lat_ms": 4203.9,
+    "per_endpoint": [
+      {
+        "endpoint": "ep-f",
+        "port": 55485,
+        "tps": 3.77,
+        "lat_avg": 1059.53,
+        "lat_p95": 3267.19,
+        "txn": 454,
+        "queries": 13143,
+        "errors": 13
+      },
+      {
+        "endpoint": "ep-2",
+        "port": 55451,
+        "tps": 3.51,
+        "lat_avg": 1137.22,
+        "lat_p95": 4128.91,
+        "txn": 423,
+        "queries": 12335,
+        "errors": 11
+      },
+      {
+        "endpoint": "ep-b",
+        "port": 55481,
+        "tps": 3.91,
+        "lat_avg": 1022.49,
+        "lat_p95": 2539.17,
+        "txn": 471,
+        "queries": 13829,
+        "errors": 18
+      },
+      {
+        "endpoint": "main",
+        "port": 55432,
+        "tps": 3.79,
+        "lat_avg": 1053.43,
+        "lat_p95": 2932.6,
+        "txn": 457,
+        "queries": 12578,
+        "errors": 15
+      },
+      {
+        "endpoint": "ep-a",
+        "port": 55480,
+        "tps": 3.74,
+        "lat_avg": 1066.42,
+        "lat_p95": 3095.38,
+        "txn": 452,
+        "queries": 13390,
+        "errors": 23
+      },
+      {
+        "endpoint": "ep-5",
+        "port": 55465,
+        "tps": 3.81,
+        "lat_avg": 1047.53,
+        "lat_p95": 3386.99,
+        "txn": 460,
+        "queries": 13070,
+        "errors": 12
+      },
+      {
+        "endpoint": "ep-e",
+        "port": 55484,
+        "tps": 3.5,
+        "lat_avg": 1141.76,
+        "lat_p95": 4203.93,
+        "txn": 423,
+        "queries": 12831,
+        "errors": 17
+      },
+      {
+        "endpoint": "ep-6",
+        "port": 55466,
+        "tps": 3.87,
+        "lat_avg": 1031.63,
+        "lat_p95": 2728.81,
+        "txn": 468,
+        "queries": 13640,
+        "errors": 16
+      }
+    ]
+  },
+  "warpdrive": {
+    "startup": {
+      "ops": {
+        "copy": 0,
+        "delete": 0,
+        "delete_objects": 1,
+        "get": 1,
+        "head": 0,
+        "list": 0,
+        "multipart": 0,
+        "put": 1
+      },
+      "get_delta": 1,
+      "get_image": 0
+    },
+    "benchmark": {
+      "ops": {
+        "copy": 0,
+        "delete": 0,
+        "delete_objects": 4,
+        "get": 9,
+        "head": 0,
+        "list": 0,
+        "multipart": 0,
+        "put": 444
+      },
+      "get_delta": 3,
+      "get_image": 5
+    },
+    "total": {
+      "put": 444,
+      "get": 9,
+      "get_delta": 4,
+      "get_image": 5,
+      "delete_objects": 4,
+      "estimated_cost_usd": 0.0022436,
+      "latencies": {
+        "delete": {
+          "avg_ms": 0.0,
+          "count": 0,
+          "max_ms": 0.0
+        },
+        "get": {
+          "avg_ms": 0.46083444444444444,
+          "count": 9,
+          "max_ms": 0.58087
+        },
+        "head": {
+          "avg_ms": 0.0,
+          "count": 0,
+          "max_ms": 0.0
+        },
+        "put": {
+          "avg_ms": 95.31182624324325,
+          "count": 444,
+          "max_ms": 382.937911
+        }
+      }
+    }
+  },
+  "layer_events": [
+    {
+      "kind": "delta",
+      "layer": "000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000003457A41C9-0000000345A9FFF1"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040080100000000-000000067F000000050000400A0000004000__0000000345E074D1"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F000000050000401C0100000000-000000067F000000050000401E0000004000__0000000345E074D1"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040230000000000-000000067F00000005000040230000004000__0000000345A9FFF1"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F000000050000400A0000005135-000000067F000000050000401E0000006B62__00000003431B4D49-00000003457A41C9"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F000000050000401C00000000AB-000000067F00000005000040210100000000__000000033FBF7989-00000003431B4D49"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F000000050000401E0000004000-000000067F000000050000401E0000008000__0000000340F57B51"
+    },
+    {
+      "kind": "image",
+      "layer": "000000067F00000005000040230000004000-000000067F00000005000040230000008000__0000000345A9FFF1"
+    },
+    {
+      "kind": "delta",
+      "layer": "000000067F000000050000401E0000006BE6-000000067F00000005000040210100000000__00000003431B4D49-00000003457A41C9"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+DB SCHEMA public
+DB SCHEMA public
+DB SCHEMA public
+DB SCHEMA public
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            11920
+        write:                           12306
+        other:                           1880
+        total:                           26106
+    transactions:                        910    (7.55 per sec.)
+    queries:                             26106  (216.62 per sec.)
+    ignored errors:                      29     (0.24 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          120.5134s
+    total number of events:              910
+
+Latency (ms):
+         min:                                   17.08
+         avg:                                  529.27
+         max:                                 3187.08
+         95th percentile:                     1479.41
+         sum:                               481631.87
+
+Threads fairness:
+    events (avg/stddev):           227.5000/4.39
+    execution time (avg/stddev):   120.4080/0.13
+

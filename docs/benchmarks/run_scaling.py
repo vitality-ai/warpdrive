@@ -40,7 +40,7 @@ PAGESERVER_DIR= NEON_ROOT / ".neon/pageserver_1"
 PAGESERVER_LOG= Path("/tmp/warpdrive_pageserver.log")
 TENANT_ID     = "48619806dd4d362a965bc701199c9ee4"
 TENANT_DIR    = PAGESERVER_DIR / "tenants" / TENANT_ID
-WARPDRIVE_URL = "http://localhost:9710"
+WARPDRIVE_URL = f"http://{os.environ.get('STORAGE_BACKEND_HOST', 'localhost')}:9710"
 WARPDRIVE_AUTH= ("adminkey", "adminsecretkey123456")
 SYSBENCH_DIR  = Path("/home/nash/cj/warpdrive/sysbench-tpcc")
 RESULTS_ROOT  = Path("/home/nash/cj/warpdrive/warpdrive/docs/benchmarks/logs/scaling_v2")
@@ -365,6 +365,7 @@ def run_one(T, dry_run=False):
     # run sysbench in parallel across all endpoints
     log(f"Running sysbench {SYSBENCH_TIME}s across {T} endpoint(s)...")
     bench_start = time.monotonic()
+    bench_start_epoch = time.time()
     sysbench_results = []
     with ThreadPoolExecutor(max_workers=T) as ex:
         futs = {
@@ -376,6 +377,7 @@ def run_one(T, dry_run=False):
             sysbench_results.append(r)
             log(f"  {r['endpoint']}:{r['port']}  {r['tps']:.1f} TPS  {r['lat_avg']:.0f}ms avg")
     bench_elapsed = time.monotonic() - bench_start
+    bench_end_epoch = time.time()
 
     # final metrics
     final_metrics = warpdrive_get("/_admin/metrics") if not dry_run else {"ops": {}, "estimated_cost_usd": 0}
@@ -393,6 +395,8 @@ def run_one(T, dry_run=False):
     result = {
         "timestamp":        datetime.now(timezone.utc).isoformat(),
         "T":                T,
+        "bench_start_epoch": bench_start_epoch,
+        "bench_end_epoch":   bench_end_epoch,
         "endpoints":        [{"name": ep, "port": port} for ep, port in endpoints],
         "config":           PHASE9_CONF,
         "sysbench": {

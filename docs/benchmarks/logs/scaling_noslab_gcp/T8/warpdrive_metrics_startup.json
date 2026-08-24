@@ -1,0 +1,35 @@
+{
+  "estimated_cost_usd": 1.04e-05,
+  "latencies": {
+    "delete": {
+      "avg_ms": 0.0,
+      "count": 0,
+      "max_ms": 0.0
+    },
+    "get": {
+      "avg_ms": 0.54297,
+      "count": 1,
+      "max_ms": 0.54297
+    },
+    "head": {
+      "avg_ms": 0.0,
+      "count": 0,
+      "max_ms": 0.0
+    },
+    "put": {
+      "avg_ms": 60.883336,
+      "count": 1,
+      "max_ms": 60.883336
+    }
+  },
+  "ops": {
+    "copy": 0,
+    "delete": 0,
+    "delete_objects": 1,
+    "get": 1,
+    "head": 0,
+    "list": 0,
+    "multipart": 0,
+    "put": 1
+  }
+}

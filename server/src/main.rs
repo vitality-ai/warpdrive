@@ -26,9 +26,11 @@ async fn admin_metrics_handler() -> HttpResponse {
     {
         let counts = metrics::capture();
         let cost = counts.estimated_cost_usd();
+        let latencies = metrics::capture_latencies();
         return HttpResponse::Ok().json(serde_json::json!({
             "ops": counts,
             "estimated_cost_usd": cost,
+            "latencies": latencies,
         }));
     }
     #[cfg(not(feature = "op-counters"))]

@@ -71,6 +71,14 @@ lazy_static! {
         let conn = Connection::open(&db_path).expect("Failed to open the database");
 
         conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+        // TEMPORARILY DISABLED for A/B measurement against the PUT-handler
+        // chunk-write fix -- re-enable to measure synchronous=NORMAL's own
+        // contribution on top of that fix. NORMAL is the standard, safe
+        // pairing with WAL mode (SQLite's own recommendation): durable
+        // against an application crash, and avoids an fsync on every single
+        // commit -- the default (FULL) fsyncs the WAL on every commit
+        // regardless of journal mode.
+        conn.execute_batch("PRAGMA synchronous=NORMAL;").ok();
 
         // Object metadata table — one row per (user, bucket, key, version_id).
         // version_id='' means versioning is disabled for that bucket.
@@ -792,12 +800,20 @@ impl SQLiteMetadataStore {
         let user_metadata_json = serde_json::to_string(&metadata.user_metadata)
             .unwrap_or_else(|_| "{}".to_string());
 
-        let conn = DB_CONN.lock().unwrap();
+        let mut conn = DB_CONN.lock().unwrap();
+        // One explicit transaction for the whole call, instead of each
+        // statement running as its own separate autocommit transaction --
+        // shortens how long the global connection lock needs to be held per
+        // request, and cuts redundant transaction-commit overhead. Dropping
+        // `tx` without calling commit() (e.g. via the `?` below) rolls back
+        // automatically, so a mid-sequence failure can't leave a partial
+        // write (a DELETE with no matching INSERT, etc).
+        let tx = conn.transaction().map_err(actix_web::error::ErrorInternalServerError)?;
 
-        match versioning.as_str() {
+        let result: (Option<String>, Vec<(u64, u64)>) = match versioning.as_str() {
             "disabled" => {
                 // Read old extents before deleting so the caller can GC them.
-                let old_extents: Vec<(u64, u64)> = conn.query_row(
+                let old_extents: Vec<(u64, u64)> = tx.query_row(
                     "SELECT offset_size_list FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id=''",
                     params![user_id, bucket, key],
                     |row| row.get::<_, Option<Vec<u8>>>(0),
@@ -805,11 +821,11 @@ impl SQLiteMetadataStore {
                 .and_then(|b| crate::util::serializer::deserialize_offset_size(&b).ok())
                 .unwrap_or_default();
 
-                conn.execute(
+                tx.execute(
                     "DELETE FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id=''",
                     params![user_id, bucket, key],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO objects
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
@@ -825,16 +841,16 @@ impl SQLiteMetadataStore {
                             metadata.checksum_type.as_deref().unwrap_or(""),
                             metadata.slab_hint.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                Ok((None, old_extents))
+                (None, old_extents)
             }
             "enabled" => {
                 let vid = generate_version_id();
                 // Demote current latest; old versions stay in DB (versioning preserves them).
-                conn.execute(
+                tx.execute(
                     "UPDATE objects SET is_latest=0 WHERE user=?1 AND bucket=?2 AND key=?3 AND is_latest=1",
                     params![user_id, bucket, key],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO objects
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
@@ -850,13 +866,13 @@ impl SQLiteMetadataStore {
                             metadata.checksum_type.as_deref().unwrap_or(""),
                             metadata.slab_hint.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                Ok((Some(vid), vec![]))
+                (Some(vid), vec![])
             }
             _ /* "suspended" */ => {
                 // Read extents from whichever null-variant exists: 'null' (prior suspended write)
                 // or '' (object written before versioning was ever enabled).
                 let extents_from = |vid: &str| -> Vec<(u64, u64)> {
-                    conn.query_row(
+                    tx.query_row(
                         "SELECT offset_size_list FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id=?4",
                         params![user_id, bucket, key, vid],
                         |row| row.get::<_, Option<Vec<u8>>>(0),
@@ -870,19 +886,19 @@ impl SQLiteMetadataStore {
                 };
 
                 // Delete both the null-version and the pre-versioning non-versioned row.
-                conn.execute(
+                tx.execute(
                     "DELETE FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id='null'",
                     params![user_id, bucket, key],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id=''",
                     params![user_id, bucket, key],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                conn.execute(
+                tx.execute(
                     "UPDATE objects SET is_latest=0 WHERE user=?1 AND bucket=?2 AND key=?3 AND is_latest=1",
                     params![user_id, bucket, key],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO objects
                         (user,bucket,key,version_id,is_latest,is_delete_marker,
                          offset_size_list,etag,size,content_type,last_modified,
@@ -898,9 +914,12 @@ impl SQLiteMetadataStore {
                             metadata.checksum_type.as_deref().unwrap_or(""),
                             metadata.slab_hint.as_deref().unwrap_or("")],
                 ).map_err(actix_web::error::ErrorInternalServerError)?;
-                Ok((Some("null".to_string()), old_extents))
+                (Some("null".to_string()), old_extents)
             }
-        }
+        };
+
+        tx.commit().map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(result)
     }
 
     /// Return live objects filtered by slab hint, ordered by insertion.

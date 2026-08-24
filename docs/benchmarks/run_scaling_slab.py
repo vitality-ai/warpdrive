@@ -38,12 +38,12 @@ NEON_LOCAL    = NEON_ROOT / "target/release/neon_local"
 PAGESERVER_BIN= NEON_ROOT / "target/release/pageserver"
 PAGESERVER_DIR= NEON_ROOT / ".neon/pageserver_1"
 PAGESERVER_LOG= Path("/tmp/warpdrive_pageserver.log")
-TENANT_ID     = "b2f51f6ebb6dbee89e761553264babe6"
+TENANT_ID     = "bf15ffc04f5f086e83febfff46d6774c"  # same tenant mirrored into both MinIO and WarpDrive buckets
 TENANT_DIR    = PAGESERVER_DIR / "tenants" / TENANT_ID
-WARPDRIVE_URL = "http://localhost:9710"
+WARPDRIVE_URL = f"http://{os.environ.get('STORAGE_BACKEND_HOST', 'localhost')}:9710"
 WARPDRIVE_AUTH= ("adminkey", "adminsecretkey123456")
 SYSBENCH_DIR  = Path("/home/nash/cj/warpdrive/sysbench-tpcc")
-RESULTS_ROOT  = Path("/home/nash/cj/warpdrive/warpdrive/docs/benchmarks/logs/scaling_slab_128mb")
+RESULTS_ROOT  = Path("/home/nash/cj/warpdrive/warpdrive/docs/benchmarks/logs/scaling_slab_gcp")
 MONITOR_SCRIPT= Path("/home/nash/cj/warpdrive/warpdrive/docs/benchmarks/monitor_layer_downloads.py")
 
 SYSBENCH_TIME    = 120   # seconds
@@ -198,7 +198,7 @@ def wipe_local_layers(dry_run=False):
     log("Wiping local layer files...")
     if dry_run:
         log("  [dry-run] would delete layer files under " + str(TENANT_DIR))
-        return
+        return 0
     deleted = 0
     for timeline_dir in (TENANT_DIR / "timelines").glob("*/"):
         for f in timeline_dir.glob("*"):
@@ -208,6 +208,7 @@ def wipe_local_layers(dry_run=False):
                     f.unlink()
                     deleted += 1
     log(f"  Deleted {deleted} local layer files")
+    return deleted
 
 def restart_pageserver(dry_run=False):
     log("Restarting pageserver...")
@@ -222,6 +223,17 @@ def restart_pageserver(dry_run=False):
     env = os.environ.copy()
     env["WARPDRIVE_ADMIN_ACCESS_KEY"] = "adminkey"
     env["WARPDRIVE_ADMIN_SECRET_KEY"] = "adminsecretkey123456"
+    # Pageserver's own S3 client needs these to authenticate against
+    # WarpDrive's S3-compatible endpoint -- distinct from the WARPDRIVE_ADMIN_*
+    # vars above (those are for WarpDrive's own admin API).
+    env["AWS_ACCESS_KEY_ID"] = "adminkey"
+    env["AWS_SECRET_ACCESS_KEY"] = "adminsecretkey123456"
+    env["AWS_DEFAULT_REGION"] = "us-east-1"
+    # On GCP, the AWS SDK's credential chain tries the EC2 Instance Metadata
+    # Service before env-var credentials; GCP's own metadata server answers
+    # that path with an unrelated 405 and the SDK retries forever instead of
+    # failing fast, so the tenant never attaches. See KNOWN_ISSUES.md.
+    env["AWS_EC2_METADATA_DISABLED"] = "true"
     # WARPD_SLAB_BASE_URL intentionally omitted: slab batch handler needs
     # streaming support before it can handle large (14GB) layer sets without OOM.
     proc = subprocess.Popen(
@@ -343,8 +355,9 @@ def run_one(T, dry_run=False):
     log(f"  Output: {out_dir}")
     log(f"{'='*60}")
 
+    run_start_epoch = time.time()
     stop_all_endpoints(dry_run)
-    wipe_local_layers(dry_run)
+    layer_files_wiped = wipe_local_layers(dry_run)
     restart_pageserver(dry_run)
 
     if not dry_run:
@@ -354,7 +367,9 @@ def run_one(T, dry_run=False):
 
     log_pos_before_start = pageserver_log_pos()
 
+    endpoint_start_begin_epoch = time.time()
     start_endpoints(endpoints, dry_run)
+    endpoint_start_end_epoch = time.time()
 
     if not dry_run:
         log(f"Waiting {WARMUP_WAIT}s for endpoints to settle...")
@@ -370,6 +385,7 @@ def run_one(T, dry_run=False):
     # run sysbench in parallel across all endpoints
     log(f"Running sysbench {SYSBENCH_TIME}s across {T} endpoint(s)...")
     bench_start = time.monotonic()
+    bench_start_epoch = time.time()
     sysbench_results = []
     with ThreadPoolExecutor(max_workers=T) as ex:
         futs = {
@@ -381,6 +397,7 @@ def run_one(T, dry_run=False):
             sysbench_results.append(r)
             log(f"  {r['endpoint']}:{r['port']}  {r['tps']:.1f} TPS  {r['lat_avg']:.0f}ms avg")
     bench_elapsed = time.monotonic() - bench_start
+    bench_end_epoch = time.time()
 
     # final metrics
     final_metrics = warpdrive_get("/_admin/metrics") if not dry_run else {"ops": {}, "estimated_cost_usd": 0}
@@ -398,6 +415,13 @@ def run_one(T, dry_run=False):
     result = {
         "timestamp":        datetime.now(timezone.utc).isoformat(),
         "T":                T,
+        "bench_start_epoch": bench_start_epoch,
+        "bench_end_epoch":   bench_end_epoch,
+        "cold_start": {
+            "startup_wall_s": round(bench_start_epoch - run_start_epoch, 2),
+            "endpoint_start_wall_s": round(endpoint_start_end_epoch - endpoint_start_begin_epoch, 2),
+            "layer_files_wiped": layer_files_wiped,
+        },
         "endpoints":        [{"name": ep, "port": port} for ep, port in endpoints],
         "config":           PHASE9_CONF,
         "sysbench": {
@@ -429,6 +453,7 @@ def run_one(T, dry_run=False):
                 "get_image":    startup_downloads["image"] + bench_downloads["image"],
                 "delete_objects": ops.get("delete_objects", 0),
                 "estimated_cost_usd": final_metrics.get("estimated_cost_usd", 0),
+                "latencies":    final_metrics.get("latencies", {}),
             },
         },
         "layer_events":     startup_events + bench_events,
@@ -436,12 +461,29 @@ def run_one(T, dry_run=False):
 
     out_path = out_dir / "result.json"
     out_path.write_text(json.dumps(result, indent=2))
+
+    # Artifacts: a pageserver log slice scoped to exactly this run (byte-offset
+    # scoped, since the log file itself spans every run across every day),
+    # plus raw WarpDrive/pageserver metrics snapshots for standalone inspection.
+    try:
+        with open(PAGESERVER_LOG, "rb") as f:
+            f.seek(log_pos_before_start)
+            log_slice = f.read()
+        (out_dir / "pageserver_log_slice.log").write_bytes(log_slice)
+    except Exception as e:
+        log(f"  WARN: failed to save pageserver log slice: {e}")
+    if not dry_run:
+        (out_dir / "warpdrive_metrics_startup.json").write_text(json.dumps(startup_metrics, indent=2))
+        (out_dir / "warpdrive_metrics_final.json").write_text(json.dumps(final_metrics, indent=2))
+        pageserver_metrics = run("curl -s --max-time 10 http://127.0.0.1:9898/metrics")
+        (out_dir / "pageserver_metrics_final.txt").write_text(pageserver_metrics.stdout)
+
     log(f"\n  DONE T={T}")
     log(f"  TPS:    {total_tps:.1f} total  ({total_tps/T:.1f} per tenant)")
     log(f"  Lat:    {avg_lat:.0f}ms avg  {p95_lat:.0f}ms p95")
     log(f"  PUTs:   {ops.get('put',0)}  GETs: {ops.get('get',0)}  DEL_OBJ: {ops.get('delete_objects',0)}")
     log(f"  Cost:   ${final_metrics.get('estimated_cost_usd',0):.6f}")
-    log(f"  Saved:  {out_path}")
+    log(f"  Saved:  {out_path}  (+ pageserver_log_slice.log, warpdrive_metrics_*.json in {out_dir})")
     return result
 
 # ── main ─────────────────────────────────────────────────────────────────────

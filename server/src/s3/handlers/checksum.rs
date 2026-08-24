@@ -5,6 +5,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sha2::{Sha256, Digest};
 use sha1::Sha1;
 use crc::{Crc, CRC_32_ISCSI, Algorithm};
+use lazy_static::lazy_static;
 
 const CRC_64_NVME_ALGO: Algorithm<u64> = Algorithm {
     width: 64,
@@ -146,5 +147,57 @@ pub fn compute_composite_checksum(algo: &ChecksumAlgorithm, part_checksums: &[St
     }
     let hash_b64 = compute_checksum(algo, &combined);
     format!("{}-{}", hash_b64, part_checksums.len())
+}
+
+// ---------------------------------------------------------------------------
+// Incremental (streaming) checksum -- used on the PUT path so objects above
+// the in-memory buffering threshold never need their full body materialized
+// just to compute a checksum. Below that threshold, the plain whole-buffer
+// functions above are simpler and are used instead.
+// ---------------------------------------------------------------------------
+
+lazy_static! {
+    static ref CRC32C_TABLE: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+    static ref CRC64NVME_TABLE: Crc<u64> = Crc::<u64>::new(&CRC_64_NVME_ALGO);
+}
+
+pub enum ChecksumHasher {
+    Sha256(Sha256),
+    Sha1(Sha1),
+    Crc32(crc32fast::Hasher),
+    Crc32c(crc::Digest<'static, u32>),
+    Crc64Nvme(crc::Digest<'static, u64>),
+}
+
+impl ChecksumHasher {
+    pub fn new(algo: &ChecksumAlgorithm) -> Self {
+        match algo {
+            ChecksumAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            ChecksumAlgorithm::Sha1 => Self::Sha1(Sha1::new()),
+            ChecksumAlgorithm::Crc32 => Self::Crc32(crc32fast::Hasher::new()),
+            ChecksumAlgorithm::Crc32c => Self::Crc32c(CRC32C_TABLE.digest()),
+            ChecksumAlgorithm::Crc64Nvme => Self::Crc64Nvme(CRC64NVME_TABLE.digest()),
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha256(h) => Digest::update(h, data),
+            Self::Sha1(h) => Digest::update(h, data),
+            Self::Crc32(h) => h.update(data),
+            Self::Crc32c(h) => h.update(data),
+            Self::Crc64Nvme(h) => h.update(data),
+        }
+    }
+
+    pub fn finalize_b64(self) -> String {
+        match self {
+            Self::Sha256(h) => B64.encode(h.finalize()),
+            Self::Sha1(h) => B64.encode(h.finalize()),
+            Self::Crc32(h) => B64.encode(h.finalize().to_be_bytes()),
+            Self::Crc32c(h) => B64.encode(h.finalize().to_be_bytes()),
+            Self::Crc64Nvme(h) => B64.encode(h.finalize().to_be_bytes()),
+        }
+    }
 }
 
