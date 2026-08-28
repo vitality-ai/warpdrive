@@ -1,0 +1,8 @@
+Step,Pct,Time,CPUUserTime,CPUSysTime,CPUElapsedTime,CPUActiveAllProcesses,CPUIdleAllProcesses,Algorithm,Resolver,Iteration,Threads,Concurrency,Requests,Datasize,HTTPS,Encryption
+Download,1,514.616,6,38,52,51,729,Uring,throughput,0,4,1,80,671088640,0,0
+Download,1,958.335,16,83,96,104,1337,Uring,throughput,0,4,2,160,1342177280,0,0
+Download,1,1467.59,12,167,146,199,1963,Uring,throughput,0,4,4,320,2684354560,0,0
+Download,1,2827.77,34,348,283,423,3714,Uring,throughput,0,4,8,640,5368709120,0,0
+Download,1,5610.94,52,724,561,859,7314,Uring,throughput,0,4,16,1280,10737418240,0,0
+Download,1,11138,120,1610,1114,1849,14205,Uring,throughput,0,4,32,2560,21474836480,0,0
+Download,1,22465.5,272,4176,2246,4827,27092,Uring,throughput,0,4,64,5120,42949672960,0,0

@@ -19,10 +19,10 @@ use lazy_static::lazy_static;
 use log::debug;
 use std::collections::HashMap;
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 // ── configuration ────────────────────────────────────────────────────────────
 
@@ -58,6 +58,15 @@ struct BucketSlots {
 lazy_static! {
     /// Global slot index keyed by "user_id/bucket".
     static ref SLOT_INDEX: Mutex<HashMap<String, BucketSlots>> = Mutex::new(HashMap::new());
+    /// Cached read-only file handles keyed by bucket path, so a batch read of
+    /// k colocated objects does one open() instead of k. A bucket's cache
+    /// entry is written exactly once and never replaced (pread/read_at is
+    /// safe to call concurrently on a shared handle since it doesn't move a
+    /// cursor), so this is an RwLock rather than a Mutex: once an entry
+    /// exists, concurrent reads only ever take the shared read lock and never
+    /// contend with each other; the exclusive write lock is only needed the
+    /// first time a given bucket is opened. Never held across I/O.
+    static ref READ_FILE_CACHE: RwLock<HashMap<PathBuf, Arc<File>>> = RwLock::new(HashMap::new());
 }
 
 // ── store ────────────────────────────────────────────────────────────────────
@@ -187,10 +196,27 @@ impl Storage for LocalXFSSlabStore {
         offset: u64,
         size: u64,
     ) -> Result<Vec<u8>, Error> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(self.bucket_path(user_id, bucket))
-            .map_err(ErrorInternalServerError)?;
+        let path = self.bucket_path(user_id, bucket);
+
+        // Fast path: shared read lock, so concurrent reads against an
+        // already-cached bucket file never contend with each other.
+        let cached = READ_FILE_CACHE.read().unwrap().get(&path).cloned();
+        let file = if let Some(f) = cached {
+            f
+        } else {
+            // Slow path: only the first request for a given bucket takes the
+            // exclusive write lock. If another thread won the race and
+            // inserted first, `or_insert` keeps theirs and our redundant
+            // handle is simply dropped (closed).
+            let opened = Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .open(&path)
+                    .map_err(ErrorInternalServerError)?,
+            );
+            let mut cache = READ_FILE_CACHE.write().unwrap();
+            Arc::clone(cache.entry(path).or_insert(opened))
+        };
 
         let mut buf = vec![0u8; size as usize];
         file.read_at(&mut buf, offset)

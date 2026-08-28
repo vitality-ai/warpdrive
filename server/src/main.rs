@@ -105,6 +105,13 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
     })
+    // Nagle's algorithm is enabled by default on every accepted connection
+    // (actix-http's tcp_nodelay defaults to None/off). For large response
+    // bodies written in bounded internal buffer flushes, Nagle batching
+    // combined with the client's delayed-ACK timer can stall each flush
+    // boundary, capping single-connection throughput far below the raw
+    // network's capacity regardless of how the response body is built.
+    .tcp_nodelay(true)
     .bind(("0.0.0.0", 9710))?
     .run()
     .await

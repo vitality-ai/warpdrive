@@ -1,0 +1,15 @@
+Step,Pct,Time,CPUUserTime,CPUSysTime,CPUElapsedTime,CPUActiveAllProcesses,CPUIdleAllProcesses,Algorithm,Resolver,Iteration,Threads,Concurrency,Requests,Datasize,HTTPS,Encryption
+Upload,0.871622,776.73,3,10,78,21,1211,Uring,throughput,0,4,1,8,67108864,0,0
+Download,0.128378,114.402,8,7,12,15,162,Uring,throughput,0,4,1,8,67108864,0,0
+Upload,0.89704,1661,6,21,166,49,2579,Uring,throughput,0,4,2,16,134217728,0,0
+Download,0.10296,190.645,16,14,19,30,265,Uring,throughput,0,4,2,16,134217728,0,0
+Upload,0.921102,3407.17,8,42,341,86,5315,Uring,throughput,0,4,4,32,268435456,0,0
+Download,0.0788976,291.843,8,28,29,34,407,Uring,throughput,0,4,4,32,268435456,0,0
+Upload,0.926301,7135.4,15,85,714,165,11146,Uring,throughput,0,4,8,64,536870912,0,0
+Download,0.0736994,567.715,14,60,56,92,767,Uring,throughput,0,4,8,64,536870912,0,0
+Upload,0.946909,14135.2,25,166,1414,368,22026,Uring,throughput,0,4,16,128,1073741824,0,0
+Download,0.0530914,792.534,14,102,79,132,1049,Uring,throughput,0,4,16,128,1073741824,0,0
+Upload,0.952581,28262.4,43,329,2826,726,44033,Uring,throughput,0,4,32,256,2147483648,0,0
+Download,0.0474195,1406.91,20,209,140,233,1829,Uring,throughput,0,4,32,256,2147483648,0,0
+Upload,0.954065,56677.1,86,715,5667,1365,88426,Uring,throughput,0,4,64,512,4294967296,0,0
+Download,0.0459349,2728.8,42,530,273,592,3351,Uring,throughput,0,4,64,512,4294967296,0,0
