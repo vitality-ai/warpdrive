@@ -1,0 +1,8 @@
+nhints=  2  median=  585.3 MB/s  range=[441.2, 599.1]  stdev=53.2  samples=[441, 493, 593, 599, 584, 585, 586, 595, 572, 594]
+nhints=  4  median=  841.3 MB/s  range=[818.3, 859.4]  stdev=15.1  samples=[823, 818, 833, 850, 857, 859, 831, 849, 830, 855]
+nhints=  8  median= 1013.8 MB/s  range=[980.5, 1055.9]  stdev=23.0  samples=[1005, 1043, 1009, 1056, 1030, 1019, 995, 1022, 981, 998]
+nhints= 16  median= 1011.3 MB/s  range=[950.3, 1040.8]  stdev=28.8  samples=[1041, 1003, 967, 1034, 1026, 1004, 1019, 950, 1021, 1001]
+nhints= 32  median= 1003.2 MB/s  range=[995.1, 1036.0]  stdev=14.0  samples=[996, 995, 1036, 997, 1008, 1026, 1001, 1005, 1000, 1019]
+nhints= 64  median=  992.2 MB/s  range=[897.5, 1046.1]  stdev=47.8  samples=[987, 1046, 1024, 1010, 965, 897, 907, 1006, 978, 998]
+
+[exited with code 0]

@@ -139,34 +139,55 @@ built here.
 ## Combining batching with modest parallelism
 
 Tested directly: split the same ~2GB corpus across multiple slab hints
-(8 hints × 32 objects, then 16 hints × 16 objects, both 8 MiB each) and
-fetch each hint's batch with one thread via a plain
+and fetch each hint's batch with one thread via a plain
 `concurrent.futures.ThreadPoolExecutor` — no io_uring, no custom
 networking code, no vendored AWS SDK, ~40 lines of ordinary Python calling
-`requests` and `boto3`'s SigV4 signer.
+`requests` and `boto3`'s SigV4 signer. Total data volume held constant at
+256 objects / 2GB throughout — only the number of hints (= threads =
+connections) changes, so this isolates parallelism as the only variable.
 
-| Approach | Median throughput (5 runs) | % of 8-conn network ceiling |
-|---|---:|---:|
-| Batch-GET, 1 connection (from above) | 359 MB/s | 18% |
-| Batch-GET × 8 parallel threads (8 hints) | **1018 MB/s** | 51% |
-| Batch-GET × 16 parallel threads (16 hints) | 956 MB/s | 48% |
-| AnyBlob individual GETs, 8 connections (`t=4,c=2`, from `ANYBLOB_BASELINE.md`) | 1401 MB/s | 71% |
+First pass (5 runs at 8 and 16 threads) looked ambiguous — 1018 vs 956
+MB/s, but with overlapping ranges (891-1058 vs 806-982), too close to
+call given the noise. Re-run properly: **10 timed samples at each of
+2, 4, 8, 16, 32, and 64 threads**, warm-up discarded, full corpus
+re-uploaded per configuration:
+
+| Threads | Median | Range | Stdev |
+|---:|---:|---:|---:|
+| 2 | 585.3 MB/s | 441-599 | 53.2 |
+| 4 | 841.3 MB/s | 818-859 | 15.1 |
+| 8 | **1013.8 MB/s** | 980-1056 | 23.0 |
+| 16 | 1011.3 MB/s | 950-1041 | 28.8 |
+| 32 | 1003.2 MB/s | 995-1036 | 14.0 |
+| 64 | 992.2 MB/s | 897-1046 | 47.8 |
+
+This resolves cleanly, no longer ambiguous: throughput climbs sharply
+from 2→4→8 threads (585→841→1014 MB/s), then **genuinely flatlines from
+8 through 64 threads** — all four medians sit within one another's noise
+bands (stdev 14-48 MB/s on medians 992-1014). Going past 8 threads buys
+nothing, confirmed out to 8x more threads than the original (ambiguous)
+comparison covered, not a plateau inferred from two adjacent, noisy
+samples.
 
 Two honest conclusions, both worth stating precisely:
 
 1. **A trivial, ~40-line Python client gets WarpDrive's batching primitive
-   to roughly half the network ceiling** — a ~3x improvement over the
-   single-connection case — with no engineering beyond "run a few requests
-   in a thread pool." 16 threads bought nothing over 8 (956 vs 1018 MB/s,
-   within noise, both plateauing), most likely a Python/GIL-level ceiling
-   in this specific trivial client rather than anything server-side —
-   there was no attempt to push past this with a better client, since
-   that would start reintroducing the engineering complexity this whole
-   comparison is about avoiding.
+   to roughly half the network ceiling** (1014 / 1985 MB/s ≈ 51%) — a
+   ~2.8x improvement over the single-connection case (359 MB/s) — with no
+   engineering beyond "run a few requests in a thread pool," and this
+   ceiling is a genuine, confirmed property of this simple client (most
+   likely Python/GIL-bound), not something more threads can fix. There
+   was no attempt to push past it with a better client, since that would
+   start reintroducing the engineering complexity this whole comparison
+   is about avoiding.
 
 2. **AnyBlob's io_uring engineering still wins on raw per-connection
-   throughput** even at matched connection count (1401 vs 1018 MB/s at 8
+   throughput** even at matched connection count (1401 vs 1014 MB/s at 8
    connections) — real, measurable, not something batching alone erases.
+   And unlike the batched approach, AnyBlob's number keeps climbing well
+   past 8 connections (up to ~1920 MB/s by `c=32-64` in
+   `ANYBLOB_BASELINE.md`) — its engineering buys headroom this simple
+   client's plateau doesn't have.
    But AnyBlob needs to issue and process one request per *object* to get
    that number (256 individual request/response cycles — SigV4 signing,
    HTTP parsing, server-side auth+SQLite lookup, all ×256), while the
