@@ -97,32 +97,45 @@ All numbers below are on the *same single TCP connection* (no client-side
 concurrency anywhere in this table) so they isolate the primitive's value
 from AnyBlob's parallelism story:
 
-| Scenario | Median throughput | Range (5 runs) |
-|---|---:|---:|
-| Single 2GB object, 1 GET request | 514 MB/s | 470-615 |
-| Sequential 256×8MiB individual GETs, 1 connection | 386 MB/s | 364-416 |
-| **Batch-GET: 256 objects (2GB) in 1 request** | **359 MB/s** | 345-390 |
-| Network ceiling, 1 raw TCP connection | 1362 MB/s | — |
-| Network ceiling, 8 raw TCP connections | ~1985 MB/s | — |
+| Scenario | Median throughput | Range (10 runs) | Stdev |
+|---|---:|---:|---:|
+| Single 2GB object, 1 GET request | 514 MB/s | 470-615 (5 runs) | — |
+| Sequential 256×8MiB individual GETs, 1 connection | 383.0 MB/s | 336.5-473.2 | 39.7 |
+| **Batch-GET: 256 objects (2GB) in 1 request** | **367.4 MB/s** | 351.5-386.2 | 11.5 |
+| Network ceiling, 1 raw TCP connection | 1362 MB/s | — | — |
+| Network ceiling, 8 raw TCP connections | ~1985 MB/s | — | — |
 
-(Run-to-run variance on the large single-shot transfers was substantial
-before a warm-up pass was added — up to 3x on a single sample, most
-likely `pd-balanced` disk quota / GCP network jitter rather than anything
-in WarpDrive's own code, since the effect disappeared once page cache was
-warm. All numbers above are post-warm-up medians, not single samples —
-this matters when the swings are this large.)
+(Methodology note, itself a real finding: run-to-run variance on the
+large single-shot transfers was substantial before a warm-up pass was
+added — up to 3x on a single sample. First cause: cold page cache,
+fixed by a warm-up pass. Second, subtler cause, caught when this
+comparison was first tightened to 10 samples: an *unrelated* prior
+experiment (`parallel-batch-test`, the multi-threaded sweep below) had
+accumulated a 17GB backing file on this same VM, and its LRU pressure
+was evicting `slab-batch-test`'s pages between runs — even *with* a
+warm-up pass, since the eviction was coming from a different bucket's
+activity, not this one. That produced a batch-GET median of 247 MB/s
+with stdev 92.6 — a result that looked like a real, large regression,
+but was purely a cross-experiment cache-contamination artifact. Deleting
+the stale 17GB dataset dropped variance back to stdev 11.5 and the
+median back to the expected ~360s range. On a shared, long-running test
+VM, an experiment's own state can silently contaminate a later,
+unrelated one's measurements — worth checking before trusting a surprise
+result, not just re-running it.)
 
 ## What this does and doesn't prove
 
 **Does**: after three real fixes, WarpDrive's batch-GET primitive —
 hit with a client that does nothing clever at all, one HTTP request, no
-concurrency, no io_uring — achieves throughput within **~7% of** a
-sequential loop of individual GETs at the same connection count (359 vs
-386 MB/s), while using **1 round trip instead of 256**. That 7% gap is
-almost certainly the remaining per-object bookkeeping in the batch loop
-(256× `StorageService::new()`, 256× `format!()` header allocation, 256×
-SQLite row materialization) — plausibly closeable, but diminishing
-returns for further chasing today.
+concurrency, no io_uring — achieves throughput within **~4% of** a
+sequential loop of individual GETs at the same connection count (367.4 vs
+383.0 MB/s median, confirmed with 10 samples each, batch-GET's own
+variance notably *tighter* — stdev 11.5 vs 39.7), while using **1 round
+trip instead of 256**. That remaining few-percent gap is almost certainly
+the remaining per-object bookkeeping in the batch loop (256×
+`StorageService::new()`, 256× `format!()` header allocation, 256× SQLite
+row materialization) — plausibly closeable, but diminishing returns for
+further chasing today.
 
 **Doesn't**: neither approach gets anywhere close to the ~1.9 GB/s network
 ceiling on a single connection — that requires parallelism (multiple

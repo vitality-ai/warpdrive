@@ -1,0 +1,9 @@
+=== batch-GET, 256 objects (2GB), 1 connection ===
+median=367.4 MB/s range=[351.5, 386.2] stdev=11.5
+samples= [386, 369, 378, 366, 380, 358, 354, 360, 352, 369]
+
+=== sequential 256x8MiB individual GETs, 1 connection ===
+median=383.0 MB/s range=[336.5, 473.2] stdev=39.7
+samples= [378, 376, 383, 336, 383, 380, 473, 451, 414, 398]
+
+[exited with code 0]
