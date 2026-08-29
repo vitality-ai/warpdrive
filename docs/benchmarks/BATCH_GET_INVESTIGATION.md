@@ -123,6 +123,8 @@ VM, an experiment's own state can silently contaminate a later,
 unrelated one's measurements — worth checking before trusting a surprise
 result, not just re-running it.)
 
+![Single-connection comparison: batch-GET vs sequential individual GETs](logs/batch_get_investigation/plots/01_single_connection_comparison.png)
+
 ## What this does and doesn't prove
 
 **Does**: after three real fixes, WarpDrive's batch-GET primitive —
@@ -181,6 +183,8 @@ bands (stdev 14-48 MB/s on medians 992-1014). Going past 8 threads buys
 nothing, confirmed out to 8x more threads than the original (ambiguous)
 comparison covered, not a plateau inferred from two adjacent, noisy
 samples.
+
+![Parallel scaling story: throughput vs threads, AnyBlob comparison, and full distribution per thread count](logs/batch_get_investigation/plots/02_parallel_scaling_story.png)
 
 Two honest conclusions, both worth stating precisely:
 
