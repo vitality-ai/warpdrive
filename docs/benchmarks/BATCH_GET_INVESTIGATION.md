@@ -242,7 +242,56 @@ one GCP zone, sub-millisecond RTT) — is a good next experiment but wasn't
 run here; the crossover already shows up without needing added latency to
 reveal it, at low connection counts specifically.
 
-## Known remaining limitation
+## Does this hold at realistic delta-layer sizes?
+
+Everything above used 8 MiB objects — a convenient round number, not a
+real Neon size. Checked the actual Neon codebase:
+`libs/pageserver_api/src/config.rs:851` —
+`DEFAULT_CHECKPOINT_DISTANCE: u64 = 256 * 1024 * 1024` (256 MiB). This is
+used directly as `target_file_size` for both the initial L0 flush
+(`tenant/timeline.rs`) and compaction output
+(`tenant/timeline/compaction.rs`) — so a real, default-config Neon delta
+layer is **256 MiB**, not 8 MiB, roughly 32x larger than what the rest of
+this document tested.
+
+Re-ran the same connection-count sweep with 8 objects of 256 MiB each
+(2 GiB total, same as before, just 32x fewer/larger objects) — batch-GET
+vs real AnyBlob, one-shot, matched connections:
+
+| Connections | Objects/MiB per batch | Batch-GET | Individual GET (real AnyBlob) | Batch vs individual |
+|---:|---|---:|---:|---:|
+| 1 | 8 obj / 2048 MiB | 261.9 MB/s | 472.9 MB/s | -44.6% |
+| 2 | 4 obj / 1024 MiB | 399.4 MB/s | 1077.9 MB/s | -62.9% |
+| 4 | 2 obj / 512 MiB | 635.9 MB/s | 1505.9 MB/s | -57.8% |
+| 8 | 1 obj / 256 MiB | 807.5 MB/s | 1577.1 MB/s | -48.8% |
+
+![Realistic delta-layer size: batch-GET loses at every connection count tested](logs/batch_get_investigation/realistic_delta_size/plots/01_realistic_size_comparison.png)
+
+**This flips the earlier conclusion, and it's important to say so
+plainly: at Neon's real default delta-layer size, batching does not help
+— individual GETs win at every connection count tested, by 45-63%.** The
+mechanism is exactly what the small-object result predicted, just run in
+the other direction: batching's whole value proposition is trading many
+round trips for one, and with only 8 objects total that round-trip
+saving (8→1) is far smaller in absolute terms than with 256 objects
+(256→1), while our batch implementation's fixed cost — eagerly buffering
+the entire response into one `Vec` before sending it as a single large
+HTTP body (the "Known remaining limitation" below) — doesn't shrink to
+match. Individual GETs, meanwhile, were never bottlenecked by per-request
+overhead in the first place once each request is already moving 256 MiB;
+there's no round-trip tax left for batching to save.
+
+**Practical reading for the actual Neon integration this whole
+investigation was building toward**: the batching primitive as it stands
+today is well-suited to workloads with *many small* objects sharing a
+checkpoint epoch, not the *few large* L0/compacted delta layers Neon
+produces by default. It would still help a workload that hasn't hit
+`checkpoint_distance` yet and is flushing many small in-memory-layer
+fragments, or a deployment tuned toward a much smaller checkpoint
+distance (as this project's own earlier "Phase9" benchmark config did,
+using 4 MiB) — but not the common default-configuration case. This is
+exactly the kind of finding that should gate scope before any real
+pageserver integration work, rather than surface after it.
 
 The buffer-the-whole-batch approach (fix 2) is hardcoded, not adaptive —
 it trades back to the exact OOM risk the original streaming design was

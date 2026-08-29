@@ -1,0 +1,6 @@
+=== single connection: batch-GET (8 layers, 1 request) ===
+{'median': 261.93240739689895, 'min': 254.01745471162772, 'max': 265.94175785338183, 'stdev': 3.505318167893444, 'samples': [264.6, 265.9, 261.1, 261.5, 254.0, 263.7, 257.8, 262.4, 260.2, 263.4]}
+=== single connection: sequential individual GETs (8 layers, 8 requests) ===
+{'median': 472.933717192151, 'min': 425.8032304424276, 'max': 654.171940990667, 'stdev': 76.73899880751945, 'samples': [451.1, 461.4, 511.7, 425.8, 654.2, 432.9, 505.2, 607.2, 484.5, 440.8]}
+
+[exited with code 0]
