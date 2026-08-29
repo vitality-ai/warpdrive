@@ -153,71 +153,94 @@ built here.
 
 ## Combining batching with modest parallelism
 
-Tested directly: split the same ~2GB corpus across multiple slab hints
-and fetch each hint's batch with one thread via a plain
-`concurrent.futures.ThreadPoolExecutor` — no io_uring, no custom
-networking code, no vendored AWS SDK, ~40 lines of ordinary Python calling
-`requests` and `boto3`'s SigV4 signer. Total data volume held constant at
-256 objects / 2GB throughout — only the number of hints (= threads =
-connections) changes, so this isolates parallelism as the only variable.
+First version of this section compared our own batch-GET parallel sweep
+against two things that turned out to be the wrong comparisons, both
+corrected here:
 
-First pass (5 runs at 8 and 16 threads) looked ambiguous — 1018 vs 956
-MB/s, but with overlapping ranges (891-1058 vs 806-982), too close to
-call given the noise. Re-run properly: **10 timed samples at each of
-2, 4, 8, 16, 32, and 64 threads**, warm-up discarded, full corpus
-re-uploaded per configuration:
+1. Initial 5-sample runs at 8 vs 16 threads were ambiguous (overlapping
+   ranges) — refined to 10 samples each across 2→64 threads, confirming
+   batch-GET's own throughput climbs 2→4→8 threads then genuinely
+   flatlines from 8 through 64 (~1000-1014 MB/s, all within noise of
+   each other).
+2. That plateau was then compared against **AnyBlob's *sustained*
+   benchmark throughput** (thousands of repeated requests, connection
+   setup amortized away) and, separately, against a **naive Python
+   `ThreadPoolExecutor` + `requests`** stand-in for "individual GETs in
+   parallel." Neither is the right comparison for the question that
+   actually matters: *for a one-time fetch of exactly these 256 objects,
+   does batching beat the best individual-GET client actually has to
+   offer, at the same connection count?* Re-ran AnyBlob itself
+   (`-t N -c 1 -l 256`, one-shot, stop after 256 requests) at each
+   matched connection count — the real comparison:
 
-| Threads | Median | Range | Stdev |
-|---:|---:|---:|---:|
-| 2 | 585.3 MB/s | 441-599 | 53.2 |
-| 4 | 841.3 MB/s | 818-859 | 15.1 |
-| 8 | **1013.8 MB/s** | 980-1056 | 23.0 |
-| 16 | 1011.3 MB/s | 950-1041 | 28.8 |
-| 32 | 1003.2 MB/s | 995-1036 | 14.0 |
-| 64 | 992.2 MB/s | 897-1046 | 47.8 |
+| Connections | Objects/MiB per worker's batch | Batch-GET | AnyBlob (real, one-shot) | Batch advantage |
+|---:|---|---:|---:|---:|
+| 2 | 128 obj / 1024 MiB | 585.5 MB/s | 494.1 MB/s | **+18.5%** |
+| 4 | 64 obj / 512 MiB | 841.0 MB/s | 743.2 MB/s | **+13.1%** |
+| 8 | 32 obj / 256 MiB | 1014.0 MB/s | 1650.6 MB/s | -38.6% |
+| 16 | 16 obj / 128 MiB | 1011.5 MB/s | 1850.7 MB/s | -45.4% |
+| 32 | 8 obj / 64 MiB | 1003.0 MB/s | 1869.3 MB/s | -46.3% |
+| 64 | 4 obj / 32 MiB | 992.5 MB/s | 1852.1 MB/s | -46.4% |
 
-This resolves cleanly, no longer ambiguous: throughput climbs sharply
-from 2→4→8 threads (585→841→1014 MB/s), then **genuinely flatlines from
-8 through 64 threads** — all four medians sit within one another's noise
-bands (stdev 14-48 MB/s on medians 992-1014). Going past 8 threads buys
-nothing, confirmed out to 8x more threads than the original (ambiguous)
-comparison covered, not a plateau inferred from two adjacent, noisy
-samples.
+![Parallel scaling story: batching vs real AnyBlob, matched connection count, with the crossover](logs/batch_get_investigation/plots/02_parallel_scaling_story.png)
 
-![Parallel scaling story: throughput vs threads, AnyBlob comparison, and full distribution per thread count](logs/batch_get_investigation/plots/02_parallel_scaling_story.png)
+**The real crossover is between 4 and 8 connections** — narrower than the
+naive-Python comparison suggested (which put it between 8 and 16, simply
+because plain Python threads are worse than AnyBlob's io_uring engine, so
+that comparison flattered batching). Two honest conclusions:
 
-Two honest conclusions, both worth stating precisely:
+1. **Batching wins, decisively, when the connection budget is small**
+   (2-4 connections: +13-19% over real AnyBlob) — exactly the regime
+   where each connection would otherwise need many sequential round
+   trips (128 or 64 individual requests per connection here). This is
+   also the regime a large, individual delta-layer-sized object with a
+   modest fan-out most plausibly maps onto (see below).
+2. **AnyBlob's io_uring engineering wins once 8+ connections are
+   available** (-39 to -46%) and keeps climbing toward the network
+   ceiling while batch-GET's simple parallel client plateaus around
+   ~1000-1014 MB/s regardless of adding more workers — a genuine,
+   confirmed ceiling in this implementation, plausibly the shared
+   `Mutex`-guarded SQLite connection in `sqlite_store.rs` serializing
+   concurrent metadata lookups (not confirmed; the strongest remaining
+   candidate from reading the code, not verified with new
+   instrumentation).
 
-1. **A trivial, ~40-line Python client gets WarpDrive's batching primitive
-   to roughly half the network ceiling** (1014 / 1985 MB/s ≈ 51%) — a
-   ~2.8x improvement over the single-connection case (359 MB/s) — with no
-   engineering beyond "run a few requests in a thread pool," and this
-   ceiling is a genuine, confirmed property of this simple client (most
-   likely Python/GIL-bound), not something more threads can fix. There
-   was no attempt to push past it with a better client, since that would
-   start reintroducing the engineering complexity this whole comparison
-   is about avoiding.
+### Why AnyBlob can't just "know what it needs" the way batch-GET does
 
-2. **AnyBlob's io_uring engineering still wins on raw per-connection
-   throughput** even at matched connection count (1401 vs 1014 MB/s at 8
-   connections) — real, measurable, not something batching alone erases.
-   And unlike the batched approach, AnyBlob's number keeps climbing well
-   past 8 connections (up to ~1920 MB/s by `c=32-64` in
-   `ANYBLOB_BASELINE.md`) — its engineering buys headroom this simple
-   client's plateau doesn't have.
-   But AnyBlob needs to issue and process one request per *object* to get
-   that number (256 individual request/response cycles — SigV4 signing,
-   HTTP parsing, server-side auth+SQLite lookup, all ×256), while the
-   batched approach needs only **8** — one per hint, regardless of how
-   many objects are in it. That gap in request count (not just connection
-   count) is where batching's real, distinct value lives: less client and
-   server CPU spent on repeated per-request bookkeeping, and — most
-   concretely for the motivating use case — far fewer round trips for a
-   one-time, cold-start-shaped fetch (e.g. Neon's pageserver prefetching
-   the K delta layers for one checkpoint epoch at startup), which is a
-   latency question, not a sustained-throughput one, and is exactly the
-   shape AnyBlob's own benchmark methodology (many repeated requests
-   against a warm connection) doesn't directly measure.
+It's tempting to frame this as "AnyBlob can't hint at what objects it
+needs, but batch-GET knows exactly." That's not quite right and worth
+correcting precisely: AnyBlob is a generic client — tell it a key, it
+fetches that key, efficiently. The real use case (Neon's pageserver)
+already knows the exact object keys it wants from its own layer manifest
+before fetching anything, so "not knowing what to fetch" was never the
+issue on either side.
+
+The actual distinction is **protocol-level, not client-level**: standard
+S3 (which AnyBlob implements) has no primitive for "fetch every object
+tagged with X" — `GetObject` names exactly one key, full stop. Even a
+client that already has the complete list of 256 keys in hand must still
+issue 256 separate calls; there is no batched-fetch-by-group verb in the
+protocol at all (`ListObjectsV2` with a prefix returns matching *keys*,
+not object bytes, and would cost a separate round trip before any data
+starts flowing). WarpDrive's slab hint moves "what belongs to this group"
+into server-side metadata, recorded once at write time — a read only
+needs a short group identifier, not an enumerated key list, and gets
+everything back in one round trip. That's the correct version of the
+composability claim: not a knock on AnyBlob's design, but a genuine gap
+in what the underlying protocol lets *any* client do.
+
+### Latency, not just throughput
+
+Everything above is throughput (MB/s) for a *fixed* transfer, which is
+mathematically just the reciprocal of completion time (latency) for that
+transfer — so the crossover above **is** a latency finding, not only a
+throughput one: at 2-4 connections, batch-GET completes the 256-object
+fetch faster in wall-clock terms, not just at a higher rate. The natural
+follow-up question — does batching's advantage grow further under
+realistic network RTT between compute and storage (this test ran within
+one GCP zone, sub-millisecond RTT) — is a good next experiment but wasn't
+run here; the crossover already shows up without needing added latency to
+reveal it, at low connection counts specifically.
 
 ## Known remaining limitation
 

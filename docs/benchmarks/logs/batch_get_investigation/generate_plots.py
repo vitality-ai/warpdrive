@@ -67,24 +67,41 @@ def read_anyblob_get(target):
     return rows
 
 
+def parse_worker_sweep(path, key_name):
+    text = Path(path).read_text()
+    out = {}
+    for m in re.finditer(key_name + r"=\s*(\d+).*?samples=\[([^\]]+)\]", text):
+        out[int(m.group(1))] = [float(x) for x in m.group(2).split(",")]
+    return out
+
+
 def main():
     single_conn_file = HERE / "single_conn_tightened_results.txt"
     batch_samples = parse_samples(single_conn_file, r"batch-GET, 256 objects \(2GB\), 1 connection ===\n")[0]
     seq_samples = parse_samples(single_conn_file, r"sequential 256x8MiB individual GETs, 1 connection ===\n")[0]
 
-    sweep_file = HERE / "parallel_full_sweep_results.txt"
-    sweep_text = sweep_file.read_text()
-    sweep = {}
-    for m in re.finditer(r"nhints=\s*(\d+).*?samples=\[([^\]]+)\]", sweep_text):
-        n = int(m.group(1))
-        vals = [float(x) for x in m.group(2).split(",")]
-        sweep[n] = vals
+    sweep = parse_worker_sweep(HERE / "parallel_full_sweep_results.txt", "nhints")
     nhints_sorted = sorted(sweep.keys())
 
-    # AnyBlob individual GET at matched total-connection-count (t=4 fixed,
-    # so total connections = 4*c) -- read straight from Experiment 1's CSV.
-    wd_get = dict(read_anyblob_get("warpdrive"))
-    matched = {4 * c: tp for c, tp in wd_get.items()}  # total_conn -> MB/s
+    # Fair, matched-connection-count, one-shot completion-time comparison
+    # against REAL AnyBlob (not a naive Python ThreadPoolExecutor stand-in --
+    # an earlier version of this script used plain `requests` + threads for
+    # the "individual GETs" line, which understates what a properly
+    # engineered client can do and overstated batching's win margin).
+    # AnyBlob run with `-t nconn -c 1 -l 256`: nconn connections, one
+    # outstanding request per connection, 256 total requests then stop --
+    # a genuine one-shot fetch, not AnyBlob's *sustained* benchmark
+    # throughput (which amortizes connection setup over thousands of
+    # requests and isn't a fair stand-in for a one-time cold fetch).
+    individual = parse_worker_sweep(HERE / "anyblob_oneshot_matched_results.txt", "nconn")
+    individual_sorted = sorted(individual.keys())
+    assert individual_sorted == nhints_sorted, "worker counts must match for a fair comparison"
+
+    # Objects-per-worker table, tying the connection-count axis to a
+    # concrete "how many delta layers of what size fit" framing.
+    TOTAL_OBJS = 256
+    OBJ_SIZE_MIB = 8
+    per_worker_table = [(n, TOTAL_OBJS // n, (TOTAL_OBJS // n) * OBJ_SIZE_MIB) for n in nhints_sorted]
 
     # ------------------------------------------------------------------
     # Figure 1: single-connection comparison -- bar chart with min/max
@@ -125,59 +142,86 @@ def main():
     plt.close(fig1)
 
     # ------------------------------------------------------------------
-    # Figure 2: parallel scaling story -- two stacked panels.
-    #  A. throughput vs threads, with AnyBlob's matched-connection-count
-    #     curve overlaid, plus network ceiling references.
-    #  B. per-thread-count spread (min/median/max) to make the "genuine
-    #     plateau, not noise" finding visually explicit.
+    # Figure 2: the crossover story -- two stacked panels, both holding
+    # worker/connection count constant between batch and individual (the
+    # fair comparison; see note above on why AnyBlob's sustained-benchmark
+    # numbers aren't used here).
+    #  A. throughput vs worker count, both approaches, one-shot completion
+    #     time for the same 256 objects each time.
+    #  B. % difference (batch vs individual) per worker count, so the
+    #     crossover itself -- not just the two raw curves -- is the thing
+    #     on screen.
     # ------------------------------------------------------------------
-    fig2, axes = plt.subplots(2, 1, figsize=(9.5, 10.5), sharex=True)
-    fig2.suptitle("Experiment 2 — combining batching with modest parallelism\n"
-                  "(plain ThreadPoolExecutor, no io_uring; 2GB total data held constant)",
-                  fontsize=13, fontweight="bold")
+    fig2, axes = plt.subplots(2, 1, figsize=(9.5, 10.5))
+    fig2.suptitle("Experiment 2 — batching vs. real AnyBlob, matched connection count\n"
+                  "(both one-shot completion time for the same 256 objects / 2GB)",
+                  fontsize=12.5, fontweight="bold")
 
     ax = axes[0]
-    meds_sweep = [statistics.median(sweep[n]) for n in nhints_sorted]
-    mins_sweep = [min(sweep[n]) for n in nhints_sorted]
-    maxs_sweep = [max(sweep[n]) for n in nhints_sorted]
-    yerr_sweep = [[m - lo for m, lo in zip(meds_sweep, mins_sweep)],
-                  [hi - m for m, hi in zip(meds_sweep, maxs_sweep)]]
-    ax.errorbar(nhints_sorted, meds_sweep, yerr=yerr_sweep, fmt="s-", color=BATCH_COLOR,
-                linewidth=2, markersize=7, capsize=5, label="Batch-GET x N parallel threads",
+    meds_batch = [statistics.median(sweep[n]) for n in nhints_sorted]
+    mins_batch = [min(sweep[n]) for n in nhints_sorted]
+    maxs_batch = [max(sweep[n]) for n in nhints_sorted]
+    yerr_batch = [[m - lo for m, lo in zip(meds_batch, mins_batch)],
+                  [hi - m for m, hi in zip(meds_batch, maxs_batch)]]
+    ax.errorbar(nhints_sorted, meds_batch, yerr=yerr_batch, fmt="s-", color=BATCH_COLOR,
+                linewidth=2, markersize=7, capsize=5, label="Batch-GET x N workers (1 request/worker)",
                 zorder=3)
 
-    ab_x = sorted(k for k in matched if k in nhints_sorted or k in (4, 8, 16, 32, 64))
-    ab_y = [matched[k] for k in ab_x]
-    ax.plot(ab_x, ab_y, "o--", color=ANYBLOB_COLOR, linewidth=2, markersize=7,
-             label="AnyBlob individual GETs, matched connection count", zorder=3)
+    meds_ind = [statistics.median(individual[n]) for n in individual_sorted]
+    mins_ind = [min(individual[n]) for n in individual_sorted]
+    maxs_ind = [max(individual[n]) for n in individual_sorted]
+    yerr_ind = [[m - lo for m, lo in zip(meds_ind, mins_ind)],
+                [hi - m for m, hi in zip(meds_ind, maxs_ind)]]
+    ax.errorbar(individual_sorted, meds_ind, yerr=yerr_ind, fmt="o--", color=ANYBLOB_COLOR,
+                linewidth=2, markersize=7, capsize=5,
+                label="AnyBlob individual GETs, matched connections (one-shot, -t N -c 1 -l 256)", zorder=3)
 
     ax.axhline(NET_CEILING_1CONN, color=CEILING_COLOR, linestyle="--", linewidth=1.0,
                label=f"Network ceiling, 1 conn ({NET_CEILING_1CONN:.0f} MB/s)")
     ax.axhline(NET_CEILING_8CONN, color=CEILING_COLOR, linestyle=":", linewidth=1.0,
                label=f"Network ceiling, 8 conns ({NET_CEILING_8CONN:.0f} MB/s)")
-    ax.axvspan(8, 64, color=BATCH_COLOR, alpha=0.07, zorder=0)
-    ax.annotate("plateau: 8→64 threads\nall within noise of each other",
-                (22, 700), fontsize=8.5, color=BATCH_COLOR, ha="center",
+    ax.axvspan(2, 5.6, color=BATCH_COLOR, alpha=0.08, zorder=0)
+    ax.axvspan(5.6, 64, color=ANYBLOB_COLOR, alpha=0.06, zorder=0)
+    ax.annotate("batching wins:\nfew connections,\nround trips dominate",
+                (2.8, 1250), fontsize=8.5, color=BATCH_COLOR, ha="center",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=BATCH_COLOR, alpha=0.9))
-    for x, y in zip(nhints_sorted, meds_sweep):
+    ax.annotate("AnyBlob wins:\nenough connections that\nio_uring concurrency dominates",
+                (24, 500), fontsize=8.5, color=ANYBLOB_COLOR, ha="center",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=ANYBLOB_COLOR, alpha=0.9))
+    for x, y in zip(nhints_sorted, meds_batch):
         ax.annotate(f"{y:.0f}", (x, y), textcoords="offset points", xytext=(0, -16),
                     ha="center", fontsize=7.5, color=BATCH_COLOR)
+    for x, y in zip(individual_sorted, meds_ind):
+        ax.annotate(f"{y:.0f}", (x, y), textcoords="offset points", xytext=(0, 8),
+                    ha="center", fontsize=7.5, color=ANYBLOB_COLOR)
     ax.set_ylabel("Throughput (MB/s)")
-    ax.set_title("A. Throughput vs thread/connection count (whiskers = min–max, n=10)", loc="left", fontsize=10)
-    ax.legend(fontsize=8, loc="lower right")
+    ax.set_title("A. Throughput vs connection count (whiskers = min–max, n=10)", loc="left", fontsize=10)
+    ax.legend(fontsize=8, loc="center right")
     style_axis(ax, nhints_sorted)
 
     ax = axes[1]
-    box_data = [sweep[n] for n in nhints_sorted]
-    bp = ax.boxplot(box_data, positions=nhints_sorted, widths=[n * 0.25 for n in nhints_sorted],
-                     patch_artist=True, showmeans=True,
-                     boxprops=dict(facecolor=BATCH_COLOR, alpha=0.35),
-                     medianprops=dict(color="black", linewidth=1.5),
-                     meanprops=dict(marker="D", markerfacecolor="white", markeredgecolor="black"))
-    ax.set_ylabel("Throughput (MB/s)")
-    ax.set_xlabel("Number of parallel threads (= slab hints = connections)")
-    ax.set_title("B. Full sample distribution per thread count — confirms the plateau isn't noise", loc="left", fontsize=10)
-    style_axis(ax, nhints_sorted)
+    pct_diff = [100.0 * (b - i) / i for b, i in zip(meds_batch, meds_ind)]
+    bar_colors = [BATCH_COLOR if p >= 0 else ANYBLOB_COLOR for p in pct_diff]
+    xlabels = [f"{n}\n({objs} obj,\n{mib} MiB)" for n, objs, mib in per_worker_table]
+    bars = ax.bar(xlabels, pct_diff, color=bar_colors,
+                  edgecolor="black", linewidth=0.6, zorder=3)
+    ax.axhline(0, color="black", linewidth=1.0, zorder=2)
+    for bar, p in zip(bars, pct_diff):
+        ax.annotate(f"{p:+.0f}%", (bar.get_x() + bar.get_width() / 2, p),
+                    textcoords="offset points", xytext=(0, 6 if p >= 0 else -14),
+                    ha="center", fontsize=9, fontweight="bold")
+    lo_win = min(p for p in pct_diff if p >= 0)
+    hi_win = max(p for p in pct_diff if p >= 0)
+    lo_lose = max(p for p in pct_diff if p < 0)
+    hi_lose = min(p for p in pct_diff if p < 0)
+    ax.set_ylabel("Batch-GET advantage over real AnyBlob (%)")
+    ax.set_xlabel("Connections (= workers)  —  objects per worker's single batch request  —  MiB per batch (8 MiB objects)")
+    ax.set_title(f"B. The crossover — batching's advantage flips from +{lo_win:.0f}-{hi_win:.0f}% "
+                 f"to {hi_lose:.0f}-{lo_lose:.0f}% between 4 and 8 connections", loc="left", fontsize=10)
+    ax.grid(True, axis="y", which="major", linestyle="-", linewidth=0.8, color="#888888", alpha=0.85, zorder=0)
+    ax.grid(True, axis="y", which="minor", linestyle=":", linewidth=0.6, color="#aaaaaa", alpha=0.6, zorder=0)
+    ax.yaxis.set_minor_locator(mticker.AutoMinorLocator())
+    ax.set_axisbelow(True)
 
     fig2.tight_layout(rect=[0, 0, 1, 0.95])
     fig2.savefig(OUT / "02_parallel_scaling_story.png", dpi=150)
@@ -188,8 +232,9 @@ def main():
           f"batch median={statistics.median(batch_samples):.1f} "
           f"gap={gap_pct:.1f}%")
     for n in nhints_sorted:
-        print(f"nhints={n:3d} median={statistics.median(sweep[n]):.1f} "
-              f"stdev={statistics.stdev(sweep[n]):.1f}")
+        print(f"n={n:3d}  batch={statistics.median(sweep[n]):.1f}  "
+              f"individual={statistics.median(individual[n]):.1f}  "
+              f"diff={100.0*(statistics.median(sweep[n])-statistics.median(individual[n]))/statistics.median(individual[n]):+.1f}%")
     print(f"\nSaved plots to {OUT}/")
 
 

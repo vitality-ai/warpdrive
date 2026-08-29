@@ -1,0 +1,8 @@
+nworkers=  2  median=  418.7 MB/s  range=[387.2, 442.2]  stdev=17.7  samples=[437, 411, 387, 394, 406, 427, 442, 419, 419, 428]
+nworkers=  4  median=  569.3 MB/s  range=[530.8, 645.3]  stdev=30.4  samples=[645, 553, 569, 583, 531, 556, 578, 588, 570, 557]
+nworkers=  8  median=  789.3 MB/s  range=[752.0, 980.4]  stdev=81.8  samples=[895, 772, 757, 928, 980, 806, 770, 837, 752, 760]
+nworkers= 16  median= 1699.0 MB/s  range=[1594.3, 1748.1]  stdev=47.7  samples=[1690, 1694, 1688, 1704, 1713, 1594, 1720, 1705, 1748, 1612]
+nworkers= 32  median= 1733.7 MB/s  range=[1680.0, 1761.1]  stdev=26.5  samples=[1740, 1728, 1680, 1761, 1717, 1747, 1740, 1694, 1751, 1705]
+nworkers= 64  median= 1737.7 MB/s  range=[1717.5, 1785.0]  stdev=21.4  samples=[1759, 1785, 1738, 1748, 1726, 1737, 1759, 1717, 1728, 1719]
+
+[exited with code 0]
