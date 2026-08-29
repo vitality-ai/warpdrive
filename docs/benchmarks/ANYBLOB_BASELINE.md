@@ -1,5 +1,14 @@
 # AnyBlob client-side baseline — MinIO vs WarpDrive
 
+**tl;dr**: both MinIO and WarpDrive converge to the same network-imposed
+GET ceiling, but WarpDrive needs 4-way client concurrency to get there
+where MinIO needs 8-way — real, useful signal, independent of any
+batching primitive. PUT tells the opposite story: WarpDrive starts 4-5.7x
+ahead of MinIO at low concurrency but degrades sharply under heavy
+concurrent write load, a genuine bottleneck worth its own investigation.
+
+![Summary: GET vs PUT throughput scaling](logs/anyblob_baseline/plots/03_get_vs_put_summary.png)
+
 ## Idea
 
 Before building/exposing WarpDrive's own server-side batching + colocation
@@ -146,7 +155,11 @@ each one needs to get there.
 `c * 4 * 20`. Throughput = `Datasize / Time` from AnyBlob's own summary
 CSV (raw data: `logs/anyblob_baseline/{minio,warpdrive}_get.csv{,.summary}`; the
 three vendored-source patches described above are saved at
-`logs/anyblob_baseline/patches/`).
+`logs/anyblob_baseline/patches/`; plot generator:
+`logs/anyblob_baseline/generate_plots.py`, recomputes every number directly
+from the CSVs so the charts and this table can't drift apart).
+
+![GET story: raw throughput, saturation point, CPU cost](logs/anyblob_baseline/plots/01_get_story.png)
 
 | Concurrency (c) | MinIO throughput | WarpDrive throughput | Client CPU (user+sys ms), MinIO / WarpDrive |
 |---:|---:|---:|---:|
@@ -229,6 +242,8 @@ transfer-correctness issue (every object round-tripped and was
 successfully deleted afterward). Throughput below is computed from the
 known real payload (`requests * 16 MiB`) divided by AnyBlob's own `Time`
 column, which is unaffected by the mislabeling.
+
+![PUT story: raw throughput and the CPU-drops-while-throughput-drops diagnostic](logs/anyblob_baseline/plots/02_put_story.png)
 
 | Concurrency (c) | MinIO PUT throughput | WarpDrive PUT throughput |
 |---:|---:|---:|
