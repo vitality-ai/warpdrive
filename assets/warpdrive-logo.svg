@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1700" height="570" viewBox="0 0 1700 570"
+     preserveAspectRatio="xMidYMid meet"
+     role="img" aria-labelledby="wd-logo-title wd-logo-desc"
+     shape-rendering="geometricPrecision">
+  <title id="wd-logo-title">WarpDrive logo</title>
+  <desc id="wd-logo-desc">The WarpDrive horizontal lockup: a ringed warp-motion emblem on the left, the WARPDRIVE wordmark on the right.</desc>
+
+  <defs>
+    <linearGradient id="wd-logo-mark-color" x1="60" y1="490" x2="510" y2="80" gradientUnits="userSpaceOnUse">
+      <stop class="wd-logo-a" offset="0" stop-color="#4a0e63"/>
+      <stop class="wd-logo-b" offset="0.55" stop-color="#c92a6b"/>
+      <stop class="wd-logo-c" offset="1" stop-color="#ff8a3d"/>
+    </linearGradient>
+    <linearGradient id="wd-logo-word-color" x1="630" y1="0" x2="1670" y2="570" gradientUnits="userSpaceOnUse">
+      <stop class="wd-logo-a" offset="0" stop-color="#4a0e63"/>
+      <stop class="wd-logo-b" offset="0.55" stop-color="#c92a6b"/>
+      <stop class="wd-logo-c" offset="1" stop-color="#ff8a3d"/>
+    </linearGradient>
+    <clipPath id="wd-logo-disc-clip">
+      <circle cx="285" cy="285" r="205"/>
+    </clipPath>
+    <style>
+      @media (prefers-color-scheme: dark) {
+        .wd-logo-a { stop-color: #b06bd9; }
+        .wd-logo-b { stop-color: #ff5f96; }
+        .wd-logo-c { stop-color: #ffb366; }
+      }
+    </style>
+  </defs>
+
+  <!-- Emblem: a warp-gate ring with three tapering motion streaks piercing through it. -->
+  <g id="wd-logo-mark">
+    <circle cx="285" cy="285" r="205" fill="none" stroke="url(#wd-logo-mark-color)" stroke-width="32"/>
+
+    <g clip-path="url(#wd-logo-disc-clip)" transform="rotate(-35 285 285)" fill="url(#wd-logo-mark-color)">
+      <path d="M 55 199 L 55 231 L 615 216 Z"/>
+      <path d="M 150 265 L 150 291 L 615 279 Z"/>
+      <path d="M 235 323 L 235 343 L 615 335 Z"/>
+    </g>
+  </g>
+
+  <!-- Wordmark -->
+  <text id="wd-logo-word" x="630" y="352"
+        font-family="Arial, Helvetica, sans-serif" font-weight="800"
+        font-size="172" letter-spacing="1" fill="url(#wd-logo-word-color)">WARPDRIVE</text>
+</svg>
