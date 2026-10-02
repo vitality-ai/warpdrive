@@ -39,6 +39,16 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 
 See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
 
+## Performance Benchmarks
+
+WarpDrive's content-dependent placement is measured against real tools and real data, not synthetic benchmarks. Full methodology, more queries/nprobe levels, and plots in [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md).
+
+| System | Type | Workload | Result |
+|--------|------|----------|--------|
+| [DuckDB](https://duckdb.org) | Analytical SQL engine | Official TPC-H (via `dbgen`), selective query (Q6) | **149x faster** (7756.6ms → 51.9ms) via row-group pushdown |
+| [Lance](https://lancedb.github.io/lance/) | Vector search (`IVF_PQ`) | `take` latency, 20k vectors/768-dim | **Up to 41x faster**, recall@10 identical to baseline |
+| Lance | Vector search (`IVF_PQ`) | SIFT1M-small (published benchmark corpus) | **Up to 5.5x faster**, recall@10 identical to baseline |
+
 ## Compatibility Tests
 
 WarpDrive is tested against real-world storage clients and databases to validate S3 compatibility. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
