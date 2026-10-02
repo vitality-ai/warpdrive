@@ -2,9 +2,11 @@
   <img src="assets/warpdrive-logo.svg" alt="WarpDrive" width="420">
 
   <p><strong>Object storage for systems and the agentic era</strong></p>
+  <p>Fast by default. Explainable SLAs. Safely customizable.</p>
 
   <p>
     <a href="https://vitality-ai.github.io/warpdrive/site/"><img alt="Website" src="https://img.shields.io/badge/Website-4a0e63?style=for-the-badge&logo=googlechrome&logoColor=ffb366&labelColor=4a0e63"></a>
+    <a href="https://github.com/vitality-ai/warpdrive/releases"><img alt="Version" src="https://img.shields.io/badge/version-1.0.0-ff8a3d?style=for-the-badge&logo=semver&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/vitality-ai/warpdrive?style=for-the-badge&logo=star&color=ff8a3d&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/network/members"><img alt="Forks" src="https://img.shields.io/github/forks/vitality-ai/warpdrive?style=for-the-badge&logo=git-fork&color=c92a6b&logoColor=white&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/issues"><img alt="Issues" src="https://img.shields.io/github/issues/vitality-ai/warpdrive?style=for-the-badge&logo=bug&color=ff5f96&logoColor=1a1025&labelColor=1a1025"></a>
@@ -20,8 +22,16 @@
 
 ## About
 
-WarpDrive is a purpose-built KV/Object store focused on workloads that demand high throughput. Practical applications driving our development are storage-disaggregated architectures and data-intensive distributed systems.
-Our broader aim is to build storage primitives and interfaces with a deep understanding of the underlying backend architecture, making computational pushdown and storage-centric execution first-class capabilities. By exposing these abstractions cleanly, we aim to simplify how data systems, ML frameworks, and agentic workflows move computation closer to data, reducing unnecessary data movement while enabling efficient large-scale processing, retrieval, and orchestration. Our road map ([Technical Roadmap](docs/Technical-Roadmap.md)) for our future versions will be driven by the next generation's storage needs with solid fundamental understanding of the history of these storage systems with a product first design. [v0.1.0 Technical Architecture](docs/Technical-Architecture.md).
+WarpDrive is an object store that's fast out of the box, tells you exactly why it's fast enough to put in an SLA, and lets you customize *how* it places your data without ever risking the system coming down.
+
+Run it as a **single node** and get a fully S3-compatible store in one process — drop-in for local development and embedded use (see the compatibility results below). Run it **distributed** and get a real multi-node, erasure-coded engine with no single coordinator, no leader election, and quorum-based reads/writes, the same shape of design production systems like MinIO and Ceph already trust.
+
+What makes WarpDrive different is **content-dependent placement**: instead of treating every object as an opaque blob, a bucket can opt a workload's own structure (Parquet column chunks, vector-index partitions) into how its bytes are striped and erasure-coded — and the system reports the real cost of that choice before it ever risks availability. Measured end-to-end against real tools, not synthetic benchmarks:
+
+- **149x faster** on a selective, official TPC-H query (DuckDB, real `dbgen` data) — pushdown that skips untouched stripes entirely instead of reconstructing the whole object.
+- **Up to 41x faster** on real Lance vector-search (`IVF_PQ`) `take` latency, with **recall@10 identical** to the unpacked baseline on the real SIFT1M-small benchmark — speed with no accuracy trade-off.
+
+Full real-measurement writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-real-results.md`](docs/benchmarks/v1.0.0-real-results.md). Architecture for both modes: [Technical Architecture](docs/Technical-Architecture.md). Our longer-term direction: [Technical Roadmap](docs/Technical-Roadmap.md).
 
 ---
 
