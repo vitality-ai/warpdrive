@@ -7,10 +7,10 @@ focusing on efficient storage and retrieval of objects through a simplified arch
 
 As of **v1.0.0**, WarpDrive runs in two modes:
 
-- **Single-node mode** — a single process, fully S3-compatible, for local
+- **Single-node mode**: a single process, fully S3-compatible, for local
   deployments and development. This is the original architecture below,
   unchanged.
-- **Distributed mode** — a multi-node, erasure-coded object engine with
+- **Distributed mode**: a multi-node, erasure-coded object engine with
   pluggable placement, built as a layer in front of the same single-node
   storage/API code (every peer is still a single-node server underneath).
   See [Distributed Mode](#distributed-mode---v100) below, and the measured
@@ -60,7 +60,7 @@ graph TD
 
 ## Distributed Mode - v1.0.0
 
-Every deployed node is **symmetric** — the same binary, both a storage node
+Every deployed node is **symmetric**: the same binary, both a storage node
 (the single-node architecture above, unchanged) and a coordinator that can
 accept a request, decide placement, and fan out to peers. There is no
 dedicated coordinator process and no leader election: consistent with how
@@ -76,7 +76,7 @@ placement/packer choice actually gets wired up across the cluster's nodes.
 
 ```mermaid
 flowchart TB
-    subgraph CLUSTER["Cluster membership — additive only, no leader election"]
+    subgraph CLUSTER["Cluster membership (additive only, no leader election)"]
         NA["Node A :9710"]
         NB["Node B :9711"]
         NC["Node C :9712"]
@@ -92,18 +92,18 @@ flowchart TB
     NA --> PEERS["live peer list\n(every node converges on the same set)"]
     PEERS --> PP
 
-    subgraph BUCKET["Per-bucket config — BucketConfigStore"]
+    subgraph BUCKET["Per-bucket config (BucketConfigStore)"]
         PP{{"PlacementPolicy: ComputedPlacement\nrendezvous hash of (bucket,key) -> k+m peers"}}
         CFG["packer_name + overhead_threshold_pct\n(fallback to plain if over budget)"]
     end
 
     CFG --> REG
 
-    subgraph REGISTRY["StripePacker registry — packing.rs"]
+    subgraph REGISTRY["StripePacker registry (packing.rs)"]
         REG{{"registry, keyed by packer_name"}}
         FAC["FacPacker\nsize-based bin-packing\n(Fusion's Algorithm 1)"]
         IVF["IvfCentroidPacker\ngroups by k-means cluster id,\nthen bin-packs within each cluster"]
-        WASMP["WasmPacker — planned, not yet shipped\nuser-submitted code, sandboxed inside the\ncoordinator (wasmtime/wasmer), simulated for\ncorrectness (checksum match) before a bucket\nis allowed to go live on it"]
+        WASMP["WasmPacker (planned, not yet shipped)\nuser-submitted code, sandboxed inside the\ncoordinator (wasmtime/wasmer), simulated for\ncorrectness (checksum match) before a bucket\nis allowed to go live on it"]
     end
 
     REG --> FAC
@@ -111,13 +111,13 @@ flowchart TB
     REG -.-> WASMP
 ```
 
-A bucket only ever names a `packer_name` — swapping in a new packer (native
+A bucket only ever names a `packer_name`: swapping in a new packer (native
 or, once built, WASM) never changes `coordinator.rs` or any client-visible
 behavior, only which registry entry a bucket's config points at.
 
 ### Write path
 
-Placement is resolved **fresh** on every write and then pinned — this is
+Placement is resolved **fresh** on every write and then pinned. This is
 what makes "a node joining later never moves existing data" actually true.
 
 ```mermaid
@@ -158,7 +158,7 @@ sequenceDiagram
 
 ### Read path
 
-GET and DELETE **never** call `PlacementPolicy` — they read the pin that the
+GET and DELETE **never** call `PlacementPolicy`. They read the pin that the
 write path already recorded, regardless of what the peer list looks like
 now.
 
@@ -175,7 +175,7 @@ sequenceDiagram
 
     C->>Co: GET bucket/key (optional Range)
     Co->>LS: look up pinned peer set / stripe layout
-    Note over Co,LS: no PlacementPolicy recompute —<br/>this is what keeps already-placed data stable
+    Note over Co,LS: no PlacementPolicy recompute<br/>this is what keeps already-placed data stable
     Co->>Co: map the requested byte range to the<br/>minimal set of stripes actually needed
     par concurrent fetch, only the needed shards
         Co->>P1: fetch shard
@@ -186,50 +186,50 @@ sequenceDiagram
         Co->>EC: decode(available shards) -> reconstruct
     end
     Note over Co,P3: read quorum: k shards (data, or data+parity on reconstruction)
-    opt pushdown query — POST /cluster/{bucket}/{key}/query
+    opt pushdown query (POST /cluster/{bucket}/{key}/query)
         Co->>PD: filter one column in place on its own peer, no reassembly
     end
     Co-->>C: 200/206 + bytes
 ```
 
-**What each piece is, concretely (not aspirational — all shipped and tested
+**What each piece is, concretely (not aspirational, all shipped and tested
 unless marked "planned"):**
 
-- **`PlacementPolicy`** (`placement.rs`) — `ComputedPlacement`, a CRUSH-style
+- **`PlacementPolicy`** (`placement.rs`): `ComputedPlacement`, a CRUSH-style
   deterministic hash of `(bucket, key)` to a `k+m` peer set. Resolved fresh at
-  PUT time and pinned into `LocationStore`; GET/DELETE read the pin, so a
+  PUT time and pinned into `LocationStore`. GET/DELETE read the pin, so a
   node joining or leaving never moves already-placed data.
-- **`StripePacker`** (`packing.rs`) — pluggable **content-dependent
+- **`StripePacker`** (`packing.rs`): pluggable **content-dependent
   placement**, the opt-in layer on top of the always-on default above.
   `FacPacker` (Fusion's Algorithm 1, size-based bin-packing) and
   `IvfCentroidPacker` (groups by k-means cluster id, then bin-packs
   within each cluster) are both registered implementations of the same
-  trait — a bucket picks one via `BucketConfigStore`, or uses neither and
+  trait. A bucket picks one via `BucketConfigStore`, or uses neither and
   gets plain erasure-coded storage. **Planned, not yet shipped:**
-  `WasmPacker` — a user-submitted packer compiled to WASM, run sandboxed
+  `WasmPacker`: a user-submitted packer compiled to WASM, run sandboxed
   inside the coordinator process (no syscalls/network/filesystem access,
   resource-limited), simulated against a checksum of the original bytes
   for correctness before a bucket is ever allowed to go live on it. Same
-  trait, same registry, same call site — only the authoring path changes.
-- **`ErasureCoder`** (`ec.rs`) — `ReedSolomonCoder`, the `reed-solomon-erasure` crate
+  trait, same registry, same call site. Only the authoring path changes.
+- **`ErasureCoder`** (`ec.rs`): `ReedSolomonCoder`, the `reed-solomon-erasure` crate
   encode/decode, with a second `encode_shards`/`decode_shards` path for
   pre-packed (content-dependent) stripes.
 - **`LocationStore` / `ContentLocationStore`** (Bitcask-style: append-only
-  log + in-memory index) — the plain object → peer-set pin, and the
+  log + in-memory index): the plain object → peer-set pin, and the
   multi-stripe unit → (offset, stripe, peers) record content-dependent
   placement needs, kept as two stores since the record shapes genuinely
   differ.
-- **`cluster/s3_shim.rs`** — a minimal S3 surface (GET/PUT/HEAD/List)
+- **`cluster/s3_shim.rs`**: a minimal S3 surface (GET/PUT/HEAD/List)
   over the same coordinator path, built specifically so third-party clients
   that need bucket/list semantics (Lance's `object_store::aws`) work
   unmodified, not just protocol-agnostic range-GET clients (DuckDB's
   `httpfs`, which needs no shim).
-- **`pushdown.rs`** — a `ColumnCodec` trait + a `/query` endpoint that filters
+- **`pushdown.rs`**: a `ColumnCodec` trait + a `/query` endpoint that filters
   a column in-place on the peer holding it, no whole-object reassembly.
-- **Membership** — additive only (SeaweedFS/MinIO-pool style): a new node
+- **Membership**: additive only (SeaweedFS/MinIO-pool style). A new node
   calls `/cluster/join`, is added to the live peer list, and starts taking
-  new writes immediately. Already-placed objects are never rebalanced —
-  documented non-goal, not an oversight (see
+  new writes immediately. Already-placed objects are never rebalanced
+  (documented non-goal, not an oversight, see
   `docs/Distributed-Engine-Plan.md`).
 
 Measured results for content-dependent placement, run against this engine
