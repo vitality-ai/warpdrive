@@ -735,13 +735,52 @@ granularity/selectivity sweep against the real cluster, replacing the simulator'
   one-time MinIO comparison run on the same real infrastructure (user's suggestion —
   strengthens the poster with a real third-party baseline, not just simulator-vs-real).
 
-**Phase 3 (content-dependent placement, later, time permitting):** only after phases 1-2
-are done and only if days remain before Oct 8 AOE. Implement `ContentDependentPlacement`
-behind the trait boundary built in phase 1: port `fac_core.py`'s `construct_stripes`,
-add the `x-warpd-computable-units` header, add the per-bucket granularity knob. If this
-phase doesn't fit, the poster reports phase 1+2 results honestly (a real, fast, distributed,
-erasure-coded core with one placement policy) and states content-dependent placement as
-designed-for-but-not-yet-implemented, which is itself a defensible, honest claim.
+**Phase 3 (content-dependent placement): core write/read path done and verified.**
+Prioritized ahead of the MinIO comparison per explicit user direction — this is the
+poster's actual scientific claim (Findings 1-3), the baseline alone can't reproduce it.
+
+- **Architectural correction the user caught before implementation started:** the first
+  instinct was to hardcode `construct_stripes` as a generic bin-packer. Corrected to a
+  contract first: `packing.rs`'s `StripePacker` trait (`pack(k, units) -> Vec<Stripe>`),
+  with `FacPacker` (Fusion's Algorithm 1, generalized, faithfully ported from this
+  project's own `fac_core.py`) as the one shipped implementation — consistent with every
+  other component here (`Storage`, `PlacementPolicy`, `LocationStore`, `ErasureCoder`,
+  `PeerClient`) being a trait with one concrete implementation, not a concrete type.
+  Verified against a hand-traced reference run of `fac_core.py`'s own algorithm, not just
+  invariant checks (no unit split, no bin over capacity) — those alone wouldn't catch a
+  subtly wrong port.
+- **`ErasureCoder` extended, not replaced:** added `encode_shards`/`decode_shards` (given
+  `k` pre-chunked, already-content-packed bins, compute/reconstruct `m` parity shards) —
+  the existing `encode`/`decode` (flat-buffer split) stay for `ComputedPlacement`'s
+  single-stripe path, unchanged.
+- **New multi-stripe record + store** (`content_location_store.rs`, same Bitcask pattern
+  as `location_store.rs`, kept separate rather than overloading one schema to cover both
+  shapes): per object, a `k`/`m`, `original_len`, a unit_id→(offset,len) index into the
+  *original* bytes, and one `StripeRecord` (peers, capacity, bin→unit_ids) per stripe.
+- **New orchestration** (`packed.rs`): PUT slices the body by the `x-warpd-computable-units`
+  header (`[[offset,len],...]`, the poster's own spec — presence of the header is the
+  dispatch signal, no separate bucket-config call, and no Parquet/IVF-specific logic
+  anywhere in this code, matching `fac_core.py`'s own "no format-specific logic lives
+  here"), packs via `StripePacker`, erasure-codes each stripe independently, places each
+  stripe's peers by calling the *existing* `PlacementPolicy` once per stripe (varying the
+  key, not a new trait impl — `ContentDependentPlacement` never needed to force-fit the
+  single-peer-set `PlacementPolicy` signature). GET does the reverse: per stripe, fetch
+  shards, `decode_shards`, then walk each bin's unit list to place recovered bytes back
+  at their *original* offsets.
+- **Verified end to end, cross-node, on the local 5-node cluster:** a 160-byte object (6
+  units of distinguishable content, sizes matching the same hand-traced packing
+  scenario) PUT through node0 with the header, GET back byte-identical from **all 5
+  nodes** — confirming replication works too (added after first catching that the
+  content-location pin wasn't replicated at all, same class of bug as the original
+  `location_store.rs` gap from phase 1, fixed the same way: reused
+  `cluster_internal_put_location`'s exact pattern for a new `content_location`
+  endpoint, replicated to the union of every stripe's peers since different stripes can
+  land on different peer subsets).
+- **Not yet done:** porting the real Parquet/IVF workload generators (`hipc_poster/formats.py`)
+  to drive real traffic with real headers against this path, replacing the simulator's
+  numbers for Findings 1-3; the per-bucket granularity knob (client-side concern per the
+  poster's own framing — granularity is decided when the client builds its
+  computable-units list, not inside WarpDrive); and a possible MinIO comparison.
 
 This plan intentionally does not assign calendar days to phases 2-3 yet — phase 1's actual
 velocity will tell us how much time is left, which is the point of moving very fast on it

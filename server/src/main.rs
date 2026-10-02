@@ -22,6 +22,7 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
 use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
+    cluster_internal_put_content_location,
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
@@ -72,6 +73,14 @@ fn build_cluster_state() -> web::Data<ClusterState> {
         peer_client: peer_client_from_env(),
         location_http: reqwest::Client::new(),
         timing: Arc::new(warp_drive::cluster::timing_stats::TimingStats::default()),
+        packer: Arc::new(warp_drive::cluster::packing::FacPacker),
+        content_location_store: Arc::new(
+            warp_drive::cluster::content_location_store::BitcaskContentLocationStore::open(
+                std::env::var("WARPDRIVE_CONTENT_LOCATION_LOG")
+                    .unwrap_or_else(|_| "cluster_content_location.log".to_string()),
+            )
+            .expect("failed to open content location store log"),
+        ),
     };
     web::Data::new(state)
 }
@@ -145,6 +154,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/shard_timing", web::get().to(cluster_shard_server_timing))
             .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
+            .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
             .route("/cluster/_internal/location/{bucket}/{key:.*}", web::delete().to(cluster_internal_delete_location))
             .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
             .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))

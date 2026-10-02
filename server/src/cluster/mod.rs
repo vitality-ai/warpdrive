@@ -14,6 +14,7 @@ pub mod tcp_peer_client;
 pub mod location_store;
 pub mod content_location_store;
 pub mod coordinator;
+pub mod packed;
 
 pub mod shard_proto {
     tonic::include_proto!("warpdrive.cluster");

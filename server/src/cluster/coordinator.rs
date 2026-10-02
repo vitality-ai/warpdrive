@@ -17,9 +17,11 @@ use log::{info, warn};
 use serde::Deserialize;
 use std::sync::Arc;
 
+use super::content_location_store::ContentLocationStore;
 use super::ec::ErasureCoder;
 use super::location_store::{LocationRecord, LocationStore};
 use super::membership::Membership;
+use super::packing::StripePacker;
 use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
 
@@ -35,17 +37,40 @@ pub struct ClusterState {
     /// infrequent metadata, not worth a second trait boundary.
     pub location_http: reqwest::Client,
     pub timing: Arc<super::timing_stats::TimingStats>,
+    /// Phase 3: content-dependent placement. `packer` is the contract
+    /// (`FacPacker` the one implementation); `content_location_store` pins
+    /// multi-stripe objects, separate from `location_store` since the
+    /// record shapes differ (one peer set vs. many). See `packed.rs`.
+    pub packer: Arc<dyn StripePacker>,
+    pub content_location_store: Arc<dyn ContentLocationStore>,
 }
 
 /// Write succeeds once this many of the `k+m` peers acknowledge: `k`, or
 /// `k+1` in the edge case where parity count equals data-shard count —
 /// MinIO's own quorum rule, verified against its docs (see architecture).
-fn required_write_acks(k: usize, m: usize) -> usize {
+pub(crate) fn required_write_acks(k: usize, m: usize) -> usize {
     if m == k {
         k + 1
     } else {
         k
     }
+}
+
+/// Parses `x-warpd-computable-units: [[offset,len],[offset,len],...]`,
+/// the poster's own header spec — a flat JSON array of 2-element
+/// `[offset, len]` arrays delimiting each computable unit within the
+/// request body. No format awareness here: the client decides what a
+/// unit is.
+fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderValue) -> Result<Vec<(u64, u64)>, Error> {
+    let s = header_val
+        .to_str()
+        .map_err(|_| ErrorBadRequest("x-warpd-computable-units header is not valid UTF-8"))?;
+    let parsed: Vec<[u64; 2]> = serde_json::from_str(s)
+        .map_err(|e| ErrorBadRequest(format!("x-warpd-computable-units header is not a JSON [[offset,len],...] list: {e}")))?;
+    if parsed.is_empty() {
+        return Err(ErrorBadRequest("x-warpd-computable-units must list at least one unit"));
+    }
+    Ok(parsed.into_iter().map(|pair| (pair[0], pair[1])).collect())
 }
 
 /// Replicate a `LocationRecord` to every peer in `peers` (symmetric,
@@ -106,10 +131,24 @@ async fn replicate_location_delete(state: &ClusterState, bucket: &str, key: &str
 pub async fn cluster_put_object(
     path: web::Path<(String, String)>,
     body: web::Bytes,
+    req: actix_web::HttpRequest,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let request_start = std::time::Instant::now();
     let (bucket, key) = path.into_inner();
+
+    // Content-dependent placement (phase 3): the presence of this header
+    // is the dispatch signal, not a separate bucket-level config call —
+    // matches the poster's own per-PUT header framing. No format-specific
+    // logic lives in WarpDrive itself; the client decides what a
+    // "computable unit" is (a Parquet column chunk, an IVF partition,
+    // whatever), WarpDrive just bin-packs and erasure-codes whatever
+    // (offset, len) list it's given.
+    if let Some(header_val) = req.headers().get("x-warpd-computable-units") {
+        let units_header = parse_computable_units_header(header_val)?;
+        return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, &state).await;
+    }
+
+    let request_start = std::time::Instant::now();
     let peers = state.membership.peers();
     if peers.is_empty() {
         return Err(ErrorInternalServerError(
@@ -231,6 +270,14 @@ pub async fn cluster_get_object(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+
+    // A content-dependent PUT pins into a separate store (different record
+    // shape — many stripes, not one shard set). Check there first: cheap,
+    // and a key is either content-dependent or not, decided once at PUT
+    // time by header presence.
+    if let Some(record) = state.content_location_store.get(&bucket, &key) {
+        return super::packed::get_object_content_dependent(record, &state).await;
+    }
 
     // Never recompute placement here — look up the pin from write time.
     let record = state
@@ -356,6 +403,19 @@ pub async fn cluster_put_retention(
         )));
     }
 
+    Ok(HttpResponse::Ok().finish())
+}
+
+/// Receiving side of content-dependent location-pin replication — the
+/// multi-stripe counterpart to `cluster_internal_put_location` below.
+pub async fn cluster_internal_put_content_location(
+    body: web::Json<super::content_location_store::ContentDependentRecord>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    state
+        .content_location_store
+        .put(body.into_inner())
+        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
 }
 
