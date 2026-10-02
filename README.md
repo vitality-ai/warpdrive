@@ -10,8 +10,6 @@
     <a href="https://github.com/vitality-ai/warpdrive/releases"><img alt="Version" src="https://img.shields.io/badge/version-1.0.0-ff8a3d?style=for-the-badge&logo=semver&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/vitality-ai/warpdrive?style=for-the-badge&logo=star&color=ff8a3d&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/network/members"><img alt="Forks" src="https://img.shields.io/github/forks/vitality-ai/warpdrive?style=for-the-badge&logo=git-fork&color=c92a6b&logoColor=white&labelColor=1a1025"></a>
-    <a href="https://github.com/vitality-ai/warpdrive/issues"><img alt="Issues" src="https://img.shields.io/github/issues/vitality-ai/warpdrive?style=for-the-badge&logo=bug&color=ff5f96&logoColor=1a1025&labelColor=1a1025"></a>
-    <a href="https://github.com/vitality-ai/warpdrive/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/vitality-ai/warpdrive?style=for-the-badge&logo=law&color=8a4fd1&logoColor=white&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive"><img alt="Rust" src="https://img.shields.io/badge/Rust-98.6%25-CE422B?style=for-the-badge&logo=rust&logoColor=white&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/vitality-ai/warpdrive?style=for-the-badge&logo=clock&color=b06bd9&logoColor=1a1025&labelColor=1a1025"></a>
   </p>
