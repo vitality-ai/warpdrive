@@ -13,7 +13,7 @@ pub(super) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 pub(super) const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Empty body that reports a custom Content-Length for HEAD responses.
-/// `pub(crate)`: reused by the cluster API's S3 shim (`cluster/s3_shim.rs`)
+/// `pub(crate)`: reused by the cluster API's minimal S3 surface (`cluster/s3_surface.rs`)
 /// for the same reason the S3 API needed it — actix recomputes
 /// Content-Length from the actual (empty) body on a plain `.finish()`,
 /// silently overriding any manually inserted header.

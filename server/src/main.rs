@@ -22,12 +22,12 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
 use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
-    cluster_internal_put_content_location, cluster_content_record,
+    cluster_internal_put_content_location, cluster_internal_delete_content_location, cluster_content_record,
     cluster_put_bucket_config, cluster_internal_put_bucket_config,
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
-use warp_drive::cluster::s3_shim::{cluster_s3_head_object, cluster_s3_list_objects};
+use warp_drive::cluster::s3_surface::{cluster_s3_head_object, cluster_s3_list_objects};
 use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
 use warp_drive::cluster::location_store::BitcaskLocationStore;
@@ -190,13 +190,14 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
             .route("/cluster/_internal/location/{bucket}/{key:.*}", web::delete().to(cluster_internal_delete_location))
+            .route("/cluster/_internal/content_location/{bucket}/{key:.*}", web::delete().to(cluster_internal_delete_content_location))
             .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
             .route("/cluster/_internal/bucket_config", web::post().to(cluster_internal_put_bucket_config))
             .route("/cluster/_internal/pushdown_filter", web::post().to(cluster_internal_pushdown_filter))
             .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
             .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
             .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
-            // Minimal S3-protocol shim (s3_shim.rs) — a distinct "s3/" prefix
+            // Minimal S3-protocol surface (s3_surface.rs) — a distinct "s3/" prefix
             // so it never collides with the generic {bucket}/{key:.*} routes
             // below; GET/PUT reuse those same handlers directly (same Range
             // support, same FAC dispatch), only HEAD/LIST are new.

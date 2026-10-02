@@ -58,7 +58,47 @@ graph TD
     S3CLIENT[S3 Client] -->|boto3/aws-cli| S3API
 ```
 
+### Request sequence (PUT and GET)
+
+```mermaid
+sequenceDiagram
+    participant C as S3 Client
+    participant API as API Server :9710
+    participant AUTH as SigV4 auth
+    participant SVC as StorageService
+    participant META as MetadataService
+    participant BIN as Binary Storage
+    participant DB as SQLite
+
+    C->>API: PUT /bucket/key (SigV4-signed)
+    API->>AUTH: authenticate_s3_request
+    AUTH-->>API: ok, or 403
+    API->>SVC: write_object(body)
+    SVC->>BIN: append to this user's single binary file
+    BIN-->>SVC: (offset, size)
+    SVC->>META: write_metadata(bucket, key, offset, size)
+    META->>DB: INSERT key -> offset/size
+    API-->>C: 200 OK
+
+    C->>API: GET /bucket/key (SigV4-signed)
+    API->>AUTH: authenticate_s3_request
+    API->>META: read_metadata(bucket, key)
+    META->>DB: SELECT offset/size WHERE key
+    DB-->>META: (offset, size), or none -> 404
+    API->>SVC: read_object(offset, size)
+    SVC->>BIN: read that byte range of the binary file
+    BIN-->>SVC: bytes
+    API-->>C: 200/206 + bytes
+```
+
+Real SigV4 signature verification on every request is exactly what the
+distributed mode's minimal `/cluster/s3/` surface (below) does **not**
+have. One key, one binary file per user, one metadata row per object. No
+quorum, no placement, no erasure coding to reason about here.
+
 ## Distributed Mode - v1.0.0-beta
+
+Correctness review log: [`docs/reviews/v1.0.0-beta-code-review.md`](reviews/v1.0.0-beta-code-review.md).
 
 Every deployed node is **symmetric**: the same binary, both a storage node
 (the single-node architecture above, unchanged) and a coordinator that can
@@ -79,8 +119,12 @@ config picks a placement policy, and that config's `packer_name` selects one
 entry from the `StripePacker` registry.
 
 **1. A new node joins the running cluster.** No leader election, no
-consensus. Any existing node adds the new peer to its in-memory list and
-the update propagates until every node agrees.
+consensus. The joining node announces itself to every peer it currently
+knows about over plain HTTP, best-effort: a peer that's briefly
+unreachable during that round simply doesn't get the update, and that gap
+isn't automatically repaired later (no gossip, no retry). In practice
+(all peers reachable) every node converges on the same list; the failure
+mode is a split list after a missed announce, not a hang or an error.
 
 ![Cluster membership: additive only, no leader election](diagrams/01-cluster-membership.svg)
 
@@ -135,8 +179,9 @@ sequenceDiagram
     P2-->>Co: ack
     PN-->>Co: ack
     Note over Co,PN: write quorum: k acks required (k+1 if m == k)
-    Co->>LS: pin resolved peer set + stripe layout
-    Co-->>C: 200 OK
+    Co->>LS: pin resolved peer set + stripe layout<br/>(replicated to every known peer, not just P1..PN)
+    Co->>LS: clear any stale pin for this key in the<br/>*other* store (plain vs. packed), if one exists
+    Co-->>C: 200 OK (x-warpd-placement, x-warpd-pack-overhead-pct)
 ```
 
 ### Read path
@@ -159,16 +204,19 @@ sequenceDiagram
     C->>Co: GET bucket/key (optional Range)
     Co->>LS: look up pinned peer set / stripe layout
     Note over Co,LS: no PlacementPolicy recompute<br/>this is what keeps already-placed data stable
-    Co->>Co: map the requested byte range to the<br/>minimal set of stripes actually needed
-    par concurrent fetch, only the needed shards
+    alt packed object
+        Co->>Co: narrow to only the stripe(s) whose<br/>units overlap the requested range
+    else plain object
+        Co->>Co: no sub-object structure to narrow:<br/>always the one whole-object stripe
+    end
+    par every one of that stripe's k+m shards, queried concurrently
         Co->>P1: fetch shard
         Co->>P2: fetch shard
+        Co->>P3: fetch shard
     end
-    alt a data shard is missing or slow
-        Co->>P3: fetch a parity shard instead
-        Co->>EC: decode(available shards) -> reconstruct
-    end
-    Note over Co,P3: read quorum: k shards (data, or data+parity on reconstruction)
+    Note over Co,P3: decode needs only k of the k+m responses<br/>(reconstructs from whichever arrive, not a staged<br/>"data first, parity if one is slow" fetch)
+    Co->>EC: decode with *this object's own* stored k/m<br/>(not the node's own process-wide config)
+    Note over Co,P3: read quorum: k shards available
     opt pushdown query (POST /cluster/{bucket}/{key}/query)
         Co->>PD: filter one column in place on its own peer, no reassembly
     end
@@ -188,7 +236,12 @@ unless marked "planned"):**
   `IvfCentroidPacker` (groups by k-means cluster id, then bin-packs
   within each cluster) are both registered implementations of the same
   trait. A bucket picks one via `BucketConfigStore`, or uses neither and
-  gets plain erasure-coded storage. **Planned, not yet shipped:**
+  gets plain erasure-coded storage. Every packer's output is checked the
+  same generic, packer-agnostic way before any shard is written: the
+  stripes are reconstructed in memory and compared byte-for-byte against
+  the original object, catching a dropped/duplicated/misplaced unit
+  regardless of which algorithm produced it (not a bespoke check of any
+  one packer's own logic). **Planned, not yet shipped:**
   `WasmPacker`: a user-submitted packer compiled to WASM, run sandboxed
   inside the coordinator process (no syscalls/network/filesystem access,
   resource-limited), simulated against a checksum of the original bytes
@@ -202,11 +255,17 @@ unless marked "planned"):**
   multi-stripe unit → (offset, stripe, peers) record content-dependent
   placement needs, kept as two stores since the record shapes genuinely
   differ.
-- **`cluster/s3_shim.rs`**: a minimal S3 surface (GET/PUT/HEAD/List)
+- **`cluster/s3_surface.rs`**: a minimal S3 surface (GET/PUT/HEAD/List)
   over the same coordinator path, built specifically so third-party clients
   that need bucket/list semantics (Lance's `object_store::aws`) work
   unmodified, not just protocol-agnostic range-GET clients (DuckDB's
-  `httpfs`, which needs no shim).
+  `httpfs`, which needs no extra surface). Deliberately minimal, stated plainly: no
+  SigV4 verification (any `Authorization` header is accepted unchecked),
+  no multipart upload, no LIST pagination, and `ETag`/`LastModified` in
+  LIST responses are fixed placeholder values, not real ones. This is a
+  distinct, much smaller surface than the single-node `/s3/` API's real
+  SigV4-authenticated implementation, not the same compatibility level
+  under a different URL prefix.
 - **`pushdown.rs`**: a `ColumnCodec` trait + a `/query` endpoint that filters
   a column in-place on the peer holding it, no whole-object reassembly.
 - **Membership**: additive only (SeaweedFS/MinIO-pool style). A new node

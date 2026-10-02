@@ -8,12 +8,73 @@
 use actix_web::error::ErrorInternalServerError;
 use actix_web::{Error, HttpResponse};
 use futures::future::join_all;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMeta};
-use super::coordinator::{required_write_acks, ClusterState};
+use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
+use super::ec::ErasureCoder;
 use super::packing::Stripe;
+
+/// Generic, packer-agnostic correctness check: reconstructs what a GET
+/// would produce from `stripes`' bin layout (assuming every bin decodes
+/// back perfectly, which is EC's job, not this check's) and compares it
+/// byte-for-byte against the real `body`, entirely in memory, before a
+/// single byte is written to the network. Deliberately generic rather than
+/// bespoke per-algorithm validation (checking "did FacPacker's greedy loop
+/// run correctly," say): any `StripePacker` bug — a dropped unit, a
+/// duplicated unit, a unit assigned to the wrong offset — corrupts the
+/// reconstructed object the same way regardless of which packer produced
+/// it, so one mechanism catches all of them. `unpadded_bins` is each
+/// stripe's bins *before* padding to `stripe.capacity`, i.e. exactly the
+/// concatenated unit bytes that went in.
+fn verify_stripes_reconstruct_original(
+    body: &[u8],
+    units_header: &[UnitMeta],
+    stripes: &[Stripe],
+    unpadded_bins: &[Vec<Vec<u8>>],
+) -> Result<(), Error> {
+    let mut output = vec![0u8; body.len()];
+    let mut covered = vec![false; body.len()];
+
+    for (stripe, bins) in stripes.iter().zip(unpadded_bins.iter()) {
+        for (unit_ids, bin_bytes) in stripe.bins.iter().zip(bins.iter()) {
+            let mut pos = 0usize;
+            for uid in unit_ids {
+                let unit = units_header
+                    .iter()
+                    .find(|u| &u.unit_id == uid)
+                    .ok_or_else(|| ErrorInternalServerError("packer returned an unknown unit id"))?;
+                let (start, len) = (unit.offset as usize, unit.len as usize);
+                let end = start + len;
+                output
+                    .get_mut(start..end)
+                    .ok_or_else(|| ErrorInternalServerError("packed unit out of bounds of the original object"))?
+                    .copy_from_slice(
+                        bin_bytes
+                            .get(pos..pos + len)
+                            .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?,
+                    );
+                for c in &mut covered[start..end] {
+                    *c = true;
+                }
+                pos += len;
+            }
+        }
+    }
+
+    if covered.iter().any(|c| !c) {
+        return Err(ErrorInternalServerError(
+            "content-dependent checksum failed: packer did not cover every byte of the object exactly once",
+        ));
+    }
+    if output != body {
+        return Err(ErrorInternalServerError(
+            "content-dependent checksum failed: packed stripes do not reconstruct the original object exactly",
+        ));
+    }
+    Ok(())
+}
 
 /// Also used by `pushdown.rs`'s peer-local filter handler, which needs to
 /// read exactly the same shard key a stripe's bins were stored under.
@@ -52,12 +113,17 @@ pub async fn put_object_content_dependent(
     }
 
     let required_acks = required_write_acks(k, m);
-    let mut stripe_records = Vec::with_capacity(stripes.len());
 
-    for (stripe_index, stripe) in stripes.iter().enumerate() {
-        let mut bins_bytes: Vec<Vec<u8>> = Vec::with_capacity(k);
+    // Build every stripe's bins *unpadded* first (the exact bytes a GET's
+    // reassembly expects to get back out), and verify the whole set
+    // reconstructs `body` byte-for-byte before any network call happens —
+    // see `verify_stripes_reconstruct_original`'s doc for why this is
+    // generic (packer-agnostic), not a bespoke check of one algorithm.
+    let mut unpadded_bins: Vec<Vec<Vec<u8>>> = Vec::with_capacity(stripes.len());
+    for stripe in &stripes {
+        let mut bins_bytes: Vec<Vec<u8>> = Vec::with_capacity(stripe.bins.len());
         for bin_unit_ids in &stripe.bins {
-            let mut buf = Vec::with_capacity(stripe.capacity);
+            let mut buf = Vec::new();
             for uid in bin_unit_ids {
                 let unit = units_header
                     .iter()
@@ -69,8 +135,18 @@ pub async fn put_object_content_dependent(
                         .ok_or_else(|| ErrorInternalServerError("computable unit out of bounds of body"))?,
                 );
             }
-            buf.resize(stripe.capacity, 0u8);
             bins_bytes.push(buf);
+        }
+        unpadded_bins.push(bins_bytes);
+    }
+    verify_stripes_reconstruct_original(body, units_header, &stripes, &unpadded_bins)?;
+
+    let mut stripe_records = Vec::with_capacity(stripes.len());
+
+    for (stripe_index, (stripe, bins_bytes)) in stripes.iter().zip(unpadded_bins.into_iter()).enumerate() {
+        let mut bins_bytes = bins_bytes;
+        for buf in bins_bytes.iter_mut() {
+            buf.resize(stripe.capacity, 0u8);
         }
 
         let all_shards = state
@@ -112,20 +188,11 @@ pub async fn put_object_content_dependent(
         stripes: stripe_records,
     };
 
-    // Replicate to the union of every stripe's peers — different stripes
-    // can land on different peer subsets (each resolved independently via
-    // its own stripe-qualified key), so the pin needs to reach all of
-    // them, not just one, for any of them to be able to coordinate a
-    // future GET. Same pattern as `coordinator.rs`'s `replicate_location_put`.
-    let all_peers: Vec<String> = record
-        .stripes
-        .iter()
-        .flat_map(|s| s.shard_peers.iter().cloned())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    let puts = all_peers.iter().cloned().map(|peer| {
+    // Replicate to *every* known peer, not just the union of this object's
+    // stripe peers — same reasoning as `coordinator.rs`'s
+    // `replicate_location_put`: a GET can land on any node, and only a node
+    // holding a copy of this pin can find the object at all.
+    let puts = peers.iter().cloned().map(|peer| {
         let client = state.location_http.clone();
         let record = record.clone();
         async move {
@@ -139,6 +206,17 @@ pub async fn put_object_content_dependent(
         return Err(ErrorInternalServerError(format!(
             "content-location pin quorum not met: {acked}/{required_acks} peers stored the record"
         )));
+    }
+
+    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup:
+    // this key may have previously been written plain (e.g. this bucket's
+    // packer/threshold changed, or this particular object's overhead
+    // crossed back under the threshold this time). Clear any stale
+    // `LocationStore` entry so a plain GET path never shadows this fresher
+    // packed write.
+    if state.location_store.get(bucket, key).is_some() {
+        let _ = state.location_store.delete(bucket, key);
+        replicate_location_delete(state, bucket, key, &peers).await;
     }
 
     Ok(HttpResponse::Ok().finish())
@@ -178,8 +256,12 @@ async fn fetch_and_decode_stripe(
         )));
     }
 
+    // Same fix as `coordinator.rs`'s plain GET: decode with *this record's*
+    // k/m, not the node's process-wide `state.ec`.
     let t_decode_start = std::time::Instant::now();
-    let decoded = state.ec.decode_shards(&shards).map_err(|e| ErrorInternalServerError(e.to_string()));
+    let decoded = super::ec::ReedSolomonCoder::new(record.k, record.m)
+        .and_then(|decoder| decoder.decode_shards(&shards))
+        .map_err(|e| ErrorInternalServerError(e.to_string()));
     let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1000.0;
     log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={}", stripe.shard_peers.len());
     decoded
@@ -317,4 +399,57 @@ pub async fn get_object_content_dependent_range(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::*;
+
+    fn unit(id: &str, offset: u64, len: u64) -> UnitMeta {
+        UnitMeta { unit_id: id.to_string(), offset, len, uncompressed_len: len, codec: "opaque".to_string(), metadata: Vec::new() }
+    }
+
+    // One stripe, 2 bins: bin0 = [u0], bin1 = [u1]. Matches how
+    // `put_object_content_dependent` actually shapes `unpadded_bins` (one
+    // inner Vec<u8> per bin, in `stripe.bins` order), before padding.
+    fn stripe_two_bins() -> Stripe {
+        Stripe { bins: vec![vec!["u0".to_string()], vec!["u1".to_string()]], capacity: 5 }
+    }
+
+    #[test]
+    fn verify_passes_when_stripes_reconstruct_the_original_exactly() {
+        let body = b"helloworld".to_vec(); // u0="hello" (0..5), u1="world" (5..10)
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        let stripes = vec![stripe_two_bins()];
+        let bins = vec![vec![b"hello".to_vec(), b"world".to_vec()]];
+
+        assert!(verify_stripes_reconstruct_original(&body, &units, &stripes, &bins).is_ok());
+    }
+
+    #[test]
+    fn verify_fails_when_a_unit_is_dropped_entirely() {
+        let body = b"helloworld".to_vec();
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        let stripes = vec![stripe_two_bins()];
+        // bin1 is empty: u1's bytes never get written anywhere -- the
+        // "dropped unit" bug class this check exists to catch.
+        let bins = vec![vec![b"hello".to_vec(), Vec::new()]];
+
+        let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn verify_fails_when_bin_bytes_dont_match_the_original() {
+        let body = b"helloworld".to_vec();
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        let stripes = vec![stripe_two_bins()];
+        // Full coverage, but u1's bytes are simply wrong (e.g. a corrupted
+        // or mis-assigned bin) -- the coverage check alone wouldn't catch
+        // this, only the byte-equality check does.
+        let bins = vec![vec![b"hello".to_vec(), b"WORLD".to_vec()]];
+
+        let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
+        assert!(err.is_err());
+    }
 }

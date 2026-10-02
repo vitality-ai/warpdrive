@@ -85,7 +85,7 @@ curl http://localhost:9710/cluster/mybucket/myobject -o file.bin
 curl -X DELETE http://localhost:9710/cluster/mybucket/myobject
 ```
 
-Any node can serve any request, there's no dedicated coordinator to route to. Placement, erasure coding (Reed-Solomon), and quorum reads/writes all happen automatically, with no extra configuration required.
+Any node can serve any request, there's no dedicated coordinator to route to: a PUT's placement pin is replicated to every known peer (quorum-acked, so one briefly-unreachable peer doesn't fail an otherwise-healthy write), not just the peers holding shard data. Placement, erasure coding (Reed-Solomon), and quorum reads/writes all happen automatically, with no extra configuration required.
 
 ### Content-dependent placement (optional, per-bucket)
 
@@ -109,7 +109,7 @@ Each entry is `[offset, length, length, codec]` in the original object's byte la
 
 ### S3-shaped access for third-party tools (Lance, etc.)
 
-Tools that need real S3 bucket/list semantics (not just range-GET, e.g. Lance's `object_store::aws` client) can point at `/cluster/s3/{bucket}/{key}` instead, which supports GET/PUT/HEAD/List on top of the same cluster engine.
+Tools that need real S3 bucket/list semantics (not just range-GET, e.g. Lance's `object_store::aws` client) can point at `/cluster/s3/{bucket}/{key}` instead, which supports GET/PUT/HEAD/List on top of the same cluster engine. This is a deliberately minimal surface, not the same compatibility level as the single-node `/s3/` API above: no SigV4 signature verification (any `Authorization` header is accepted unchecked), no multipart upload, no LIST pagination, and `ETag`/`LastModified` are fixed placeholder values. Scoped to exactly what `object_store::aws` needs to open and read a dataset.
 
 ### Read more
 

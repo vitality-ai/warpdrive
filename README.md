@@ -21,6 +21,8 @@
 
 ## About
 
+WarpDrive is purpose-built for high-throughput workloads: storage-disaggregated architectures and data-intensive distributed systems. Our broader aim is storage primitives built with a deep understanding of the backend underneath them, making computational pushdown and storage-centric execution first-class. That lets data systems, ML frameworks, and agentic workflows move computation closer to data: less unnecessary movement, more efficient large-scale processing, retrieval, and orchestration.
+
 WarpDrive is an object store that's fast by default, explains its own performance well enough to back an SLA, and lets you customize data placement without risking availability.
 
 Run it **single-node** for a fully S3-compatible store in one process, a drop-in for local development and embedded use (see compatibility results below). Run it **distributed** for a multi-node, erasure-coded engine: no single coordinator, no leader election, quorum-based reads/writes.
@@ -30,7 +32,7 @@ What makes WarpDrive different is **content-dependent placement**: a bucket can 
 - **149x faster** on a selective official TPC-H query (DuckDB, via its own `dbgen`): pushdown skips untouched stripes instead of reconstructing the whole object.
 - **Up to 41x faster** on Lance vector search (`IVF_PQ`) `take` latency, recall@10 identical to the unpacked baseline on SIFT1M-small. Speed with no accuracy trade-off.
 
-WarpDrive is purpose-built for high-throughput workloads: storage-disaggregated architectures and data-intensive distributed systems. Our broader aim is storage primitives built with a deep understanding of the backend underneath them, making computational pushdown and storage-centric execution first-class. That lets data systems, ML frameworks, and agentic workflows move computation closer to data: less unnecessary movement, more efficient large-scale processing, retrieval, and orchestration.
+Both numbers are WarpDrive-packed vs. WarpDrive-plain on a single local cluster, RS(3,2), not a comparison against MinIO or against Fusion's own RS(9,6) parameter.
 
 Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md). Architecture for both modes: [Technical Architecture](docs/Technical-Architecture.md). Our longer-term direction: [Technical Roadmap](docs/Technical-Roadmap.md).
 
@@ -52,7 +54,7 @@ WarpDrive's content-dependent placement is measured against real tools and real 
 
 ## Compatibility Tests
 
-WarpDrive is tested against real-world storage clients and databases to validate S3 compatibility. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
+WarpDrive is tested against real-world storage clients and databases to validate S3 compatibility. These are single-node `/s3/` API tests, separate from the distributed-engine benchmarks above. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
 
 | System | Type | Version Tested | Status | Notes |
 |--------|------|---------------|--------|-------|

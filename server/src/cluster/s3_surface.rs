@@ -4,8 +4,8 @@
 //! (`s3::handlers`, SigV4 auth, bucket operations): that API writes to
 //! single-node local storage only, never through `cluster_put_object`'s
 //! FAC/plain dispatch — pointing a real S3 client at it would prove
-//! "talks to WarpDrive," not "reconfigurability helps." This shim is the
-//! other direction: real-enough S3 protocol (GET/PUT/HEAD/LIST) in front of
+//! "talks to WarpDrive," not "reconfigurability helps." This surface is
+//! the other direction: real-enough S3 protocol (GET/PUT/HEAD/LIST) in front of
 //! the *same* dispatch DuckDB's Range-GET already proved, for clients like
 //! Lance's `object_store::aws` that need genuine bucket/list semantics, not
 //! just an arbitrary HTTP+Range URL the way DuckDB's `httpfs` accepts.

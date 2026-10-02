@@ -87,7 +87,7 @@ pub trait ContentLocationStore: Send + Sync {
     fn put(&self, record: ContentDependentRecord) -> io::Result<()>;
     fn get(&self, bucket: &str, key: &str) -> Option<ContentDependentRecord>;
     fn delete(&self, bucket: &str, key: &str) -> io::Result<()>;
-    /// See `LocationStore::list` — same minimal-S3-shim purpose, for the
+    /// See `LocationStore::list` — same minimal-S3-surface purpose, for the
     /// content-dependent half of a bucket's objects.
     fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
 }

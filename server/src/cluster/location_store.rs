@@ -42,7 +42,7 @@ pub trait LocationStore: Send + Sync {
     fn get(&self, bucket: &str, key: &str) -> Option<LocationRecord>;
     fn delete(&self, bucket: &str, key: &str) -> io::Result<()>;
     /// Keys (with their byte size) in `bucket` whose key starts with
-    /// `prefix` — the minimal S3 ListObjectsV2 shim needs this (object
+    /// `prefix` — the minimal S3 ListObjectsV2 surface needs this (object
     /// stores speaking the real S3 protocol, like Lance's client, list a
     /// dataset's files; the raw `/cluster/{bucket}/{key}` API never needed
     /// this since callers always know their own key).

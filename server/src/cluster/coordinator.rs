@@ -153,7 +153,7 @@ async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, p
 
 /// Replicate a tombstone (delete) for `(bucket, key)` to every peer in
 /// `peers`. Same symmetric-including-self treatment as the put path.
-async fn replicate_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
+pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
     let deletes = peers.iter().cloned().map(|peer| {
         let client = state.location_http.clone();
         let bucket = bucket.to_string();
@@ -181,6 +181,63 @@ async fn replicate_location_delete(state: &ClusterState, bucket: &str, key: &str
     join_all(deletes).await.into_iter().filter(|ok| *ok).count()
 }
 
+/// Content-location counterpart of `replicate_location_delete` — needed so
+/// a plain PUT that overwrites a key previously packed can clear the stale
+/// `ContentLocationStore` pin (see `put_object_plain`'s overwrite handling)
+/// and so `cluster_delete_object` can tombstone a packed object, neither of
+/// which was possible before: a packed object lived *only* in
+/// `ContentLocationStore`, which DELETE never touched, and a plain overwrite
+/// never cleared the packed pin GET still preferred.
+pub(crate) async fn replicate_content_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
+    let deletes = peers.iter().cloned().map(|peer| {
+        let client = state.location_http.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        async move {
+            let url = format!(
+                "{}/cluster/_internal/content_location/{}/{}",
+                peer.trim_end_matches('/'),
+                bucket,
+                key
+            );
+            match client.delete(&url).send().await {
+                Ok(r) if r.status().is_success() => true,
+                Ok(r) => {
+                    warn!("content-location tombstone replication to {peer} returned {}", r.status());
+                    false
+                }
+                Err(e) => {
+                    warn!("content-location tombstone replication to {peer} failed: {e}");
+                    false
+                }
+            }
+        }
+    });
+    join_all(deletes).await.into_iter().filter(|ok| *ok).count()
+}
+
+/// Attaches `x-warpd-placement` (`plain`|`packed`) and, when a packing
+/// decision was actually computed — whether it was used or rejected as
+/// over-budget — `x-warpd-pack-overhead-pct` to a PUT response. This is
+/// what makes "the system reports the cost of that choice" a real,
+/// client-visible fact rather than something only ever logged
+/// server-side: before this, the overhead number existed (it's what the
+/// threshold check above already compares against) but was never handed
+/// back to the caller in any form.
+fn attach_placement_headers(mut resp: HttpResponse, placement: &'static str, overhead_pct: Option<f64>) -> HttpResponse {
+    resp.headers_mut().insert(
+        actix_web::http::header::HeaderName::from_static("x-warpd-placement"),
+        actix_web::http::header::HeaderValue::from_static(placement),
+    );
+    if let Some(pct) = overhead_pct {
+        if let Ok(val) = actix_web::http::header::HeaderValue::from_str(&format!("{pct:.4}")) {
+            resp.headers_mut()
+                .insert(actix_web::http::header::HeaderName::from_static("x-warpd-pack-overhead-pct"), val);
+        }
+    }
+    resp
+}
+
 pub async fn cluster_put_object(
     path: web::Path<(String, String)>,
     body: web::Bytes,
@@ -197,7 +254,9 @@ pub async fn cluster_put_object(
     // same cost as before this feature existed (see the North star's
     // before/after performance check).
     let Some(config) = state.bucket_config_store.get(&bucket) else {
-        return put_object_plain(&bucket, &key, &body, &state).await;
+        return put_object_plain(&bucket, &key, &body, &state)
+            .await
+            .map(|r| attach_placement_headers(r, "plain", None));
     };
 
     // For a configured bucket, the header's job narrows to two things:
@@ -213,7 +272,9 @@ pub async fn cluster_put_object(
         .unwrap_or(false);
     if forced_plain {
         info!("bucket={bucket} key={key} x-warpd-computable-units: false — explicit opt-out of this bucket's custom placement");
-        return put_object_plain(&bucket, &key, &body, &state).await;
+        return put_object_plain(&bucket, &key, &body, &state)
+            .await
+            .map(|r| attach_placement_headers(r, "plain", None));
     }
 
     // No header at all on a configured bucket: still attempt content-
@@ -255,13 +316,18 @@ pub async fn cluster_put_object(
         let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
 
         if overhead <= config.overhead_threshold_pct {
-            return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, stripes, &state).await;
+            return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, stripes, &state)
+                .await
+                .map(|r| attach_placement_headers(r, "packed", Some(overhead)));
         }
         info!(
             "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
              {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
             config.overhead_threshold_pct, config.packer_name
         );
+        return put_object_plain(&bucket, &key, &body, &state)
+            .await
+            .map(|r| attach_placement_headers(r, "plain", Some(overhead)));
     } else {
         warn!(
             "bucket={bucket} key={key} bucket config names unknown packer {:?} — \
@@ -270,7 +336,9 @@ pub async fn cluster_put_object(
         );
     }
 
-    put_object_plain(&bucket, &key, &body, &state).await
+    put_object_plain(&bucket, &key, &body, &state)
+        .await
+        .map(|r| attach_placement_headers(r, "plain", None))
 }
 
 async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterState) -> Result<HttpResponse, Error> {
@@ -337,10 +405,13 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
 
     // Pin the resolved placement — this, not the hash function, is what
     // makes reads stable across later membership changes. Replicated to
-    // every shard-holder peer (not just written locally): a GET can land
-    // on any node, and only a node holding a copy of this pin can find the
-    // object at all. All peers are treated symmetrically, including this
-    // one, via the same internal HTTP call — no special self-case.
+    // *every* known peer, not just the k+m shard-holders: a GET can land
+    // on any node (any node can be coordinator), and only a node holding a
+    // copy of this pin can find the object at all. Quorum-acked (not
+    // all-acked) so one unreachable peer doesn't fail an otherwise-healthy
+    // write; in the common case (all peers reachable) every node ends up
+    // with the pin, making "any node can serve GET" actually true rather
+    // than only true for the k+m peers that happened to hold shards.
     let record = LocationRecord {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -354,13 +425,26 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     };
 
     let t0 = std::time::Instant::now();
-    let loc_acked = replicate_location_put(&state, &record, &chosen).await;
+    let loc_acked = replicate_location_put(&state, &record, &peers).await;
     state.timing.location_replicate.record(t0.elapsed());
     if loc_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "location pin quorum not met: {loc_acked}/{required_acks} peers stored the placement record \
              (shard data was written, but the object may not be findable from every node)"
         )));
+    }
+
+    // This key may have previously been written content-dependent (packed)
+    // on a bucket whose config later changed, or simply have had its
+    // overhead cross the threshold this time where it didn't before. GET
+    // checks `content_location_store` first, so if that stale record is
+    // left in place a client could PUT successfully here and still read
+    // back the *old* packed bytes on the next GET. Clear it, best-effort:
+    // a plain PUT having already satisfied its own quorum is the operation
+    // that should be considered to have succeeded either way.
+    if state.content_location_store.get(&bucket, &key).is_some() {
+        let _ = state.content_location_store.delete(&bucket, &key);
+        replicate_content_location_delete(&state, &bucket, &key, &peers).await;
     }
 
     state.timing.total.record(request_start.elapsed());
@@ -474,8 +558,17 @@ pub async fn cluster_get_object(
         )));
     }
 
-    let data = state
-        .ec
+    // Decode with *this object's own* k/m, not the node's process-wide
+    // `state.ec` — those can disagree (a node restarted with different
+    // `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M`, or a cluster mid-migration to new
+    // parameters) and `state.ec` silently wins today, which is wrong:
+    // `record.k`/`record.m` were already being used for the quorum count
+    // above, but not for the decode that quorum count exists to gate.
+    // `ReedSolomonCoder::new` just builds a small Galois-field table, cheap
+    // enough to construct per request rather than needing a shared cache.
+    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m)
+        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    let data = decoder
         .decode(&shards, record.original_len)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
 
@@ -524,37 +617,67 @@ pub async fn cluster_delete_object(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
-    let record = match state.location_store.get(&bucket, &key) {
-        Some(r) => r,
-        None => return Ok(HttpResponse::NotFound().finish()),
-    };
+    // A key is either plain (`LocationStore`) or content-dependent/packed
+    // (`ContentLocationStore`) — decided once, at PUT time, by which path
+    // handled it. DELETE used to only ever check `LocationStore`, so a
+    // packed object (which never has a `LocationStore` entry) returned 404
+    // and was never actually removed. Check both; a key can even have a
+    // *stale* entry in the other store left over from an earlier overwrite
+    // that changed which path it took (see `put_object_plain`'s and
+    // `put_object_content_dependent`'s overwrite handling) — clear both
+    // unconditionally rather than assuming only one is ever present.
+    let plain_record = state.location_store.get(&bucket, &key);
+    let packed_record = state.content_location_store.get(&bucket, &key);
+
+    if plain_record.is_none() && packed_record.is_none() {
+        return Ok(HttpResponse::NotFound().finish());
+    }
 
     // Object lock enforcement: one record, one lookup, no distributed lock
-    // manager (see location_store.rs and the architecture doc).
-    if let (Some(mode), Some(until)) = (&record.retention_mode, &record.retain_until) {
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        if until.as_str() > now.as_str() {
-            return Err(ErrorForbidden(format!(
-                "object is locked under {mode} retention until {until}"
-            )));
+    // manager (see location_store.rs and the architecture doc). Retention
+    // only exists on the plain record today (`cluster_put_retention` only
+    // ever writes `LocationStore`) — a packed object has no lock fields to
+    // check.
+    if let Some(record) = &plain_record {
+        if let (Some(mode), Some(until)) = (&record.retention_mode, &record.retain_until) {
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            if until.as_str() > now.as_str() {
+                return Err(ErrorForbidden(format!(
+                    "object is locked under {mode} retention until {until}"
+                )));
+            }
         }
-    }
-    if record.legal_hold {
-        return Err(ErrorForbidden("object has an active legal hold"));
+        if record.legal_hold {
+            return Err(ErrorForbidden("object has an active legal hold"));
+        }
     }
 
     // Shard bytes are left for later background reclamation, matching the
     // existing single-node Storage::delete semantics (queue, don't block
     // on immediate space reclamation) — only the pin removal is
-    // authoritative for whether a GET can still find the object. The
-    // tombstone is replicated the same way the pin itself was written, to
-    // every peer that might hold a copy.
-    let required_acks = required_write_acks(record.k, record.m);
-    let acked = replicate_location_delete(&state, &bucket, &key, &record.shard_peers).await;
-    if acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
-            "tombstone quorum not met: {acked}/{required_acks} peers removed the placement record"
-        )));
+    // authoritative for whether a GET can still find the object. Tombstones
+    // are replicated to every known peer (see `put_object_plain`'s matching
+    // comment on why that's "every peer," not just the ones that happen to
+    // hold a shard).
+    let peers = state.membership.peers();
+
+    if let Some(record) = &plain_record {
+        let required_acks = required_write_acks(record.k, record.m);
+        let acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
+        if acked < required_acks {
+            return Err(ErrorInternalServerError(format!(
+                "tombstone quorum not met: {acked}/{required_acks} peers removed the placement record"
+            )));
+        }
+    }
+    if let Some(record) = &packed_record {
+        let required_acks = required_write_acks(record.k, record.m);
+        let acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+        if acked < required_acks {
+            return Err(ErrorInternalServerError(format!(
+                "tombstone quorum not met: {acked}/{required_acks} peers removed the content-dependent placement record"
+            )));
+        }
     }
 
     Ok(HttpResponse::Ok().finish())
@@ -702,6 +825,20 @@ pub async fn cluster_internal_delete_location(
     let (bucket, key) = path.into_inner();
     state
         .location_store
+        .delete(&bucket, &key)
+        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::Ok().finish())
+}
+
+/// Receiving side of content-location tombstone replication — the
+/// multi-stripe counterpart to `cluster_internal_delete_location` above.
+pub async fn cluster_internal_delete_content_location(
+    path: web::Path<(String, String)>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let (bucket, key) = path.into_inner();
+    state
+        .content_location_store
         .delete(&bucket, &key)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())

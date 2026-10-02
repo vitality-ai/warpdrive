@@ -17,7 +17,7 @@ pub mod bucket_config;
 pub mod coordinator;
 pub mod packed;
 pub mod pushdown;
-pub mod s3_shim;
+pub mod s3_surface;
 
 pub mod shard_proto {
     tonic::include_proto!("warpdrive.cluster");
