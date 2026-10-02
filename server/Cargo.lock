@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "warp_drive"
-version = "1.0.0"
+version = "1.0.0-beta"
 dependencies = [
  "actix-web",
  "async-trait",

@@ -56,7 +56,7 @@ For advanced usage and development details, see the [Developer's Documentation](
 
 ---
 
-## Distributed Mode (v1.0.0)
+## Distributed Mode (v1.0.0-beta)
 
 Everything above is single-node mode. WarpDrive can also run as a multi-node, erasure-coded cluster. Full architecture, diagrams, and measured results: [Technical Architecture](Technical-Architecture.md) and [v1.0.0 Results](benchmarks/v1.0.0-results.md).
 

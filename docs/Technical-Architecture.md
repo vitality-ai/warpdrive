@@ -5,7 +5,7 @@
 WarpDrive is a high-throughput key-value/object store optimized for Storage Disaggregated Architectures and AI/ML workloads. The implementation is based on Facebook's 2008 Haystack paper,
 focusing on efficient storage and retrieval of objects through a simplified architecture.
 
-As of **v1.0.0**, WarpDrive runs in two modes:
+As of **v1.0.0-beta**, WarpDrive runs in two modes:
 
 - **Single-node mode**: a single process, fully S3-compatible, for local
   deployments and development. This is the original architecture below,
@@ -58,7 +58,7 @@ graph TD
     S3CLIENT[S3 Client] -->|boto3/aws-cli| S3API
 ```
 
-## Distributed Mode - v1.0.0
+## Distributed Mode - v1.0.0-beta
 
 Every deployed node is **symmetric**: the same binary, both a storage node
 (the single-node architecture above, unchanged) and a coordinator that can
