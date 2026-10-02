@@ -21,9 +21,7 @@
 
 ## About
 
-WarpDrive is purpose-built for high-throughput workloads: storage-disaggregated architectures and data-intensive distributed systems. Our broader aim is storage primitives built with a deep understanding of the backend underneath them, making computational pushdown and storage-centric execution first-class. That lets data systems, ML frameworks, and agentic workflows move computation closer to data: less unnecessary movement, more efficient large-scale processing, retrieval, and orchestration.
-
-WarpDrive is an object store that's fast by default, explains its own performance well enough to back an SLA, and lets you customize data placement without risking availability.
+WarpDrive is purpose-built for high-throughput workloads: storage-disaggregated architectures and data-intensive distributed systems. Our broader aim is storage primitives built with a deep understanding of the backend underneath them, making computational pushdown and storage-centric execution first-class, so data systems, ML frameworks, and agentic workflows can move computation closer to data: less unnecessary movement, more efficient large-scale processing, retrieval, and orchestration. It's fast by default, explains its own performance well enough to back an SLA, and lets you customize data placement without risking availability.
 
 Run it **single-node** for a fully S3-compatible store in one process, a drop-in for local development and embedded use (see compatibility results below). Run it **distributed** for a multi-node, erasure-coded engine: no single coordinator, no leader election, quorum-based reads/writes.
 
