@@ -352,8 +352,10 @@ function drawBars(id, labels, datasets, opts={}) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 600, H = canvas.offsetHeight || 230;
+  const H = parseInt(canvas.getAttribute('height'), 10) || 230;
+  const W = canvas.offsetWidth || 600;
   canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
   const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
   const pad = { top:36, right:8, bottom:22, left:50 };
   const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
@@ -424,8 +426,10 @@ function drawLine(id, labels, datasets, opts={}) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 400, H = canvas.offsetHeight || 210;
+  const H = parseInt(canvas.getAttribute('height'), 10) || 210;
+  const W = canvas.offsetWidth || 400;
   canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
   const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
   const pad = { top:36, right:14, bottom:22, left:46 };
   const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
