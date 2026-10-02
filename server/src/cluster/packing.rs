@@ -12,6 +12,15 @@
 pub struct Unit {
     pub unit_id: String,
     pub size: usize,
+    /// Opaque, packer-defined bytes — `FacPacker` ignores this entirely
+    /// (it only ever looks at `size`), but a different packer can use it
+    /// for whatever its own algorithm needs: e.g. a workload-aware packer
+    /// for IVF vector partitions reads this as an encoded spatial-locality
+    /// rank derived from the partition's real centroid, so it can group
+    /// partitions that tend to be probed *together* into the same stripe —
+    /// something size alone can never express. Empty for every caller that
+    /// doesn't need it (the default, zero behavior change for FacPacker).
+    pub metadata: Vec<u8>,
 }
 
 /// `k` bins (each a list of unit_ids, in the order they were packed into
@@ -30,46 +39,121 @@ pub trait StripePacker: Send + Sync {
     fn pack(&self, k: usize, units: &[Unit]) -> Vec<Stripe>;
 }
 
+/// Real storage overhead of a packing result, w.r.t. the optimal MDS size
+/// `(1 + m/k) * total_original_bytes` — Fusion's own definition (ASPLOS'25
+/// §6.3). This is the number the per-bucket overhead threshold (see
+/// `bucket_config.rs`) is compared against: computed once, before any shard
+/// is written, so an over-threshold pack can be abandoned with zero network
+/// cost, not discovered after the fact.
+pub fn overhead_pct(k: usize, m: usize, units: &[Unit], stripes: &[Stripe]) -> f64 {
+    let total_original: usize = units.iter().map(|u| u.size).sum();
+    if total_original == 0 {
+        return 0.0;
+    }
+    let actual_physical: usize = stripes.iter().map(|s| (k + m) * s.capacity).sum();
+    let optimal_physical = (1.0 + m as f64 / k as f64) * total_original as f64;
+    100.0 * (actual_physical as f64 / optimal_physical - 1.0)
+}
+
+/// Fusion's Algorithm 1, generalized, as a standalone helper — not just
+/// `FacPacker`'s private body. Greedy: seed each stripe with the largest
+/// remaining unit, pack the rest into whichever other bin is least full
+/// and still has room under the seed's size (the stripe's `capacity`).
+/// Extracted so a workload-aware packer (`IvfCentroidPacker` below) can
+/// apply this same real bin-packing *within* a group of units it already
+/// knows belong together, instead of inventing a cruder one-unit-per-bin
+/// rule. Real bin-packing efficiency and workload-awareness aren't
+/// alternatives — they compose.
+fn fac_pack(k: usize, units: &[&Unit]) -> Vec<Stripe> {
+    let mut remaining: Vec<&Unit> = units.to_vec();
+    remaining.sort_by(|a, b| b.size.cmp(&a.size));
+
+    let mut stripes = Vec::new();
+
+    while !remaining.is_empty() {
+        let seed = remaining.remove(0);
+        let mut bins: Vec<Vec<String>> = vec![Vec::new(); k];
+        bins[0].push(seed.unit_id.clone());
+        let mut bin_sizes = vec![0usize; k];
+        bin_sizes[0] = seed.size;
+        let capacity = seed.size;
+
+        let mut still_remaining = Vec::new();
+        for u in remaining {
+            let candidate = (1..k)
+                .filter(|&b| bin_sizes[b] + u.size <= capacity)
+                .min_by_key(|&b| bin_sizes[b]);
+            match candidate {
+                Some(b) => {
+                    bins[b].push(u.unit_id.clone());
+                    bin_sizes[b] += u.size;
+                }
+                None => still_remaining.push(u),
+            }
+        }
+        remaining = still_remaining;
+
+        stripes.push(Stripe { bins, capacity });
+    }
+
+    stripes
+}
+
 /// FAC: Fusion's Algorithm 1, generalized — the one implementation shipped
-/// here. Greedy: seed each stripe with the largest remaining unit, pack
-/// the rest into whichever other bin is least full and still has room
-/// under the seed's size (the stripe's `capacity`).
+/// here. Thin wrapper over `fac_pack`, applied globally across all units.
 pub struct FacPacker;
 
 impl StripePacker for FacPacker {
     fn pack(&self, k: usize, units: &[Unit]) -> Vec<Stripe> {
-        let mut remaining: Vec<&Unit> = units.iter().collect();
-        remaining.sort_by(|a, b| b.size.cmp(&a.size));
+        let refs: Vec<&Unit> = units.iter().collect();
+        fac_pack(k, &refs)
+    }
+}
 
-        let mut stripes = Vec::new();
+/// A second, deliberately *different* `StripePacker` — not a generalization
+/// of FAC, a genuinely different algorithm motivated by how IVF vector
+/// search actually accesses data. An `nprobe` query touches whichever
+/// centroids are geometrically nearest the query vector, and nearby
+/// centroids tend to get probed together. FAC only ever looks at
+/// `Unit::size` — it has no way to express "these two units are usually
+/// needed together."
+///
+/// This packer reads `Unit::metadata` as a little-endian `u32` *cluster
+/// id* — a real k-means cluster assignment over the index's actual
+/// centroids (see `hipc_poster/lance_real_offsets.py`), not a guessed or
+/// random grouping. Units are grouped by *exact* cluster id (not just
+/// sorted-order proximity — an earlier version of this packer sorted by a
+/// flattened 1-D "spatial rank" and chunked every `k`, which only
+/// guarantees chain-adjacent units are close, not that an arbitrary
+/// query's whole probed set is; measured directly, that version showed no
+/// improvement over no packing at all). Within each cluster, `fac_pack`
+/// runs exactly as `FacPacker` would — real multi-unit-per-bin packing,
+/// not one unit per bin — so a cluster of many partitions still fills a
+/// stripe's bins efficiently instead of spilling into one stripe per `k`
+/// partitions regardless of how many the cluster actually has.
+pub struct IvfCentroidPacker;
 
-        while !remaining.is_empty() {
-            let seed = remaining.remove(0);
-            let mut bins: Vec<Vec<String>> = vec![Vec::new(); k];
-            bins[0].push(seed.unit_id.clone());
-            let mut bin_sizes = vec![0usize; k];
-            bin_sizes[0] = seed.size;
-            let capacity = seed.size;
+fn cluster_id(u: &Unit) -> u32 {
+    if u.metadata.len() >= 4 {
+        u32::from_le_bytes([u.metadata[0], u.metadata[1], u.metadata[2], u.metadata[3]])
+    } else {
+        u32::MAX // unranked (e.g. framing) units: their own group, sorted last
+    }
+}
 
-            let mut still_remaining = Vec::new();
-            for u in remaining {
-                let candidate = (1..k)
-                    .filter(|&b| bin_sizes[b] + u.size <= capacity)
-                    .min_by_key(|&b| bin_sizes[b]);
-                match candidate {
-                    Some(b) => {
-                        bins[b].push(u.unit_id.clone());
-                        bin_sizes[b] += u.size;
-                    }
-                    None => still_remaining.push(u),
-                }
+impl StripePacker for IvfCentroidPacker {
+    fn pack(&self, k: usize, units: &[Unit]) -> Vec<Stripe> {
+        let mut groups: Vec<(u32, Vec<&Unit>)> = Vec::new();
+        for u in units {
+            let cid = cluster_id(u);
+            match groups.iter_mut().find(|(id, _)| *id == cid) {
+                Some(entry) => entry.1.push(u),
+                None => groups.push((cid, vec![u])),
             }
-            remaining = still_remaining;
-
-            stripes.push(Stripe { bins, capacity });
         }
+        groups.sort_by_key(|(id, _)| *id);
 
-        stripes
+        groups.into_iter().flat_map(|(_, us)| fac_pack(k, &us)).collect()
     }
 }
 
@@ -81,7 +165,7 @@ mod tests {
         sizes
             .iter()
             .enumerate()
-            .map(|(i, &size)| Unit { unit_id: format!("u{i}"), size })
+            .map(|(i, &size)| Unit { unit_id: format!("u{i}"), size, metadata: Vec::new() })
             .collect()
     }
 
@@ -142,5 +226,110 @@ mod tests {
         assert_eq!(s1.bins[0], vec!["u5"]);
         assert_eq!(s1.bins[1], Vec::<String>::new());
         assert_eq!(s1.bins[2], Vec::<String>::new());
+    }
+
+    #[test]
+    fn overhead_pct_matches_a_real_measured_run() {
+        // Grounded in an actual local-cluster run (RS(3,2), column-chunk
+        // granularity Parquet workload): total_original=256375,
+        // actual_physical=429370 -> 0.4864% overhead. Not a hand-derived
+        // number — this is what the live FacPacker produced.
+        let u = vec![Unit { unit_id: "u".into(), size: 256_375, metadata: Vec::new() }];
+        let stripes = vec![Stripe { bins: vec![Vec::new(); 3], capacity: 85_874 }];
+        let pct = overhead_pct(3, 2, &u, &stripes);
+        assert!((pct - 0.4864).abs() < 0.01, "got {pct}");
+    }
+
+    fn units_with_rank(ranks: &[(usize, u32)]) -> Vec<Unit> {
+        ranks
+            .iter()
+            .enumerate()
+            .map(|(i, &(size, rank))| Unit {
+                unit_id: format!("u{i}"),
+                size,
+                metadata: rank.to_le_bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ivf_centroid_packer_never_splits_a_unit_and_every_unit_appears_exactly_once() {
+        // cluster ids (the second element) deliberately repeat, so this
+        // also exercises grouping, not just the single-unit-per-id case.
+        let u = units_with_rank(&[(10, 0), (20, 0), (15, 1), (30, 1), (5, 1), (8, 2)]);
+        let stripes = IvfCentroidPacker.pack(3, &u);
+
+        let mut seen = std::collections::HashSet::new();
+        for s in &stripes {
+            for bin in &s.bins {
+                for id in bin {
+                    assert!(seen.insert(id.clone()), "unit {id} appeared more than once");
+                }
+            }
+        }
+        assert_eq!(seen.len(), u.len());
+    }
+
+    #[test]
+    fn ivf_centroid_packer_no_bin_exceeds_its_stripes_capacity() {
+        let u = units_with_rank(&[(10, 0), (20, 0), (15, 1), (30, 1), (5, 1), (8, 2)]);
+        let stripes = IvfCentroidPacker.pack(3, &u);
+        let by_id: std::collections::HashMap<_, _> = u.iter().map(|unit| (unit.unit_id.clone(), unit.size)).collect();
+
+        for s in &stripes {
+            for bin in &s.bins {
+                let total: usize = bin.iter().map(|id| by_id[id]).sum();
+                assert!(total <= s.capacity, "bin total {total} exceeds capacity {}", s.capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn ivf_centroid_packer_groups_by_exact_cluster_id_not_by_size() {
+        // near_a/b/c share cluster id 0; far_a/b/c share cluster id 1.
+        // Sizes are deliberately scrambled so a size-based packer
+        // (FacPacker) would group these completely differently -- this
+        // test specifically checks IvfCentroidPacker groups by cluster id,
+        // not by size.
+        let u = vec![
+            Unit { unit_id: "near_a".into(), size: 100, metadata: 0u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "near_b".into(), size: 10, metadata: 0u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "near_c".into(), size: 50, metadata: 0u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "far_a".into(), size: 20, metadata: 1u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "far_b".into(), size: 90, metadata: 1u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "far_c".into(), size: 5, metadata: 1u32.to_le_bytes().to_vec() },
+        ];
+        let stripes = IvfCentroidPacker.pack(3, &u);
+        assert_eq!(stripes.len(), 2);
+
+        let stripe0_ids: std::collections::HashSet<_> = stripes[0].bins.iter().flatten().cloned().collect();
+        assert_eq!(
+            stripe0_ids,
+            ["near_a", "near_b", "near_c"].iter().map(|s| s.to_string()).collect()
+        );
+        let stripe1_ids: std::collections::HashSet<_> = stripes[1].bins.iter().flatten().cloned().collect();
+        assert_eq!(
+            stripe1_ids,
+            ["far_a", "far_b", "far_c"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn ivf_centroid_packer_packs_multiple_units_per_bin_within_a_cluster() {
+        // A single cluster of 4 small units under k=3 bins should use real
+        // bin-packing (multiple units sharing a bin) rather than needing
+        // 2 stripes for a one-unit-per-bin rule -- this is the entire
+        // point of running fac_pack within each cluster instead of a
+        // naive one-partition-per-bin grouping.
+        let u = vec![
+            Unit { unit_id: "a".into(), size: 10, metadata: 0u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "b".into(), size: 4, metadata: 0u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "c".into(), size: 3, metadata: 0u32.to_le_bytes().to_vec() },
+            Unit { unit_id: "d".into(), size: 2, metadata: 0u32.to_le_bytes().to_vec() },
+        ];
+        let stripes = IvfCentroidPacker.pack(3, &u);
+        assert_eq!(stripes.len(), 1, "4 small same-cluster units under k=3 should fit in one stripe, got {}", stripes.len());
+        let total_units: usize = stripes[0].bins.iter().map(|b| b.len()).sum();
+        assert_eq!(total_units, 4);
     }
 }

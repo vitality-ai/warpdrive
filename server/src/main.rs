@@ -22,9 +22,12 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
 use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
-    cluster_internal_put_content_location,
+    cluster_internal_put_content_location, cluster_content_record,
+    cluster_put_bucket_config, cluster_internal_put_bucket_config,
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
+use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
+use warp_drive::cluster::s3_shim::{cluster_s3_head_object, cluster_s3_list_objects};
 use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
 use warp_drive::cluster::location_store::BitcaskLocationStore;
@@ -32,11 +35,20 @@ use warp_drive::cluster::membership::Membership;
 use warp_drive::cluster::peer_client::{HttpPeerClient, PeerClient};
 use warp_drive::cluster::placement::ComputedPlacement;
 use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
+use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
+use warp_drive::cluster::packing::StripePacker;
 
-/// RS(k, m) for the cluster layer. Dev-loop default is RS(3,2) (small local
-/// cluster, fast iteration); phase 2's real experiment overrides this to
-/// RS(9,6) to match the poster's own simulated parameter. Per-bucket
-/// selection is deferred (see docs/Distributed-Engine-Plan.md).
+/// RS(k, m) for the cluster layer, `k` = data shards, `m` = parity shards
+/// (`k+m` total). Dev-loop default is `k=3, m=2` (small local cluster, fast
+/// iteration). To match Fusion's own default erasure code for a real
+/// reproduction, set `WARPDRIVE_RS_K=6 WARPDRIVE_RS_M=3` — **not** 9 and 6.
+/// Fusion's paper writes this as "RS(9,6)" in `(n, k)` notation: n=9 total
+/// blocks, k=6 *data* blocks, parity = n-k = 3 (ASPLOS'25 Fig. 2: "A (9, 6)
+/// erasure code... 6 data blocks and 3 parity blocks"). That's the opposite
+/// of this project's own `(k, m)` = (data, parity) convention, so reading
+/// their "9" as our `k` is the wrong translation — caught after an initial
+/// run used k=9,m=6 (15 total nodes) by mistake. Per-bucket selection is
+/// deferred (see docs/Distributed-Engine-Plan.md).
 fn ec_params_from_env() -> (usize, usize) {
     let k = std::env::var("WARPDRIVE_RS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let m = std::env::var("WARPDRIVE_RS_M").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
@@ -73,7 +85,17 @@ fn build_cluster_state() -> web::Data<ClusterState> {
         peer_client: peer_client_from_env(),
         location_http: reqwest::Client::new(),
         timing: Arc::new(warp_drive::cluster::timing_stats::TimingStats::default()),
-        packer: Arc::new(warp_drive::cluster::packing::FacPacker),
+        // Registry, not a single packer: a bucket's config (bucket_config.rs)
+        // names which entry to use. "fac" is the one shipped implementation;
+        // a user-defined packer becomes a third pluggable policy by
+        // implementing StripePacker and registering it here under its own
+        // name, not by modifying coordinator.rs.
+        packers: {
+            let mut m: std::collections::HashMap<String, Arc<dyn StripePacker>> = std::collections::HashMap::new();
+            m.insert("fac".to_string(), Arc::new(warp_drive::cluster::packing::FacPacker));
+            m.insert("ivf_centroid".to_string(), Arc::new(warp_drive::cluster::packing::IvfCentroidPacker));
+            m
+        },
         content_location_store: Arc::new(
             warp_drive::cluster::content_location_store::BitcaskContentLocationStore::open(
                 std::env::var("WARPDRIVE_CONTENT_LOCATION_LOG")
@@ -81,6 +103,18 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             )
             .expect("failed to open content location store log"),
         ),
+        bucket_config_store: Arc::new(
+            BitcaskBucketConfigStore::open(
+                std::env::var("WARPDRIVE_BUCKET_CONFIG_LOG")
+                    .unwrap_or_else(|_| "cluster_bucket_config.log".to_string()),
+            )
+            .expect("failed to open bucket config store log"),
+        ) as Arc<dyn BucketConfigStore>,
+        column_codecs: {
+            let mut m: std::collections::HashMap<String, Arc<dyn ColumnCodec>> = std::collections::HashMap::new();
+            m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
+            m
+        },
     };
     web::Data::new(state)
 }
@@ -156,7 +190,20 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
             .route("/cluster/_internal/location/{bucket}/{key:.*}", web::delete().to(cluster_internal_delete_location))
+            .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
+            .route("/cluster/_internal/bucket_config", web::post().to(cluster_internal_put_bucket_config))
+            .route("/cluster/_internal/pushdown_filter", web::post().to(cluster_internal_pushdown_filter))
+            .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
             .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
+            .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
+            // Minimal S3-protocol shim (s3_shim.rs) — a distinct "s3/" prefix
+            // so it never collides with the generic {bucket}/{key:.*} routes
+            // below; GET/PUT reuse those same handlers directly (same Range
+            // support, same FAC dispatch), only HEAD/LIST are new.
+            .route("/cluster/s3/{bucket}", web::get().to(cluster_s3_list_objects))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_put_object))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_get_object))
             .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))
             .route("/cluster/{bucket}/{key:.*}", web::get().to(cluster_get_object))
             .route("/cluster/{bucket}/{key:.*}", web::delete().to(cluster_delete_object))

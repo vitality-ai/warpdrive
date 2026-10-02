@@ -15,15 +15,20 @@ use actix_web::{web, Error, HttpResponse};
 use futures::future::join_all;
 use log::{info, warn};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::content_location_store::ContentLocationStore;
+use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
+use super::content_location_store::{ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
 use super::location_store::{LocationRecord, LocationStore};
 use super::membership::Membership;
 use super::packing::StripePacker;
 use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
+use super::pushdown::ColumnCodec;
+use crate::s3::handlers::common::{parse_range_header, RangeResult};
+use base64::Engine;
 
 pub struct ClusterState {
     pub membership: Arc<Membership>,
@@ -37,12 +42,21 @@ pub struct ClusterState {
     /// infrequent metadata, not worth a second trait boundary.
     pub location_http: reqwest::Client,
     pub timing: Arc<super::timing_stats::TimingStats>,
-    /// Phase 3: content-dependent placement. `packer` is the contract
-    /// (`FacPacker` the one implementation); `content_location_store` pins
-    /// multi-stripe objects, separate from `location_store` since the
+    /// Phase 3: content-dependent placement. Registry, not a single
+    /// `Arc<dyn StripePacker>` — a bucket's config (below) names which
+    /// entry to use, so a user-defined packer only needs to implement
+    /// `StripePacker` and be registered here, same as `FacPacker`, to
+    /// become a third pluggable placement policy. `content_location_store`
+    /// pins multi-stripe objects, separate from `location_store` since the
     /// record shapes differ (one peer set vs. many). See `packed.rs`.
-    pub packer: Arc<dyn StripePacker>,
+    pub packers: HashMap<String, Arc<dyn StripePacker>>,
     pub content_location_store: Arc<dyn ContentLocationStore>,
+    /// Per-bucket placement policy choice + overhead-threshold fallback
+    /// config (see `bucket_config.rs`). Missing bucket -> `default_bucket_config`.
+    pub bucket_config_store: Arc<dyn BucketConfigStore>,
+    /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
+    /// the codec name a unit was tagged with at PUT time.
+    pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
 }
 
 /// Write succeeds once this many of the `k+m` peers acknowledge: `k`, or
@@ -56,21 +70,60 @@ pub(crate) fn required_write_acks(k: usize, m: usize) -> usize {
     }
 }
 
-/// Parses `x-warpd-computable-units: [[offset,len],[offset,len],...]`,
-/// the poster's own header spec — a flat JSON array of 2-element
-/// `[offset, len]` arrays delimiting each computable unit within the
-/// request body. No format awareness here: the client decides what a
-/// unit is.
-fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderValue) -> Result<Vec<(u64, u64)>, Error> {
+/// Parses `x-warpd-computable-units`, the poster's own header spec — a flat
+/// JSON array where each entry is either `[offset, len]` (the plain
+/// storage/placement path: not pushdown-capable, `codec: "opaque"`,
+/// compressibility 1.0) or `[offset, len, uncompressed_len, codec]` (also
+/// usable for pushdown — see `pushdown.rs`). No format awareness here: the
+/// client decides what a unit is and, optionally, how it's encoded.
+fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderValue) -> Result<Vec<UnitMeta>, Error> {
     let s = header_val
         .to_str()
         .map_err(|_| ErrorBadRequest("x-warpd-computable-units header is not valid UTF-8"))?;
-    let parsed: Vec<[u64; 2]> = serde_json::from_str(s)
-        .map_err(|e| ErrorBadRequest(format!("x-warpd-computable-units header is not a JSON [[offset,len],...] list: {e}")))?;
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(s)
+        .map_err(|e| ErrorBadRequest(format!("x-warpd-computable-units header is not a JSON array: {e}")))?;
     if parsed.is_empty() {
         return Err(ErrorBadRequest("x-warpd-computable-units must list at least one unit"));
     }
-    Ok(parsed.into_iter().map(|pair| (pair[0], pair[1])).collect())
+
+    parsed
+        .into_iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let arr = entry
+                .as_array()
+                .ok_or_else(|| ErrorBadRequest("each computable unit must be a JSON array"))?;
+            if arr.len() < 2 {
+                return Err(ErrorBadRequest("each computable unit needs at least [offset, len]"));
+            }
+            let offset = arr[0].as_u64().ok_or_else(|| ErrorBadRequest("offset must be an integer"))?;
+            let len = arr[1].as_u64().ok_or_else(|| ErrorBadRequest("len must be an integer"))?;
+            let (uncompressed_len, codec) = if arr.len() >= 4 {
+                let u = arr[2]
+                    .as_u64()
+                    .ok_or_else(|| ErrorBadRequest("uncompressed_len must be an integer"))?;
+                let c = arr[3]
+                    .as_str()
+                    .ok_or_else(|| ErrorBadRequest("codec must be a string"))?
+                    .to_string();
+                (u, c)
+            } else {
+                (len, "opaque".to_string())
+            };
+            // Optional 5th element: base64-encoded opaque metadata, passed
+            // straight through to packing::Unit::metadata — see that
+            // field's doc. Absent for every caller that doesn't need it.
+            let metadata = if arr.len() >= 5 {
+                let b64 = arr[4].as_str().ok_or_else(|| ErrorBadRequest("metadata must be a base64 string"))?;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| ErrorBadRequest(format!("metadata is not valid base64: {e}")))?
+            } else {
+                Vec::new()
+            };
+            Ok(UnitMeta { unit_id: format!("u{i}"), offset, len, uncompressed_len, codec, metadata })
+        })
+        .collect()
 }
 
 /// Replicate a `LocationRecord` to every peer in `peers` (symmetric,
@@ -136,18 +189,93 @@ pub async fn cluster_put_object(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
-    // Content-dependent placement (phase 3): the presence of this header
-    // is the dispatch signal, not a separate bucket-level config call —
-    // matches the poster's own per-PUT header framing. No format-specific
-    // logic lives in WarpDrive itself; the client decides what a
-    // "computable unit" is (a Parquet column chunk, an IVF partition,
-    // whatever), WarpDrive just bin-packs and erasure-codes whatever
-    // (offset, len) list it's given.
-    if let Some(header_val) = req.headers().get("x-warpd-computable-units") {
-        let units_header = parse_computable_units_header(header_val)?;
-        return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, &state).await;
+    // Content-dependent placement is a *bucket*-level decision
+    // (bucket_config.rs), the same as every other bucket setting in this
+    // project (versioning, ACL, retention) — not something a client opts
+    // into per PUT by sending a header. An unconfigured bucket returns
+    // here immediately: no header parsing, no packing attempt, the exact
+    // same cost as before this feature existed (see the North star's
+    // before/after performance check).
+    let Some(config) = state.bucket_config_store.get(&bucket) else {
+        return put_object_plain(&bucket, &key, &body, &state).await;
+    };
+
+    // For a configured bucket, the header's job narrows to two things:
+    // supplying real unit boundaries when the client has them, and acting
+    // as a per-object escape hatch — the literal value "false" forces
+    // plain erasure coding for just this one object, overriding the
+    // bucket's default. Anything else is parsed as the usual
+    // [[offset,len,...],...] list.
+    let header_val = req.headers().get("x-warpd-computable-units");
+    let forced_plain = header_val
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    if forced_plain {
+        info!("bucket={bucket} key={key} x-warpd-computable-units: false — explicit opt-out of this bucket's custom placement");
+        return put_object_plain(&bucket, &key, &body, &state).await;
     }
 
+    // No header at all on a configured bucket: still attempt content-
+    // dependent placement, treating the whole object as a single unit.
+    // This needs no special-casing to stay safe — a single unit packed
+    // under RS(k>1,m) always costs strictly more than plain EC (the other
+    // k-1 bins pad to the seed's size with nothing to fill them), so the
+    // overhead-threshold check below rejects it and falls back to plain
+    // on its own, the same as any other over-budget pack.
+    let units_header = match header_val {
+        Some(h) => parse_computable_units_header(h)?,
+        None => vec![UnitMeta {
+            unit_id: "u0".to_string(),
+            offset: 0,
+            len: body.len() as u64,
+            uncompressed_len: body.len() as u64,
+            codec: "opaque".to_string(),
+            metadata: Vec::new(),
+        }],
+    };
+
+    // *Which* packing algorithm runs, and whether its result is even worth
+    // using, is itself part of the bucket's config. This mirrors Fusion's
+    // own mechanism (ASPLOS'25 §4.2): "a system-level hyperparameter...
+    // the maximum additional storage overhead [tolerated]... if the
+    // algorithm cannot construct stripes within the specified storage
+    // budget, it defaults to erasure coding the object into fixed-sized
+    // blocks" — made per-bucket instead of a single global constant. A bad
+    // or unknown `packer_name` degrades to the plain path with a warning
+    // rather than failing the write: a misconfigured option should never
+    // be why a PUT fails.
+    if let Some(packer) = state.packers.get(&config.packer_name) {
+        let k = state.ec.k();
+        let units: Vec<super::packing::Unit> = units_header
+            .iter()
+            .map(|u| super::packing::Unit { unit_id: u.unit_id.clone(), size: u.len as usize, metadata: u.metadata.clone() })
+            .collect();
+        let stripes = packer.pack(k, &units);
+        let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
+
+        if overhead <= config.overhead_threshold_pct {
+            return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, stripes, &state).await;
+        }
+        info!(
+            "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
+             {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
+            config.overhead_threshold_pct, config.packer_name
+        );
+    } else {
+        warn!(
+            "bucket={bucket} key={key} bucket config names unknown packer {:?} — \
+             falling back to plain erasure coding for this object",
+            config.packer_name
+        );
+    }
+
+    put_object_plain(&bucket, &key, &body, &state).await
+}
+
+async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterState) -> Result<HttpResponse, Error> {
+    let bucket = bucket.to_string();
+    let key = key.to_string();
     let request_start = std::time::Instant::now();
     let peers = state.membership.peers();
     if peers.is_empty() {
@@ -267,6 +395,7 @@ pub async fn cluster_grpc_client_timing() -> HttpResponse {
 
 pub async fn cluster_get_object(
     path: web::Path<(String, String)>,
+    req: actix_web::HttpRequest,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
@@ -276,7 +405,33 @@ pub async fn cluster_get_object(
     // and a key is either content-dependent or not, decided once at PUT
     // time by header presence.
     if let Some(record) = state.content_location_store.get(&bucket, &key) {
-        return super::packed::get_object_content_dependent(record, &state).await;
+        let total_len = record.original_len as u64;
+        // Range-aware fetch only reaches the stripes whose units actually
+        // overlap the requested bytes (see packed.rs) — this is the whole
+        // reason a DuckDB-style selective Parquet read benefits from
+        // content-dependent placement and a plain object doesn't.
+        let range_result = parse_range_header(&req, total_len);
+        return match range_result {
+            RangeResult::Valid(start, end) => {
+                let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
+                Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
+                    .insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                    .body(data))
+            }
+            RangeResult::Unsatisfiable => Err(
+                actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
+            ),
+            RangeResult::None => {
+                let resp = super::packed::get_object_content_dependent(record, &state).await?;
+                let mut resp = resp;
+                resp.headers_mut().insert(
+                    actix_web::http::header::HeaderName::from_static("accept-ranges"),
+                    actix_web::http::header::HeaderValue::from_static("bytes"),
+                );
+                Ok(resp)
+            }
+        };
     }
 
     // Never recompute placement here — look up the pin from write time.
@@ -284,7 +439,12 @@ pub async fn cluster_get_object(
         .location_store
         .get(&bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
+    let total_len = record.original_len as u64;
 
+    // No sub-object structure to be selective about here: a Range request
+    // still requires a full fan-out and full EC decode, then an in-memory
+    // slice. This is the expected, unoptimized baseline a Range-GET demo
+    // compares against — the cost difference is the point.
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = bucket.clone();
@@ -319,7 +479,43 @@ pub async fn cluster_get_object(
         .decode(&shards, record.original_len)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
 
-    Ok(HttpResponse::Ok().body(data))
+    match parse_range_header(&req, total_len) {
+        RangeResult::Valid(start, end) => {
+            let slice = data
+                .get(start as usize..=end as usize)
+                .ok_or_else(|| actix_web::error::ErrorRangeNotSatisfiable("range out of bounds"))?
+                .to_vec();
+            Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
+                .insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                .body(slice))
+        }
+        RangeResult::Unsatisfiable => Err(
+            actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
+        ),
+        RangeResult::None => {
+            Ok(HttpResponse::Ok().insert_header(("Accept-Ranges", "bytes")).body(data))
+        }
+    }
+}
+
+/// Diagnostic: the stored `ContentDependentRecord` itself (stripe
+/// capacities, bin layout, peer placement) — not the object's bytes. Lets
+/// an external workload driver compute real storage-overhead/metadata-cost
+/// metrics from what the live `StripePacker` actually decided, rather than
+/// a separate calculation, which is the point of this being a *real*
+/// measurement and not the simulator's cost model. See
+/// docs/Distributed-Engine-Plan.md's phase 3.
+pub async fn cluster_content_record(
+    path: web::Path<(String, String)>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let (bucket, key) = path.into_inner();
+    let record = state
+        .content_location_store
+        .get(&bucket, &key)
+        .ok_or_else(|| ErrorNotFound("no content-dependent record for this key"))?;
+    Ok(HttpResponse::Ok().json(record))
 }
 
 pub async fn cluster_delete_object(
@@ -403,6 +599,70 @@ pub async fn cluster_put_retention(
         )));
     }
 
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BucketConfigRequest {
+    pub packer_name: String,
+    pub overhead_threshold_pct: f64,
+}
+
+/// Admin endpoint: sets a bucket's placement-policy/overhead-threshold
+/// config (`bucket_config.rs`) and replicates it synchronously to *every*
+/// known peer, requiring all of them to ack — unlike shard/location writes,
+/// where quorum is enough (an unreachable replica just means a future read
+/// retries another one), every node must agree on a bucket's policy, or two
+/// coordinators could silently choose different layouts for "the same"
+/// bucket depending on which one happens to handle a given PUT.
+pub async fn cluster_put_bucket_config(
+    path: web::Path<String>,
+    body: web::Json<BucketConfigRequest>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let bucket = path.into_inner();
+    let peers = state.membership.peers();
+    if peers.is_empty() {
+        return Err(ErrorInternalServerError(
+            "no peers configured (set WARPDRIVE_PEERS or join the cluster first)",
+        ));
+    }
+
+    let config = BucketPlacementConfig {
+        bucket: bucket.clone(),
+        packer_name: body.packer_name.clone(),
+        overhead_threshold_pct: body.overhead_threshold_pct,
+    };
+
+    let puts = peers.iter().cloned().map(|peer| {
+        let client = state.location_http.clone();
+        let config = config.clone();
+        async move {
+            let url = format!("{}/cluster/_internal/bucket_config", peer.trim_end_matches('/'));
+            client.post(&url).json(&config).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+        }
+    });
+    let results = join_all(puts).await;
+    let acked = results.iter().filter(|ok| **ok).count();
+    if acked < peers.len() {
+        return Err(ErrorInternalServerError(format!(
+            "bucket config requires every peer to ack: {acked}/{} acknowledged",
+            peers.len()
+        )));
+    }
+
+    Ok(HttpResponse::Ok().finish())
+}
+
+/// Receiving side of bucket-config replication.
+pub async fn cluster_internal_put_bucket_config(
+    body: web::Json<BucketPlacementConfig>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    state
+        .bucket_config_store
+        .put(body.into_inner())
+        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
 }
 

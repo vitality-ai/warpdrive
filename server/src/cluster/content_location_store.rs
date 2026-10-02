@@ -28,6 +28,29 @@ pub struct StripeRecord {
     pub bins: Vec<Vec<String>>,
 }
 
+/// One computable unit's position in the original object plus what's
+/// needed to run pushdown against it. `len` is the unit's stored
+/// (compressed) byte length; `uncompressed_len` and `codec` are only
+/// meaningful for pushdown-capable units — a unit built without codec
+/// information (the plain storage/placement path, most callers) gets
+/// `codec: "opaque"` and `uncompressed_len == len`, i.e. compressibility
+/// 1.0, which the cost equation (see `pushdown.rs`) naturally treats as
+/// "never worth pushing down a projection for, filtering is still fine."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnitMeta {
+    pub unit_id: String,
+    pub offset: u64,
+    pub len: u64,
+    pub uncompressed_len: u64,
+    pub codec: String,
+    /// Opaque bytes passed straight through to `packing::Unit::metadata` at
+    /// pack time — see that field's doc for why (workload-aware packers
+    /// need more than a unit's size). `#[serde(default)]` so records
+    /// written before this field existed still replay from the Bitcask log.
+    #[serde(default)]
+    pub metadata: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContentDependentRecord {
     pub bucket: String,
@@ -35,17 +58,38 @@ pub struct ContentDependentRecord {
     pub k: usize,
     pub m: usize,
     pub original_len: usize,
-    /// unit_id -> (offset, len) within the *original* object, so a whole-
-    /// object GET can place each unit's recovered bytes back where they
-    /// came from.
-    pub units: Vec<(String, u64, u64)>,
+    /// Each unit's position in the *original* object, so a whole-object GET
+    /// can place each unit's recovered bytes back where they came from —
+    /// plus its codec info for pushdown (see `UnitMeta`).
+    pub units: Vec<UnitMeta>,
     pub stripes: Vec<StripeRecord>,
+}
+
+impl ContentDependentRecord {
+    /// Finds which stripe and which bin within it holds `unit_id` — the
+    /// lookup a pushdown query needs before it knows which single peer to
+    /// route to. Small linear scan; objects have at most a few hundred
+    /// computable units in practice (Table 3 of the Fusion paper: 84-320),
+    /// so this is not worth indexing.
+    pub fn locate_unit(&self, unit_id: &str) -> Option<(usize, usize)> {
+        for (stripe_idx, stripe) in self.stripes.iter().enumerate() {
+            for (bin_idx, bin) in stripe.bins.iter().enumerate() {
+                if bin.iter().any(|id| id == unit_id) {
+                    return Some((stripe_idx, bin_idx));
+                }
+            }
+        }
+        None
+    }
 }
 
 pub trait ContentLocationStore: Send + Sync {
     fn put(&self, record: ContentDependentRecord) -> io::Result<()>;
     fn get(&self, bucket: &str, key: &str) -> Option<ContentDependentRecord>;
     fn delete(&self, bucket: &str, key: &str) -> io::Result<()>;
+    /// See `LocationStore::list` — same minimal-S3-shim purpose, for the
+    /// content-dependent half of a bucket's objects.
+    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
 }
 
 fn record_key(bucket: &str, key: &str) -> String {
@@ -123,6 +167,18 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         self.index.write().unwrap().remove(&rk);
         Ok(())
     }
+
+    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
+        let bucket_prefix = format!("{bucket}/");
+        let full_prefix = format!("{bucket_prefix}{prefix}");
+        self.index
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(&full_prefix))
+            .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +192,10 @@ mod tests {
             k: 3,
             m: 2,
             original_len: 100,
-            units: vec![("u0".into(), 0, 50), ("u1".into(), 50, 50)],
+            units: vec![
+                UnitMeta { unit_id: "u0".into(), offset: 0, len: 50, uncompressed_len: 50, codec: "opaque".into(), metadata: Vec::new() },
+                UnitMeta { unit_id: "u1".into(), offset: 50, len: 50, uncompressed_len: 50, codec: "opaque".into(), metadata: Vec::new() },
+            ],
             stripes: vec![StripeRecord {
                 shard_peers: vec!["http://node0:9710".into(), "http://node1:9710".into()],
                 capacity: 50,
@@ -172,5 +231,13 @@ mod tests {
         store.put(sample("b1", "k1")).unwrap();
         store.delete("b1", "k1").unwrap();
         assert!(store.get("b1", "k1").is_none());
+    }
+
+    #[test]
+    fn locate_unit_finds_its_stripe_and_bin() {
+        let record = sample("b1", "k1");
+        assert_eq!(record.locate_unit("u0"), Some((0, 0)));
+        assert_eq!(record.locate_unit("u1"), Some((0, 1)));
+        assert_eq!(record.locate_unit("not-a-real-unit"), None);
     }
 }

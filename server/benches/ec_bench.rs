@@ -5,8 +5,13 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 
-const RS_K: usize = 9;
-const RS_M: usize = 6;
+// Fusion's own default erasure code (ASPLOS'25 Fig. 2): 6 data + 3 parity
+// blocks = 9 total. Their paper calls this "RS(9,6)" in (n,k) = (total,
+// data) notation -- the opposite of this project's (k,m) = (data,parity)
+// convention, so it's k=6, m=3 here, not k=9, m=6 (that was an earlier
+// mistake, caught and corrected 2026-10-02).
+const RS_K: usize = 6;
+const RS_M: usize = 3;
 
 fn bench_encode(c: &mut Criterion) {
     let coder = ReedSolomonCoder::new(RS_K, RS_M).unwrap();

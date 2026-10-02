@@ -13,7 +13,11 @@ pub(super) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 pub(super) const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Empty body that reports a custom Content-Length for HEAD responses.
-pub(super) struct HeadBody(pub(super) u64);
+/// `pub(crate)`: reused by the cluster API's S3 shim (`cluster/s3_shim.rs`)
+/// for the same reason the S3 API needed it — actix recomputes
+/// Content-Length from the actual (empty) body on a plain `.finish()`,
+/// silently overriding any manually inserted header.
+pub(crate) struct HeadBody(pub(crate) u64);
 impl MessageBody for HeadBody {
     type Error = std::convert::Infallible;
     fn size(&self) -> BodySize { BodySize::Sized(self.0) }
@@ -22,7 +26,10 @@ impl MessageBody for HeadBody {
     }
 }
 
-pub(super) enum RangeResult {
+/// `pub(crate)`, not `pub(super)`: reused by the cluster API's Range-GET
+/// support (`cluster/coordinator.rs`) so there's one Range-header parser
+/// in the codebase, not two.
+pub(crate) enum RangeResult {
     None,
     Valid(u64, u64),
     Unsatisfiable,
@@ -121,7 +128,7 @@ pub(super) fn stream_slices(chunks: &[(u64, u64)]) -> Vec<(u64, u64)> {
 }
 
 /// Parse `Range: bytes=X-Y`, `bytes=X-`, or `bytes=-N` (suffix).
-pub(super) fn parse_range_header(req: &HttpRequest, total: u64) -> RangeResult {
+pub(crate) fn parse_range_header(req: &HttpRequest, total: u64) -> RangeResult {
     let hdr = match req.headers().get("range").and_then(|v| v.to_str().ok()) {
         Some(h) => h.to_string(),
         None => return RangeResult::None,

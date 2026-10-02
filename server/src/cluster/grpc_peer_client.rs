@@ -74,8 +74,27 @@ impl ShardService for ShardServiceImpl {
     }
 }
 
+/// Tonic's default per-message limit is 4MB — fine for small shards, far
+/// too small once a real file (a Lance data fragment, an 11GB-scale Parquet
+/// file's shard) gets erasure-coded into `k` roughly-`size/k`-byte pieces.
+/// Found directly, not anticipated: PUTting a ~61MB Lance vector fragment
+/// failed with "message length too large: found 20491849 bytes, the limit
+/// is: 4194304 bytes" the first time an object large enough to hit it was
+/// ever PUT in this project. 256MB is generous without being unbounded;
+/// configurable since "generous enough" depends on the deployment's actual
+/// object sizes.
+fn grpc_max_message_size() -> usize {
+    std::env::var("WARPDRIVE_GRPC_MAX_MESSAGE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256 * 1024 * 1024)
+}
+
 pub fn make_server() -> ShardServiceServer<ShardServiceImpl> {
+    let limit = grpc_max_message_size();
     ShardServiceServer::new(ShardServiceImpl)
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +197,10 @@ impl GrpcPeerClient {
             })
             .await?;
 
-        Ok(ShardServiceClient::new(pool.pick()))
+        let limit = grpc_max_message_size();
+        Ok(ShardServiceClient::new(pool.pick())
+            .max_decoding_message_size(limit)
+            .max_encoding_message_size(limit))
     }
 }
 

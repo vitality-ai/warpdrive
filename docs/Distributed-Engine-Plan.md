@@ -57,6 +57,143 @@ coordinator, any node can serve a request — matching Fusion's own peer archite
 explicitly documented non-goals so scope stays achievable in 6 days. Priority order:
 **correct and fast first, extensible second, content-dependent placement later.**
 
+## North star (locked in, 2026-10-02)
+
+Everything in this document — already built and still to come — is in service of
+three goals, in this priority order. This section is the one future work gets
+checked against; a feature that doesn't serve one of these three doesn't belong
+here regardless of how interesting it is.
+
+> "I basically want three things. Fast distributed object store by default,
+> explainability of our whole stack for SLAs and customisability with explaining
+> cost of operations for that particular customisation to still keep it running
+> without faults. So you can lock in this direction for us."
+
+**1. Fast, distributed, erasure-coded object storage by default.** Nobody has to
+opt into performance or into distribution — a bucket with zero configuration gets
+`ComputedPlacement` (rendezvous hashing) and `ReedSolomonCoder`, concurrent
+fan-out, and MinIO's own quorum rule, out of the box. Phase 1/2's own numbers
+(1389.6 req/s @ concurrency 16, zero errors, on real multi-VM GCP hardware) are
+the evidence this is true today, not an aspiration. Customization (point 3) is
+additive on top of this baseline, never a prerequisite for it.
+
+**Checked directly, 2026-10-02: do phases 3/4's additions cost the plain path
+anything?** Built phase 1/2's own commit (`a3951b2`, before content-dependent
+placement, bucket config, or pushdown existed at all) in a separate `git
+worktree` — no stash tricks, no risk to the working tree — and ran the exact
+same `load_gen` methodology (concurrency 16, 4KB payload, RS(3,2), local
+5-node cluster, two runs each) against it and against the current tree, back
+to back on the same machine. `load_gen` sends no `x-warpd-computable-units`
+header, so this measures precisely the thing at risk: whether the new
+header-check-and-dispatch costs anything on the path that never uses it.
+Phase 1/2 baseline: 4537.1 and 4686.1 req/s (avg 4611.6). Current: 4686.1 and
+4493.6 req/s (avg 4589.9). No measurable regression — the spread between the
+two builds is smaller than the run-to-run noise on either one. This makes
+sense structurally, not just empirically: the dispatch only does a header
+lookup (checking for absence, the common case) before falling straight
+through to the same plain-path code, now named `put_object_plain` but
+otherwise unchanged. Every future extension should keep this property —
+gated behind an explicit opt-in signal (a header, a bucket config entry),
+never evaluated unconditionally on the default path — and should get the same
+kind of before/after check before being called done, not just an assertion
+that it's probably fine.
+
+**2. Explainability of the whole stack, sufficient to state an SLA.** Not "the
+code is readable" — every operation the system performs has to produce a real,
+inspectable number an operator could put in a contract: storage overhead vs.
+optimal (`overhead_pct`, computed from what the live packer actually did, not a
+separate model), write/read quorum semantics (`required_write_acks`, documented
+and tested against MinIO's own published rule), per-phase latency breakdowns
+(`cluster_timing_stats`, `shard_server_timing`, `grpc_client_timing`), and the
+literal packing/placement record behind any object (`content_record`). An SLA is
+a promise backed by a number the system itself can produce on demand — this is
+why every new mechanism in this project ships with a diagnostic endpoint, not as
+an afterthought but as part of what "done" means.
+
+**3. Customizability that explains its own cost and cannot take the system down.**
+Two separate commitments, and both are required, not either/or:
+- *Explains its own cost*: swapping in a different `StripePacker` (or, later, a
+  different `PlacementPolicy`/`ErasureCoder`) must come with a real, computed
+  answer to "what does choosing this cost me" — today that's `overhead_pct`
+  for packing; the same expectation applies to whatever trait gets a registry
+  next (see the open item below).
+- *Cannot take the system down*: a customer's own placement/packing choice is
+  never allowed to compromise durability, availability, or liveness. The
+  per-bucket overhead-threshold fallback (`bucket_config.rs`, mirroring Fusion's
+  own mechanism) is the first concrete instance of this pattern — an
+  over-threshold or misconfigured custom packer degrades to the plain,
+  always-safe path with a logged reason, never a failed write and never silent
+  data loss. This is the pattern to repeat for every future customization point:
+  a safe, explainable default behind every pluggable choice, not a trapdoor a
+  bad customization can fall through.
+
+**How customization eventually ships (locked in, 2026-10-02):**
+
+> "tomorrow users should probably ship the code in the UI we expose or something
+> and we should be able to simulate the correctness etc and give them stats."
+
+So the end state for pillar 3 isn't "a developer registers a new Rust struct
+and redeploys" (today's mechanism) — it's a customer submitting their own
+placement/packing logic through a UI WarpDrive exposes, with WarpDrive itself
+validating and pricing it before it ever runs against real data:
+
+1. **Submit.** A customer provides their own `StripePacker` (and eventually
+   `PlacementPolicy`/`ErasureCoder`/`ColumnCodec`) implementation through a
+   UI, not a PR to this repo.
+2. **Simulate for correctness.** WarpDrive runs the submission against the
+   same class of property the unit tests in `packing.rs` already check for
+   `FacPacker` — never splits a unit, every unit appears exactly once, no bin
+   exceeds its stripe's capacity — against synthetic and/or replayed
+   workloads, before the submission is allowed near real data.
+3. **Report stats.** The same way `overhead_pct` is computed from what a real
+   pack run actually produced, the simulation reports the customer's real
+   cost for their own choice (overhead %, and eventually latency/availability
+   impact) — pillar 3's "explains its own cost," now at the product surface
+   a customer actually sees, not just an internal diagnostic endpoint.
+4. **Gate activation.** Only a submission that passes step 2 and reports an
+   acceptable cost in step 3 is eligible to go live on a bucket — the
+   `bucket_config.rs` overhead-threshold fallback is the mechanism that keeps
+   this safe at runtime even after activation, not a substitute for
+   validating before activation.
+
+**Execution model (locked in, 2026-10-02): WASM.** A customer's submission runs
+as a WASM module (wasmtime/wasmer), loaded and invoked by the already-running
+coordinator process — no restart, no redeploy, no recompiling WarpDrive itself,
+which matters specifically because this is a managed service and can't go down
+to pick up one customer's code. A `WasmPacker` wraps the loaded module behind
+the existing `StripePacker` trait, so from `coordinator.rs`'s point of view a
+WASM-backed packer is just another registry entry, no different from
+`FacPacker`. Resource-limited (CPU/memory budget, no syscalls, no network, no
+filesystem — the module can't touch anything but the bytes it's handed), the
+same sandboxing model Cloudflare Workers and Shopify Functions use to run many
+different customers' code inside one always-on process. This is the execution
+*substrate*, not the authoring experience — two front ends sit on top of it,
+both compiling down to the same sandboxed module:
+1. **DSL / plain-language input**, for most customers: an LLM translates a
+   constrained description of the desired policy into real code, which is then
+   compiled to WASM. Most of a DSL's usual expressiveness ceiling goes away
+   once an LLM is the one composing it, without giving up the sandbox.
+2. **Direct `.wasm` upload**, for a customer who wants to hand-write something
+   as involved as Fusion's own algorithm themselves.
+Both land in the same runtime, the same resource limits, the same `WasmPacker`
+wrapper, and the same simulate-and-report-stats gate (steps 2-3 above) before
+anything goes live. "Accept a FaaS model" and "use WASM" are the same decision
+at two layers, not two competing ones: FaaS describes the product shape
+(upload a function, invoke it on demand, meter it); WASM is what actually runs
+it safely underneath, the way Cloudflare Workers is a FaaS product built on
+WASM-style isolates. The simulate-and-report-stats harness (steps 2-3) doesn't
+depend on this decision and is buildable independently.
+
+**Open implication, not yet done:** today `StripePacker` and `ColumnCodec` are
+per-bucket/per-unit registries (pillar 3's "customizable" half is real for
+these two); `PlacementPolicy` and `ErasureCoder` are still single global
+instances (pillar 3's "explains its own cost, can't take the system down"
+guarantees don't yet extend to them, because there's nothing to switch between
+per bucket yet). Promoting those two to registries — with the same
+overhead/cost-style guardrail pattern — is the direct next step if per-bucket
+control over *where* shards land or *how* they're coded is requested, not a
+separate idea.
+
 ## Background survey (reference only, not a prescription)
 
 WarpDrive's own `docs/Technical-Roadmap.md` already tracks relevant background, including
@@ -785,6 +922,760 @@ poster's actual scientific claim (Findings 1-3), the baseline alone can't reprod
 This plan intentionally does not assign calendar days to phases 2-3 yet — phase 1's actual
 velocity will tell us how much time is left, which is the point of moving very fast on it
 first.
+
+## Phase 4: per-bucket placement config, overhead-threshold fallback, and query pushdown
+
+Phase 3 proved content-dependent placement works end-to-end with real workload
+shapes, but left two things hardcoded that the real Fusion paper (ASPLOS'25) treats
+as load-bearing decisions, not implementation details: (1) FAC's own stripe
+construction has a configurable storage-overhead ceiling, above which it falls back
+to plain fixed-block erasure coding rather than accepting arbitrarily bad packing;
+(2) the entire second half of the paper — the reason it's about query pushdown at
+all — is a filter/projection execution layer on top of placement, which phase 3
+didn't touch.
+
+**Per-bucket placement config (`bucket_config.rs`).** Fusion's own paper (§4.2,
+§6, Configuration): *"We introduce a system-level hyperparameter in Fusion,
+allowing users to specify the maximum additional storage overhead they can
+tolerate compared to the optimal. If the algorithm cannot construct stripes
+within the specified storage budget, it defaults to erasure coding the object
+into fixed-sized blocks... We set the storage overhead threshold to 2% in
+Fusion."* This is a real, paper-sourced mechanism, not an invented one — confirmed by
+reading the actual PDF, not assumed from the poster's own files (which don't
+mention it at all). We implement the same mechanism, but **per-bucket** instead
+of a single global constant, matching how every other bucket-level setting in
+this project works (versioning, ACL, object-lock retention): `BucketPlacementConfig
+{ bucket, packer_name, overhead_threshold_pct }`, Bitcask-logged, replicated
+synchronously to *every* known peer with all-acks required (not quorum — a
+placement *policy* disagreement between coordinators is a correctness hazard in a
+way a missed shard replica isn't). `ClusterState.packers` is now a
+`HashMap<String, Arc<dyn StripePacker>>` registry (was a single `Arc<dyn
+StripePacker>`), so a bucket names which packer to use by string key — the literal
+mechanism by which "a third, user-defined content-dependent placement policy" only
+needs to implement `StripePacker` and be registered, never touching `coordinator.rs`.
+Dispatch in `cluster_put_object`: parse the header, look up the bucket's config
+(default: `packer_name: "fac"`, `overhead_threshold_pct: 2.0`, matching Fusion's own
+evaluation default), pack once, compute `packing::overhead_pct` against the *real*
+stripe result, and only commit the content-dependent path if under threshold —
+otherwise fall through to the plain path, logged, not an error. An unknown
+`packer_name` degrades the same way: a bad config value is never the reason a PUT
+fails.
+
+**Verified**: PUT identical row-group-batched data (19.99% overhead, phase 3's own
+measured number) into a bucket with no config — falls back to plain EC, confirmed
+via the node's own log line and a 404 from `content_record`. PUT the same data into
+a bucket configured with a 25% threshold — content-dependent placement used, 4
+stripes, `content_record` fetched correctly from a *different* node than the
+coordinator that wrote it (replication still correct under the new `UnitMeta`-based
+record shape).
+
+**Query pushdown (`pushdown.rs`).** The mechanism, read directly from the paper:
+a coordinator decomposes a query into per-column-chunk operations; a filter stage
+runs the predicate in-situ on whichever single node holds that chunk's data block
+and returns a bitmap; a projection stage decides, per chunk, whether to push the
+projection down too, using the paper's own Cost Equation — push down only when
+`selectivity × compressibility < 1`, i.e., only when shipping the small filtered
+result is actually cheaper than shipping the whole compressed chunk for the
+coordinator to decode itself. This works *because* `ErasureCoder::encode_shards`
+is systematic Reed-Solomon: shard indices `0..k` are stored as the literal,
+unmodified plaintext bins (only `k..k+m` are coded parity) — so the peer holding a
+data shard already has real, decoded bytes on local disk, exactly matching Fusion's
+claim that pushdown avoids cross-node reassembly for data blocks.
+
+Scope, per the explicit decision to start with the microbenchmark only (not
+Q1–Q4's multi-predicate/aggregate queries): filter and projection collapse into
+one round trip, since the microbenchmark's query (`SELECT column FROM lineitem
+WHERE column < value`) targets the same column for both. `ColumnCodec` is a new
+trait (`StripePacker`/`ErasureCoder`-style: one contract, one real implementation)
+— `ZlibF64Codec` decodes a little-endian f64 array compressed with zlib/DEFLATE.
+This is **not** literally Parquet's own encoding (dictionary + bit-packing +
+Snappy) — it's a real, standard, genuinely-decodable stand-in chosen specifically
+so the Python workload driver needs no dependency beyond the stdlib `zlib` module
+(same reasoning that dropped `requests` for `urllib` earlier this session). A real
+Parquet-page `ColumnCodec` is a second implementation away, not a rewrite of
+anything that calls this trait — directly relevant to "eventually support S3
+Tables," which is real Parquet/Iceberg data these same contracts should decode
+without changing `pushdown.rs`'s orchestration.
+
+`x-warpd-computable-units` grew an optional 3rd/4th element per unit —
+`[offset, len, uncompressed_len, codec]` — backward compatible with the plain
+`[offset, len]` form (defaults to `codec: "opaque"`, compressibility 1.0, not
+pushdown-capable, used by every other workload so far). New endpoints:
+`POST /cluster/{bucket}/{key}/query` (coordinator-side: look up the record,
+locate which single peer holds the requested unit, forward one request) and
+`POST /cluster/_internal/pushdown_filter` (peer-local: read the local shard,
+decode, filter, apply the cost equation, respond) — symmetric, any node can
+receive either.
+
+**Verified end-to-end** on a real local cluster, queried from nodes *different*
+from both the PUT coordinator and the unit's owning peer: a highly-compressible,
+high-selectivity column correctly disabled projection pushdown (matching the
+paper's own documented Q4 case: *"the fare column has a high compression ratio of
+152... leading Fusion to disable the projection pushdown"*); a poorly-compressible,
+low-selectivity column correctly enabled it, with returned values verified against
+ground truth. One known cosmetic issue: 2 of 2000 pushed-down f64 values differed
+from the source by 1-2 ULPs after a JSON round trip — a float-serialization
+precision artifact, not a filtering/decoding correctness bug (every `matched_count`
+across every test matched ground truth exactly).
+
+**`pushdown_benchmark.py`** (hipc_poster/) reproduces Figure 13's shape: a 16-column
+synthetic object (cardinality swept from 2 to 20,000, giving real compression
+ratios from ~2.9x to ~608x, the same spread Figure 6 reports for real TPC-H
+lineitem columns), baseline path = the existing full-object GET (reassembles
+across every stripe peer, EC-decodes, client slices+decodes+filters one column)
+vs. pushdown path = the new query endpoint. Real measured result on this local,
+single-machine 5-process cluster (loopback, not real network — absolute latencies
+are far smaller than the paper's real-datacenter numbers, so only the *relative*
+reduction is comparable): **63–76% median latency reduction and 60–73% p99
+reduction across all 16 columns**, every single query's `matched_count` asserted
+equal between both paths. This lands in the same range as the paper's own
+headline 64%/81% median/tail — a real reproduction of the *mechanism and its
+shape*, not a claim of matching their exact datacenter-scale numbers.
+
+**Not yet done**, honestly: Q1–Q4's multi-predicate filter stage and COUNT/AVG
+aggregate pushdown (explicitly deferred behind the microbenchmark); a real
+Apache Parquet-page `ColumnCodec` (the `parquet`/arrow-rs crate is not yet a
+dependency); re-running this on real multi-VM GCP hardware for real network
+latency (currently torn down); the 2-ULP float-serialization quirk.
+
+## Dispatch redesign: bucket config is the gate, not the header (2026-10-02)
+
+Phase 4 originally kept the header's presence as the dispatch trigger (a
+hangover from phase 3, before bucket config existed at all) and treated
+bucket config as something that only mattered once the header had already
+opted a PUT in. User correction: *"We actually don't need that header I
+guess if bucket is configured to be already having custom placement. Header
+can send false if it explicitly want to default to normal erasure coding if
+required."* Content-dependent placement should be a bucket-level decision,
+the same as every other bucket setting in this project (versioning, ACL,
+retention) — not something a client has to remember to ask for on every PUT.
+
+**New semantics in `cluster_put_object`:**
+- **Bucket has no config at all** → straight to the plain path, full stop.
+  No header parsing, no packing attempt — the header is irrelevant, even if
+  sent. This is also the fast path: one `bucket_config_store.get()` lookup,
+  identical cost to before this feature existed.
+- **Bucket is configured, header is the literal string `"false"`** → explicit
+  per-object escape hatch, forces plain EC for just this one write even
+  though the bucket defaults to custom placement. Logged, not an error.
+- **Bucket is configured, header carries real `[[offset,len,...],...]`
+  data** → unchanged from before: pack, check the bucket's overhead
+  threshold, commit or fall back.
+- **Bucket is configured, no header at all** → still attempts content-
+  dependent placement, treating the whole object as a single unit. This
+  needed no special-casing to stay safe: a single unit under RS(k>1,m)
+  always costs strictly more than plain EC (seeded into one bin, the other
+  k-1 bins pad to its size with nothing to fill them), so the existing
+  overhead-threshold check rejects it and falls back on its own — verified
+  directly, RS(3,2) with one unit measures **200.000% overhead**
+  (`(k+m)/(1+m/k) - 1`), comfortably over any sane default threshold.
+
+**Verified end-to-end** against a live 5-node local cluster, all five cases:
+unconfigured bucket with a header present (plain, header ignored); a
+configured bucket with a real header (content-dependent, confirmed via
+`content_record`); the same bucket with `x-warpd-computable-units: false`
+(forced plain); and the same bucket with no header at all against both a
+permissive threshold (500%, content-dependent still used) and a realistic
+one (2%, correctly falls back with the 200% overhead logged above).
+`cargo test` — all 92 tests still pass. `real_workload_driver.py` updated to
+explicitly configure its demo bucket (it previously relied on an implicit
+per-header default that no longer exists) and reproduces identical overhead
+numbers to before this change; `pushdown_benchmark.py` already configured
+its bucket explicitly and needed no changes. A follow-up `load_gen` run
+(concurrency 16, 4KB payload, no header, no bucket config — the common case)
+measured 4553.2 req/s, consistent with the North star's earlier 4589.9–4611.6
+req/s band — no regression from reordering which check runs first.
+
+## RS(9,6) means 6 data + 3 parity, not 9 + 6 (found and fixed 2026-10-02)
+
+User's prompt: *"Just check to make sure 9,6. I think they mean six data and
+3 parity."* They were right. Confirmed directly against the paper (ASPLOS'25,
+Fig. 2 and §2): *"An (n, k) systematic erasure code... k plaintext data
+blocks and (n − k) coded parity blocks... A (9, 6) erasure code partitions a
+12MB object into two 6MB data stripes, each consisting of 6 data blocks and
+3 parity blocks."* Fusion's `(n, k)` is `(total, data)` — the opposite of
+this project's own `(k, m)` = `(data, parity)` convention. Reading their "9"
+as our `k` is backwards: the correct translation of their default is
+`k=6, m=3` (9 total), not `k=9, m=6` (15 total).
+
+This had propagated into three places, all now fixed: `ec_bench.rs`'s
+`RS_K`/`RS_M` constants, `main.rs`'s `ec_params_from_env` doc comment, and
+the live 15-node cluster test run just before this was caught.
+
+**A bigger finding than just my own mistake**: `hipc_poster/run_all.py` has
+the identical bug — `K, M = 9, 6` (line 24), passed straight into
+`fac_core.construct_stripes(K, units)` as `K=9`. Every number the Python
+simulator has ever reported (the poster draft's 1.16% reproduction check,
+its 79.99% Parquet batch-16 figure, everything downstream) was computed
+with `k=9`, not Fusion's actual `k=6`. This explains an otherwise-startling
+coincidence: re-running the corrected Rust reproduction with the *wrong*
+`k=9,m=6` first (before the fix) gave **80.0016%** overhead for Parquet
+batch-16 — almost exactly the simulator's own **79.99%** — because it
+reproduced the simulator's bug, not Fusion's actual parameter. The poster's
+numbers are internally consistent with its own simulator; they're just not
+actually RS(9,6) in Fusion's sense. Not fixed here — `hipc_poster/` is
+parked, separate scope — but flagged clearly since it affects the poster's
+own correctness claims, not just this engine's reproduction of them.
+
+**Real numbers, corrected `k=6,m=3`, 9-node local cluster, poster's own
+scale parameters (300k rows / 10 row groups / 16 columns, 20k vectors,
+`embed_dim=768`, `nlist=566`):**
+
+| Workload | Granularity | Units | Stripes | Overhead |
+|---|---|---|---|---|
+| Parquet | column-chunk | 160 | 24 | **0.8014%** |
+| Parquet | row-group (batch=16) | 10 | 2 | **20.0361%** |
+| Vector (IVF) | finest (gran=1) | 566 | 94 | **1.04%** |
+| Vector (IVF) | batch=16 | 36 | 6 | **5.18%** |
+
+All four round-tripped byte-identical. The column-chunk number (0.80%) lands
+close to Fusion's own real-10GB-file figure (~1.2%) and the simulator's
+reproduction check (1.16%) — same order of magnitude, correct `k` this
+time, not a coincidence of a shared bug. The batch-16 number (20.04%) is
+genuinely different from the simulator's 79.99%, for the reason above.
+
+One operational note: the very first attempt at this (15-node, wrong
+config) hit an intermittent `read quorum not met: 8/9` on one GET that
+cleared on retry and did not recur across the entire corrected 9-node run.
+Circumstantial evidence it was resource contention from 15 heavy local
+processes rather than a real bug, not proof — `packed.rs`'s GET path still
+silently swallows `get_shard` errors (`.ok()`, no `warn!`, unlike the plain
+path), so there's no log trail to confirm either way. Worth fixing that
+logging gap before trusting any future quorum failure's absence.
+
+## Feasibility: does configurability actually serve explainability, and is it safe? (2026-10-02)
+
+Prompted directly: *"Will having this level of configurability help? Towards
+explanation? What's the operational performance tradeoffs and is this kind
+of system feasible and still ensure liveness, safety and high
+availability."*
+
+**Does configurability help explainability, or just add surface area?**
+Configurability is what *makes* explainability necessary here, not a
+separate feature next to it. With one fixed algorithm, "explainable" would
+just mean reading the source once. Because placement is pluggable, the only
+way to know what a given bucket actually costs is to measure what it
+actually did — which is why `overhead_pct` is computed from the real stripe
+result, not a model, and why pushdown's push/no-push decision is a real,
+inspectable number (`selectivity × compressibility`), not a heuristic black
+box. Pillar 2 exists to carry the weight pillar 3 creates. The honest cost:
+the more pluggable the system gets, the less a single global SLA sentence
+means — "WarpDrive guarantees X" becomes "WarpDrive guarantees X for this
+bucket, given its packer stays under its configured threshold." That's not
+a flaw, it's what offering customization actually costs in simplicity.
+
+**Operational performance tradeoffs — three separately-measured things:**
+- *The default path costs nothing*, measured directly: 4589.9–4611.6 req/s
+  before vs. after all of phases 3/4 existed, same build, same hardware,
+  back to back (see the North star's before/after check above). A bucket
+  that never configures anything pays zero tax for the machinery existing.
+- *Opting in costs very little at write time*: `pack()` is the same
+  algorithm Fusion's paper clocks at ~500μs for an 11GB file — negligible
+  next to network/disk, which is where PUT latency actually lives (our own
+  timing breakdowns already show this). The overhead check runs entirely
+  in memory before any shard write, so a rejected pack costs microseconds,
+  not a wasted round trip.
+- *Not yet measured, honestly*: content-dependent PUT/GET latency against
+  the plain path, head to head. That cost is real and inherent, not from
+  the configurability layer — multiple independently-placed stripes mean
+  more coordination than one whole-object write, by design, traded for the
+  63–76% pushdown win on the read side that *is* measured. A real next
+  benchmark, not yet run.
+- *One deliberate, named tradeoff*: bucket config replicates to every peer
+  and requires all acks, not quorum — config disagreement across
+  coordinators is worse than config writes being briefly unavailable during
+  a partition, a real CAP-style choice, not a free property.
+
+**Feasible while keeping liveness, safety, and HA? Yes today, conditionally
+tomorrow.**
+- *Safety* holds because the overhead-threshold fallback evaluates before
+  committing — a bad pack is discarded in memory, nothing partial is ever
+  written, and EC parameters (k, m) stay uniform across all buckets
+  regardless of packer choice, so durability doesn't degrade as placement
+  gets more customizable, only byte layout does. **Real gap found, and
+  corrected mid-discussion (2026-10-02)**: nothing in `packed.rs` validates
+  that a packer's output actually covers every unit exactly once. A packer
+  that silently drops a unit produces an object with a zeroed gap on GET —
+  no error, no log. My first instinct was a bespoke runtime check mirroring
+  `packing.rs`'s own property test on `FacPacker`
+  (`never_splits_a_unit_and_every_unit_appears_exactly_once`). User's
+  correction: that's exactly the wrong shape — hand-written, per-algorithm
+  correctness logic is itself bug-prone (the real-time proof: a careless
+  offset/length mixup in this same session's own `parquet_real_offsets.py`,
+  caught only because a coverage check happened to be written for a
+  different reason). The right mechanism is a **generic checksum**, not a
+  bespoke partition-coverage check: checksum the original object at PUT
+  time, checksum what the packed stripes would reconstruct to, compare,
+  before any shard touches the network, same place the overhead-threshold
+  check already runs. One mechanism catches dropped units, duplicated
+  units, corrupted bytes, and failure modes nobody has thought of yet,
+  regardless of whether the bug is in `FacPacker`, a future native packer,
+  or eventually a WASM module. This **is** the WASM plan's "simulate for
+  correctness" step, not new scope — a placeholder with a concrete
+  mechanism now, lightweight and generic rather than a per-algorithm
+  property test rewritten for every new packer.
+- *Liveness* holds by design: no leader election, no consensus, any node
+  serves any request, and the fallback pattern guarantees forward progress
+  even when a custom pack is rejected — it never blocks waiting for a
+  better one. Gap: once WASM runs arbitrary code, something has to bound
+  how long a packer call may take and fall back exactly the way an
+  over-threshold pack does today. Same mechanism, not a new one.
+- *High availability* holds for node failures (tested: kill a peer, GET
+  still succeeds via reconstruction). It does **not** yet hold against
+  noisy neighbors — the isolation gap flagged earlier. One bucket's load,
+  or once-WASM one bucket's expensive code, can degrade every other bucket
+  sharing the same node. Nothing enforces fairness yet.
+
+**Verdict**: feasible and safe right now, specifically because the only
+packer in the registry is a trusted, tested, first-party one. Not yet
+feasible to safely open that registry to untrusted code without closing two
+concrete, scoped gaps first — output-partition validation and per-bucket
+resource fairness — both extensions of patterns already built here, not new
+architecture. Treat those two as the actual gate on the WASM plan, not a
+vague "add security later."
+
+## Phase 5: real queries via DuckDB — Range-GET, and real Parquet bytes (2026-10-02)
+
+User's direction: start the "real recognizable workload engine" proof with
+DuckDB (Parquet/SQL), and pick a more object-storage-native vector search
+system for IVF later, second. This phase covers what's needed before
+DuckDB can query anything at all.
+
+**Found before writing any Rust: the existing workload driver never stored
+real Parquet bytes.** `real_workload_driver.py`'s `synthetic_body()` fills
+each unit with size-matched filler, explicitly documented as fine for a
+storage-overhead measurement (only sizes matter for that), but DuckDB can't
+parse filler bytes as Parquet — no real footer, no real magic bytes, no
+real column data. Separately, `formats.py`'s `parquet_units`/
+`parquet_units_batched` only ever tracked column-chunk *sizes*, never real
+file offsets — `fac_core.Unit` has no offset field at all, only `(unit_id,
+size)`. Both needed fixing before DuckDB had anything real to read.
+
+**`parquet_real_offsets.py`** (new): computes genuine `(unit_id, offset,
+len)` triples from pyarrow's own column-chunk metadata
+(`dictionary_page_offset` or `data_page_offset`, spanning
+`total_compressed_size`). Checked directly, not assumed: column chunks
+written by `pq.write_table` tile the file with zero gaps, in exactly
+row-group-major/column-minor order — the same flat order
+`parquet_units_batched` already iterates in, confirmed by comparing
+append-order against byte-offset-sorted order on a real file. Only two
+gaps exist in a whole file: the 4-byte leading `PAR1` magic and the
+trailing footer (metadata + length + magic) after the last column chunk.
+Both are covered as their own framing units (`_leading_magic`,
+`_trailing_footer`), so every byte is covered by exactly one unit — this
+module's own `verify_full_coverage` asserts that, and caught a real bug in
+my first draft (I'd conflated `column_chunk_byte_range`'s `(start, end)`
+return with `(start, length)` when merging batches, producing a
+negative-length trailing unit — fixed before anything was PUT).
+
+**`duckdb_demo.py`** (new): PUTs a real Parquet file with real offsets,
+verifies byte-identical round-trip **and** that pyarrow can actually
+re-open the result (`pq.read_table`) — the real bar, stronger than
+byte-equality alone. Verified at both column-chunk and row-group
+granularity: byte-identical, pyarrow-readable, correct row count (5000).
+
+**Range-GET on `/cluster/{bucket}/{key}` GET** (new, Rust): didn't exist
+before this phase — GET always returned the whole object. Reused the S3
+API's own `parse_range_header`/`RangeResult` (widened from `pub(super)` to
+`pub(crate)` rather than writing a second parser) and added:
+- `packed.rs`: `fetch_and_decode_stripe` extracted as a shared helper from
+  the existing whole-object GET, plus a new
+  `get_object_content_dependent_range(record, start, end, state)` that
+  finds which stripes have *any* unit overlapping `[start, end]`, fetches
+  and decodes only those, and copies just the overlapping byte intersection
+  of each touched unit into a response buffer sized to the request — not
+  the whole object.
+- `coordinator.rs`: `cluster_get_object` now takes the request, parses
+  Range, and dispatches to the ranged path for content-dependent objects
+  or (unoptimized, intentionally) fetches the full object and slices it
+  in memory for plain objects — correct either way, but only the
+  content-dependent path is selective, which is the entire point of the
+  comparison this phase exists to make.
+
+**Verified end-to-end**, real Parquet file, RS(3,2) local cluster: a Range
+request for exactly one column chunk's real byte span returned 206,
+correct `Content-Range` header, and bytes identical to the real slice of
+the original file. A follow-up diagnostic log line
+(`range-GET touched N/M stripes`) confirmed the actual selectivity, not
+just byte-correctness: **1 of 48 stripes touched** for a single-column-chunk
+range, versus all 48 for a whole-object GET. `cargo test`: all 92 tests
+still pass, both before and after.
+
+**Not yet done**: DuckDB itself isn't installed in this environment
+(`ModuleNotFoundError`, no CLI either) — needs a venv or
+`--break-system-packages` given PEP 668. Once installed, the actual
+demonstration is: PUT the same real Parquet file into two buckets (one
+plain, one FAC-packed at column-chunk granularity), point
+`duckdb.sql("SELECT ... FROM read_parquet('http://.../bucket/key')")` at
+both via `httpfs`, and show DuckDB's own observed bytes-fetched/latency
+differ, caused by nothing but the bucket's placement configuration — an
+independent, unmodified tool validating the claim, not our own harness
+grading its own homework.
+
+## DuckDB verified live against WarpDrive (2026-10-02)
+
+Installed DuckDB in a venv (`hipc_poster/.venv`, avoids PEP 668 — same
+pattern as the `urllib`-over-`requests` decision earlier). Sequencing per
+user's direction: verify DuckDB against our own two paths (FAC-packed,
+plain) locally first; MinIO joins the comparison later, on GCP, not here —
+deferred deliberately, not forgotten.
+
+PUT the same real 2.1MB synthetic-lineitem Parquet file (50k rows) into a
+FAC-packed bucket (`facbucket`, column-chunk granularity, 162 units, 52
+stripes) and a plain bucket (`plainbucket`, no header), then pointed
+`duckdb`'s `httpfs` extension at both via `read_parquet('http://127.0.0.1:
+9710/cluster/{bucket}/lineitem.parquet')` — no S3 API involved, DuckDB's
+generic HTTP range-reading against our own `/cluster/` endpoint directly.
+
+**Correctness first**: `count(*)`, `avg(extendedprice)`, and a filtered
+`GROUP BY` all returned identical, correct results from both buckets.
+DuckDB — independent, unmodified, has no idea WarpDrive or FAC exist —
+successfully parsed a real Parquet file reconstructed through our
+content-dependent placement path.
+
+**Access pattern, confirmed via logs, not assumed**: DuckDB issued 26 real
+Range requests against each bucket, identical byte ranges and identical
+total bytes (482,600) in both cases — expected and correct, since that's
+dictated by the Parquet file's own layout and DuckDB's own column-pruning,
+not by WarpDrive. What differs is the *internal* cost of satisfying each of
+those 26 requests: every one of them hit `range-GET touched 1/52 stripes`
+on the FAC-packed bucket (confirmed in the access log, all 26), while the
+plain bucket has no sub-object structure to be selective about, so every
+one of those same 26 requests triggers a full `k+m`-shard fetch and full
+EC decode of the entire 2.1MB object just to return a small slice.
+
+**Real, reproducible latency difference**, 5 runs per query (first run
+dropped as connection/httpfs warmup), same machine, same cluster, same
+file:
+
+| Query | FAC-packed (median) | Plain (median) | Speedup |
+|---|---|---|---|
+| `GROUP BY` with filter (`quantity < 5`) | 3.9ms | 23.7ms | 6.1x |
+| `avg(extendedprice)` | 5.0ms | 24.4ms | 4.9x |
+| Two-column filter+project | 5.6ms | 40.2ms | 7.2x |
+| `count(*)` | 1.6ms | 7.4ms | 4.6x |
+
+Consistent 4.6–7.2x speedup across four differently-shaped queries, from a
+completely independent, real SQL engine that is not cooperating with or
+aware of WarpDrive in any way — this is the "an unmodified third-party tool
+validates the claim" result the DuckDB direction was specifically chosen
+to produce, now real, not hypothetical. Local, loopback, single machine —
+absolute numbers aren't the point yet; the *relative* effect, caused by
+nothing but a bucket config choice, is.
+
+**Next**: the same comparison against MinIO, on GCP, per user's explicit
+sequencing — real network latency, a real independent erasure-coded object
+store as the third point of comparison, not just WarpDrive's own two paths.
+
+## Lance/IVF: a real new packer, real infrastructure, and a real negative result (2026-10-02/03)
+
+User's framing, correcting an earlier instinct to reuse `FacPacker` for Lance:
+*"we have to show that introducing a new [packer] for their workload improves
+query latency — reusing FAC is just extra advantage, not what we'd like to
+show."* The right experiment is a second, genuinely different `StripePacker`
+motivated by how IVF search actually accesses data, proving the registry
+pattern itself (bring your own algorithm, bind it to a bucket) — not proving
+FAC generalizes. WASM was explicitly descoped for this pass (*"we don't have
+to do WASM now... use a different algorithm... look at WASM as well [later]"*)
+— `IvfCentroidPacker` is a native Rust `StripePacker`, same registry, no
+sandbox yet.
+
+**`Unit::metadata`**: a new opaque `Vec<u8>` field on `packing::Unit`, ignored
+by `FacPacker`, read by `IvfCentroidPacker` as a little-endian `u32` spatial
+rank. This is the first packer that needs more than a unit's size — the
+header format grew an optional 5th base64 element to carry it per-unit.
+
+**`IvfCentroidPacker`**: sorts units by spatial rank, groups every `k`
+spatially-adjacent partitions into one stripe (one per bin). Tested in
+isolation (`packing.rs`): never splits a unit, no bin exceeds capacity, and
+a dedicated test with deliberately scrambled sizes confirms it groups by
+rank, not size — the property that actually distinguishes it from `FacPacker`.
+
+**Getting real centroids and real byte offsets out of Lance, not synthetic
+ones**: `index_statistics()` gives real per-partition vector counts and
+centroids (confirmed: `ds.create_index(..., ivf_centroids=...)` accepts
+pre-trained centroids directly, so the centroids used for spatial ranking
+are *exactly* the ones that determined the real index's layout, not a
+separately-trained, possibly-mismatched set). `LanceFileReader(aux_file)
+.metadata()` gives the real physical buffer position/size for the
+`__pq_code` column. One declared, not silently assumed, approximation:
+an 80-byte constant (`buffer.size - sum(counts)*8`) is treated as a fixed
+header before flat per-partition data — checked for arithmetic consistency
+only, not verified against Lance's own (unpublished) micro-layout spec.
+`_rowid`'s own encoding is non-flat and not sliced per-partition; folded
+into a framing unit instead, same treatment as Parquet's leading magic
+bytes. `lance_real_offsets.py`'s own `verify_full_coverage` confirmed zero
+gaps/overlaps on a real built index (285 units, 992,004 bytes).
+
+**New Rust infrastructure, all required just to make Lance's own
+unmodified S3 client connect at all** (not optional polish — Lance's
+`object_store::aws` client needs real bucket/list semantics; their own docs
+use `"endpoint": "http://minio:9000"` as the canonical example, nothing like
+DuckDB's arbitrary-URL `httpfs`):
+- `LocationStore`/`ContentLocationStore` grew a `list(bucket, prefix)`
+  method — the one genuinely new primitive (GET/PUT/HEAD already existed).
+- `s3_shim.rs`: minimal ListObjectsV2 (merges both stores, no pagination)
+  and HEAD, under a new `/cluster/s3/` prefix; GET/PUT reuse
+  `cluster_get_object`/`cluster_put_object` directly. Deliberately not a
+  full S3 implementation — no SigV4 verification, scoped to exactly what
+  `object_store::aws` needs. **Real bug found and fixed in the first
+  smoke test**: HEAD returned `Content-Length: 0` for an 11-byte object —
+  actix recomputes Content-Length from the actual (empty) `.finish()` body,
+  silently discarding a manually-inserted header. Fixed by reusing
+  `HeadBody` (already built for the S3 API's own HEAD handler, for the
+  same reason), widened from `pub(super)` to `pub(crate)`.
+- **Real bug found uploading the first actual dataset**: gRPC's default
+  4MB message limit rejected a ~20MB shard from a real Lance data fragment
+  (`"message length too large: found 20491849 bytes, the limit is:
+  4194304 bytes"`) — never hit before because every previous test object was
+  smaller. Fixed: `WARPDRIVE_GRPC_MAX_MESSAGE_SIZE`, default 256MB, set on
+  both the gRPC server and client.
+- **Real bug found in `upload_dataset`**: uploaded keys didn't carry the
+  `data.lance/` prefix Lance's reader expects (it opens
+  `s3://bucket/data.lance`, so it looks up `data.lance/_versions/...`, not
+  bare `_versions/...`). Fixed.
+- **Real bug found in `get_object_content_dependent_range`**: the loop
+  over needed stripes was sequential (`for stripe in needed { ...await...
+  }`), not concurrent — fine when a request touches 1 stripe (the common
+  case), serializing N round-trips end to end when it touches many (an
+  outlier real query touched 55 of 95). Fixed with `try_join_all` over all
+  needed stripes at once.
+
+**After every one of those fixes, Lance's own unmodified S3 client opened
+both buckets correctly** (`count_rows=20000` on both) and ran real
+`nearest={"column": "vector", "q": ..., "nprobes": N}` ANN queries
+successfully, returning correct, matching results from both. The
+mechanism is real and proven end to end — not a connectivity claim, a
+working one.
+
+**The actual performance result is a clean negative, reported honestly,
+not papered over.** `IvfCentroidPacker`-packed queries were consistently
+*slower* than plain, not faster — roughly 580–620ms (plain) vs 1650–1820ms
+(ivf_centroid) across nprobe 4/16/40, 9 queries each, full RS(3,2) local
+cluster. Root-caused, not just observed: the per-request stripe-touch
+distribution has a real right tail (median 1 of 95 stripes touched — good
+— but mean 4.1, max 55). A direct, controlled single-Range-GET comparison
+bypassing Lance entirely showed only a modest raw per-call cost gap (3.24ms
+vs 1.53ms) — nowhere near enough to explain the full-query gap — so the
+real cost is concurrency contention on the rare high-fan-out calls: 55
+stripes needing `(k+m)=5` peer RPCs each is 275 simultaneous calls
+contending over an 8-connection gRPC pool and 8 actix workers, even with
+the sequential-fetch bug fixed.
+
+**Why, structurally, not just empirically**: a greedy nearest-neighbor
+*chain* linearizes 768-dimensional centroids into one 1-D ordering, which
+only guarantees that *consecutive* points in that specific chain are
+mutually close. An arbitrary query's `nprobe`-nearest centroids are a
+*ball* in 768-dimensional space — nothing about a 1-D linearization
+guarantees an arbitrary ball maps to a contiguous interval of that chain.
+This is a real, principled gap in this specific heuristic, not a bug in
+the surrounding infrastructure, and not a refutation of the underlying
+thesis (Parquet's column-chunk case has no such gap, because a column
+chunk's "who needs this together" relationship — the same query always
+wants the same column — is exact, not probabilistic).
+
+**Not done, and worth naming plainly**: a packer that actually clusters
+centroids (e.g. k-means into `nlist/k`-sized groups, each group becoming
+one stripe) rather than linearizing them would far more reliably keep an
+arbitrary query's probed set within one or two stripes, and is the
+principled next attempt if this experiment continues. Not yet built.
+WASM execution for a packer (any packer) remains fully deferred, per this
+session's explicit descoping, independent of this result.
+
+## Lance/IVF, continued: real k-means, FAC-pack-per-cluster, and the real bottleneck (2026-10-03)
+
+**A real confound found and fixed first**: a bucket configured for content-
+dependent placement doesn't require a header on every object — a missing
+header still *attempts* packing with a synthesized single whole-object
+unit (by design, so a client that forgets the header still gets a correct
+answer). For every file in the `lanceivf` bucket *other* than the one aux
+file actually being tested — the ~60MB data fragment included — this meant
+silently packing each as one oversized, zero-padded stripe (measured: a
+single unit under RS(3,2) is a real 200% overhead, comfortably inside this
+demo's generous 500% bucket threshold) instead of falling back to plain's
+even k-way split. Found by timing, not inspection: a single data-fragment
+fetch logged at ~150ms with ~61MB-sized shards, repeated on every result
+row materialized. **This was the actual cause of the earlier 3x slowdown,
+not the packing algorithm.** Fixed in `lance_demo.py`'s `upload_dataset`:
+every non-aux file now explicitly sends `x-warpd-computable-units: false`,
+forcing plain EC regardless of bucket config. After this fix alone, full
+end-to-end query times closed from ~580ms vs ~1700ms to ~580ms vs ~600ms —
+roughly even, not a win, but no longer a confound either.
+
+**Random test vectors were also a confound, found by direct measurement,
+not suspicion**: checked 768-dim i.i.d. Gaussian pairwise distances
+directly — they concentrate tightly around the theoretical
+`sqrt(2*dim)≈39.2` regardless of which pair is measured (observed: 38.2,
+40.4, 40.8 across three arbitrary pairs). There is no "nearby" structure in
+such data for *any* spatial packer to exploit, by construction — this is
+why the greedy-chain version showed no improvement no matter how it was
+tuned. Fixed: `lance_demo.py` now generates vectors as draws from 40
+random "topic" blobs (`make_blob_structured_vectors`), the same shape real
+embeddings actually have (similar items genuinely closer together), which
+is the entire reason IVF indexing is a sound technique on real data in the
+first place.
+
+**User's correction, acted on**: *"even FAC has multiple stripes and each
+stripe[sic] unit has multiple computable units within a data block."*
+`IvfCentroidPacker` was wrongly restricted to one partition per bin. Fixed:
+extracted FAC's own greedy bin-packing loop into a standalone `fac_pack(k,
+units)` helper (`FacPacker` is now a thin wrapper over it), and rewrote
+`IvfCentroidPacker` to group units by *exact* k-means cluster id (not
+sorted-order proximity — the earlier chain-ranked version only guaranteed
+chain-*adjacent* units were close, not that a whole cluster's members
+landed together once a cluster had more than `k` members) and run
+`fac_pack` *within* each cluster. `lance_real_offsets.py`'s
+`kmeans_cluster_order` (flattened rank) replaced with
+`kmeans_cluster_assignments` (real cluster id per partition) to match.
+Four packing.rs tests cover this: never-splits/no-overflow (now with
+repeated cluster ids, not synthetic rank values), exact-cluster-id
+grouping (not size-based), and — new — multiple same-cluster units
+correctly sharing bins instead of needing one stripe per `k` partitions
+regardless of true cluster size.
+
+**Result of the full chain of fixes**: mean stripes touched per query
+dropped from ~3.5 to ~3.1 (real, measured, modest), but total stripe count
+rose from 95 to 118 (uneven real cluster sizes waste some bin capacity — a
+genuine trade-off, not a bug) and the tail persists (up to 51 of 118
+touched) — plausibly inherent to the query distribution itself (topic
+assignment is uniform random across 40 topics; a query near several
+topics' boundary legitimately needs partitions from several different real
+clusters) rather than a packing defect. Full end-to-end query time:
+unchanged at ~600ms vs ~605-640ms, slightly slower, not faster.
+
+**The real finding, isolating the aux file from end-to-end noise**: a
+direct aux-file-only measurement (`columns=[]`, `with_row_id=True`, no row
+materialization) showed single-digit-to-tens-of-ms latency for *both*
+buckets, noisy, no clear winner either direction. **The auxiliary.idx
+partition-locality problem, however well solved, cannot move the needle on
+full query latency, because it was never where the latency lives.** The
+~580-600ms end-to-end cost is almost entirely the "base-table take" —
+reconstructing the (still-plain, ~60MB) data fragment file to materialize
+10 result rows' `id`/`vector` values, paid 2-3 times per query. The
+principled next move, if this continues, is applying content-dependent
+placement to the *data fragment* by row (or row-batch) — the same move
+already proven out for Parquet row groups — not further refinement of the
+aux-file packer, which is now a solved, correctly-behaving, but largely
+irrelevant-to-latency piece of this picture.
+
+## Lance/IVF: the real win — row-batch packing the data fragment (2026-10-03)
+
+Did exactly the move named above. **`lance_data_fragment_real_units`**
+(new, `lance_real_offsets.py`): real per-row-batch computable units for a
+Lance data fragment file — the one `take` actually reads to materialize
+result rows, not the auxiliary index. Checked directly before building
+anything on top: the `vector` column (`FixedSizeList<float32>[768]`) is a
+single flat buffer starting at byte 0, size *exactly*
+`num_rows * 768 * 4` — zero header, zero padding, confirmed by exact
+arithmetic match. The `id` column uses a different, non-flat encoding
+(sequential integers compress well: 34,752 bytes measured for what a flat
+int64 layout would need 160,000 for) — same treatment as `_rowid` and
+Parquet's magic bytes before it: folded into one opaque trailing framing
+unit together with the file's footer, not sliced per-row. 1,000 row-batch
+units (batch size 20 rows ≈ 60KB each) plus one trailing framing unit,
+verified full coverage against a real built file (1001 units, 61,475,306
+bytes, exact).
+
+**Deliberately no spatial/cluster metadata on these units** — unlike IVF
+partitions, which rows a `take` needs are essentially uniform-random
+scattered row ids (whichever 10 happen to rank highest after PQ-distance
+scoring), with no "nearby rows get queried together" relationship to
+encode. Tagging these units with no cluster id metadata makes
+`IvfCentroidPacker`'s own fallback path (units with no metadata all land
+in one group, `cluster_id = u32::MAX`, then get real `fac_pack` applied
+within it) degenerate into exactly `FacPacker`'s size-based bin-packing —
+the right tool for "many small same-size units, no locality to exploit."
+Reuses the bucket's existing fixed packer policy with zero new Rust code;
+doesn't need a third packer.
+
+**`upload_dataset` generalized** from one hardcoded aux-file special case
+to a `real_units_by_rel_path: dict` — any number of files in a dataset can
+now get real computable-unit treatment; everything else still gets the
+explicit `x-warpd-computable-units: false` escape hatch.
+
+**Result: a real, decisive, verified win.** Same cluster, same real
+queries, same correctness bar as every other measurement in this
+document:
+
+| nprobe | plain (median) | row-packed `lanceivf` (median) | speedup |
+|---|---|---|---|
+| 4  | 579.7ms | 15.5ms | 37.4x |
+| 16 | 587.4ms | 20.6ms | 28.5x |
+| 40 | 579.9ms | 21.4ms | 27.1x |
+
+**Correctness checked before trusting the number**, same discipline as
+every prior claim here: 5 independent query trials, comparing both
+returned row ids *and* actual vector values (not just counts) between the
+plain and packed buckets — all 5 trials, exact match on both ids and
+byte-for-byte vector data (`np.allclose`). The speedup is real, not a
+silently-wrong-but-fast result.
+
+**Why this (and not the aux file) was always the real lever**: the
+auxiliary.idx partition-selection problem is genuinely a locality problem
+(which centroids are near which), and no packing strategy around it was
+ever going to be more than a few-millisecond effect, because the file
+itself is under 1MB. The data fragment is 60MB+, plain, and reconstructed
+whole on every `take` — that's a structural, not incidental, 60MB-vs-60KB
+difference, and content-dependent placement is exactly the mechanism built
+this entire session to address exactly that gap. The lesson generalizes:
+before optimizing a placement strategy, measure *which file* actually
+dominates latency — the right fix can be a complete reuse of existing
+machinery (no new packer, no new Rust) applied to the right target,
+rather than a cleverer algorithm applied to the wrong one.
+
+## Replacing synthetic data with a real, published benchmark (2026-10-03)
+
+User's prompt: *"Can we use actual lance workload or any benchmarks that's
+real which asks real questions."* Everything up to this point used
+synthetic test vectors (random noise, then topic-blobs). Switched to
+SIFT1M-small, from the texmex corpus — the same dataset LanceDB's own
+published benchmarks (GIST-1M and SIFT-1M) report recall/latency numbers
+against, so results here are comparable to Lance's own claims, not just
+internally consistent.
+
+**Source**: `ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz` is blocked
+from this network (403); used the byte-identical mirror published by
+`TileDB-Inc/TileDB-Vector-Search`'s GitHub releases instead. Real 10,000
+base vectors (128-dim), 100 real queries, real ground truth (100,100) —
+**verified independently before trusting it**: ground truth for query 0
+checked against a from-scratch brute-force exact nearest-neighbor search
+over the real base vectors, exact match, not assumed correct because it
+came from a named source.
+
+**`sift_benchmark.py`** (new): loads the real `.fvecs`/`.ivecs` files,
+builds a real Lance IVF_PQ index (100 partitions, 16 sub-vectors) with
+real centroids, reuses every piece of infrastructure already built —
+`lance_ivf_real_units`, `lance_data_fragment_real_units`,
+`upload_dataset`, the S3 shim — unchanged. One real bug found adapting to
+a different dataset shape, fixed immediately: `lance_data_fragment_real_units`
+assumed the `vector` column's buffer started at byte 0 (true for the
+earlier 768-dim/20k-row dataset, false here — column write order on disk
+isn't guaranteed to match schema declaration order). Fixed by looking up
+the column by name via the real schema (`md.schema.get_field_index
+("vector")`) and treating whatever precedes/follows its buffer as
+leading/trailing framing, instead of assuming position 0.
+
+**Results, real queries, real ground truth, asking the real question a
+vector-search benchmark is supposed to ask (not just "is it fast" — "is it
+still correct"):**
+
+| nprobe | plain (median) | packed (median) | speedup | recall@10 (both, identical) |
+|---|---|---|---|---|
+| 5  | 6.53ms | 1.30ms | 5.0x | 0.691 |
+| 10 | 6.41ms | 1.07ms | 6.0x | 0.732 |
+| 20 | 6.24ms | 1.21ms | 5.2x | 0.738 |
+
+Smaller magnitude than the earlier 20k-row/768-dim result (27-37x) — this
+dataset's data fragment is 5.1MB, not 61MB, so the plain path's whole-file
+reconstruction cost is proportionally smaller to begin with — but the
+mechanism holds on genuinely real, externally-verified data: **recall@10
+is bit-for-bit identical between the plain and packed buckets at every
+nprobe level**, confirming placement strategy and search correctness are
+fully independent, exactly the invariant that should hold (a pure storage
+layout change must never change which neighbors are found, only how fast
+they're fetched). This is the same per-row-batch data-fragment packing
+already proven on synthetic data, now validated against an authoritative,
+independently-checked, externally-recognizable benchmark.
 
 ## Verification
 

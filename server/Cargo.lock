@@ -3053,6 +3053,7 @@ dependencies = [
  "dotenvy",
  "env_logger",
  "flatbuffers",
+ "flate2",
  "futures",
  "hex",
  "hmac",

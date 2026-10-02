@@ -41,6 +41,12 @@ pub trait LocationStore: Send + Sync {
     fn put(&self, record: LocationRecord) -> io::Result<()>;
     fn get(&self, bucket: &str, key: &str) -> Option<LocationRecord>;
     fn delete(&self, bucket: &str, key: &str) -> io::Result<()>;
+    /// Keys (with their byte size) in `bucket` whose key starts with
+    /// `prefix` — the minimal S3 ListObjectsV2 shim needs this (object
+    /// stores speaking the real S3 protocol, like Lance's client, list a
+    /// dataset's files; the raw `/cluster/{bucket}/{key}` API never needed
+    /// this since callers always know their own key).
+    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
 }
 
 fn record_key(bucket: &str, key: &str) -> String {
@@ -124,6 +130,18 @@ impl LocationStore for BitcaskLocationStore {
         self.append_line(&line)?;
         self.index.write().unwrap().remove(&rk);
         Ok(())
+    }
+
+    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
+        let bucket_prefix = format!("{bucket}/");
+        let full_prefix = format!("{bucket_prefix}{prefix}");
+        self.index
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(&full_prefix))
+            .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
+            .collect()
     }
 }
 
