@@ -6,6 +6,7 @@
 
   <p>
     <a href="https://vitality-ai.github.io/warpdrive/site/"><img alt="Website" src="https://img.shields.io/badge/Website-4a0e63?style=for-the-badge&logo=googlechrome&logoColor=ffb366&labelColor=4a0e63"></a>
+    <a href="https://discord.gg/ZrxZnE87X"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/releases"><img alt="Version" src="https://img.shields.io/badge/version-1.0.0-ff8a3d?style=for-the-badge&logo=semver&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/vitality-ai/warpdrive?style=for-the-badge&logo=star&color=ff8a3d&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/network/members"><img alt="Forks" src="https://img.shields.io/github/forks/vitality-ai/warpdrive?style=for-the-badge&logo=git-fork&color=c92a6b&logoColor=white&labelColor=1a1025"></a>
@@ -26,7 +27,7 @@ WarpDrive is an object store that's fast out of the box, tells you why it's fast
 
 Run it as a **single node** to get a fully S3-compatible store in one process, a drop-in for local development and embedded use (see the compatibility results below). Run it **distributed** to get a multi-node, erasure-coded engine with no single coordinator, no leader election, and quorum-based reads/writes.
 
-What makes WarpDrive different is **content-dependent placement**. Instead of treating every object as an opaque blob, a bucket can opt a workload's own structure (Parquet column chunks, vector-index partitions) into how its bytes are striped and erasure-coded, and the system reports the cost of that choice before it risks availability. Measured end-to-end against established tools, not synthetic benchmarks:
+What makes WarpDrive different is **content-dependent placement**. Instead of treating every object as an opaque blob, a bucket can opt a workload's own structure (Parquet column chunks, vector-index partitions) into how its bytes are striped and erasure-coded, and the system reports the cost of that choice before it risks availability.
 
 - **149x faster** on a selective, official TPC-H query (DuckDB, via its own `dbgen`). Pushdown skips untouched stripes instead of reconstructing the whole object.
 - **Up to 41x faster** on Lance vector-search (`IVF_PQ`) `take` latency, with recall@10 identical to the unpacked baseline on the SIFT1M-small benchmark. Speed with no accuracy trade-off.
