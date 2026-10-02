@@ -74,46 +74,29 @@ placement/packer choice actually gets wired up across the cluster's nodes.
 
 ### Cluster membership and per-bucket placement configuration
 
-```mermaid
-flowchart TB
-    subgraph CLUSTER["Cluster membership (additive only, no leader election)"]
-        NA["Node A :9710"]
-        NB["Node B :9711"]
-        NC["Node C :9712"]
-        ND["Node D :9713"]
-        NE["Node E :9714\n(joins live)"]
-        NA --- NB
-        NB --- NC
-        NC --- ND
-        ND --- NA
-        NE -.->|"POST /cluster/join"| NA
-    end
+Three steps, each building on the last: a node joins the cluster, a bucket's
+config picks a placement policy, and that config's `packer_name` selects one
+entry from the `StripePacker` registry.
 
-    NA --> PEERS["live peer list\n(every node converges on the same set)"]
-    PEERS --> PP
+**1. A new node joins the running cluster.** No leader election, no
+consensus. Any existing node adds the new peer to its in-memory list and
+the update propagates until every node agrees.
 
-    subgraph BUCKET["Per-bucket config (BucketConfigStore)"]
-        PP{{"PlacementPolicy: ComputedPlacement\nrendezvous hash of (bucket,key) -> k+m peers"}}
-        CFG["packer_name + overhead_threshold_pct\n(fallback to plain if over budget)"]
-    end
+![Cluster membership: additive only, no leader election](diagrams/01-cluster-membership.svg)
 
-    CFG --> REG
+**2. A bucket's config resolves a `PlacementPolicy`.** The live peer list
+from step 1, plus the bucket's own `packer_name`/`overhead_threshold_pct`,
+feed `ComputedPlacement`'s rendezvous hash to pick the `k+m` peers for this
+write.
 
-    subgraph REGISTRY["StripePacker registry (packing.rs)"]
-        REG{{"registry, keyed by packer_name"}}
-        FAC["FacPacker\nsize-based bin-packing\n(Fusion's Algorithm 1)"]
-        IVF["IvfCentroidPacker\ngroups by k-means cluster id,\nthen bin-packs within each cluster"]
-        WASMP["WasmPacker (planned, not yet shipped)\nuser-submitted code, sandboxed inside the\ncoordinator (wasmtime/wasmer), simulated for\ncorrectness (checksum match) before a bucket\nis allowed to go live on it"]
-    end
+![Per-bucket placement configuration](diagrams/02-placement-policy.svg)
 
-    REG --> FAC
-    REG --> IVF
-    REG -.-> WASMP
-```
-
-A bucket only ever names a `packer_name`: swapping in a new packer (native
-or, once built, WASM) never changes `coordinator.rs` or any client-visible
+**3. `packer_name` selects one `StripePacker` registry entry.** A bucket
+only ever names a `packer_name`. Swapping in a new packer (native or,
+once built, WASM) never changes `coordinator.rs` or any client-visible
 behavior, only which registry entry a bucket's config points at.
+
+![StripePacker registry](diagrams/03-packer-registry.svg)
 
 ### Write path
 

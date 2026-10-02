@@ -1,0 +1,40 @@
+<svg viewBox="0 0 860 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arrowR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5A6A82"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="400" fill="#FFFFFF"/>
+  <text x="430" y="28" text-anchor="middle" font-size="13" font-weight="700" letter-spacing="0.5" fill="#0F1A2E">STRIPEPACKER REGISTRY (packing.rs)</text>
+
+  <!-- input -->
+  <rect x="40" y="150" width="200" height="80" rx="10" fill="#F3EEFE" stroke="#7C3AED" stroke-width="2"/>
+  <text x="140" y="178" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">BucketConfigStore</text>
+  <text x="140" y="198" text-anchor="middle" font-size="11" fill="#5A6A82">packer_name selects</text>
+  <text x="140" y="215" text-anchor="middle" font-size="11" fill="#5A6A82">one registry entry</text>
+
+  <!-- registry hub -->
+  <circle cx="330" cy="190" r="8" fill="#5A6A82"/>
+  <path d="M240,190 L322,190" fill="none" stroke="#5A6A82" stroke-width="2" marker-end="url(#arrowR)"/>
+
+  <!-- three packer options -->
+  <path d="M338,190 C 420,190 430,78 500,73" fill="none" stroke="#007A66" stroke-width="2" marker-end="url(#arrowR)"/>
+  <rect x="510" y="48" width="300" height="60" rx="10" fill="#E6FBF7" stroke="#007A66" stroke-width="2"/>
+  <text x="660" y="72" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">FacPacker</text>
+  <text x="660" y="90" text-anchor="middle" font-size="10.5" fill="#5A6A82">size-based bin-packing (Fusion's Algorithm 1)</text>
+
+  <path d="M338,190 L 500,190" fill="none" stroke="#B45309" stroke-width="2" marker-end="url(#arrowR)"/>
+  <rect x="510" y="160" width="300" height="60" rx="10" fill="#FFF3E0" stroke="#B45309" stroke-width="2"/>
+  <text x="660" y="184" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">IvfCentroidPacker</text>
+  <text x="660" y="202" text-anchor="middle" font-size="10.5" fill="#5A6A82">groups by k-means cluster id, bin-packs within each</text>
+
+  <path d="M338,190 C 420,190 430,302 500,307" fill="none" stroke="#9AA3B2" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrowR)"/>
+  <rect x="510" y="277" width="300" height="60" rx="10" fill="#F4F4F6" stroke="#9AA3B2" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="660" y="299" text-anchor="middle" font-size="12" font-weight="700" fill="#5A6A82">WasmPacker <tspan font-size="10" font-weight="600">(planned)</tspan></text>
+  <text x="660" y="317" text-anchor="middle" font-size="10.5" fill="#8A93A2">user-submitted code, sandboxed in the coordinator</text>
+
+  <!-- outcome box -->
+  <rect x="40" y="355" width="780" height="34" rx="10" fill="#F4F7FB" stroke="#D1DAE8" stroke-width="1.5"/>
+  <text x="430" y="377" text-anchor="middle" font-size="11.5" fill="#5A6A82"><tspan font-weight="700" fill="#0F1A2E">Same trait, same registry, same call site.</tspan> Only which entry a bucket points at changes, coordinator.rs never does.</text>
+</svg>

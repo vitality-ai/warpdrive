@@ -1,0 +1,40 @@
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arrowG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5A6A82"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="300" fill="#FFFFFF"/>
+  <text x="430" y="28" text-anchor="middle" font-size="13" font-weight="700" letter-spacing="0.5" fill="#0F1A2E">PER-BUCKET PLACEMENT CONFIGURATION</text>
+
+  <!-- inputs -->
+  <rect x="40" y="65" width="190" height="60" rx="10" fill="#E6FBF7" stroke="#007A66" stroke-width="2"/>
+  <text x="135" y="90" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">Live peer list</text>
+  <text x="135" y="107" text-anchor="middle" font-size="10" fill="#5A6A82">from cluster membership</text>
+
+  <rect x="40" y="175" width="190" height="70" rx="10" fill="#F3EEFE" stroke="#7C3AED" stroke-width="2"/>
+  <text x="135" y="200" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">BucketConfigStore</text>
+  <text x="135" y="216" text-anchor="middle" font-size="10" fill="#5A6A82">packer_name +</text>
+  <text x="135" y="230" text-anchor="middle" font-size="10" fill="#5A6A82">overhead_threshold_pct</text>
+
+  <!-- center -->
+  <rect x="320" y="110" width="230" height="90" rx="12" fill="#FFF3E0" stroke="#B45309" stroke-width="2.5"/>
+  <text x="435" y="138" text-anchor="middle" font-size="13" font-weight="700" fill="#0F1A2E">PlacementPolicy</text>
+  <text x="435" y="158" text-anchor="middle" font-size="11" fill="#5A6A82">ComputedPlacement</text>
+  <text x="435" y="175" text-anchor="middle" font-size="11" fill="#5A6A82">rendezvous hash of (bucket, key)</text>
+
+  <!-- output -->
+  <rect x="640" y="120" width="180" height="70" rx="10" fill="#FFE8EC" stroke="#CF222E" stroke-width="2"/>
+  <text x="730" y="148" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">k + m peer set</text>
+  <text x="730" y="165" text-anchor="middle" font-size="10" fill="#5A6A82">chosen for this write</text>
+
+  <!-- arrows -->
+  <path d="M230,95 C 270,95 280,130 320,140" fill="none" stroke="#5A6A82" stroke-width="2" marker-end="url(#arrowG)"/>
+  <path d="M230,210 C 270,210 280,170 320,160" fill="none" stroke="#5A6A82" stroke-width="2" marker-end="url(#arrowG)"/>
+  <path d="M550,155 L 632,155" fill="none" stroke="#5A6A82" stroke-width="2" marker-end="url(#arrowG)"/>
+
+  <!-- outcome box -->
+  <rect x="60" y="250" width="740" height="38" rx="10" fill="#F4F7FB" stroke="#D1DAE8" stroke-width="1.5"/>
+  <text x="430" y="274" text-anchor="middle" font-size="11.5" fill="#5A6A82">Resolved fresh at <tspan font-weight="700" fill="#0F1A2E">PUT</tspan> time, then pinned into LocationStore. <tspan font-weight="700" fill="#0F1A2E">GET/DELETE</tspan> read the pin, never recompute.</text>
+</svg>
