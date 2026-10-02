@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Distributed Engine Results v1.0.0 — WarpDrive</title>
+<meta name="description" content="Measured results for WarpDrive's distributed, erasure-coded engine with content-dependent placement, against DuckDB (TPC-H) and Lance (vector search).">
+<style>
+:root {
+  --bg:       #07090F;
+  --surface:  #0D1018;
+  --surface2: #131924;
+  --border:   #1D2638;
+  --text:     #D6E0EE;
+  --muted:    #5A6A82;
+  --warm:     #00C8A8;
+  --cold:     #FF6E6E;
+  --green:    #1FBC7A;
+  --yellow:   #D29922;
+  --purple:   #A78BFA;
+  --amber:    #F59E0B;
+  --accent-bg: rgba(0,200,168,0.07);
+  --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:#F4F7FB; --surface:#FFFFFF; --surface2:#EEF2F8; --border:#D1DAE8;
+    --text:#0F1A2E; --muted:#607090; --warm:#007A66; --cold:#CF222E;
+    --green:#15874F; --yellow:#9A6700; --purple:#7C3AED; --amber:#B45309;
+    --accent-bg:rgba(0,122,102,0.07);
+  }
+}
+:root[data-theme="light"] {
+  --bg:#F4F7FB; --surface:#FFFFFF; --surface2:#EEF2F8; --border:#D1DAE8;
+  --text:#0F1A2E; --muted:#607090; --warm:#007A66; --cold:#CF222E;
+  --green:#15874F; --yellow:#9A6700; --purple:#7C3AED; --amber:#B45309;
+  --accent-bg:rgba(0,122,102,0.07);
+}
+:root[data-theme="dark"] {
+  --bg:#07090F; --surface:#0D1018; --surface2:#131924; --border:#1D2638;
+  --text:#D6E0EE; --muted:#5A6A82; --warm:#00C8A8; --cold:#FF6E6E;
+  --green:#1FBC7A; --yellow:#D29922; --purple:#A78BFA; --amber:#F59E0B;
+  --accent-bg:rgba(0,200,168,0.07);
+}
+
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+body {
+  background:var(--bg); color:var(--text);
+  font-family:var(--sans); font-size:14px; line-height:1.6;
+  padding:0 0 80px;
+  -webkit-font-smoothing:antialiased;
+}
+
+.site-nav {
+  position:sticky; top:0; z-index:100;
+  background:var(--bg); border-bottom:1px solid var(--border);
+  padding:0 40px; display:flex; align-items:center; height:44px; gap:16px;
+}
+.site-nav a { font-family:var(--mono); font-size:12px; color:var(--muted); text-decoration:none; display:flex; align-items:center; gap:5px; }
+.site-nav a:hover { color:var(--text); }
+.site-nav .sep { color:var(--border); }
+.site-nav .wm { color:var(--text); font-weight:600; }
+
+.page { max-width:1040px; margin:0 auto; padding:0 40px; }
+
+header { padding:32px 0 20px; border-bottom:1px solid var(--border); margin-bottom:28px; }
+.eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--warm); margin-bottom:8px; }
+h1 { font-family:var(--mono); font-size:19px; font-weight:600; color:var(--text); margin-bottom:10px; }
+.subtitle { font-size:13px; color:var(--muted); line-height:1.8; }
+.subtitle code { font-family:var(--mono); background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:11px; color:var(--text); }
+.badge-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+.badge { font-family:var(--mono); font-size:11px; border-radius:20px; padding:3px 10px; border:1px solid; }
+.badge-warm  { color:var(--warm);   border-color:var(--warm);   background:color-mix(in srgb,var(--warm)   10%,transparent); }
+.badge-cold  { color:var(--cold);   border-color:var(--cold);   background:color-mix(in srgb,var(--cold)   10%,transparent); }
+.badge-purp  { color:var(--purple); border-color:var(--purple); background:color-mix(in srgb,var(--purple) 10%,transparent); }
+.badge-amber { color:var(--amber);  border-color:var(--amber);  background:color-mix(in srgb,var(--amber)  10%,transparent); }
+
+.section-label {
+  font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--warm); margin-bottom:14px; padding-bottom:6px;
+  border-bottom:1px solid color-mix(in srgb,var(--warm) 25%,transparent);
+}
+
+.stat-row { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:28px; }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+.stat-label { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:6px; }
+.stat-value { font-size:28px; font-weight:700; font-family:var(--mono); font-variant-numeric:tabular-nums; line-height:1; margin-bottom:4px; }
+.stat-sub { font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; line-height:1.5; }
+.val-cold  { color:var(--cold);   }
+.val-warm  { color:var(--warm);   }
+.val-purp  { color:var(--purple); }
+.val-amber { color:var(--amber);  }
+
+.section { margin-bottom:32px; }
+.section p.lead { font-size:13px; color:var(--muted); line-height:1.75; margin-bottom:16px; }
+
+.chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:12px; }
+.card h2 { font-size:10px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:10px; }
+.card img { display:block; width:100%; height:auto; border-radius:4px; background:#fff; }
+.chart-note { font-size:12px; color:var(--muted); line-height:1.65; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
+.chart-note strong { color:var(--text); }
+
+.table-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 18px; margin-bottom:28px; }
+.table-card h2 { font-size:10px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:12px; }
+.table-scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }
+th { text-align:left; font-family:var(--mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:500; padding:7px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+td { padding:7px 10px; border-bottom:1px solid color-mix(in srgb,var(--border) 45%,transparent); font-family:var(--mono); font-size:12px; white-space:nowrap; }
+tr:last-child td { border-bottom:none; }
+.c-warm { color:var(--warm); }
+.c-cold { color:var(--cold); }
+.c-dim  { color:var(--muted); }
+
+.formula-box { background:var(--accent-bg); border:1px solid var(--border); border-left:3px solid var(--warm); border-radius:6px; padding:16px 18px; }
+.formula-note { font-family:var(--mono); font-size:12px; color:var(--muted); line-height:1.9; }
+.formula-note strong { color:var(--text); }
+.formula-note ul { margin:8px 0 8px 18px; }
+
+@media (max-width:720px) {
+  .chart-grid { grid-template-columns:1fr; }
+  .stat-row   { grid-template-columns:repeat(2,1fr); }
+}
+</style>
+</head>
+<body>
+
+<nav class="site-nav">
+  <a href="../index.html">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+    <span class="wm">warpdrive</span>
+  </a>
+  <span class="sep">/</span>
+  <a href="#">Distributed Engine Results v1.0.0</a>
+</nav>
+
+<div class="page">
+
+<header>
+  <div class="eyebrow">v1.0.0 · Distributed, Erasure-Coded Engine</div>
+  <h1>Content-Dependent Placement · Measured Results</h1>
+  <p class="subtitle">
+    Measured against a live WarpDrive cluster (symmetric multi-node, gRPC fan-out, Reed-Solomon erasure coding), not a simulator.<br>
+    Established tools used unmodified against their own data: <code>Lance</code> vector search, <code>DuckDB</code>'s <code>tpch</code> extension (official <code>dbgen</code> + queries), and the texmex/SIFT1M-small corpus.
+  </p>
+  <div class="badge-row">
+    <span class="badge badge-warm">DuckDB · official TPC-H</span>
+    <span class="badge badge-cold">Lance · IVF_PQ vector search</span>
+    <span class="badge badge-purp">SIFT1M-small · published benchmark</span>
+    <span class="badge badge-amber">RS(3,2) erasure coding</span>
+  </div>
+</header>
+
+<div class="stat-row">
+  <div class="stat-card">
+    <div class="stat-label">TPC-H Q6 (selective)</div>
+    <div class="stat-value val-warm">149x</div>
+    <div class="stat-sub">7756.6ms → 51.9ms, row-group pushdown</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Lance <code style="font-size:11px">take</code> latency</div>
+    <div class="stat-value val-cold">up to 41x</div>
+    <div class="stat-sub">20k vectors/768-dim, row-batch packing</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">SIFT1M-small recall@10</div>
+    <div class="stat-value val-purp">identical</div>
+    <div class="stat-sub">plain vs. packed, every nprobe level</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">TPC-H Q1 (control)</div>
+    <div class="stat-value val-amber">419.7ms</div>
+    <div class="stat-sub">low selectivity, less to prune</div>
+  </div>
+</div>
+
+<!-- TPC-H -->
+<div class="section">
+  <div class="section-label">Analytical SQL · Official TPC-H via DuckDB, pushdown</div>
+  <p class="lead">
+    DuckDB's <code style="font-family:var(--mono)">tpch</code> extension generates the official TPC-H dataset (<code style="font-family:var(--mono)">dbgen</code>, sf=1 → 6,001,215 <code style="font-family:var(--mono)">lineitem</code> rows) and exposes the official 22 queries verbatim. Q1 and Q6 are the only two that touch solely <code style="font-family:var(--mono)">lineitem</code>. The exported Parquet file was physically sorted by <code style="font-family:var(--mono)">l_shipdate</code> before upload, a standard clustering technique (the same idea as Databricks' Z-ORDER), which is what makes Q6's one-year date predicate actually prunable via row-group min/max statistics.
+  </p>
+  <div class="chart-grid" style="grid-template-columns:1fr">
+    <div class="card">
+      <h2>Q6 (selective) vs. Q1 (control), median latency</h2>
+      <img src="images/v1.0.0/tpch_pushdown_latency.png" alt="TPC-H pushdown latency chart">
+      <p class="chart-note">Packed-bucket cost scales down with query selectivity (a stripe boundary to skip past); plain-bucket cost stays flat regardless of selectivity (no sub-object boundary to exploit at all).</p>
+    </div>
+  </div>
+  <div class="table-card">
+    <h2>Full results</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Query</th><th>Selectivity</th><th>Bucket</th><th>Median latency</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Q6</td><td>Selective (1-yr window + discount/quantity range)</td><td class="c-dim">plain</td><td>7756.6 ms</td><td class="c-dim">no stripe concept, full reconstruction per range-GET</td></tr>
+          <tr><td>Q6</td><td>Selective</td><td class="c-warm">packed</td><td>51.9 ms</td><td class="c-warm">149x faster, 252 range-GETs, avg 1.0 of 268 stripes touched/request</td></tr>
+          <tr><td>Q1</td><td>Low selectivity (~96% of rows match)</td><td class="c-dim">packed only</td><td>419.7 ms</td><td class="c-dim">control: 1074 range-GETs, avg 2.2 of 268 stripes/request</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- LANCE -->
+<div class="section">
+  <div class="section-label">Vector Search · Lance IVF_PQ, content-dependent placement</div>
+  <p class="lead">
+    Lance's own <code style="font-family:var(--mono)">object_store::aws</code> client pointed at two WarpDrive buckets holding the same dataset, same index, same unmodified query engine. One bucket stored plain (whole-object erasure coding), the other configured to use <code style="font-family:var(--mono)">IvfCentroidPacker</code>, which groups IVF partitions by k-means cluster id and bin-packs within each cluster.
+  </p>
+  <div class="chart-grid">
+    <div class="card">
+      <h2>SIFT1M-small · published benchmark corpus</h2>
+      <img src="images/v1.0.0/sift1m_small_latency_recall.png" alt="SIFT1M-small latency and recall chart">
+      <p class="chart-note">Recall@10 identical between plain and packed at every nprobe level, checked against independently-verifiable ground truth.</p>
+    </div>
+    <div class="card">
+      <h2>20k vectors/768-dim · row-batch packing</h2>
+      <img src="images/v1.0.0/lance_rowbatch_latency.png" alt="Lance row-batch packing latency chart">
+      <p class="chart-note">The dominant cost was reconstructing the ~60MB data fragment file to materialize 10 result rows. Row-batch packing (20 rows/batch, no cluster metadata needed) gives the largest win measured so far.</p>
+    </div>
+  </div>
+  <div class="table-card">
+    <h2>SIFT1M-small results</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>nprobe</th><th>plain (ms)</th><th>packed (ms)</th><th>speedup</th><th>recall@10 (plain)</th><th>recall@10 (packed)</th></tr></thead>
+        <tbody>
+          <tr><td>5</td><td>26.35</td><td class="c-warm">6.68</td><td class="c-warm">3.9x</td><td>0.743</td><td>0.743</td></tr>
+          <tr><td>10</td><td>6.08</td><td class="c-warm">1.10</td><td class="c-warm">5.5x</td><td>0.765</td><td>0.765</td></tr>
+          <tr><td>20</td><td>5.99</td><td class="c-warm">1.24</td><td class="c-warm">4.8x</td><td>0.768</td><td>0.768</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="table-card" style="margin-bottom:0">
+    <h2>Row-batch packing results (20k vectors/768-dim)</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>nprobe</th><th>plain (ms)</th><th>packed (ms)</th><th>speedup</th></tr></thead>
+        <tbody>
+          <tr><td>4</td><td>603.5</td><td class="c-warm">14.7</td><td class="c-warm">41x</td></tr>
+          <tr><td>16</td><td>604.9</td><td class="c-warm">29.8</td><td class="c-warm">20x</td></tr>
+          <tr><td>40</td><td>616.9</td><td class="c-warm">24.0</td><td class="c-warm">26x</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- CAVEATS -->
+<div class="formula-box">
+  <div class="formula-note">
+    <strong>Methodology notes and caveats, stated directly:</strong>
+    <ul>
+      <li>All results use the dev-loop default <strong>RS(3,2)</strong> (3 data + 2 parity shards), not Fusion's RS(9,6). Re-running at RS(9,6) is the natural next validation step.</li>
+      <li>All measurements are from a <strong>local multi-process cluster on one machine</strong> (real gRPC calls, real disk I/O per node), not yet a multi-VM/cross-datacenter run.</li>
+      <li><strong>No MinIO comparison yet</strong>, tracked as follow-up work.</li>
+      <li><strong>SIFT1M-small, not full SIFT1M</strong>, the 10k-vector subset, not the full 1M-vector corpus.</li>
+      <li>Every number above came from a script that also independently verifies correctness (byte-identical round-trip, recall@10 against ground truth, or exact result-value equality) in the same run that produced the timing.</li>
+    </ul>
+  </div>
+</div>
+
+</div>
+
+</body>
+</html>

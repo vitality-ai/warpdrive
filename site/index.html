@@ -558,10 +558,15 @@
         <a href="#install">Install</a>
         <a href="#compat">Integrations</a>
         <a href="#characterization">Characterization</a>
+        <a href="#distributed">Distributed Engine</a>
         <button id="theme-toggle" aria-label="Toggle theme">
           <svg class="icon-sun icon-sun-default" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
           <svg class="icon-moon icon-moon-default" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
+        <a class="btn-github" href="https://discord.gg/ZrxZnE87X" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24"><path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .077-.01c3.927 1.793 8.18 1.793 12.061 0a.073.073 0 0 1 .078.01c.12.099.246.198.373.292a.077.077 0 0 1-.006.127 12.3 12.3 0 0 1-1.873.892.076.076 0 0 0-.04.107c.36.698.772 1.364 1.225 1.993a.078.078 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.06.06 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+          Discord
+        </a>
         <a class="btn-github" href="https://github.com/vitality-ai/warpdrive" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
@@ -831,6 +836,43 @@ EOF</pre>
         Full characterization report with charts →
       </a>
     </section>
+
+    <!-- distributed engine -->
+    <section id="distributed">
+      <h2>Distributed engine, v1.0.0</h2>
+      <p class="section-sub">WarpDrive also runs as a multi-node, erasure-coded cluster with pluggable content-dependent placement: a bucket can opt a workload's own structure (Parquet column chunks, vector-index partitions) into how its bytes are striped and erasure-coded. Measured against established tools, not synthetic benchmarks: DuckDB's official TPC-H (via its own <code>dbgen</code>) and Lance's <code>IVF_PQ</code> vector search.</p>
+
+      <div class="bench-note">
+        <strong>Finding:</strong> content-dependent placement's benefit scales with query selectivity. A selective TPC-H query (Q6, pruned to the row groups it actually needs) goes from 7756.6ms to 51.9ms, a 149x speedup, while a low-selectivity query (Q1, ~96% of rows match) only improves modestly, since there's less to prune either way. On Lance vector search, recall@10 stays bit-for-bit identical between plain and packed buckets at every nprobe level, placement changes where bytes live, never which bytes come back.
+      </div>
+
+      <div class="bench-grid">
+        <div class="bench-card">
+          <div class="bench-label">TPC-H Q6 · selective</div>
+          <div class="bench-value">149x<span class="bench-unit">faster</span></div>
+          <div class="bench-sub">7756.6ms → 51.9ms · row-group pushdown</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">Lance <code>take</code> latency</div>
+          <div class="bench-value">41x<span class="bench-unit">faster</span></div>
+          <div class="bench-sub">20k vectors/768-dim · row-batch packing</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">SIFT1M-small recall@10</div>
+          <div class="bench-value">0<span class="bench-unit">delta</span></div>
+          <div class="bench-sub">identical, plain vs. packed, every nprobe</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">TPC-H Q1 · control</div>
+          <div class="bench-value">419.7<span class="bench-unit">ms</span></div>
+          <div class="bench-sub">low selectivity, packed only</div>
+        </div>
+      </div>
+
+      <a class="btn-outline" href="characterization/v1.0.0-results.html">
+        Full distributed engine report with charts →
+      </a>
+    </section>
   </div>
 
   <footer>
@@ -841,6 +883,7 @@ EOF</pre>
         <a href="LICENSE">License</a>
         <a href="https://github.com/vitality-ai/warpdrive/blob/main/docs/Technical-Architecture.md" target="_blank" rel="noopener">Architecture</a>
         <a href="https://github.com/vitality-ai/warpdrive/blob/main/docs/Technical-Roadmap.md" target="_blank" rel="noopener">Roadmap</a>
+        <a href="https://discord.gg/ZrxZnE87X" target="_blank" rel="noopener">Discord</a>
       </div>
     </div>
   </footer>
