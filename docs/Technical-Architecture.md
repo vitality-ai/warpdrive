@@ -17,16 +17,6 @@ As of **v1.0.0-beta**, WarpDrive runs in two modes:
   results in
   [`docs/benchmarks/v1.0.0-results.md`](benchmarks/v1.0.0-results.md).
 
-**Why `-beta`, for both modes, not just the new distributed engine:**
-distributed mode hasn't been validated at production scale yet (single
-local cluster only, no multi-VM/cross-datacenter run, no MinIO
-comparison). Single-node mode has its own open gap: authentication is
-currently a single shared admin credential, not real multi-user
-IAM-style auth and authorization (see `docs/TEST-COVERAGE.md`'s note on
-`test_object_copy_not_owned_bucket` needing real multi-user auth, which
-doesn't exist yet). Both are real, tracked gaps, not just the
-distributed engine's.
-
 ## Single-Node Mode (fully S3-compatible, for local deployments) - v0.1.0
 
 
