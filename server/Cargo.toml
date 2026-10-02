@@ -29,6 +29,32 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 dotenvy = "0.15"
 hmac = "0.12"
 base64 = "0.22"
+reed-solomon-erasure = "6.0"
+async-trait = "0.1"
+tonic = "0.11"
+prost = "0.12"
+
+[build-dependencies]
+tonic-build = "0.11"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 actix-web = "4.11.0"
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "ec_bench"
+harness = false
+
+[[bin]]
+name = "transport_bench"
+path = "src/bin/transport_bench.rs"
+
+[[bin]]
+name = "load_gen"
+path = "src/bin/load_gen.rs"
+
+[[bin]]
+name = "fanout_bench"
+path = "src/bin/fanout_bench.rs"
