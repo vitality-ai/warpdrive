@@ -2,14 +2,6 @@
 
 ## Context
 
-This plan is about building a real distributed WarpDrive. It is not a HiPC-poster task —
-the poster is a separate, parked piece of work (currently 3 pages, retrim decision
-pending, tracked independently). The only thing this plan takes from that context is a
-deadline: a real distributed engine, not a Python simulator, needs to exist before
-Oct 8, 2026 AOE (today is Oct 2 — **6 days**), because the poster's current numbers come
-from a simulator (`hipc_poster/`) and the user wants real measurements to exist instead.
-Everything else below is scoped purely to WarpDrive itself.
-
 A read-only codebase survey (`/Users/cj/cj/personal/claude/warpdrive-distributed`, cloned
 fresh from `vitality-ai/warpdrive`, `main` @ `dc53849`) found:
 
