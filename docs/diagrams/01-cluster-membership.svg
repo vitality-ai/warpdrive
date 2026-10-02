@@ -1,0 +1,55 @@
+<svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arrow1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#B45309"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="340" fill="#FFFFFF"/>
+  <text x="430" y="28" text-anchor="middle" font-size="13" font-weight="700" letter-spacing="0.5" fill="#0F1A2E">CLUSTER MEMBERSHIP: ADDITIVE ONLY, NO LEADER ELECTION</text>
+
+  <!-- diamond ring of 4 existing nodes, every pair connected -->
+  <g stroke="#D1DAE8" stroke-width="2">
+    <line x1="215" y1="150" x2="365" y2="90"/>
+    <line x1="365" y1="90" x2="365" y2="230"/>
+    <line x1="365" y1="230" x2="215" y2="150"/>
+    <line x1="215" y1="150" x2="215" y2="150"/>
+    <line x1="365" y1="90" x2="215" y2="230"/>
+    <line x1="215" y1="230" x2="365" y2="230"/>
+    <line x1="215" y1="150" x2="215" y2="230"/>
+  </g>
+
+  <g>
+    <rect x="170" y="125" width="90" height="50" rx="10" fill="#E6FBF7" stroke="#007A66" stroke-width="2"/>
+    <text x="215" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">Node A</text>
+    <text x="215" y="162" text-anchor="middle" font-size="10" fill="#5A6A82">:9710</text>
+  </g>
+  <g>
+    <rect x="320" y="65" width="90" height="50" rx="10" fill="#E6FBF7" stroke="#007A66" stroke-width="2"/>
+    <text x="365" y="86" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">Node B</text>
+    <text x="365" y="102" text-anchor="middle" font-size="10" fill="#5A6A82">:9711</text>
+  </g>
+  <g>
+    <rect x="320" y="205" width="90" height="50" rx="10" fill="#E6FBF7" stroke="#007A66" stroke-width="2"/>
+    <text x="365" y="226" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">Node C</text>
+    <text x="365" y="242" text-anchor="middle" font-size="10" fill="#5A6A82">:9712</text>
+  </g>
+  <g>
+    <rect x="170" y="205" width="90" height="50" rx="10" fill="#E6FBF7" stroke="#007A66" stroke-width="2"/>
+    <text x="215" y="226" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">Node D</text>
+    <text x="215" y="242" text-anchor="middle" font-size="10" fill="#5A6A82">:9713</text>
+  </g>
+
+  <!-- joining node -->
+  <rect x="610" y="140" width="120" height="56" rx="10" fill="#FFF3E0" stroke="#B45309" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="670" y="162" text-anchor="middle" font-size="12" font-weight="700" fill="#0F1A2E">Node E</text>
+  <text x="670" y="178" text-anchor="middle" font-size="10" fill="#5A6A82">:9714, joining</text>
+
+  <path d="M608,158 C 520,140 460,140 412,130" fill="none" stroke="#B45309" stroke-width="2.5" stroke-dasharray="6,3" marker-end="url(#arrow1)"/>
+  <text x="520" y="118" text-anchor="middle" font-size="11" font-weight="600" fill="#B45309">POST /cluster/join</text>
+
+  <!-- outcome box -->
+  <rect x="80" y="275" width="700" height="52" rx="10" fill="#F4F7FB" stroke="#D1DAE8" stroke-width="1.5"/>
+  <text x="430" y="296" text-anchor="middle" font-size="12" font-weight="600" fill="#0F1A2E">Every node converges on the same live peer list.</text>
+  <text x="430" y="314" text-anchor="middle" font-size="11" fill="#5A6A82">Already-placed objects are never rebalanced when a node joins. A documented non-goal, not an oversight.</text>
+</svg>

@@ -1,0 +1,38 @@
+// Wire format for the raw-TCP PeerClient (no HTTP/2, no gRPC) — the third
+// transport candidate in the decision point, built specifically to strip
+// away HTTP/2 framing/multiplexing overhead after diagnosis pointed at it
+// (see docs/Distributed-Engine-Plan.md). Framing on the wire: a 4-byte
+// big-endian length prefix, then exactly that many bytes of an Envelope.
+namespace shardwire;
+
+table PutShardRequest {
+  bucket: string;
+  key: string;
+  shard_idx: uint32;
+  data: [ubyte];
+}
+
+table PutShardResponse {
+  ok: bool;
+  error: string;
+}
+
+table GetShardRequest {
+  bucket: string;
+  key: string;
+  shard_idx: uint32;
+}
+
+table GetShardResponse {
+  ok: bool;
+  error: string;
+  data: [ubyte];
+}
+
+union Body { PutShardRequest, PutShardResponse, GetShardRequest, GetShardResponse }
+
+table Envelope {
+  body: Body;
+}
+
+root_type Envelope;

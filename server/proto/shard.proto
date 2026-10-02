@@ -1,0 +1,33 @@
+// Inter-node shard transport over gRPC — the alternative PeerClient
+// implementation benchmarked head-to-head against plain HTTP in the
+// transport decision point (docs/Distributed-Engine-Plan.md). The shard
+// payload is a plain `bytes` field: gRPC's own protobuf framing already
+// gives structure (bucket/key/shard_idx + payload), so there's nothing
+// left for FlatBuffers to add here, unlike the HTTP path where it reuses
+// the native API's existing wire format.
+syntax = "proto3";
+package warpdrive.cluster;
+
+service ShardService {
+  rpc PutShard(PutShardRequest) returns (PutShardResponse);
+  rpc GetShard(GetShardRequest) returns (GetShardResponse);
+}
+
+message PutShardRequest {
+  string bucket = 1;
+  string key = 2;
+  uint32 shard_idx = 3;
+  bytes data = 4;
+}
+
+message PutShardResponse {}
+
+message GetShardRequest {
+  string bucket = 1;
+  string key = 2;
+  uint32 shard_idx = 3;
+}
+
+message GetShardResponse {
+  bytes data = 1;
+}
