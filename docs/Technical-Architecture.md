@@ -10,12 +10,12 @@ As of **v1.0.0**, WarpDrive runs in two modes:
 - **Single-node mode** — a single process, fully S3-compatible, for local
   deployments and development. This is the original architecture below,
   unchanged.
-- **Distributed mode** — a real, multi-node, erasure-coded object engine with
+- **Distributed mode** — a multi-node, erasure-coded object engine with
   pluggable placement, built as a layer in front of the same single-node
   storage/API code (every peer is still a single-node server underneath).
-  See [Distributed Mode](#distributed-mode---v100) below, and the full
-  real-measurement results in
-  [`docs/benchmarks/v1.0.0-real-results.md`](benchmarks/v1.0.0-real-results.md).
+  See [Distributed Mode](#distributed-mode---v100) below, and the measured
+  results in
+  [`docs/benchmarks/v1.0.0-results.md`](benchmarks/v1.0.0-results.md).
 
 ## Single-Node Mode (fully S3-compatible, for local deployments) - v0.1.0
 
@@ -74,7 +74,7 @@ graph TD
 
     subgraph "Any node, acting as coordinator for this request"
         COORD[cluster/coordinator.rs]
-        S3SHIM["cluster/s3_shim.rs\n(GET/PUT/HEAD/List, real bucket semantics\nfor Lance's object_store client)"]
+        S3SHIM["cluster/s3_shim.rs\n(GET/PUT/HEAD/List, bucket semantics\nfor Lance's object_store client)"]
         PLACEMENT{{"PlacementPolicy\n(trait, 1 impl: ComputedPlacement\nrendezvous hash, no leader election)"}}
         BUCKETCFG["BucketConfigStore\n(per-bucket packer choice +\noverhead-threshold fallback)"]
         PACKERS{{"StripePacker registry\n(trait: FacPacker, IvfCentroidPacker,\nuser-pluggable)"}}
@@ -108,11 +108,11 @@ graph TD
 - **`StripePacker`** (`packing.rs`) — pluggable **content-dependent
   placement**, the opt-in layer on top of the always-on default above.
   `FacPacker` (Fusion's Algorithm 1, size-based bin-packing) and
-  `IvfCentroidPacker` (groups by real k-means cluster id, then bin-packs
+  `IvfCentroidPacker` (groups by k-means cluster id, then bin-packs
   within each cluster) are both registered implementations of the same
   trait — a bucket picks one via `BucketConfigStore`, or uses neither and
   gets plain erasure-coded storage.
-- **`ErasureCoder`** (`ec.rs`) — `ReedSolomonCoder`, real `reed-solomon-erasure`
+- **`ErasureCoder`** (`ec.rs`) — `ReedSolomonCoder`, the `reed-solomon-erasure` crate
   encode/decode, with a second `encode_shards`/`decode_shards` path for
   pre-packed (content-dependent) stripes.
 - **`LocationStore` / `ContentLocationStore`** (Bitcask-style: append-only
@@ -120,9 +120,9 @@ graph TD
   multi-stripe unit → (offset, stripe, peers) record content-dependent
   placement needs, kept as two stores since the record shapes genuinely
   differ.
-- **`cluster/s3_shim.rs`** — a minimal real S3 surface (GET/PUT/HEAD/List)
+- **`cluster/s3_shim.rs`** — a minimal S3 surface (GET/PUT/HEAD/List)
   over the same coordinator path, built specifically so third-party clients
-  that need real bucket/list semantics (Lance's `object_store::aws`) work
+  that need bucket/list semantics (Lance's `object_store::aws`) work
   unmodified, not just protocol-agnostic range-GET clients (DuckDB's
   `httpfs`, which needs no shim).
 - **`pushdown.rs`** — a `ColumnCodec` trait + a `/query` endpoint that filters
@@ -133,8 +133,8 @@ graph TD
   documented non-goal, not an oversight (see
   `docs/Distributed-Engine-Plan.md`).
 
-**Real measured results for content-dependent placement, run against this
-exact engine** (real Lance IVF_PQ vector search, real SIFT1M-small benchmark
-data, real official TPC-H via DuckDB's own `dbgen` and query set) are in
-[`docs/benchmarks/v1.0.0-real-results.md`](benchmarks/v1.0.0-real-results.md).
+Measured results for content-dependent placement, run against this engine
+(Lance IVF_PQ vector search, the SIFT1M-small benchmark data, official
+TPC-H via DuckDB's `dbgen` and query set) are in
+[`docs/benchmarks/v1.0.0-results.md`](benchmarks/v1.0.0-results.md).
 

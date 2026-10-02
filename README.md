@@ -22,16 +22,16 @@
 
 ## About
 
-WarpDrive is an object store that's fast out of the box, tells you exactly why it's fast enough to put in an SLA, and lets you customize *how* it places your data without ever risking the system coming down.
+WarpDrive is an object store that's fast out of the box, tells you why it's fast enough to put in an SLA, and lets you customize how it places your data without risking the system coming down.
 
-Run it as a **single node** and get a fully S3-compatible store in one process — drop-in for local development and embedded use (see the compatibility results below). Run it **distributed** and get a real multi-node, erasure-coded engine with no single coordinator, no leader election, and quorum-based reads/writes, the same shape of design production systems like MinIO and Ceph already trust.
+Run it as a **single node** and get a fully S3-compatible store in one process — a drop-in for local development and embedded use (see the compatibility results below). Run it **distributed** and get a multi-node, erasure-coded engine with no single coordinator, no leader election, and quorum-based reads/writes, the same shape of design production systems like MinIO and Ceph already use.
 
-What makes WarpDrive different is **content-dependent placement**: instead of treating every object as an opaque blob, a bucket can opt a workload's own structure (Parquet column chunks, vector-index partitions) into how its bytes are striped and erasure-coded — and the system reports the real cost of that choice before it ever risks availability. Measured end-to-end against real tools, not synthetic benchmarks:
+What makes WarpDrive different is **content-dependent placement**: instead of treating every object as an opaque blob, a bucket can opt a workload's own structure (Parquet column chunks, vector-index partitions) into how its bytes are striped and erasure-coded — and the system reports the cost of that choice before it risks availability. Measured end-to-end against established tools, not synthetic benchmarks:
 
-- **149x faster** on a selective, official TPC-H query (DuckDB, real `dbgen` data) — pushdown that skips untouched stripes entirely instead of reconstructing the whole object.
-- **Up to 41x faster** on real Lance vector-search (`IVF_PQ`) `take` latency, with **recall@10 identical** to the unpacked baseline on the real SIFT1M-small benchmark — speed with no accuracy trade-off.
+- **149x faster** on a selective, official TPC-H query (DuckDB, via its own `dbgen`) — pushdown that skips untouched stripes instead of reconstructing the whole object.
+- **Up to 41x faster** on Lance vector-search (`IVF_PQ`) `take` latency, with recall@10 identical to the unpacked baseline on the SIFT1M-small benchmark — speed with no accuracy trade-off.
 
-Full real-measurement writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-real-results.md`](docs/benchmarks/v1.0.0-real-results.md). Architecture for both modes: [Technical Architecture](docs/Technical-Architecture.md). Our longer-term direction: [Technical Roadmap](docs/Technical-Roadmap.md).
+Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md). Architecture for both modes: [Technical Architecture](docs/Technical-Architecture.md). Our longer-term direction: [Technical Roadmap](docs/Technical-Roadmap.md).
 
 ---
 
