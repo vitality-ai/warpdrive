@@ -32,6 +32,18 @@ pub struct LocationRecord {
     pub k: usize,
     pub m: usize,
     pub original_len: usize,
+    /// This version's shards live at `shard_storage::versioned_key(key,
+    /// version)`, never plain `key` -- so an overwrite's shard writes can
+    /// never land on the same shard key an in-flight or still-pinned read
+    /// of the *previous* version is using, however that write turns out
+    /// (full success, partial failure, or racing against another PUT of
+    /// the same key). The pin only ever points at one version's worth of
+    /// shards at a time, flipped to the new version's id after quorum
+    /// (#151). `#[serde(default)]`: empty string means a record written
+    /// before this field existed, whose shards are at the old, unversioned
+    /// `shard_key(bucket, key, idx)` -- see callers of this field.
+    #[serde(default)]
+    pub version: String,
     pub retention_mode: Option<String>, // "GOVERNANCE" | "COMPLIANCE"
     pub retain_until: Option<String>,   // RFC3339
     pub legal_hold: bool,
@@ -224,6 +236,7 @@ mod tests {
             k: 1,
             m: 1,
             original_len: 42,
+            version: "v1".to_string(),
             retention_mode: None,
             retain_until: None,
             legal_hold: false,

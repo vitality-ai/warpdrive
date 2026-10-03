@@ -136,6 +136,11 @@ pub struct PushdownQueryResponse {
 pub struct PushdownFilterInternalRequest {
     pub bucket: String,
     pub key: String,
+    /// See `ContentDependentRecord::version` (#151) — the coordinator
+    /// already has the record, so it fills this in once rather than
+    /// having the peer look the record up itself just to find it.
+    #[serde(default)]
+    pub version: String,
     pub stripe_index: usize,
     pub bin_index: usize,
     pub offset_in_bin: usize,
@@ -182,7 +187,14 @@ pub async fn cluster_internal_pushdown_filter(
 ) -> Result<HttpResponse, Error> {
     let req = body.into_inner();
     let sk = super::packed::stripe_key(&req.key, req.stripe_index);
-    let raw_bin = super::shard_storage::load_shard(&req.bucket, &sk, req.bin_index)?;
+    // #151: empty `version` means the record predates the field -- read
+    // the bare (unversioned) stripe key in that case.
+    let wire_key = if req.version.is_empty() {
+        sk
+    } else {
+        super::shard_storage::versioned_key(&sk, &req.version)
+    };
+    let raw_bin = super::shard_storage::load_shard(&req.bucket, &wire_key, req.bin_index)?;
     let response = evaluate(&raw_bin, &req, &state)?;
     Ok(HttpResponse::Ok().json(response))
 }
@@ -241,6 +253,7 @@ pub async fn cluster_pushdown_query(
     let internal_req = PushdownFilterInternalRequest {
         bucket: bucket.clone(),
         key: key.clone(),
+        version: record.version.clone(),
         stripe_index: stripe_idx,
         bin_index: bin_idx,
         offset_in_bin,

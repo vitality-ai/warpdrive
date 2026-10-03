@@ -27,6 +27,7 @@ use super::packing::StripePacker;
 use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
 use super::pushdown::ColumnCodec;
+use super::shard_storage::{new_version_id, versioned_key};
 use crate::s3::handlers::common::{parse_range_header, RangeResult};
 use base64::Engine;
 
@@ -413,6 +414,16 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
 
     let required_acks = required_write_acks(k, m);
 
+    // #151: every version of an object writes its shards under a brand
+    // new key (`versioned_key`), never overwriting the previous version's
+    // shards in place. This is what actually prevents corruption on a
+    // failed or concurrent overwrite -- the pin below is only flipped to
+    // this `version` after quorum, so until (and unless) that happens, a
+    // reader still using the *old* pin keeps reading the old version's
+    // shards, completely untouched by this write, however it turns out.
+    let version = new_version_id();
+    let wire_key = versioned_key(&key, &version);
+
     let t0 = std::time::Instant::now();
     let puts = chosen
         .iter()
@@ -422,9 +433,9 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         .map(|(idx, (peer, shard))| {
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.clone();
-            let key = key.clone();
+            let wire_key = wire_key.clone();
             async move {
-                let res = client.put_shard(&peer, &bucket, &key, idx, shard).await;
+                let res = client.put_shard(&peer, &bucket, &wire_key, idx, shard).await;
                 if let Err(ref e) = res {
                     warn!("put_shard idx={idx} peer={peer} failed: {e}");
                 }
@@ -457,6 +468,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         k,
         m,
         original_len: encoded.original_len,
+        version,
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
@@ -577,6 +589,16 @@ pub async fn cluster_get_object(
         .ok_or_else(|| ErrorNotFound("object not found"))?;
     let total_len = record.original_len as u64;
 
+    // #151: an empty `version` means this pin predates the field
+    // (`#[serde(default)]`) -- its shards are at the old, unversioned
+    // `shard_key(bucket, key, idx)`, so fetch with the bare key in that
+    // case rather than a `versioned_key` that was never written.
+    let wire_key = if record.version.is_empty() {
+        key.clone()
+    } else {
+        versioned_key(&key, &record.version)
+    };
+
     // No sub-object structure to be selective about here: a Range request
     // still requires a full fan-out and full EC decode, then an in-memory
     // slice. This is the expected, unoptimized baseline a Range-GET demo
@@ -584,9 +606,9 @@ pub async fn cluster_get_object(
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = bucket.clone();
-        let key = key.clone();
+        let wire_key = wire_key.clone();
         async move {
-            match client.get_shard(&peer, &bucket, &key, idx).await {
+            match client.get_shard(&peer, &bucket, &wire_key, idx).await {
                 Ok(data) => Some((idx, data)),
                 Err(e) => {
                     warn!("get_shard idx={idx} peer={peer} failed: {e}");

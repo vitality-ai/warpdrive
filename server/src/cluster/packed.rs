@@ -15,6 +15,7 @@ use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMe
 use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
 use super::ec::ErasureCoder;
 use super::packing::Stripe;
+use super::shard_storage::{new_version_id, versioned_key};
 
 /// Generic, packer-agnostic correctness check: for every unit the caller
 /// declared in `units_header`, confirms it was packed into exactly one bin
@@ -192,6 +193,14 @@ pub async fn put_object_content_dependent(
     }
     verify_stripes_reconstruct_original(body, units_header, &stripes, &unpadded_bins)?;
 
+    // #151, same reasoning and same mechanism as `put_object_plain`'s:
+    // every version of this object writes its stripes' shards under a
+    // brand new key, never overwriting a previous version's shards in
+    // place. One version id for the *whole* object (shared by every
+    // stripe), not one per stripe -- a reader always resolves every
+    // stripe's wire key from this same single `record.version`.
+    let version = new_version_id();
+
     let mut stripe_records = Vec::with_capacity(stripes.len());
 
     for (stripe_index, (stripe, bins_bytes)) in stripes.iter().zip(unpadded_bins.into_iter()).enumerate() {
@@ -205,14 +214,20 @@ pub async fn put_object_content_dependent(
             .encode_shards(bins_bytes)
             .map_err(|e| ErrorInternalServerError(e.to_string()))?;
 
+        // Placement itself stays keyed on the plain (unversioned) stripe
+        // key, same as `put_object_plain` keeps placement keyed on the
+        // plain object key: which peers a stripe maps to shouldn't churn
+        // on every overwrite, only the wire key identifying *which*
+        // version's bytes are being read or written at those peers.
         let sk = stripe_key(key, stripe_index);
         let chosen = state.placement.place(bucket, &sk, &peers, k, m);
+        let wire_key = versioned_key(&sk, &version);
 
         let puts = chosen.iter().cloned().zip(all_shards).enumerate().map(|(idx, (peer, shard))| {
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.to_string();
-            let sk = sk.clone();
-            async move { client.put_shard(&peer, &bucket, &sk, idx, shard).await }
+            let wire_key = wire_key.clone();
+            async move { client.put_shard(&peer, &bucket, &wire_key, idx, shard).await }
         });
         let results = join_all(puts).await;
         let acked = results.iter().filter(|r| r.is_ok()).count();
@@ -237,6 +252,7 @@ pub async fn put_object_content_dependent(
         original_len: body.len(),
         units: units_header.to_vec(),
         stripes: stripe_records,
+        version,
     };
 
     // Replicate to *every* known peer, not just the union of this object's
@@ -288,13 +304,21 @@ async fn fetch_and_decode_stripe(
     state: &ClusterState,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let sk = stripe_key(&record.key, stripe_index);
+    // #151: empty `version` means this pin predates the field -- fetch
+    // with the bare (unversioned) stripe key in that case, same fallback
+    // as `cluster_get_object`'s plain path.
+    let wire_key = if record.version.is_empty() {
+        sk
+    } else {
+        versioned_key(&sk, &record.version)
+    };
 
     let t_fetch_start = std::time::Instant::now();
     let gets = stripe.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = record.bucket.clone();
-        let sk = sk.clone();
-        async move { client.get_shard(&peer, &bucket, &sk, idx).await.ok().map(|d| (idx, d)) }
+        let wire_key = wire_key.clone();
+        async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
     });
     let results = join_all(gets).await;
     let fetch_ms = t_fetch_start.elapsed().as_secs_f64() * 1000.0;

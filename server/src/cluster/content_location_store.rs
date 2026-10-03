@@ -63,6 +63,15 @@ pub struct ContentDependentRecord {
     /// plus its codec info for pushdown (see `UnitMeta`).
     pub units: Vec<UnitMeta>,
     pub stripes: Vec<StripeRecord>,
+    /// Same purpose and same mechanism as `LocationRecord::version`
+    /// (#151): every stripe's shards are written under
+    /// `shard_storage::versioned_key(stripe_key(key, i), version)`, not a
+    /// plain, reused key, so an overwrite's shard writes never land on a
+    /// key this pin (or any in-flight reader still using it) is relying
+    /// on. `#[serde(default)]`: empty means a record from before this
+    /// field existed, whose shards are at the old, unversioned key.
+    #[serde(default)]
+    pub version: String,
 }
 
 impl ContentDependentRecord {
@@ -242,6 +251,7 @@ mod tests {
                 capacity: 50,
                 bins: vec![vec!["u0".into()], vec!["u1".into()], vec![]],
             }],
+            version: "v1".to_string(),
         }
     }
 
