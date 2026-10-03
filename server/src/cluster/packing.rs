@@ -8,6 +8,8 @@
 //! `PlacementPolicy`, `LocationStore`, `ErasureCoder`, `PeerClient`) is a
 //! trait with one concrete implementation, not a concrete type.
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone)]
 pub struct Unit {
     pub unit_id: String,
@@ -143,12 +145,20 @@ fn cluster_id(u: &Unit) -> u32 {
 
 impl StripePacker for IvfCentroidPacker {
     fn pack(&self, k: usize, units: &[Unit]) -> Vec<Stripe> {
+        // A HashMap for the grouping lookup (#161): a `.find()` per unit
+        // over an ever-growing `groups` Vec is O(units x distinct
+        // clusters), which an IVF index with thousands of partitions
+        // across even a few dozen clusters starts to feel.
         let mut groups: Vec<(u32, Vec<&Unit>)> = Vec::new();
+        let mut index_of: HashMap<u32, usize> = HashMap::new();
         for u in units {
             let cid = cluster_id(u);
-            match groups.iter_mut().find(|(id, _)| *id == cid) {
-                Some(entry) => entry.1.push(u),
-                None => groups.push((cid, vec![u])),
+            match index_of.get(&cid) {
+                Some(&idx) => groups[idx].1.push(u),
+                None => {
+                    index_of.insert(cid, groups.len());
+                    groups.push((cid, vec![u]));
+                }
             }
         }
         groups.sort_by_key(|(id, _)| *id);
