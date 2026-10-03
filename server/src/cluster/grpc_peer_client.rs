@@ -183,8 +183,17 @@ impl GrpcPeerClient {
             .get_or_try_init(|| async move {
                 let mut channels = Vec::with_capacity(pool_size);
                 for _ in 0..pool_size {
+                    // #162: a bare Endpoint has no connect timeout and no
+                    // per-RPC timeout. Doubly important here specifically,
+                    // since channel creation runs inside this
+                    // `OnceCell::get_or_try_init` -- a hang on the very
+                    // first connect to a black-holed peer would block
+                    // *every* concurrent caller waiting on that same
+                    // cell, not just the one that triggered it.
                     let endpoint_obj = Endpoint::from_shared(endpoint_for_init.clone())
-                        .map_err(|e| ErrorBadGateway(format!("invalid gRPC endpoint {endpoint_for_init}: {e}")))?;
+                        .map_err(|e| ErrorBadGateway(format!("invalid gRPC endpoint {endpoint_for_init}: {e}")))?
+                        .connect_timeout(std::time::Duration::from_secs(3))
+                        .timeout(std::time::Duration::from_secs(10));
                     let connect_result = endpoint_obj.connect().await;
                     let channel = connect_result
                         .map_err(|e| ErrorBadGateway(format!("gRPC connect to {endpoint_for_init} failed: {e}")))?;

@@ -151,8 +151,14 @@ impl TcpPeerClient {
         let idle_stream = pool.idle.lock().await.pop_front();
         let stream = match idle_stream {
             Some(s) => s,
-            None => TcpStream::connect(endpoint)
+            // #162: a bare TcpStream::connect has no timeout, so a
+            // black-holed peer hangs this forever. A connect that never
+            // returns also never releases the semaphore permit acquired
+            // above, so it would eventually exhaust this peer's whole
+            // pool, not just this one call.
+            None => tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(endpoint))
                 .await
+                .map_err(|_| ErrorBadGateway(format!("tcp connect to {endpoint} timed out")))?
                 .map_err(|e| ErrorBadGateway(format!("tcp connect to {endpoint} failed: {e}")))?,
         };
         Ok((stream, permit))
@@ -168,19 +174,28 @@ impl TcpPeerClient {
         let endpoint = tcp_endpoint_for(peer)?;
         let (mut stream, permit) = self.borrow(&endpoint).await?;
 
-        if let Err(e) = write_framed(&mut stream, request).await {
-            // Don't return a broken connection to the pool; let it (and
-            // its permit) drop, freeing the slot for a fresh connection.
-            return Err(ErrorBadGateway(format!("tcp write to {peer} failed: {e}")));
+        // #162: write_framed/read_framed had no timeout either, so a peer
+        // that accepted the TCP connection but then never responds (a
+        // real "gray failure," not just a closed port) would hold this
+        // pool permit forever. Both wrapped the same way as connect
+        // above; the permit and stream are dropped (not returned to the
+        // pool) on any error path here, same as before.
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), write_framed(&mut stream, request)).await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(ErrorBadGateway(format!("tcp write to {peer} failed: {e}"))),
+            Err(_) => return Err(ErrorBadGateway(format!("tcp write to {peer} timed out"))),
         }
 
-        let read_result = read_framed(&mut stream).await;
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(10), read_framed(&mut stream)).await;
         match read_result {
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 self.release(&endpoint, stream, permit).await;
                 Ok(resp)
             }
-            Err(e) => Err(ErrorBadGateway(format!("tcp read from {peer} failed: {e}"))),
+            Ok(Err(e)) => Err(ErrorBadGateway(format!("tcp read from {peer} failed: {e}"))),
+            Err(_) => Err(ErrorBadGateway(format!("tcp read from {peer} timed out"))),
         }
     }
 }
