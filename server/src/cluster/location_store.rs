@@ -93,6 +93,18 @@ pub struct BitcaskLocationStore {
     log_path: PathBuf,
     log_file: RwLock<File>,
     index: RwLock<BTreeMap<String, LocationRecord>>,
+    /// #155: `log_file` and `index` are two *separate* locks, so without
+    /// this, two concurrent writers (e.g. a replicated PUT and a
+    /// replicated DELETE for the same key, arriving together) could each
+    /// finish their own log-append-then-index-update in a different
+    /// order, leaving the log and the index permanently disagreeing about
+    /// which one happened last -- invisible until the next restart
+    /// replays the log and gets the *other* answer (a deleted object
+    /// "resurrects", or vice versa). Held across the full append-then-
+    /// update sequence in every mutating method (`put`, `delete`,
+    /// `compact`), so the two data structures can never apply writes in
+    /// different orders from each other.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl BitcaskLocationStore {
@@ -139,6 +151,7 @@ impl BitcaskLocationStore {
             log_path,
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -158,6 +171,10 @@ impl LocationStore for BitcaskLocationStore {
         let rk = record_key(&record.bucket, &record.key);
         let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // #155: held across both the append and the index update, so a
+        // concurrent put/delete for the same key can never apply to the
+        // log and the index in different orders.
+        let _write_guard = self.write_lock.lock().unwrap();
         self.append_line(&line)?;
         self.index.write().unwrap().insert(rk, record);
         Ok(())
@@ -171,6 +188,7 @@ impl LocationStore for BitcaskLocationStore {
         let rk = record_key(bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<LocationRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let _write_guard = self.write_lock.lock().unwrap();
         self.append_line(&line)?;
         self.index.write().unwrap().remove(&rk);
         Ok(())
@@ -195,9 +213,13 @@ impl LocationStore for BitcaskLocationStore {
     }
 
     fn compact(&self) -> io::Result<()> {
-        // Hold both locks for the duration: a concurrent put/delete must
-        // see either the pre- or post-compaction state, never write to a
-        // log file mid-rewrite out from under it.
+        // #155: same `write_lock` as `put`/`delete`, so compaction can't
+        // interleave with either -- a concurrent put/delete must see
+        // either the pre- or post-compaction state, never a log file
+        // mid-rewrite out from under it, and never a snapshot of the
+        // index that's already out of sync with what made it into the
+        // compacted file.
+        let _write_guard = self.write_lock.lock().unwrap();
         let index = self.index.read().unwrap();
         let mut log_file = self.log_file.write().unwrap();
 
@@ -387,5 +409,48 @@ mod tests {
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
         assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
         assert_eq!(reopened.get("b1", "k2").unwrap(), sample("b1", "k2"));
+    }
+
+    /// #155's core invariant: the in-memory index and the on-disk log can
+    /// never disagree about a key's final state, no matter how many
+    /// threads raced to put/delete it concurrently. Before the fix (two
+    /// separate locks, log appended then index updated with no shared
+    /// lock across the two), a thread's own append could land before or
+    /// after another thread's index update in either order, so replaying
+    /// the log after a restart could produce a different answer than the
+    /// live index had -- a deleted object "resurrecting", or vice versa.
+    /// With a single lock held across both steps, every operation's
+    /// append-then-update pair is atomic relative to every other one, so
+    /// the live index and a fresh replay of the log must always agree,
+    /// whatever order the race actually resolved in.
+    #[test]
+    fn concurrent_put_delete_on_the_same_key_never_diverges_log_from_index() {
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("loc.log");
+        let store = std::sync::Arc::new(BitcaskLocationStore::open(&log_path).unwrap());
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                thread::spawn(move || {
+                    for i in 0..50 {
+                        if (t + i) % 2 == 0 {
+                            store.put(sample("b1", "racykey")).unwrap();
+                        } else {
+                            let _ = store.delete("b1", "racykey");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let live = store.get("b1", "racykey");
+        let replayed = BitcaskLocationStore::open(&log_path).unwrap().get("b1", "racykey");
+        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

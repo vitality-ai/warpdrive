@@ -61,6 +61,12 @@ pub struct BitcaskShardMetaStore {
     log_path: PathBuf,
     log_file: RwLock<File>,
     index: RwLock<HashMap<String, (u64, u64)>>,
+    /// #155 — see `location_store.rs`'s matching field doc: without one
+    /// lock held across both the log append and the index update, a
+    /// concurrent put/delete for the same shard key can apply to the log
+    /// and the index in different orders, so a restart (log replay only)
+    /// can disagree with what the live index had.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl BitcaskShardMetaStore {
@@ -110,6 +116,7 @@ impl BitcaskShardMetaStore {
             log_path,
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -122,6 +129,10 @@ impl ShardMetaStore for BitcaskShardMetaStore {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()> {
         let line = serde_json::to_string(&(shard_key, Some((offset, size))))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // #155: held across both the append and the index update, so a
+        // concurrent put/delete for the same shard key can never apply to
+        // the log and the index in different orders.
+        let _write_guard = self.write_lock.lock().unwrap();
         {
             let mut f = self.log_file.write().unwrap();
             writeln!(f, "{line}")?;
@@ -138,6 +149,7 @@ impl ShardMetaStore for BitcaskShardMetaStore {
     fn delete(&self, shard_key: &str) -> io::Result<()> {
         let line = serde_json::to_string(&(shard_key, Option::<(u64, u64)>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let _write_guard = self.write_lock.lock().unwrap();
         {
             let mut f = self.log_file.write().unwrap();
             writeln!(f, "{line}")?;
@@ -148,6 +160,9 @@ impl ShardMetaStore for BitcaskShardMetaStore {
     }
 
     fn compact(&self) -> io::Result<()> {
+        // #155: same `write_lock` as `put`/`delete`, so compaction can't
+        // interleave with either.
+        let _write_guard = self.write_lock.lock().unwrap();
         let index = self.index.read().unwrap();
         let mut log_file = self.log_file.write().unwrap();
         let tmp_path = self.log_path.with_extension("compact.tmp");
@@ -305,5 +320,40 @@ mod tests {
         store.put("k2", 100, 200).unwrap();
         assert_eq!(store.get("k1"), Some((0, 100)));
         assert_eq!(store.get("k2"), Some((100, 200)));
+    }
+
+    /// Same invariant and same reasoning as `location_store.rs`'s matching
+    /// test (#155): the live index and a fresh replay of the log must
+    /// always agree, however a concurrent put/delete race on the same key
+    /// actually resolved.
+    #[test]
+    fn concurrent_put_delete_on_the_same_key_never_diverges_log_from_index() {
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("shardmeta.log");
+        let store = std::sync::Arc::new(BitcaskShardMetaStore::open(&log_path).unwrap());
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                thread::spawn(move || {
+                    for i in 0..50 {
+                        if (t + i) % 2 == 0 {
+                            store.put("racykey", (t * 1000 + i) as u64, 10).unwrap();
+                        } else {
+                            let _ = store.delete("racykey");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let live = store.get("racykey");
+        let replayed = BitcaskShardMetaStore::open(&log_path).unwrap().get("racykey");
+        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }
