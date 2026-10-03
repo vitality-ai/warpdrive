@@ -86,8 +86,23 @@ fn store() -> Arc<dyn Storage> {
     Arc::clone(&STORE)
 }
 
+/// Length-prefixes `bucket` (`"{bucket.len()}:{bucket}:..."`) so its exact
+/// boundary is always recoverable regardless of what bytes `bucket` or
+/// `key` contain, instead of relying on a separator (`__`) that a real
+/// bucket or key can also contain. `key` doesn't need its own length
+/// prefix: `shard_idx` is always a plain decimal string with no `:` in
+/// it, so whatever follows the LAST `:` in the whole string is always
+/// `shard_idx`, and everything between bucket's closing `:` and that last
+/// `:` is always `key` -- unambiguous either way.
+///
+/// Previously `format!("{bucket}__{key}__shard{shard_idx}")`: two
+/// different `(bucket, key)` pairs could collide onto the same shard key
+/// whenever one's `__` happened to land inside the other's bucket or key
+/// (e.g. bucket `a__b` + key `c` and bucket `a` + key `b__c` both produced
+/// `a__b__c__shard0`), silently overwriting one object's shard-location
+/// pointer with another's (#150).
 pub fn shard_key(bucket: &str, key: &str, shard_idx: usize) -> String {
-    format!("{bucket}__{key}__shard{shard_idx}")
+    format!("{}:{}:{}:{}", bucket.len(), bucket, key, shard_idx)
 }
 
 pub fn store_shard(bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), Error> {
@@ -132,5 +147,35 @@ mod tests {
     fn missing_shard_returns_not_found() {
         let err = load_shard("shardtest-bucket", "never-written-key", 0).unwrap_err();
         assert_eq!(err.as_response_error().status_code(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    /// #150: the exact collision from the issue's repro -- a bucket/key
+    /// split that used to land on the same shard key once `__` was used
+    /// as the separator.
+    #[test]
+    fn shard_key_does_not_collide_when_a_separator_moves_across_the_bucket_key_boundary() {
+        assert_ne!(shard_key("a__b", "c", 0), shard_key("a", "b__c", 0));
+    }
+
+    #[test]
+    fn shard_key_is_injective_over_bucket_key_and_shard_idx() {
+        let cases: &[(&str, &str, usize)] = &[
+            ("a", "b", 0),
+            ("a", "b", 1),
+            ("a", "bb", 0),
+            ("aa", "b", 0),
+            ("a:1", "b", 1),
+            ("a", "1:b", 1),
+            ("a:b", "1", 1),
+        ];
+        for (i, &(b1, k1, i1)) in cases.iter().enumerate() {
+            for &(b2, k2, i2) in &cases[i + 1..] {
+                assert_ne!(
+                    shard_key(b1, k1, i1),
+                    shard_key(b2, k2, i2),
+                    "collision between ({b1:?},{k1:?},{i1}) and ({b2:?},{k2:?},{i2})"
+                );
+            }
+        }
     }
 }

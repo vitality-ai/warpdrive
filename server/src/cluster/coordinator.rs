@@ -246,6 +246,16 @@ pub async fn cluster_put_object(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
+    // #150: `packed.rs::stripe_key` reserves a leading NUL byte to keep a
+    // content-dependent object's per-stripe shard keys structurally
+    // disjoint from any plain object's key, on the assumption that a real
+    // key never starts with one. Enforced here, once, at the only path
+    // that can ever create a new mapping for a key -- rather than leaving
+    // it as an unenforced assumption -- so that assumption actually holds.
+    if key.contains('\0') {
+        return Err(ErrorBadRequest("object key must not contain a NUL byte"));
+    }
+
     // Content-dependent placement is a *bucket*-level decision
     // (bucket_config.rs), the same as every other bucket setting in this
     // project (versioning, ACL, retention) — not something a client opts

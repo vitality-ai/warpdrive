@@ -42,18 +42,26 @@ pub trait ShardMetaStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
-/// Append-only log of `shard_key,offset,size` (put) or `shard_key` alone
-/// preceded by a tombstone marker (delete) lines; in-memory index rebuilt
-/// by replaying the log on startup.
+/// Append-only log of JSON-lines `(shard_key, Option<(offset, size)>)`
+/// pairs; `None` is a tombstone (delete). In-memory index rebuilt by
+/// replaying the log on startup.
+///
+/// Previously raw CSV (`"{shard_key},{offset},{size}"`, split on `,`
+/// with no escaping). Since `shard_key` embeds the user's bucket and
+/// object key verbatim, a key containing a literal `,` or `\n` corrupted
+/// the log: on the next restart, `open()` either misparsed the line into
+/// the wrong fields (an `offset`/`size` that fails to parse as a number)
+/// or produced an extra line, and since `open()`'s only caller is a
+/// `lazy_static` that `.expect()`s the result, that turned into a panic
+/// on the first shard read/write after restart -- the node could no
+/// longer serve or store any shard at all (#152). JSON-lines, the same
+/// format `location_store.rs` already uses, escapes arbitrary byte
+/// content in `shard_key` as a matter of course.
 pub struct BitcaskShardMetaStore {
     log_path: PathBuf,
     log_file: RwLock<File>,
     index: RwLock<HashMap<String, (u64, u64)>>,
 }
-
-/// Tombstone marker, chosen so it can never collide with a real offset
-/// (offsets are non-negative decimal numbers, this isn't one).
-const TOMBSTONE: &str = "D";
 
 impl BitcaskShardMetaStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
@@ -65,26 +73,35 @@ impl BitcaskShardMetaStore {
         let mut index = HashMap::new();
         if log_path.exists() {
             let f = File::open(&log_path)?;
-            for line in BufReader::new(f).lines() {
-                let line = line?;
+            let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
+            let last_idx = lines.len().saturating_sub(1);
+            for (i, line) in lines.iter().enumerate() {
                 if line.is_empty() {
                     continue;
                 }
-                let mut parts = line.splitn(3, ',');
-                let key = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing key"))?;
-                let second = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing offset/tombstone"))?;
-                if second == TOMBSTONE {
-                    index.remove(key);
-                    continue;
+                match serde_json::from_str::<(String, Option<(u64, u64)>)>(line) {
+                    Ok((key, Some(record))) => {
+                        index.insert(key, record);
+                    }
+                    Ok((key, None)) => {
+                        index.remove(&key);
+                    }
+                    // Only the *last* line can be a torn write from a crash
+                    // mid-append (appends are sequential, so nothing before
+                    // it can be torn this way) -- quarantine just that one
+                    // line with a warning instead of refusing to start, per
+                    // #152's suggested fix. A malformed line anywhere else
+                    // is real corruption, not a crash artifact, and still a
+                    // hard error.
+                    Err(e) if i == last_idx => {
+                        log::warn!(
+                            "shard meta log {}: ignoring malformed trailing line, \
+                             likely a torn write from a crash: {e}",
+                            log_path.display()
+                        );
+                    }
+                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                 }
-                let offset: u64 = second
-                    .parse()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad offset"))?;
-                let size: u64 = parts
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad size"))?;
-                index.insert(key.to_string(), (offset, size));
             }
         }
 
@@ -103,9 +120,11 @@ impl BitcaskShardMetaStore {
 
 impl ShardMetaStore for BitcaskShardMetaStore {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()> {
+        let line = serde_json::to_string(&(shard_key, Some((offset, size))))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         {
             let mut f = self.log_file.write().unwrap();
-            writeln!(f, "{shard_key},{offset},{size}")?;
+            writeln!(f, "{line}")?;
             f.flush()?;
         }
         self.index.write().unwrap().insert(shard_key.to_string(), (offset, size));
@@ -117,9 +136,11 @@ impl ShardMetaStore for BitcaskShardMetaStore {
     }
 
     fn delete(&self, shard_key: &str) -> io::Result<()> {
+        let line = serde_json::to_string(&(shard_key, Option::<(u64, u64)>::None))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         {
             let mut f = self.log_file.write().unwrap();
-            writeln!(f, "{shard_key},{TOMBSTONE}")?;
+            writeln!(f, "{line}")?;
             f.flush()?;
         }
         self.index.write().unwrap().remove(shard_key);
@@ -132,8 +153,10 @@ impl ShardMetaStore for BitcaskShardMetaStore {
         let tmp_path = self.log_path.with_extension("compact.tmp");
         {
             let mut tmp = File::create(&tmp_path)?;
-            for (key, (offset, size)) in index.iter() {
-                writeln!(tmp, "{key},{offset},{size}")?;
+            for (key, &(offset, size)) in index.iter() {
+                let line = serde_json::to_string(&(key, Some((offset, size))))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                writeln!(tmp, "{line}")?;
             }
             tmp.flush()?;
         }
@@ -167,6 +190,62 @@ mod tests {
         let reopened = BitcaskShardMetaStore::open(&log_path).unwrap();
         assert_eq!(reopened.get("k1"), Some((0, 100)));
         assert_eq!(reopened.get("k2"), Some((100, 200)));
+    }
+
+    /// #152's exact repro: a shard key containing `,` and `\n` (both would
+    /// have broken the old raw-CSV log) round-trips correctly, including
+    /// across a restart that has to replay the log.
+    #[test]
+    fn a_key_containing_commas_and_newlines_round_trips_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("shardmeta.log");
+        let tricky_key = "bucket:0:a,b\nc:shard0";
+        {
+            let store = BitcaskShardMetaStore::open(&log_path).unwrap();
+            store.put(tricky_key, 7, 42).unwrap();
+            assert_eq!(store.get(tricky_key), Some((7, 42)));
+        }
+        let reopened = BitcaskShardMetaStore::open(&log_path).unwrap();
+        assert_eq!(reopened.get(tricky_key), Some((7, 42)));
+    }
+
+    /// #152's other suggested fix: a torn last line (process crashed
+    /// mid-`writeln!`, or mid-`flush`) shouldn't take down the whole
+    /// store on the next restart -- only that one line is lost.
+    #[test]
+    fn a_malformed_trailing_line_is_quarantined_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("shardmeta.log");
+        {
+            let store = BitcaskShardMetaStore::open(&log_path).unwrap();
+            store.put("k1", 0, 100).unwrap();
+        }
+        {
+            let mut f = OpenOptions::new().append(true).open(&log_path).unwrap();
+            // A JSON line with no closing bracket -- exactly what a crash
+            // mid-`writeln!` would leave behind.
+            writeln!(f, "[\"k2\",[500,30").unwrap();
+        }
+        let reopened = BitcaskShardMetaStore::open(&log_path).unwrap();
+        assert_eq!(reopened.get("k1"), Some((0, 100)));
+        assert_eq!(reopened.get("k2"), None);
+    }
+
+    /// The quarantine above is specifically for a *trailing* line -- a
+    /// malformed line anywhere earlier in the file is real corruption
+    /// (nothing before the last line can be torn by a crash, since
+    /// appends are sequential) and still has to be a hard error, not
+    /// silently dropped.
+    #[test]
+    fn a_malformed_line_before_the_last_one_is_still_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("shardmeta.log");
+        {
+            let mut f = OpenOptions::new().create(true).append(true).open(&log_path).unwrap();
+            writeln!(f, "not valid json at all").unwrap();
+            writeln!(f, "{}", serde_json::to_string(&("k1", Some((0u64, 100u64)))).unwrap()).unwrap();
+        }
+        assert!(BitcaskShardMetaStore::open(&log_path).is_err());
     }
 
     #[test]
