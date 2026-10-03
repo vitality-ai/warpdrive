@@ -276,8 +276,25 @@ pub async fn get_object_content_dependent(record: ContentDependentRecord, state:
     let units_by_id: HashMap<&str, (u64, u64)> =
         record.units.iter().map(|u| (u.unit_id.as_str(), (u.offset, u.len))).collect();
 
-    for (stripe_index, stripe) in record.stripes.iter().enumerate() {
-        let bins = fetch_and_decode_stripe(&record, stripe_index, stripe, state).await?;
+    // Fetch every stripe concurrently, not one at a time: the Range-GET
+    // path below already learned this lesson (see its own comment, a
+    // real IVF query touched up to 54 of 95 stripes and paid 54
+    // sequential round trips before being fixed). A whole-object GET
+    // touches *every* stripe by definition, so it pays this cost on
+    // every single request, not just a rare wide query, making this the
+    // more important of the two paths to fix.
+    let stripe_fetches = record.stripes.iter().enumerate().map(|(stripe_index, stripe)| {
+        let record_ref = &record;
+        async move {
+            fetch_and_decode_stripe(record_ref, stripe_index, stripe, state)
+                .await
+                .map(|bins| (stripe_index, bins))
+        }
+    });
+    let fetched: Vec<(usize, Vec<Vec<u8>>)> = futures::future::try_join_all(stripe_fetches).await?;
+
+    for (stripe_index, bins) in fetched {
+        let stripe = &record.stripes[stripe_index];
 
         for (bin_idx, unit_ids) in stripe.bins.iter().enumerate() {
             let bin_bytes = &bins[bin_idx];
