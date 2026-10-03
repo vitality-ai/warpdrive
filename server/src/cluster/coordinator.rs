@@ -14,7 +14,7 @@ use actix_web::error::{ErrorBadRequest, ErrorForbidden, ErrorInternalServerError
 use actix_web::{web, Error, HttpResponse};
 use futures::future::join_all;
 use log::{info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -160,13 +160,8 @@ pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str
         let bucket = bucket.to_string();
         let key = key.to_string();
         async move {
-            let url = format!(
-                "{}/cluster/_internal/location/{}/{}",
-                peer.trim_end_matches('/'),
-                bucket,
-                key
-            );
-            match client.delete(&url).send().await {
+            let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
+            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     warn!("location tombstone replication to {peer} returned {}", r.status());
@@ -195,13 +190,8 @@ pub(crate) async fn replicate_content_location_delete(state: &ClusterState, buck
         let bucket = bucket.to_string();
         let key = key.to_string();
         async move {
-            let url = format!(
-                "{}/cluster/_internal/content_location/{}/{}",
-                peer.trim_end_matches('/'),
-                bucket,
-                key
-            );
-            match client.delete(&url).send().await {
+            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
+            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     warn!("content-location tombstone replication to {peer} returned {}", r.status());
@@ -897,12 +887,31 @@ pub async fn cluster_internal_put_location(
     Ok(HttpResponse::Ok().finish())
 }
 
+/// `(bucket, key)` for the internal tombstone-replication endpoints,
+/// sent as a JSON body rather than URL path segments (#149): actix-web
+/// fully percent-*decodes* path parameters, so a key containing `?`,
+/// `#`, or `%` that was embedded unencoded into a path (as this used to
+/// be, via `format!(".../{bucket}/{key}")`) could be reinterpreted as a
+/// query string, a fragment, or a different literal byte sequence by
+/// the time it reached the handler -- silently deleting the pin for a
+/// *different* key than the one that was actually meant. A JSON body
+/// has no such reinterpretation step; this is exactly the same
+/// path-vs-body choice the PUT side of both these stores already made
+/// (`cluster_internal_put_location`/`_content_location` take
+/// `web::Json<LocationRecord>`/`<ContentDependentRecord>`, never a path
+/// param), just applied consistently to DELETE too.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteKeyRequest {
+    pub bucket: String,
+    pub key: String,
+}
+
 /// Receiving side of tombstone replication.
 pub async fn cluster_internal_delete_location(
-    path: web::Path<(String, String)>,
+    body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let (bucket, key) = path.into_inner();
+    let DeleteKeyRequest { bucket, key } = body.into_inner();
     state
         .location_store
         .delete(&bucket, &key)
@@ -913,10 +922,10 @@ pub async fn cluster_internal_delete_location(
 /// Receiving side of content-location tombstone replication — the
 /// multi-stripe counterpart to `cluster_internal_delete_location` above.
 pub async fn cluster_internal_delete_content_location(
-    path: web::Path<(String, String)>,
+    body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let (bucket, key) = path.into_inner();
+    let DeleteKeyRequest { bucket, key } = body.into_inner();
     state
         .content_location_store
         .delete(&bucket, &key)
@@ -956,5 +965,21 @@ mod tests {
         assert_eq!(required_write_acks(9, 6), 9);
         assert_eq!(required_write_acks(4, 4), 5);
         assert_eq!(required_write_acks(4, 2), 4);
+    }
+
+    /// #149: `replicate_location_delete`/`replicate_content_location_delete`
+    /// now send `(bucket, key)` as this JSON body instead of interpolating
+    /// them into a URL path, specifically so a key containing `?`, `#`,
+    /// `%`, space, or `/` reaches the receiving peer's handler as the
+    /// exact bytes the client meant -- a JSON string has no character
+    /// that a URL parser would ever reinterpret as a delimiter.
+    #[test]
+    fn delete_key_request_round_trips_keys_with_url_special_characters() {
+        for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
+            let req = DeleteKeyRequest { bucket: "b".to_string(), key: key.to_string() };
+            let json = serde_json::to_string(&req).unwrap();
+            let decoded: DeleteKeyRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.key, key, "round-trip mismatch for key {key:?}");
+        }
     }
 }

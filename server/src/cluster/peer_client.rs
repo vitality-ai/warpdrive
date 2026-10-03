@@ -14,6 +14,7 @@ use actix_web::error::{ErrorBadGateway, ErrorInternalServerError};
 use actix_web::Error;
 use async_trait::async_trait;
 use flatbuffers::{root, FlatBufferBuilder};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::time::Duration;
 
 use crate::util::flatbuffer_store_generated::store::{
@@ -107,7 +108,19 @@ impl PeerClient for HttpPeerClient {
         data: Vec<u8>,
     ) -> Result<(), Error> {
         let sk = shard_key(bucket, key, shard_idx);
-        let url = format!("{}/put/{}", peer.trim_end_matches('/'), sk);
+        // #149: actix-web fully percent-*decodes* path parameters, so an
+        // unencoded `sk` containing `?`, `#`, or `%` could be
+        // reinterpreted as a query string, a fragment, or a different
+        // literal byte sequence by the time it reached the receiving
+        // peer's handler -- a URL built this way can silently misdirect
+        // to a different shard key than the one actually intended.
+        // `NON_ALPHANUMERIC` rather than hand-picking a "path-segment
+        // safe" set: `sk` is an internal, opaque identifier never meant
+        // to be read, so there's nothing to gain from a smaller, more
+        // readable charset and real risk in getting one wrong the same
+        // way the original bug did.
+        let encoded_sk = utf8_percent_encode(&sk, NON_ALPHANUMERIC).to_string();
+        let url = format!("{}/put/{}", peer.trim_end_matches('/'), encoded_sk);
         let body = encode_single_file_flatbuffer(&data);
 
         let resp = self
@@ -138,7 +151,9 @@ impl PeerClient for HttpPeerClient {
         shard_idx: usize,
     ) -> Result<Vec<u8>, Error> {
         let sk = shard_key(bucket, key, shard_idx);
-        let url = format!("{}/get/{}", peer.trim_end_matches('/'), sk);
+        // #149: same reasoning as `put_shard` above.
+        let encoded_sk = utf8_percent_encode(&sk, NON_ALPHANUMERIC).to_string();
+        let url = format!("{}/get/{}", peer.trim_end_matches('/'), encoded_sk);
 
         let resp = self
             .client
@@ -182,5 +197,35 @@ mod tests {
         let b = shard_key("mybucket", "mykey", 1);
         assert_ne!(a, b);
         assert_eq!(a, shard_key("mybucket", "mykey", 0));
+    }
+
+    /// #149: `shard_key` output embeds the user's bucket and key
+    /// verbatim, and used to go straight into a URL path segment
+    /// unescaped. actix-web fully percent-*decodes* path parameters, so
+    /// a raw `?`, `#`, or `%` there could be reinterpreted as a query
+    /// string, a fragment, or a different literal byte sequence by the
+    /// receiving peer -- this is the invariant the percent-encoding fix
+    /// in `put_shard`/`get_shard` relies on: percent-encode then
+    /// percent-decode must always reconstruct the exact original bytes,
+    /// for every character that caused the original bug plus a literal
+    /// `/` (also reserved, and not even part of the original report).
+    #[test]
+    fn percent_encoding_a_shard_key_round_trips_through_decoding() {
+        for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
+            let sk = shard_key("bucket", key, 0);
+            let encoded = utf8_percent_encode(&sk, NON_ALPHANUMERIC).to_string();
+            // Every byte that isn't alphanumeric became a `%XX` escape, so
+            // none of the raw reserved characters that caused the
+            // original bug (`?`, `#`, a literal `%`, space, `/`) survive
+            // as themselves in the encoded form -- nothing for a URL
+            // parser or path router to reinterpret.
+            for reserved in ['?', '#', ' ', '/'] {
+                assert!(!encoded.contains(reserved), "encoded form still contains raw {reserved:?}: {encoded}");
+            }
+            let decoded = percent_encoding::percent_decode_str(&encoded)
+                .decode_utf8()
+                .unwrap();
+            assert_eq!(decoded, sk, "round-trip mismatch for key {key:?}");
+        }
     }
 }
