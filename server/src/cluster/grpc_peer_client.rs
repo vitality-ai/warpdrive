@@ -272,6 +272,14 @@ impl PeerClient for GrpcPeerClient {
             .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} failed: {e}")))?;
         Ok(resp.into_inner().data)
     }
+
+    fn max_shard_size(&self) -> Option<usize> {
+        // Leave real headroom below the hard cap for the rest of the gRPC
+        // message (the `PutShardRequest`'s other fields, protobuf framing)
+        // rather than exactly matching `grpc_max_message_size()` and
+        // tripping the limit on a shard that's merely close to it.
+        Some(grpc_max_message_size().saturating_sub(4096))
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +296,21 @@ mod tests {
             grpc_endpoint_for("http://127.0.0.1:9710/").unwrap(),
             "http://127.0.0.1:10710"
         );
+    }
+
+    /// #159: the whole point of `max_shard_size` is that a caller can check
+    /// *before* encoding/sending anything, so it has to report a real,
+    /// finite number by default, not `None` (which would make the check in
+    /// `coordinator.rs`/`packed.rs` a silent no-op on the default transport).
+    /// Doesn't assert the exact default (another test running in the same
+    /// process could have already set `WARPDRIVE_GRPC_MAX_MESSAGE_SIZE`) —
+    /// only the invariant that actually matters: comfortably under the raw
+    /// `grpc_max_message_size()`, never over it.
+    #[test]
+    fn max_shard_size_leaves_headroom_under_the_raw_grpc_limit() {
+        let client = GrpcPeerClient::new();
+        let reported = client.max_shard_size().expect("gRPC transport must report a finite shard-size cap");
+        assert!(reported < grpc_max_message_size());
+        assert_eq!(reported, grpc_max_message_size() - 4096);
     }
 }

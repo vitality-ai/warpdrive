@@ -63,6 +63,17 @@ pub trait PeerClient: Send + Sync {
         key: &str,
         shard_idx: usize,
     ) -> Result<Vec<u8>, Error>;
+
+    /// The largest single shard this transport can actually carry, if it has
+    /// a fixed cap — `None` means "no known cap" (HTTP and raw-TCP have no
+    /// built-in per-message limit here). Lets a caller reject an oversized
+    /// PUT upfront with a clear error (#159) instead of discovering the
+    /// limit deep inside a peer RPC, where today it surfaces only as
+    /// "write quorum not met: 0/N" with no indication why every peer
+    /// refused.
+    fn max_shard_size(&self) -> Option<usize> {
+        None
+    }
 }
 
 pub struct HttpPeerClient {

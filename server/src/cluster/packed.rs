@@ -125,6 +125,22 @@ pub async fn put_object_content_dependent(
 
     let required_acks = required_write_acks(k, m);
 
+    // #159, same reasoning as `put_object_plain`'s matching check: every
+    // shard sent for a stripe is exactly `stripe.capacity` bytes (bins are
+    // padded to it before `encode_shards`), so this is checkable before any
+    // stripe's bytes are built or any peer is contacted — one clear error
+    // instead of a late, unexplained per-stripe write-quorum failure after
+    // earlier stripes already succeeded.
+    if let Some(max) = state.peer_client.max_shard_size() {
+        if let Some(oversized) = stripes.iter().map(|s| s.capacity).max().filter(|&cap| cap > max) {
+            return Err(actix_web::error::ErrorPayloadTooLarge(format!(
+                "object too large for RS({k},{m}) under this packing: a stripe's shard would be \
+                 {oversized} bytes, over this transport's {max}-byte limit (raise \
+                 WARPDRIVE_GRPC_MAX_MESSAGE_SIZE, or switch WARPDRIVE_PEER_TRANSPORT to http/tcp)"
+            )));
+        }
+    }
+
     // Built once, not re-scanned per unit (#161): with a few hundred to a
     // few thousand units (a real Parquet file's column chunks, or an IVF
     // index's partitions), an `.iter().find()` per unit inside these
