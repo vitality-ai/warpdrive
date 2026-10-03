@@ -121,8 +121,17 @@ impl Storage for LocalXFSBinaryStore {
 
         // Positioned write (pwrite): writes at `offset` regardless of this
         // file handle's own cursor, so concurrently-opened handles to the
-        // same file never interfere with each other.
-        file.write_at(data, offset)
+        // same file never interfere with each other. `write_all_at`, not
+        // `write_at`: a single `pwrite` can legitimately write fewer bytes
+        // than requested (Linux caps a single pwrite at ~2 GiB regardless
+        // of the buffer size; signals and ENOSPC partway through can also
+        // produce a short write), and `write_at`'s return value (how many
+        // bytes actually landed) was being discarded here, so a short
+        // write was silently recorded as if `size` full bytes were
+        // written -- real data truncation with no error anywhere.
+        // `write_all_at` loops until every byte lands or a real error
+        // occurs, matching what the caller already assumes happened.
+        file.write_all_at(data, offset)
             .map_err(ErrorInternalServerError)?;
 
         debug!("Wrote data for user {} bucket {} at offset {} with size {}",
