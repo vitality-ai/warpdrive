@@ -58,16 +58,25 @@ pub trait LocationStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
+/// Length-prefixes `bucket` so its exact boundary is always recoverable
+/// regardless of what bytes `bucket` or `key` contain -- `key` is the
+/// last field, so it doesn't need its own length prefix, it's simply
+/// "whatever comes after bucket's prefix." Previously `format!("{bucket}/{key}")`:
+/// bucket `a/b` + key `c` and bucket `a` + key `b/c` both produced `a/b/c`,
+/// the same cross-bucket/key collision as `shard_key`'s (#150) in this
+/// store's own index.
 fn record_key(bucket: &str, key: &str) -> String {
-    format!("{bucket}/{key}")
+    format!("{}:{}:{}", bucket.len(), bucket, key)
 }
 
 /// Append-only log of JSON-lines `(record_key, Option<LocationRecord>)`
 /// pairs; `None` is a tombstone (delete). In-memory index is rebuilt by
 /// replaying the whole log on startup. `BTreeMap`, not `HashMap` (#163):
-/// `record_key` is `"{bucket}/{key}"`, so lexicographic order groups every
-/// bucket's keys contiguously, which is what makes `list`'s prefix lookup
-/// a bounded range scan instead of a full-table scan.
+/// `record_key` leads with bucket's own length-prefix, so lexicographic
+/// order still groups every bucket's keys contiguously (see `record_key`'s
+/// own doc for why this is also collision-free, unlike a plain `/`
+/// separator), which is what makes `list`'s prefix lookup a bounded range
+/// scan instead of a full-table scan.
 pub struct BitcaskLocationStore {
     log_path: PathBuf,
     log_file: RwLock<File>,
@@ -84,20 +93,31 @@ impl BitcaskLocationStore {
         let mut index = BTreeMap::new();
         if log_path.exists() {
             let f = File::open(&log_path)?;
-            for line in BufReader::new(f).lines() {
-                let line = line?;
+            let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
+            let last_idx = lines.len().saturating_sub(1);
+            for (i, line) in lines.iter().enumerate() {
                 if line.is_empty() {
                     continue;
                 }
-                let (rk, record): (String, Option<LocationRecord>) = serde_json::from_str(&line)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                match record {
-                    Some(r) => {
+                match serde_json::from_str::<(String, Option<LocationRecord>)>(line) {
+                    Ok((rk, Some(r))) => {
                         index.insert(rk, r);
                     }
-                    None => {
+                    Ok((rk, None)) => {
                         index.remove(&rk);
                     }
+                    // Same reasoning as `ShardMetaStore::open` (#152): only
+                    // the last line can be a torn write from a crash
+                    // mid-append, so quarantine just that one with a
+                    // warning instead of refusing to start.
+                    Err(e) if i == last_idx => {
+                        log::warn!(
+                            "location log {}: ignoring malformed trailing line, \
+                             likely a torn write from a crash: {e}",
+                            log_path.display()
+                        );
+                    }
+                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                 }
             }
         }
@@ -145,7 +165,7 @@ impl LocationStore for BitcaskLocationStore {
     }
 
     fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
-        let bucket_prefix = format!("{bucket}/");
+        let bucket_prefix = format!("{}:{}:", bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
         // A BTreeMap range starting *at* the prefix (an O(log n) binary
         // search, not a linear scan from the beginning) then taken only
@@ -210,6 +230,13 @@ mod tests {
         }
     }
 
+    /// #150's exact repro, applied to this store's own index: bucket
+    /// `a/b` + key `c` must not collide with bucket `a` + key `b/c`.
+    #[test]
+    fn record_key_does_not_collide_when_a_separator_moves_across_the_bucket_key_boundary() {
+        assert_ne!(record_key("a/b", "c"), record_key("a", "b/c"));
+    }
+
     #[test]
     fn put_then_get_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -246,6 +273,26 @@ mod tests {
         }
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
         assert!(reopened.get("b1", "k1").is_none());
+    }
+
+    /// Same reasoning as `shard_meta_store.rs`'s matching test (#152): a
+    /// torn last line (crash mid-`writeln!`) shouldn't take the whole
+    /// store down on the next restart.
+    #[test]
+    fn a_malformed_trailing_line_is_quarantined_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("loc.log");
+        {
+            let store = BitcaskLocationStore::open(&log_path).unwrap();
+            store.put(sample("b1", "k1")).unwrap();
+        }
+        {
+            let mut f = OpenOptions::new().append(true).open(&log_path).unwrap();
+            writeln!(f, "[\"b1:k2\",{{\"bucket\":\"b1\"").unwrap();
+        }
+        let reopened = BitcaskLocationStore::open(&log_path).unwrap();
+        assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
+        assert!(reopened.get("b1", "k2").is_none());
     }
 
     #[test]

@@ -89,8 +89,26 @@ fn verify_stripes_reconstruct_original(
 
 /// Also used by `pushdown.rs`'s peer-local filter handler, which needs to
 /// read exactly the same shard key a stripe's bins were stored under.
+///
+/// Leads with a literal NUL byte: real object keys arrive as HTTP URL
+/// path segments (`/cluster/{bucket}/{key:.*}`), where a raw NUL can't
+/// appear, so no plain object's key can ever start with one -- `coordinator.rs`'s
+/// `cluster_put_object` also rejects any key containing `\0` outright as
+/// of #150, closing the only way a crafted key could get this far with
+/// one anyway. `key` is then length-prefixed, pinning its exact
+/// boundary regardless of its content, and `stripe_index` -- a plain
+/// decimal, never containing `:` -- is the final field, so this is
+/// injective over `(key, stripe_index)` the same way `shard_key` is over
+/// `(bucket, key, shard_idx)`.
+///
+/// Previously `format!("{key}__cdstripe{stripe_index}")`: a *plain*
+/// object literally named e.g. `foo__cdstripe0` produced the exact same
+/// flattened string as stripe 0 of a *packed* object named `foo`, so
+/// writing either one silently overwrote the other's shard-location
+/// pointer (#150's second collision scenario -- plain vs. packed, not
+/// just bucket/key splitting).
 pub(crate) fn stripe_key(key: &str, stripe_index: usize) -> String {
-    format!("{key}__cdstripe{stripe_index}")
+    format!("\0cdstripe:{}:{key}:{stripe_index}", key.len())
 }
 
 /// `stripes` is computed by the caller (`coordinator.rs`'s dispatch), which
@@ -534,5 +552,46 @@ mod checksum_tests {
 
         let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
         assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod stripe_key_tests {
+    use super::*;
+
+    /// #150's "plain vs packed" collision: a plain object literally named
+    /// `foo\0cdstripe:3:foo:0` (what `stripe_key("foo", 0)` used to
+    /// produce before the `\0` prefix) must not collide with stripe 0 of
+    /// a packed object named `foo`. More generally, nothing in the plain
+    /// key namespace (no leading NUL byte, enforced by
+    /// `coordinator.rs::cluster_put_object`) can ever equal any
+    /// `stripe_key` output, since every `stripe_key` output starts with
+    /// one.
+    #[test]
+    fn stripe_key_output_always_starts_with_a_nul_byte() {
+        assert!(stripe_key("foo", 0).starts_with('\0'));
+        assert!(stripe_key("", 0).starts_with('\0'));
+        assert!(stripe_key("foo__cdstripe0", 1).starts_with('\0'));
+    }
+
+    #[test]
+    fn stripe_key_is_injective_over_key_and_stripe_index() {
+        let cases: &[(&str, usize)] = &[
+            ("foo", 0),
+            ("foo", 1),
+            ("foo", 10),
+            ("fo", 10),
+            ("foo:1", 0),
+            ("foo:10", 0),
+        ];
+        for (i, &(k1, s1)) in cases.iter().enumerate() {
+            for &(k2, s2) in &cases[i + 1..] {
+                assert_ne!(
+                    stripe_key(k1, s1),
+                    stripe_key(k2, s2),
+                    "collision between ({k1:?},{s1}) and ({k2:?},{s2})"
+                );
+            }
+        }
     }
 }
