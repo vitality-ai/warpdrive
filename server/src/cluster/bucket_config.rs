@@ -66,6 +66,13 @@ pub trait BucketConfigStore: Send + Sync {
 pub struct BitcaskBucketConfigStore {
     log_file: RwLock<File>,
     index: RwLock<HashMap<String, BucketPlacementConfig>>,
+    /// #155 — see `location_store.rs`'s matching field doc: without one
+    /// lock held across both the log append and the index update, two
+    /// concurrent `put`s for the same bucket (e.g. two operators changing
+    /// its config at once) could apply to the log and the index in
+    /// different orders, so a restart (log replay only) can disagree
+    /// with what the live index had.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl BitcaskBucketConfigStore {
@@ -93,6 +100,7 @@ impl BitcaskBucketConfigStore {
         Ok(Self {
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 }
@@ -100,6 +108,10 @@ impl BitcaskBucketConfigStore {
 impl BucketConfigStore for BitcaskBucketConfigStore {
     fn put(&self, config: BucketPlacementConfig) -> io::Result<()> {
         let line = serde_json::to_string(&config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // #155: held across both the append and the index update, so two
+        // concurrent puts for the same bucket can never apply to the log
+        // and the index in different orders.
+        let _write_guard = self.write_lock.lock().unwrap();
         {
             let mut f = self.log_file.write().unwrap();
             writeln!(f, "{line}")?;
@@ -167,5 +179,42 @@ mod tests {
             .put(BucketPlacementConfig { bucket: "b1".into(), packer_name: "fac".into(), overhead_threshold_pct: 10.0 })
             .unwrap();
         assert_eq!(store.get("b1").unwrap().overhead_threshold_pct, 10.0);
+    }
+
+    /// Same invariant and same reasoning as `location_store.rs`'s matching
+    /// test (#155): the live index and a fresh replay of the log must
+    /// always agree about which concurrent put for the same bucket won,
+    /// however the race actually resolved.
+    #[test]
+    fn concurrent_puts_to_the_same_bucket_never_diverge_log_from_index() {
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("bc.log");
+        let store = std::sync::Arc::new(BitcaskBucketConfigStore::open(&log_path).unwrap());
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                thread::spawn(move || {
+                    for i in 0..50 {
+                        store
+                            .put(BucketPlacementConfig {
+                                bucket: "racybucket".into(),
+                                packer_name: "fac".into(),
+                                overhead_threshold_pct: (t * 1000 + i) as f64,
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let live = store.get("racybucket");
+        let replayed = BitcaskBucketConfigStore::open(&log_path).unwrap().get("racybucket");
+        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

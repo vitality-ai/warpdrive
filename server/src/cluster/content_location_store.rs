@@ -119,6 +119,13 @@ pub struct BitcaskContentLocationStore {
     log_path: PathBuf,
     log_file: RwLock<File>,
     index: RwLock<BTreeMap<String, ContentDependentRecord>>,
+    /// #155 — see `location_store.rs`'s matching field doc for why this
+    /// is needed: without one lock held across both the log append and
+    /// the index update, a concurrent put/delete for the same key can
+    /// apply to the log and the index in different orders, so a restart
+    /// (which only ever replays the log) can disagree with what the live
+    /// index had.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl BitcaskContentLocationStore {
@@ -165,6 +172,7 @@ impl BitcaskContentLocationStore {
             log_path,
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 }
@@ -174,6 +182,10 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         let rk = record_key(&record.bucket, &record.key);
         let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // #155: held across both the append and the index update, so a
+        // concurrent put/delete for the same key can never apply to the
+        // log and the index in different orders.
+        let _write_guard = self.write_lock.lock().unwrap();
         {
             let mut f = self.log_file.write().unwrap();
             writeln!(f, "{line}")?;
@@ -191,6 +203,7 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         let rk = record_key(bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<ContentDependentRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let _write_guard = self.write_lock.lock().unwrap();
         {
             let mut f = self.log_file.write().unwrap();
             writeln!(f, "{line}")?;
@@ -213,6 +226,9 @@ impl ContentLocationStore for BitcaskContentLocationStore {
     }
 
     fn compact(&self) -> io::Result<()> {
+        // #155: same `write_lock` as `put`/`delete`, so compaction can't
+        // interleave with either.
+        let _write_guard = self.write_lock.lock().unwrap();
         let index = self.index.read().unwrap();
         let mut log_file = self.log_file.write().unwrap();
         let tmp_path = self.log_path.with_extension("compact.tmp");
@@ -379,5 +395,40 @@ mod tests {
         store.put(sample("b1", "k2")).unwrap();
         assert_eq!(store.get("b1", "k1").unwrap(), sample("b1", "k1"));
         assert_eq!(store.get("b1", "k2").unwrap(), sample("b1", "k2"));
+    }
+
+    /// Same invariant and same reasoning as `location_store.rs`'s matching
+    /// test (#155): the live index and a fresh replay of the log must
+    /// always agree, however a concurrent put/delete race on the same key
+    /// actually resolved.
+    #[test]
+    fn concurrent_put_delete_on_the_same_key_never_diverges_log_from_index() {
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("cloc.log");
+        let store = std::sync::Arc::new(BitcaskContentLocationStore::open(&log_path).unwrap());
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                thread::spawn(move || {
+                    for i in 0..50 {
+                        if (t + i) % 2 == 0 {
+                            store.put(sample("b1", "racykey")).unwrap();
+                        } else {
+                            let _ = store.delete("b1", "racykey");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let live = store.get("b1", "racykey");
+        let replayed = BitcaskContentLocationStore::open(&log_path).unwrap().get("b1", "racykey");
+        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }
