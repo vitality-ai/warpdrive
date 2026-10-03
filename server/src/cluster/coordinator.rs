@@ -451,12 +451,26 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // overhead cross the threshold this time where it didn't before. GET
     // checks `content_location_store` first, so if that stale record is
     // left in place a client could PUT successfully here and still read
-    // back the *old* packed bytes on the next GET. Clear it, best-effort:
-    // a plain PUT having already satisfied its own quorum is the operation
-    // that should be considered to have succeeded either way.
-    if state.content_location_store.get(&bucket, &key).is_some() {
-        let _ = state.content_location_store.delete(&bucket, &key);
-        replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    // back the *old* packed bytes on the next GET.
+    //
+    // Broadcast this tombstone unconditionally, not gated on a local
+    // `.is_some()` check: this *coordinator* only needed quorum to receive
+    // the original packed pin, not all of it, so it may have no local copy
+    // even though other peers still do. Skipping the broadcast on a local
+    // miss would leave those other peers serving stale packed bytes
+    // forever. Delete is idempotent on a receiver that has nothing to
+    // delete, so there's no cost to always sending it (see issue #153 and
+    // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
+    // every other write here: a PUT that can't confirm the stale pin was
+    // actually cleared cluster-wide is treated as not fully succeeded.
+    let _ = state.content_location_store.delete(&bucket, &key);
+    let cleanup_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    if cleanup_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
+             {cleanup_acked}/{required_acks} peers acknowledged the tombstone (a GET on an unacknowledged \
+             peer may still return the old packed bytes)"
+        )));
     }
 
     state.timing.total.record(request_start.elapsed());
@@ -631,19 +645,23 @@ pub async fn cluster_delete_object(
 
     // A key is either plain (`LocationStore`) or content-dependent/packed
     // (`ContentLocationStore`) — decided once, at PUT time, by which path
-    // handled it. DELETE used to only ever check `LocationStore`, so a
-    // packed object (which never has a `LocationStore` entry) returned 404
-    // and was never actually removed. Check both; a key can even have a
-    // *stale* entry in the other store left over from an earlier overwrite
-    // that changed which path it took (see `put_object_plain`'s and
-    // `put_object_content_dependent`'s overwrite handling) — clear both
-    // unconditionally rather than assuming only one is ever present.
+    // handled it. A key can even have a *stale* entry in the other store
+    // left over from an earlier overwrite that changed which path it took
+    // (see `put_object_plain`'s and `put_object_content_dependent`'s
+    // overwrite handling).
     let plain_record = state.location_store.get(&bucket, &key);
     let packed_record = state.content_location_store.get(&bucket, &key);
 
-    if plain_record.is_none() && packed_record.is_none() {
-        return Ok(HttpResponse::NotFound().finish());
-    }
+    // Deliberately *not* a 404 short-circuit when both are locally absent:
+    // this coordinator only needed quorum to receive either pin, not all
+    // of it, so it can have neither locally while the object is still
+    // genuinely readable from other peers. Returning 404 here would leave
+    // those peers' copies untouched forever. Broadcast both tombstones
+    // unconditionally below instead (idempotent on a receiver with
+    // nothing to delete) and let that be authoritative, the same fix
+    // applied to the overwrite-cleanup paths above (see issue #153).
+    // Matches real S3 semantics too: DELETE is idempotent, not an error on
+    // a key that doesn't exist.
 
     // Object lock enforcement: one record, one lookup, no distributed lock
     // manager (see location_store.rs and the architecture doc). Retention
@@ -673,23 +691,25 @@ pub async fn cluster_delete_object(
     // hold a shard).
     let peers = state.membership.peers();
 
-    if let Some(record) = &plain_record {
-        let required_acks = required_write_acks(record.k, record.m);
-        let acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
-        if acked < required_acks {
-            return Err(ErrorInternalServerError(format!(
-                "tombstone quorum not met: {acked}/{required_acks} peers removed the placement record"
-            )));
-        }
-    }
-    if let Some(record) = &packed_record {
-        let required_acks = required_write_acks(record.k, record.m);
-        let acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
-        if acked < required_acks {
-            return Err(ErrorInternalServerError(format!(
-                "tombstone quorum not met: {acked}/{required_acks} peers removed the content-dependent placement record"
-            )));
-        }
+    // k/m for the quorum-ack threshold: whichever record this node
+    // happens to have locally (either is fine, they're cluster-wide
+    // constants in practice), falling back to this node's own default if
+    // it has neither locally, same fallback `put_object_plain` uses to
+    // size a fresh write.
+    let (k, m) = plain_record
+        .as_ref()
+        .map(|r| (r.k, r.m))
+        .or_else(|| packed_record.as_ref().map(|r| (r.k, r.m)))
+        .unwrap_or_else(|| (state.ec.k(), state.ec.m()));
+    let required_acks = required_write_acks(k, m);
+
+    let plain_acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
+    let packed_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    if plain_acked < required_acks || packed_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "tombstone quorum not met: plain {plain_acked}/{required_acks}, \
+             packed {packed_acked}/{required_acks} peers acknowledged"
+        )));
     }
 
     Ok(HttpResponse::Ok().finish())

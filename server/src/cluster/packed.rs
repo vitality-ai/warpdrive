@@ -208,15 +208,19 @@ pub async fn put_object_content_dependent(
         )));
     }
 
-    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup:
-    // this key may have previously been written plain (e.g. this bucket's
-    // packer/threshold changed, or this particular object's overhead
-    // crossed back under the threshold this time). Clear any stale
-    // `LocationStore` entry so a plain GET path never shadows this fresher
-    // packed write.
-    if state.location_store.get(bucket, key).is_some() {
-        let _ = state.location_store.delete(bucket, key);
-        replicate_location_delete(state, bucket, key, &peers).await;
+    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup,
+    // and the same unconditional-broadcast fix: this *coordinator* only
+    // needed quorum to receive the original plain pin, so it may have no
+    // local copy even though other peers still do. Don't gate the
+    // tombstone broadcast on a local `.is_some()` check (see issue #153).
+    let _ = state.location_store.delete(bucket, key);
+    let cleanup_acked = replicate_location_delete(state, bucket, key, &peers).await;
+    if cleanup_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "wrote the new object, but could not confirm the stale plain pin was cleared cluster-wide: \
+             {cleanup_acked}/{required_acks} peers acknowledged the tombstone (a GET on an unacknowledged \
+             peer may still return the old plain bytes)"
+        )));
     }
 
     Ok(HttpResponse::Ok().finish())
