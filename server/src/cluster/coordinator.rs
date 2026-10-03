@@ -10,7 +10,7 @@
 //! actually true (see the architecture doc for why recomputing on every
 //! read would break that guarantee).
 
-use actix_web::error::{ErrorBadRequest, ErrorForbidden, ErrorInternalServerError, ErrorNotFound};
+use actix_web::error::{ErrorBadRequest, ErrorForbidden, ErrorInternalServerError, ErrorNotFound, ErrorPayloadTooLarge};
 use actix_web::{web, Error, HttpResponse};
 use futures::future::join_all;
 use log::{info, warn};
@@ -372,6 +372,22 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
             k + m,
             peers.len()
         )));
+    }
+
+    // #159: a shard this transport can't carry used to fail silently deep
+    // inside `PeerClient::put_shard` on every peer, surfacing only as
+    // "write quorum not met: 0/N" with no hint why every single peer
+    // refused. Checked upfront, against the active transport's own stated
+    // limit, so an oversized object gets one clear error instead.
+    let shard_len = body.len().div_ceil(k).max(1);
+    if let Some(max) = state.peer_client.max_shard_size() {
+        if shard_len > max {
+            return Err(ErrorPayloadTooLarge(format!(
+                "object too large for RS({k},{m}): each shard would be {shard_len} bytes, \
+                 over this transport's {max}-byte limit (raise WARPDRIVE_GRPC_MAX_MESSAGE_SIZE, \
+                 pick a larger k, or switch WARPDRIVE_PEER_TRANSPORT to http/tcp)"
+            )));
+        }
     }
 
     // Placement resolved fresh, against the peer list as it is *right now*.
