@@ -36,8 +36,10 @@
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError, ErrorNotFound};
 use actix_web::{web, Error, HttpResponse};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Read;
 
+use super::content_location_store::UnitMeta;
 use super::coordinator::ClusterState;
 
 pub trait ColumnCodec: Send + Sync {
@@ -208,10 +210,15 @@ pub async fn cluster_pushdown_query(
         .locate_unit(&body.unit_id)
         .ok_or_else(|| ErrorNotFound("unit_id not found in this object's record"))?;
 
-    let unit = record
-        .units
-        .iter()
-        .find(|u| u.unit_id == body.unit_id)
+    // Built once (#161): with a few hundred to a few thousand units,
+    // re-running `.find()` per preceding unit below (itself inside a loop
+    // over one bin's units) is O(bin_size x total_units) per query instead
+    // of O(bin_size).
+    let units_by_id: HashMap<&str, &UnitMeta> =
+        record.units.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+
+    let unit = *units_by_id
+        .get(body.unit_id.as_str())
         .expect("locate_unit found this unit_id, so it must be in record.units");
 
     // Units are stored in a bin in pack order (see StripeRecord::bins) —
@@ -224,10 +231,8 @@ pub async fn cluster_pushdown_query(
         if uid == &body.unit_id {
             break;
         }
-        let preceding = record
-            .units
-            .iter()
-            .find(|u| &u.unit_id == uid)
+        let preceding = *units_by_id
+            .get(uid.as_str())
             .ok_or_else(|| ErrorInternalServerError("unit id missing from record's unit index"))?;
         offset_in_bin += preceding.len as usize;
     }

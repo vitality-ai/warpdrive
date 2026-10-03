@@ -16,62 +16,73 @@ use super::coordinator::{replicate_location_delete, required_write_acks, Cluster
 use super::ec::ErasureCoder;
 use super::packing::Stripe;
 
-/// Generic, packer-agnostic correctness check: reconstructs what a GET
-/// would produce from `stripes`' bin layout (assuming every bin decodes
-/// back perfectly, which is EC's job, not this check's) and compares it
-/// byte-for-byte against the real `body`, entirely in memory, before a
-/// single byte is written to the network. Deliberately generic rather than
-/// bespoke per-algorithm validation (checking "did FacPacker's greedy loop
-/// run correctly," say): any `StripePacker` bug — a dropped unit, a
-/// duplicated unit, a unit assigned to the wrong offset — corrupts the
-/// reconstructed object the same way regardless of which packer produced
-/// it, so one mechanism catches all of them. `unpadded_bins` is each
-/// stripe's bins *before* padding to `stripe.capacity`, i.e. exactly the
-/// concatenated unit bytes that went in.
+/// Generic, packer-agnostic correctness check: for every unit the caller
+/// declared in `units_header`, confirms it was packed into exactly one bin
+/// (not zero -- dropped; not more than one -- duplicated) and that the
+/// bytes that bin holds for it match the original object exactly. Any
+/// `StripePacker` bug -- a dropped unit, a duplicated unit, a unit
+/// assigned to the wrong offset -- corrupts the reconstructed object the
+/// same way regardless of which packer produced it, so one mechanism
+/// catches all of them, without being a bespoke check of any one
+/// algorithm's own logic. `unpadded_bins` is each stripe's bins *before*
+/// padding to `stripe.capacity`, i.e. exactly the concatenated unit bytes
+/// that went in.
+///
+/// Deliberately checks per-*unit* occurrence, not whole-*body* byte
+/// coverage: an earlier version required every single byte of the
+/// original object to be covered by some unit, which is wrong whenever a
+/// caller's own `units_header` is legitimately sparse (e.g. row groups
+/// only, no header/footer framing unit) -- that's the caller's choice,
+/// not a packer bug, and the read path already tolerates it by zero-
+/// filling gaps. This version only requires that whatever units the
+/// caller *did* declare are each packed exactly once, correctly. As a
+/// side effect this also catches two declared units whose byte ranges
+/// overlap each other landing in different bins with conflicting content
+/// (the previous coverage-bitmap version silently accepted that), and
+/// it's O(units) extra memory instead of O(body bytes) for the tracking
+/// structure, which matters once an object has a several-hundred-MB body
+/// but only a few hundred units (a real Parquet file, see
+/// parquet_real_offsets.py).
 fn verify_stripes_reconstruct_original(
     body: &[u8],
     units_header: &[UnitMeta],
     stripes: &[Stripe],
     unpadded_bins: &[Vec<Vec<u8>>],
 ) -> Result<(), Error> {
-    let mut output = vec![0u8; body.len()];
-    let mut covered = vec![false; body.len()];
+    let units_by_id: HashMap<&str, &UnitMeta> =
+        units_header.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+    let mut occurrences: HashMap<&str, u32> = units_header.iter().map(|u| (u.unit_id.as_str(), 0)).collect();
 
     for (stripe, bins) in stripes.iter().zip(unpadded_bins.iter()) {
         for (unit_ids, bin_bytes) in stripe.bins.iter().zip(bins.iter()) {
             let mut pos = 0usize;
             for uid in unit_ids {
-                let unit = units_header
-                    .iter()
-                    .find(|u| &u.unit_id == uid)
+                let unit = *units_by_id
+                    .get(uid.as_str())
                     .ok_or_else(|| ErrorInternalServerError("packer returned an unknown unit id"))?;
                 let (start, len) = (unit.offset as usize, unit.len as usize);
                 let end = start + len;
-                output
-                    .get_mut(start..end)
-                    .ok_or_else(|| ErrorInternalServerError("packed unit out of bounds of the original object"))?
-                    .copy_from_slice(
-                        bin_bytes
-                            .get(pos..pos + len)
-                            .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?,
-                    );
-                for c in &mut covered[start..end] {
-                    *c = true;
+                let original = body
+                    .get(start..end)
+                    .ok_or_else(|| ErrorInternalServerError("packed unit out of bounds of the original object"))?;
+                let packed = bin_bytes
+                    .get(pos..pos + len)
+                    .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?;
+                if original != packed {
+                    return Err(ErrorInternalServerError(
+                        "content-dependent checksum failed: a packed unit's bytes do not match the original object",
+                    ));
                 }
+                *occurrences.get_mut(uid.as_str()).unwrap() += 1;
                 pos += len;
             }
         }
     }
 
-    if covered.iter().any(|c| !c) {
-        return Err(ErrorInternalServerError(
-            "content-dependent checksum failed: packer did not cover every byte of the object exactly once",
-        ));
-    }
-    if output != body {
-        return Err(ErrorInternalServerError(
-            "content-dependent checksum failed: packed stripes do not reconstruct the original object exactly",
-        ));
+    if let Some((bad_id, &count)) = occurrences.iter().find(|(_, &count)| count != 1) {
+        return Err(ErrorInternalServerError(format!(
+            "content-dependent checksum failed: unit {bad_id} appears {count} times across the packer's stripes (expected exactly 1)"
+        )));
     }
     Ok(())
 }
@@ -114,6 +125,13 @@ pub async fn put_object_content_dependent(
 
     let required_acks = required_write_acks(k, m);
 
+    // Built once, not re-scanned per unit (#161): with a few hundred to a
+    // few thousand units (a real Parquet file's column chunks, or an IVF
+    // index's partitions), an `.iter().find()` per unit inside these
+    // nested loops is O(units) work for *each* unit, O(units^2) overall.
+    let units_by_id: HashMap<&str, &UnitMeta> =
+        units_header.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+
     // Build every stripe's bins *unpadded* first (the exact bytes a GET's
     // reassembly expects to get back out), and verify the whole set
     // reconstructs `body` byte-for-byte before any network call happens —
@@ -125,9 +143,8 @@ pub async fn put_object_content_dependent(
         for bin_unit_ids in &stripe.bins {
             let mut buf = Vec::new();
             for uid in bin_unit_ids {
-                let unit = units_header
-                    .iter()
-                    .find(|u| &u.unit_id == uid)
+                let unit = *units_by_id
+                    .get(uid.as_str())
                     .ok_or_else(|| ErrorInternalServerError("packer returned an unknown unit id"))?;
                 let (start, end) = (unit.offset as usize, (unit.offset + unit.len) as usize);
                 buf.extend_from_slice(
@@ -469,6 +486,35 @@ mod checksum_tests {
         // or mis-assigned bin) -- the coverage check alone wouldn't catch
         // this, only the byte-equality check does.
         let bins = vec![vec![b"hello".to_vec(), b"WORLD".to_vec()]];
+
+        let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn verify_allows_a_sparse_units_header_that_does_not_cover_the_whole_body() {
+        // body is 10 bytes, but the caller only declared a unit for the
+        // first 5 -- legitimate (row groups only, no header/footer framing
+        // unit), not a packer bug. The read path already zero-fills the
+        // uncovered tail; this check must not reject it.
+        let body = b"helloworld".to_vec();
+        let units = vec![unit("u0", 0, 5)];
+        let stripes = vec![Stripe { bins: vec![vec!["u0".to_string()]], capacity: 5 }];
+        let bins = vec![vec![b"hello".to_vec()]];
+
+        assert!(verify_stripes_reconstruct_original(&body, &units, &stripes, &bins).is_ok());
+    }
+
+    #[test]
+    fn verify_fails_when_a_unit_is_packed_into_more_than_one_bin() {
+        let body = b"helloworld".to_vec();
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        // u0 duplicated into both bins of a two-bin stripe; u1 never
+        // packed at all. Byte content is "correct" everywhere it was
+        // written, so a whole-body coverage/equality check alone can miss
+        // this -- only counting occurrences per declared unit catches it.
+        let stripes = vec![stripe_two_bins()];
+        let bins = vec![vec![b"hello".to_vec(), b"hello".to_vec()]];
 
         let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
         assert!(err.is_err());
