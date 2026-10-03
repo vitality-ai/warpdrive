@@ -259,6 +259,18 @@ pub async fn cluster_put_object(
             .map(|r| attach_placement_headers(r, "plain", None));
     };
 
+    // An empty body can never be packed meaningfully (every bin would be
+    // zero-length, which `reed_solomon_erasure` rejects outright, 500ing
+    // what should be a trivially-valid empty-object PUT). There's also
+    // nothing to gain from packing zero bytes. Short-circuit to plain
+    // before any packer runs, the same way the plain path's own encoder
+    // already floors shard length at 1 byte for this exact case.
+    if body.is_empty() {
+        return put_object_plain(&bucket, &key, &body, &state)
+            .await
+            .map(|r| attach_placement_headers(r, "plain", None));
+    }
+
     // For a configured bucket, the header's job narrows to two things:
     // supplying real unit boundaries when the client has them, and acting
     // as a per-object escape hatch — the literal value "false" forces
