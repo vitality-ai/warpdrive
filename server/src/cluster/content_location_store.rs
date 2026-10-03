@@ -10,7 +10,7 @@
 //! objects never use.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -90,15 +90,22 @@ pub trait ContentLocationStore: Send + Sync {
     /// See `LocationStore::list` — same minimal-S3-surface purpose, for the
     /// content-dependent half of a bucket's objects.
     fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
+    /// See `LocationStore::compact` — same reasoning and same mechanism
+    /// (#163), applied to this store's own log.
+    fn compact(&self) -> io::Result<()>;
 }
 
 fn record_key(bucket: &str, key: &str) -> String {
     format!("{bucket}/{key}")
 }
 
+/// `BTreeMap`, not `HashMap` (#163) — see `location_store.rs`'s matching
+/// doc comment, same reasoning: lexicographic order over `"bucket/key"`
+/// keys makes `list`'s prefix lookup a bounded range scan.
 pub struct BitcaskContentLocationStore {
+    log_path: PathBuf,
     log_file: RwLock<File>,
-    index: RwLock<HashMap<String, ContentDependentRecord>>,
+    index: RwLock<BTreeMap<String, ContentDependentRecord>>,
 }
 
 impl BitcaskContentLocationStore {
@@ -108,7 +115,7 @@ impl BitcaskContentLocationStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut index = HashMap::new();
+        let mut index = BTreeMap::new();
         if log_path.exists() {
             let f = File::open(&log_path)?;
             for line in BufReader::new(f).lines() {
@@ -131,6 +138,7 @@ impl BitcaskContentLocationStore {
 
         let log_file = OpenOptions::new().create(true).append(true).open(&log_path)?;
         Ok(Self {
+            log_path,
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
         })
@@ -174,10 +182,28 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         self.index
             .read()
             .unwrap()
-            .iter()
-            .filter(|(k, _)| k.starts_with(&full_prefix))
+            .range(full_prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&full_prefix))
             .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
             .collect()
+    }
+
+    fn compact(&self) -> io::Result<()> {
+        let index = self.index.read().unwrap();
+        let mut log_file = self.log_file.write().unwrap();
+        let tmp_path = self.log_path.with_extension("compact.tmp");
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            for (rk, record) in index.iter() {
+                let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                writeln!(tmp, "{line}")?;
+            }
+            tmp.flush()?;
+        }
+        std::fs::rename(&tmp_path, &self.log_path)?;
+        *log_file = OpenOptions::new().create(true).append(true).open(&self.log_path)?;
+        Ok(())
     }
 }
 
@@ -239,5 +265,67 @@ mod tests {
         assert_eq!(record.locate_unit("u0"), Some((0, 0)));
         assert_eq!(record.locate_unit("u1"), Some((0, 1)));
         assert_eq!(record.locate_unit("not-a-real-unit"), None);
+    }
+
+    #[test]
+    fn list_returns_only_keys_matching_the_prefix_in_this_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
+        store.put(sample("b1", "reports/jan")).unwrap();
+        store.put(sample("b1", "reports/feb")).unwrap();
+        store.put(sample("b1", "other")).unwrap();
+        // "b1z" sorts between "b1/reports/..." and "b1/reports0" in a plain
+        // lexicographic BTreeMap over "bucket/key" strings — a range query
+        // that used an unsound exclusive-upper-bound trick instead of
+        // `take_while` could leak this in or cut off real matches early.
+        store.put(sample("b1z", "reports/mar")).unwrap();
+
+        let mut got = store.list("b1", "reports/");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("reports/feb".to_string(), 100), ("reports/jan".to_string(), 100)]
+        );
+    }
+
+    #[test]
+    fn compact_preserves_live_data_and_drops_dead_entries_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("cloc.log");
+        let store = BitcaskContentLocationStore::open(&log_path).unwrap();
+        store.put(sample("b1", "keep")).unwrap();
+        for i in 0..20 {
+            store.put(sample("b1", &format!("churn{i}"))).unwrap();
+            store.delete("b1", &format!("churn{i}")).unwrap();
+        }
+        let size_before = std::fs::metadata(&log_path).unwrap().len();
+
+        store.compact().unwrap();
+
+        let size_after = std::fs::metadata(&log_path).unwrap().len();
+        assert!(size_after < size_before, "compact should shrink the log file");
+
+        assert_eq!(store.get("b1", "keep").unwrap(), sample("b1", "keep"));
+        for i in 0..20 {
+            assert!(store.get("b1", &format!("churn{i}")).is_none());
+        }
+
+        // Correctness survives a real reopen, not just the in-memory index.
+        let reopened = BitcaskContentLocationStore::open(&log_path).unwrap();
+        assert_eq!(reopened.get("b1", "keep").unwrap(), sample("b1", "keep"));
+        for i in 0..20 {
+            assert!(reopened.get("b1", &format!("churn{i}")).is_none());
+        }
+    }
+
+    #[test]
+    fn a_write_after_compaction_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
+        store.put(sample("b1", "k1")).unwrap();
+        store.compact().unwrap();
+        store.put(sample("b1", "k2")).unwrap();
+        assert_eq!(store.get("b1", "k1").unwrap(), sample("b1", "k1"));
+        assert_eq!(store.get("b1", "k2").unwrap(), sample("b1", "k2"));
     }
 }
