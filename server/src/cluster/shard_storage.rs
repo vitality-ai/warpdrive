@@ -101,6 +101,35 @@ fn store() -> Arc<dyn Storage> {
 /// (e.g. bucket `a__b` + key `c` and bucket `a` + key `b__c` both produced
 /// `a__b__c__shard0`), silently overwriting one object's shard-location
 /// pointer with another's (#150).
+/// A fresh, per-PUT identifier with no `:` in it (hex digits and `-`
+/// only), so `versioned_key` can safely use `:` as a separator around it
+/// without ambiguity. Not globally unique in the cryptographic sense —
+/// a monotonic per-process counter paired with a nanosecond timestamp is
+/// enough to guarantee two overwrites of the same key from the same
+/// coordinator process never reuse a version id, which is all this
+/// needs (#151).
+pub fn new_version_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{seq:x}")
+}
+
+/// Folds a version id into a key string before it ever reaches
+/// `shard_key`/`store_shard`/`load_shard` — so every version of an
+/// object owns a completely distinct set of shard keys, never
+/// overwriting another version's bytes in place (#151). Injective over
+/// `(key, version)`: `version` is guaranteed `:`-free (see
+/// `new_version_id`), so it's always exactly the maximal `:`-free suffix
+/// of the result, regardless of what `key` itself contains.
+pub fn versioned_key(key: &str, version: &str) -> String {
+    format!("{key}:{version}")
+}
+
 pub fn shard_key(bucket: &str, key: &str, shard_idx: usize) -> String {
     format!("{}:{}:{}:{}", bucket.len(), bucket, key, shard_idx)
 }
@@ -147,6 +176,43 @@ mod tests {
     fn missing_shard_returns_not_found() {
         let err = load_shard("shardtest-bucket", "never-written-key", 0).unwrap_err();
         assert_eq!(err.as_response_error().status_code(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    /// #151: two overwrites of the same key must get distinct versioned
+    /// keys, so their shard writes never collide.
+    #[test]
+    fn new_version_id_is_distinct_across_calls() {
+        let a = new_version_id();
+        let b = new_version_id();
+        assert_ne!(a, b);
+        assert!(!a.contains(':'));
+        assert!(!b.contains(':'));
+    }
+
+    #[test]
+    fn versioned_key_is_injective_over_key_and_version() {
+        assert_ne!(versioned_key("foo", "v1"), versioned_key("foo", "v2"));
+        assert_ne!(versioned_key("foo", "v1"), versioned_key("foo:v1", "x"));
+        assert_ne!(versioned_key("a", "bc"), versioned_key("a:b", "c"));
+    }
+
+    /// #151's actual fix, end to end at this module's level: a shard
+    /// written under one version is unreachable through a different
+    /// version's wire key, even for the exact same (bucket, key, idx) --
+    /// this is what makes an overwrite's shard writes incapable of
+    /// corrupting a still-pinned previous version's bytes.
+    #[test]
+    fn overwriting_under_a_new_version_does_not_disturb_the_old_version() {
+        let old_data = b"version one bytes".to_vec();
+        let new_data = b"version two bytes, different length".to_vec();
+        let old_key = versioned_key("versiontest-key", "v1");
+        let new_key = versioned_key("versiontest-key", "v2");
+
+        store_shard("versiontest-bucket", &old_key, 0, &old_data).unwrap();
+        store_shard("versiontest-bucket", &new_key, 0, &new_data).unwrap();
+
+        assert_eq!(load_shard("versiontest-bucket", &old_key, 0).unwrap(), old_data);
+        assert_eq!(load_shard("versiontest-bucket", &new_key, 0).unwrap(), new_data);
     }
 
     /// #150: the exact collision from the issue's repro -- a bucket/key
