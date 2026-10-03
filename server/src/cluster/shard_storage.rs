@@ -74,8 +74,16 @@ lazy_static! {
     pub static ref SERVER_TIMING: ShardServerTiming = ShardServerTiming::default();
 }
 
+// Built once, not per shard op (#161): `StorageConfig::from_env()` does a
+// real env lookup plus a match and a debug!/warn! log line every time, and
+// while `LocalXFSBinaryStore::new()` itself is cheap (no fields), none of
+// that work needs repeating on every single store_shard/load_shard call.
+lazy_static! {
+    static ref STORE: Arc<dyn Storage> = StorageConfig::from_env().create_store();
+}
+
 fn store() -> Arc<dyn Storage> {
-    StorageConfig::from_env().create_store()
+    Arc::clone(&STORE)
 }
 
 pub fn shard_key(bucket: &str, key: &str, shard_idx: usize) -> String {

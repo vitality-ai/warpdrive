@@ -316,10 +316,23 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             let shard_idx = req.shard_idx() as usize;
             let data = req.data().map(|d| d.bytes().to_vec()).unwrap_or_default();
 
-            let result = store_shard(&bucket, &key, shard_idx, &data);
+            // #161: same reasoning as the gRPC server side -- store_shard
+            // is synchronous file I/O plus a Bitcask log append, and this
+            // whole function runs on a tokio worker thread (one task per
+            // connection). Only the blocking call itself is moved off
+            // that thread; `fbb` (not Send-friendly to move around) stays
+            // here and builds the response from the result afterward,
+            // unchanged from before.
+            // actix_web::Error isn't Send, so the error is turned into a
+            // plain String inside the closure before crossing the thread
+            // boundary (spawn_blocking's result must be Send + 'static).
+            let result: Result<(), String> =
+                tokio::task::spawn_blocking(move || store_shard(&bucket, &key, shard_idx, &data).map_err(|e| e.to_string()))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("shard store task panicked: {e}")));
             let (ok, error) = match &result {
                 Ok(()) => (true, None),
-                Err(e) => (false, Some(fbb.create_string(&e.to_string()))),
+                Err(e) => (false, Some(fbb.create_string(e))),
             };
             let resp = PutShardResponse::create(&mut fbb, &PutShardResponseArgs { ok, error });
             let out = Envelope::create(&mut fbb, &EnvelopeArgs { body_type: Body::PutShardResponse, body: Some(resp.as_union_value()) });
@@ -331,7 +344,11 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             let key = req.key().unwrap_or_default().to_string();
             let shard_idx = req.shard_idx() as usize;
 
-            match load_shard(&bucket, &key, shard_idx) {
+            let result: Result<Vec<u8>, String> =
+                tokio::task::spawn_blocking(move || load_shard(&bucket, &key, shard_idx).map_err(|e| e.to_string()))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("shard load task panicked: {e}")));
+            match result {
                 Ok(data) => {
                     let data_off = fbb.create_vector(&data);
                     let resp = GetShardResponse::create(&mut fbb, &GetShardResponseArgs { ok: true, error: None, data: Some(data_off) });
@@ -339,7 +356,7 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
                     fbb.finish(out, None);
                 }
                 Err(e) => {
-                    let error = Some(fbb.create_string(&e.to_string()));
+                    let error = Some(fbb.create_string(&e));
                     let resp = GetShardResponse::create(&mut fbb, &GetShardResponseArgs { ok: false, error, data: None });
                     let out = Envelope::create(&mut fbb, &EnvelopeArgs { body_type: Body::GetShardResponse, body: Some(resp.as_union_value()) });
                     fbb.finish(out, None);

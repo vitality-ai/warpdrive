@@ -3,7 +3,7 @@
 use crate::storage::Storage;
 use std::collections::HashMap;
 use std::fs::{OpenOptions, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::env;
@@ -41,6 +41,47 @@ fn offset_counter(user_id: &str, bucket: &str, file_path: &PathBuf) -> Arc<Atomi
         map.entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(initial))),
     )
+}
+
+// Same pattern, same reasoning, one layer up: every `write`/`read` was
+// calling `OpenOptions::open` (a real `open(2)` syscall, plus the kernel
+// work to resolve the path and allocate a file descriptor) on *every
+// single shard operation*, having never cached the handle from the last
+// one. Under real concurrent shard throughput this is pure avoidable
+// syscall overhead competing with the actual I/O for the same descriptor
+// table lock inside the kernel -- exactly the kind of thing that caps
+// throughput below what the hardware can actually do. Cached here,
+// opened once per (user, bucket), reused via positional `_at` calls
+// (`write_all_at`/`read_exact_at`) so a shared `Arc<File>` needs no
+// synchronization for the I/O itself -- pread/pwrite don't touch the
+// file's shared cursor, matching `offset_counter`'s own existing
+// "no lock needed for the write itself" invariant.
+//
+// Opened with the write-mode flags (create + read + write) regardless of
+// whether the first caller is a read or a write, so either access pattern
+// populates a handle the other can reuse. The one edge case this
+// produces: a read on a bucket that was never written returns
+// `UnexpectedEof` (empty file, just created) instead of `NotFound` (file
+// never existed) -- a different error *type* for a case that shouldn't
+// happen with correct callers (every real `(offset, size)` pair comes
+// from a prior successful write), not a different error *outcome*.
+lazy_static! {
+    static ref OPEN_FILES: Mutex<HashMap<String, Arc<File>>> = Mutex::new(HashMap::new());
+}
+
+fn cached_file(user_id: &str, bucket: &str, file_path: &PathBuf) -> io::Result<Arc<File>> {
+    let key = format!("{user_id}/{bucket}");
+    {
+        let map = OPEN_FILES.lock().unwrap();
+        if let Some(f) = map.get(&key) {
+            return Ok(Arc::clone(f));
+        }
+    }
+    let file = OpenOptions::new().create(true).read(true).write(true).open(file_path)?;
+    let mut map = OPEN_FILES.lock().unwrap();
+    Ok(Arc::clone(
+        map.entry(key).or_insert_with(|| Arc::new(file)),
+    ))
 }
 
 fn get_storage_directory() -> PathBuf {
@@ -84,25 +125,6 @@ impl LocalXFSBinaryStore {
         // Return path as user/bucket-name.bin
         user_dir.join(format!("{}.bin", bucket))
     }
-    
-    /// Open or create a user's bucket binary file for writing
-    fn open_bucket_file_for_write(&self, user_id: &str, bucket: &str) -> io::Result<File> {
-        let file_path = self.get_bucket_file_path(user_id, bucket);
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .append(false)  // Don't use append mode to allow seeking
-            .open(&file_path)
-    }
-
-    /// Open a user's bucket binary file for reading
-    fn open_bucket_file_for_read(&self, user_id: &str, bucket: &str) -> io::Result<File> {
-        let file_path = self.get_bucket_file_path(user_id, bucket);
-        OpenOptions::new()
-            .read(true)
-            .open(&file_path)
-    }
 }
 
 impl Storage for LocalXFSBinaryStore {
@@ -116,7 +138,7 @@ impl Storage for LocalXFSBinaryStore {
         // write — no lock needed for the write itself.
         let offset = counter.fetch_add(size, Ordering::SeqCst);
 
-        let file = self.open_bucket_file_for_write(user_id, bucket)
+        let file = cached_file(user_id, bucket, &file_path)
             .map_err(ErrorInternalServerError)?;
 
         // Positioned write (pwrite): writes at `offset` regardless of this
@@ -141,21 +163,20 @@ impl Storage for LocalXFSBinaryStore {
     }
     
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
-        // Read data from the bucket binary file at specific offset/size
-        let mut file = self.open_bucket_file_for_read(user_id, bucket)
+        // Positional read (pread, via read_exact_at): no seek, no shared
+        // cursor, safe to use on a handle cached and shared across
+        // concurrent callers (see `cached_file`'s doc).
+        let file_path = self.get_bucket_file_path(user_id, bucket);
+        let file = cached_file(user_id, bucket, &file_path)
             .map_err(ErrorInternalServerError)?;
-        
-        file.seek(SeekFrom::Start(offset))
-            .map_err(ErrorInternalServerError)?;
-        
+
         let mut buffer = vec![0u8; size as usize];
-        file.read_exact(&mut buffer)
+        file.read_exact_at(&mut buffer, offset)
             .map_err(ErrorInternalServerError)?;
-        
-        
-        trace!("Read data for user {} bucket {} from offset {} with size {}", 
+
+        trace!("Read data for user {} bucket {} from offset {} with size {}",
               user_id, bucket, offset, size);
-        
+
         Ok(buffer)
     }
     

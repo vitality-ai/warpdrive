@@ -61,15 +61,35 @@ pub struct ShardServiceImpl;
 impl ShardService for ShardServiceImpl {
     async fn put_shard(&self, request: Request<PutShardRequest>) -> Result<Response<PutShardResponse>, Status> {
         let req = request.into_inner();
-        store_shard(&req.bucket, &req.key, req.shard_idx as usize, &req.data)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // #161: store_shard/load_shard do synchronous file I/O plus a
+        // Bitcask log append (write lock + writeln! + flush). Calling
+        // them directly inside this async fn runs that blocking work on
+        // a tokio worker thread, stalling every *other* request that
+        // thread could otherwise be servicing for the duration of the
+        // disk I/O -- exactly the kind of thing that caps throughput
+        // below what the hardware can actually do under concurrent load.
+        // spawn_blocking moves it to the dedicated blocking thread pool.
+        // actix_web::Error wraps a `Box<dyn ResponseError>`, which isn't
+        // `Send` -- spawn_blocking's result must be, so the error is
+        // turned into a plain String *inside* the closure, before it
+        // ever has to cross the thread boundary.
+        tokio::task::spawn_blocking(move || {
+            store_shard(&req.bucket, &req.key, req.shard_idx as usize, &req.data).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("shard store task panicked: {e}")))?
+        .map_err(Status::internal)?;
         Ok(Response::new(PutShardResponse {}))
     }
 
     async fn get_shard(&self, request: Request<GetShardRequest>) -> Result<Response<GetShardResponse>, Status> {
         let req = request.into_inner();
-        let data = load_shard(&req.bucket, &req.key, req.shard_idx as usize)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+        let data = tokio::task::spawn_blocking(move || {
+            load_shard(&req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("shard load task panicked: {e}")))?
+        .map_err(Status::not_found)?;
         Ok(Response::new(GetShardResponse { data }))
     }
 }
