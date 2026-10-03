@@ -23,7 +23,14 @@ pub struct Membership {
 /// depend on gossip among the existing nodes, just on the new node doing
 /// the broadcasting itself.
 pub async fn join_cluster_via(bootstrap: &str, self_addr: &str, membership: &Membership) {
-    let client = reqwest::Client::new();
+    // Same reasoning as ClusterState::location_http (#162): no timeout at
+    // all means a black-holed bootstrap peer hangs this join attempt
+    // forever instead of failing it.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .expect("failed to build join client");
 
     let peers = match announce_self(&client, bootstrap, self_addr).await {
         Ok(peers) => peers,
