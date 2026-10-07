@@ -589,10 +589,52 @@ pub async fn cluster_get_object(
         versioned_key(&key, &record.version)
     };
 
-    // No sub-object structure to be selective about here: a Range request
-    // still requires a full fan-out and full EC decode, then an in-memory
-    // slice. This is the expected, unoptimized baseline a Range-GET demo
-    // compares against — the cost difference is the point.
+    // Hotfix (branch: fix/plain-range-selective-fetch): a Range request
+    // against the plain path used to force a full k+m fan-out and a full
+    // EC decode of the whole object before slicing out the requested
+    // bytes, no matter how small the range — every one of DuckDB's many
+    // small per-column-chunk range-GETs paid the full object's fetch and
+    // decode cost. Reed-Solomon here is systematic (ec.rs: `encode` only
+    // computes parity from the k data shards, never rewrites them), so
+    // when the data shards covering the requested range are all healthy,
+    // no decode is needed at all -- just fetch those specific data
+    // shards and slice. Falls back to the original full fetch+decode
+    // path (below) if any needed shard isn't available, so correctness
+    // under failures is unchanged.
+    if let RangeResult::Valid(start, end) = parse_range_header(&req, total_len) {
+        let shard_len = ((record.original_len + record.k - 1) / record.k).max(1);
+        let first_idx = ((start as usize) / shard_len).min(record.k - 1);
+        let last_idx = ((end as usize) / shard_len).min(record.k - 1);
+
+        let partial_gets = (first_idx..=last_idx).map(|idx| {
+            let client = Arc::clone(&state.peer_client);
+            let bucket = bucket.clone();
+            let wire_key = wire_key.clone();
+            let peer = record.shard_peers[idx].clone();
+            async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok() }
+        });
+        let partial_results = join_all(partial_gets).await;
+
+        if partial_results.iter().all(|r| r.is_some()) {
+            let mut buf = Vec::with_capacity((last_idx - first_idx + 1) * shard_len);
+            for shard in partial_results.into_iter().flatten() {
+                buf.extend_from_slice(&shard);
+            }
+            let local_start = start as usize - first_idx * shard_len;
+            let local_end = (end as usize - first_idx * shard_len).min(buf.len() - 1);
+            if let Some(slice) = buf.get(local_start..=local_end) {
+                return Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
+                    .insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                    .body(slice.to_vec()));
+            }
+        }
+        // Fall through to the full fetch+decode path below -- a needed
+        // data shard's peer was unavailable, or the slice math above
+        // came up empty; both are rare-path, not the common case this
+        // fix targets.
+    }
+
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = bucket.clone();
