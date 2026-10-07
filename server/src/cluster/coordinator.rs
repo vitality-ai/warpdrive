@@ -229,6 +229,43 @@ fn attach_placement_headers(mut resp: HttpResponse, placement: &'static str, ove
     resp
 }
 
+/// Decodes an AWS SigV4 "streaming payload" body: repeated
+/// `<hex-chunk-size>;chunk-signature=<sig>\r\n<chunk-bytes>\r\n`, ending in
+/// a zero-size chunk. Chunk signatures are not re-verified here (same
+/// no-auth-check posture as the rest of the cluster API) -- this only
+/// strips the framing so the stored object is the real payload bytes,
+/// not the wire encoding.
+fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut pos = 0usize;
+    loop {
+        let header_end = raw[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("malformed chunk: no CRLF after chunk header")?;
+        let header = std::str::from_utf8(&raw[pos..pos + header_end])
+            .map_err(|_| "malformed chunk header: not UTF-8".to_string())?;
+        let size_str = header.split(';').next().unwrap_or("");
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| format!("malformed chunk size: {size_str:?}"))?;
+        pos += header_end + 2;
+
+        if size == 0 {
+            break;
+        }
+        if pos + size > raw.len() {
+            return Err("malformed chunk: declared size exceeds remaining body".into());
+        }
+        out.extend_from_slice(&raw[pos..pos + size]);
+        pos += size;
+        if raw.get(pos..pos + 2) != Some(b"\r\n") {
+            return Err("malformed chunk: missing trailing CRLF after chunk data".into());
+        }
+        pos += 2;
+    }
+    Ok(out)
+}
+
 pub async fn cluster_put_object(
     path: web::Path<(String, String)>,
     body: web::Bytes,
@@ -236,6 +273,33 @@ pub async fn cluster_put_object(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+
+    // Hotfix (branch: fix/plain-range-selective-fetch): real S3 SDKs
+    // (minio-go, used by minio/warp and many other tools) sign PUT bodies
+    // with AWS's "streaming payload" scheme when content-length is known
+    // up front: `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+    // body wire-encoded as repeated
+    // `<hex-chunk-size>;chunk-signature=<sig>\r\n<chunk-bytes>\r\n`,
+    // terminated by a zero-size chunk. `body: web::Bytes` is the raw wire
+    // bytes -- actix/hyper only unwraps HTTP-level Transfer-Encoding, not
+    // this application-level AWS framing, so without decoding it here the
+    // stored object silently includes chunk-size/signature bytes as part
+    // of its content (confirmed via `x-amz-decoded-content-length`
+    // mismatching the raw body length). The legacy single-node S3 path
+    // (s3/handlers/object.rs) has the same gap -- it only strips
+    // "aws-chunked" from the stored Content-Encoding metadata, never
+    // decodes the body -- so this was latent there too, just never
+    // exercised by a real streaming-signing SDK client until now.
+    let body: web::Bytes = if req
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("STREAMING-"))
+    {
+        web::Bytes::from(decode_aws_chunked_payload(&body).map_err(ErrorBadRequest)?)
+    } else {
+        body
+    };
 
     // #150: `packed.rs::stripe_key` reserves a leading NUL byte to keep a
     // content-dependent object's per-stripe shard keys structurally
@@ -1012,6 +1076,46 @@ mod tests {
         assert_eq!(required_write_acks(9, 6), 9);
         assert_eq!(required_write_acks(4, 4), 5);
         assert_eq!(required_write_acks(4, 2), 4);
+    }
+
+    #[test]
+    fn decode_aws_chunked_payload_strips_framing_to_the_real_bytes() {
+        // Exact shape captured from a real minio-go (warp) PUT: two data
+        // chunks of different sizes, then a zero-size terminal chunk.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"5;chunk-signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        raw.extend_from_slice(b"hello");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"6;chunk-signature=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n");
+        raw.extend_from_slice(b" world");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"0;chunk-signature=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let decoded = decode_aws_chunked_payload(&raw).unwrap();
+        assert_eq!(decoded, b"hello world");
+    }
+
+    #[test]
+    fn decode_aws_chunked_payload_handles_single_chunk_matching_real_capture() {
+        // Same chunk size (0x10000 = 65536) seen in the real capture.
+        let mut raw = Vec::new();
+        let data = vec![0xABu8; 0x10000];
+        raw.extend_from_slice(b"10000;chunk-signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n");
+        raw.extend_from_slice(&data);
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"0;chunk-signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let decoded = decode_aws_chunked_payload(&raw).unwrap();
+        assert_eq!(decoded.len(), 0x10000);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn decode_aws_chunked_payload_rejects_truncated_chunk() {
+        let raw = b"a;chunk-signature=abc\r\nshort\r\n".to_vec();
+        assert!(decode_aws_chunked_payload(&raw).is_err());
     }
 
     /// #149: `replicate_location_delete`/`replicate_content_location_delete`
