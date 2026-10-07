@@ -327,20 +327,46 @@ async fn fetch_and_decode_stripe(
         versioned_key(&sk, &record.version)
     };
 
-    let t_fetch_start = std::time::Instant::now();
-    let gets = stripe.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
+    let fetch_one = |idx: usize| {
         let client = Arc::clone(&state.peer_client);
         let bucket = record.bucket.clone();
         let wire_key = wire_key.clone();
+        let peer = stripe.shard_peers[idx].clone();
         async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
-    });
-    let results = join_all(gets).await;
+    };
+
+    // Same bug as `coordinator.rs`'s plain GET had, same fix: this used to
+    // fetch all k+m shard peers unconditionally (confirmed via the
+    // `shard_count={k+m}` this function used to log on every single
+    // stripe) and always ran a full EC decode, even though Reed-Solomon
+    // here is systematic -- the k data shards ARE the object's bytes,
+    // untouched by `encode()`, so a healthy stripe needs zero GF math and
+    // zero parity-shard reads. Only ever fetching k+m shards meant every
+    // stripe paid for 2 parity-shard network+disk reads (RS(3,2): 40%
+    // more of both than necessary) it almost never needed.
+    let t_fetch_start = std::time::Instant::now();
+    let data_results = join_all((0..record.k).map(fetch_one)).await;
     let fetch_ms = t_fetch_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; stripe.shard_peers.len()];
-    for (idx, data) in results.into_iter().flatten() {
+    for (idx, data) in data_results.into_iter().flatten() {
         shards[idx] = Some(data);
     }
+
+    if shards[..record.k].iter().all(|s| s.is_some()) {
+        log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode=0.00ms shard_count={} (data shards only)", record.k);
+        return Ok(shards.into_iter().take(record.k).map(|s| s.expect("checked all Some above")).collect());
+    }
+
+    // A data shard's peer was unavailable -- fall back to fetching the
+    // parity shards too and reconstructing, same as before this fix.
+    let t_fallback_start = std::time::Instant::now();
+    let parity_results = join_all((record.k..stripe.shard_peers.len()).map(fetch_one)).await;
+    for (idx, data) in parity_results.into_iter().flatten() {
+        shards[idx] = Some(data);
+    }
+    let fetch_ms = fetch_ms + t_fallback_start.elapsed().as_secs_f64() * 1000.0;
+
     let present = shards.iter().filter(|s| s.is_some()).count();
     if present < record.k {
         return Err(ErrorInternalServerError(format!(
@@ -356,7 +382,7 @@ async fn fetch_and_decode_stripe(
         .and_then(|decoder| decoder.decode_shards(&shards))
         .map_err(|e| ErrorInternalServerError(e.to_string()));
     let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1000.0;
-    log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={}", stripe.shard_peers.len());
+    log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={} (fallback, data shard missing)", stripe.shard_peers.len());
     decoded
 }
 
