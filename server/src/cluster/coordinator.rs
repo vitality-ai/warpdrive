@@ -861,7 +861,11 @@ pub async fn cluster_delete_object(
         )));
     }
 
-    Ok(HttpResponse::Ok().finish())
+    // Real S3 semantics (and real S3 SDKs, e.g. minio-go used by
+    // minio/warp): a successful DeleteObject returns 204 No Content, not
+    // 200 -- the SDK client treats any other status as an error even
+    // though the delete itself succeeded.
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[derive(Debug, Deserialize)]
