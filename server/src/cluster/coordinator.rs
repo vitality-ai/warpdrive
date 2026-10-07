@@ -626,6 +626,7 @@ pub async fn cluster_get_object(
                 return Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
                     .insert_header(("Accept-Ranges", "bytes"))
                     .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                    .insert_header(("Last-Modified", super::s3_surface::now_http_date()))
                     .body(slice.to_vec()));
             }
         }
@@ -687,13 +688,17 @@ pub async fn cluster_get_object(
             Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
                 .insert_header(("Accept-Ranges", "bytes"))
                 .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                .insert_header(("Last-Modified", super::s3_surface::now_http_date()))
                 .body(slice))
         }
         RangeResult::Unsatisfiable => Err(
             actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
         ),
         RangeResult::None => {
-            Ok(HttpResponse::Ok().insert_header(("Accept-Ranges", "bytes")).body(data))
+            Ok(HttpResponse::Ok()
+                .insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("Last-Modified", super::s3_surface::now_http_date()))
+                .body(data))
         }
     }
 }
