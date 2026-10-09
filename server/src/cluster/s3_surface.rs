@@ -46,7 +46,21 @@ pub async fn cluster_s3_head_object(
 
     Ok(HttpResponse::Ok()
         .insert_header(("Accept-Ranges", "bytes"))
+        .insert_header(("Last-Modified", now_http_date()))
         .body(HeadBody(size)))
+}
+
+/// Diagnostic-only addition (branch: fix/plain-range-selective-fetch): the
+/// cluster path never tracked/emitted Last-Modified, which the s3::handlers
+/// legacy path does (see common.rs's last_modified_now/_for_header). Real S3
+/// SDK clients (minio-go, used by minio/warp) hard-require a parseable
+/// Last-Modified on every GET/HEAD response and error out client-side if
+/// it's missing -- not a data problem, just a missing header. "Now" isn't
+/// the object's real creation time (the cluster path doesn't store one),
+/// but is enough to unblock SDK-based tooling against this surface; a real
+/// fix would thread an actual stored timestamp through, same as common.rs.
+pub(crate) fn now_http_date() -> String {
+    chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 /// A minimal ListObjectsV2: no pagination (fine for a demo-scale dataset —
