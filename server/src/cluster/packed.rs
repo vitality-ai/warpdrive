@@ -173,15 +173,27 @@ pub async fn put_object_content_dependent(
     // see `verify_stripes_reconstruct_original`'s doc for why this is
     // generic (packer-agnostic), not a bespoke check of one algorithm.
     let mut unpadded_bins: Vec<Vec<Vec<u8>>> = Vec::with_capacity(stripes.len());
-    for stripe in &stripes {
+    // Computed here, once, while bin assignments are already at hand --
+    // not rebuilt or cached on every later GET. See `UnitLocation`'s doc.
+    let mut sorted_unit_locations: Vec<super::content_location_store::UnitLocation> =
+        Vec::with_capacity(units_header.len());
+    for (stripe_index, stripe) in stripes.iter().enumerate() {
         let mut bins_bytes: Vec<Vec<u8>> = Vec::with_capacity(stripe.bins.len());
-        for bin_unit_ids in &stripe.bins {
+        for (bin_idx, bin_unit_ids) in stripe.bins.iter().enumerate() {
             let mut buf = Vec::new();
             for uid in bin_unit_ids {
                 let unit = *units_by_id
                     .get(uid.as_str())
                     .ok_or_else(|| ErrorInternalServerError("packer returned an unknown unit id"))?;
                 let (start, end) = (unit.offset as usize, (unit.offset + unit.len) as usize);
+                sorted_unit_locations.push(super::content_location_store::UnitLocation {
+                    offset: unit.offset,
+                    end: unit.offset + unit.len,
+                    stripe_index,
+                    bin_idx,
+                    pos_in_bin: buf.len(),
+                    len: unit.len as usize,
+                });
                 buf.extend_from_slice(
                     body.get(start..end)
                         .ok_or_else(|| ErrorInternalServerError("computable unit out of bounds of body"))?,
@@ -191,6 +203,7 @@ pub async fn put_object_content_dependent(
         }
         unpadded_bins.push(bins_bytes);
     }
+    sorted_unit_locations.sort_by_key(|u| u.offset);
     verify_stripes_reconstruct_original(body, units_header, &stripes, &unpadded_bins)?;
 
     // #151, same reasoning and same mechanism as `put_object_plain`'s:
@@ -253,6 +266,7 @@ pub async fn put_object_content_dependent(
         units: units_header.to_vec(),
         stripes: stripe_records,
         version,
+        sorted_unit_locations,
     };
 
     // Replicate to *every* known peer, not just the union of this object's
@@ -313,20 +327,46 @@ async fn fetch_and_decode_stripe(
         versioned_key(&sk, &record.version)
     };
 
-    let t_fetch_start = std::time::Instant::now();
-    let gets = stripe.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
+    let fetch_one = |idx: usize| {
         let client = Arc::clone(&state.peer_client);
         let bucket = record.bucket.clone();
         let wire_key = wire_key.clone();
+        let peer = stripe.shard_peers[idx].clone();
         async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
-    });
-    let results = join_all(gets).await;
+    };
+
+    // Same bug as `coordinator.rs`'s plain GET had, same fix: this used to
+    // fetch all k+m shard peers unconditionally (confirmed via the
+    // `shard_count={k+m}` this function used to log on every single
+    // stripe) and always ran a full EC decode, even though Reed-Solomon
+    // here is systematic -- the k data shards ARE the object's bytes,
+    // untouched by `encode()`, so a healthy stripe needs zero GF math and
+    // zero parity-shard reads. Only ever fetching k+m shards meant every
+    // stripe paid for 2 parity-shard network+disk reads (RS(3,2): 40%
+    // more of both than necessary) it almost never needed.
+    let t_fetch_start = std::time::Instant::now();
+    let data_results = join_all((0..record.k).map(fetch_one)).await;
     let fetch_ms = t_fetch_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; stripe.shard_peers.len()];
-    for (idx, data) in results.into_iter().flatten() {
+    for (idx, data) in data_results.into_iter().flatten() {
         shards[idx] = Some(data);
     }
+
+    if shards[..record.k].iter().all(|s| s.is_some()) {
+        log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode=0.00ms shard_count={} (data shards only)", record.k);
+        return Ok(shards.into_iter().take(record.k).map(|s| s.expect("checked all Some above")).collect());
+    }
+
+    // A data shard's peer was unavailable -- fall back to fetching the
+    // parity shards too and reconstructing, same as before this fix.
+    let t_fallback_start = std::time::Instant::now();
+    let parity_results = join_all((record.k..stripe.shard_peers.len()).map(fetch_one)).await;
+    for (idx, data) in parity_results.into_iter().flatten() {
+        shards[idx] = Some(data);
+    }
+    let fetch_ms = fetch_ms + t_fallback_start.elapsed().as_secs_f64() * 1000.0;
+
     let present = shards.iter().filter(|s| s.is_some()).count();
     if present < record.k {
         return Err(ErrorInternalServerError(format!(
@@ -342,7 +382,7 @@ async fn fetch_and_decode_stripe(
         .and_then(|decoder| decoder.decode_shards(&shards))
         .map_err(|e| ErrorInternalServerError(e.to_string()));
     let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1000.0;
-    log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={}", stripe.shard_peers.len());
+    log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={} (fallback, data shard missing)", stripe.shard_peers.len());
     decoded
 }
 
@@ -411,21 +451,43 @@ pub async fn get_object_content_dependent_range(
 ) -> Result<Vec<u8>, Error> {
     let want_len = (end - start + 1) as usize;
     let mut output = vec![0u8; want_len];
-    let units_by_id: HashMap<&str, &UnitMeta> = record.units.iter().map(|u| (u.unit_id.as_str(), u)).collect();
 
-    let overlaps = |unit: &UnitMeta| unit.offset < end + 1 && unit.offset + unit.len > start;
+    // `record.sorted_unit_locations` is computed once at PUT time (see its
+    // doc) and loaded here as part of the already-deserialized record --
+    // no per-request HashMap build, no per-request scan of every stripe's
+    // every bin. Empty only for a record written before this field
+    // existed; falls back to the old units-by-id + full-stripe-scan path
+    // in that case rather than silently returning nothing.
+    let overlapping: Vec<super::content_location_store::UnitLocation> = if !record.sorted_unit_locations.is_empty() {
+        record.units_overlapping(start, end).to_vec()
+    } else {
+        let units_by_id: HashMap<&str, &UnitMeta> = record.units.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+        let overlaps = |unit: &UnitMeta| unit.offset < end + 1 && unit.offset + unit.len > start;
+        let mut out = Vec::new();
+        for (stripe_index, stripe) in record.stripes.iter().enumerate() {
+            for (bin_idx, bin_unit_ids) in stripe.bins.iter().enumerate() {
+                let mut pos = 0usize;
+                for uid in bin_unit_ids {
+                    let unit = *units_by_id.get(uid.as_str()).ok_or_else(|| ErrorInternalServerError("unit id missing from record's unit index"))?;
+                    if overlaps(unit) {
+                        out.push(super::content_location_store::UnitLocation {
+                            offset: unit.offset, end: unit.offset + unit.len, stripe_index, bin_idx,
+                            pos_in_bin: pos, len: unit.len as usize,
+                        });
+                    }
+                    pos += unit.len as usize;
+                }
+            }
+        }
+        out
+    };
 
-    let needed_stripes: Vec<usize> = record
-        .stripes
-        .iter()
-        .enumerate()
-        .filter(|(_, stripe)| {
-            stripe.bins.iter().flatten().any(|uid| {
-                units_by_id.get(uid.as_str()).map(|u| overlaps(u)).unwrap_or(false)
-            })
-        })
-        .map(|(i, _)| i)
-        .collect();
+    let needed_stripes: Vec<usize> = {
+        let mut v: Vec<usize> = overlapping.iter().map(|u| u.stripe_index).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
 
     log::info!(
         "bucket={} key={} range-GET touched {}/{} stripes",
@@ -462,36 +524,32 @@ pub async fn get_object_content_dependent_range(
         record.bucket, record.key, needed_stripes.len(), t_all_stripes.elapsed().as_secs_f64() * 1000.0
     );
 
-    for (stripe_index, bins) in fetched {
-        let stripe = &record.stripes[stripe_index];
+    // Reconstruct directly from the precomputed locations: no stripe.bins
+    // iteration, no unit_id lookup, no re-checking which units overlap
+    // (already filtered above) -- each overlapping unit already knows
+    // exactly which fetched stripe/bin/position holds its bytes.
+    let bins_by_stripe: HashMap<usize, Vec<Vec<u8>>> = fetched.into_iter().collect();
+    for unit in &overlapping {
+        let bins = bins_by_stripe
+            .get(&unit.stripe_index)
+            .ok_or_else(|| ErrorInternalServerError("fetched stripes missing a needed stripe"))?;
+        let bin_bytes = bins
+            .get(unit.bin_idx)
+            .ok_or_else(|| ErrorInternalServerError("bin index out of bounds"))?;
 
-        for (bin_idx, unit_ids) in stripe.bins.iter().enumerate() {
-            let bin_bytes = &bins[bin_idx];
-            let mut pos = 0usize;
-            for uid in unit_ids {
-                let unit = units_by_id
-                    .get(uid.as_str())
-                    .ok_or_else(|| ErrorInternalServerError("unit id missing from record's unit index"))?;
-                let unit_len = unit.len as usize;
-
-                if overlaps(unit) {
-                    let i_start = unit.offset.max(start);
-                    let i_end = (unit.offset + unit.len).min(end + 1);
-                    let src_off = (i_start - unit.offset) as usize;
-                    let dst_off = (i_start - start) as usize;
-                    let copy_len = (i_end - i_start) as usize;
-                    output
-                        .get_mut(dst_off..dst_off + copy_len)
-                        .ok_or_else(|| ErrorInternalServerError("range slice out of bounds of response buffer"))?
-                        .copy_from_slice(
-                            bin_bytes
-                                .get(pos + src_off..pos + src_off + copy_len)
-                                .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?,
-                        );
-                }
-                pos += unit_len;
-            }
-        }
+        let i_start = unit.offset.max(start);
+        let i_end = unit.end.min(end + 1);
+        let src_off = unit.pos_in_bin + (i_start - unit.offset) as usize;
+        let dst_off = (i_start - start) as usize;
+        let copy_len = (i_end - i_start) as usize;
+        output
+            .get_mut(dst_off..dst_off + copy_len)
+            .ok_or_else(|| ErrorInternalServerError("range slice out of bounds of response buffer"))?
+            .copy_from_slice(
+                bin_bytes
+                    .get(src_off..src_off + copy_len)
+                    .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?,
+            );
     }
 
     Ok(output)
