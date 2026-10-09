@@ -551,11 +551,15 @@ pub async fn cluster_get_object(
         let range_result = parse_range_header(&req, total_len);
         return match range_result {
             RangeResult::Valid(start, end) => {
+                let has_sparse_gaps = record.has_sparse_gaps;
                 let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
-                Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
-                    .insert_header(("Accept-Ranges", "bytes"))
-                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
-                    .body(data))
+                let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
+                resp.insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")));
+                if has_sparse_gaps {
+                    resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
+                }
+                Ok(resp.body(data))
             }
             RangeResult::Unsatisfiable => Err(
                 actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),

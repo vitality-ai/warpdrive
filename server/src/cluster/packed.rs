@@ -17,6 +17,27 @@ use super::ec::ErasureCoder;
 use super::packing::Stripe;
 use super::shard_storage::{new_version_id, versioned_key};
 
+/// True if `units`' declared byte ranges leave any gap in `[0, body_len)`.
+/// Sorts by offset and walks the ranges once: a gap exists wherever the
+/// next unit's offset is past where coverage has reached so far (either
+/// at the very start, between two units, or after the last one).
+/// `verify_stripes_reconstruct_original` already confirmed every declared
+/// unit occurs exactly once and matches the body, so this only has to
+/// detect what was never declared at all -- not re-check anything that
+/// function already covers.
+fn has_coverage_gaps(units: &[UnitMeta], body_len: usize) -> bool {
+    let mut ranges: Vec<(u64, u64)> = units.iter().map(|u| (u.offset, u.offset + u.len)).collect();
+    ranges.sort_unstable();
+    let mut covered_to = 0u64;
+    for (start, end) in ranges {
+        if start > covered_to {
+            return true;
+        }
+        covered_to = covered_to.max(end);
+    }
+    covered_to < body_len as u64
+}
+
 /// Generic, packer-agnostic correctness check: for every unit the caller
 /// declared in `units_header`, confirms it was packed into exactly one bin
 /// (not zero -- dropped; not more than one -- duplicated) and that the
@@ -193,6 +214,22 @@ pub async fn put_object_content_dependent(
     }
     verify_stripes_reconstruct_original(body, units_header, &stripes, &unpadded_bins)?;
 
+    // Not rejected (see `has_coverage_gaps`'s doc for why sparse coverage
+    // is a legitimate caller choice, not always a bug) -- but not silent
+    // either: a GET of an object with a gap returns 200 with the gap
+    // zero-filled, indistinguishable from a healthy object unless this is
+    // surfaced somewhere. Logged here, and carried on the record so every
+    // GET response can set `X-Warpd-Sparse-Coverage` (see
+    // get_object_content_dependent and get_object_content_dependent_range).
+    let has_sparse_gaps = has_coverage_gaps(units_header, body.len());
+    if has_sparse_gaps {
+        log::warn!(
+            "bucket={bucket} key={key} content-dependent PUT accepted with sparse unit coverage \
+             (declared units don't cover every byte of the body) -- GETs of this object will \
+             zero-fill the gaps and carry X-Warpd-Sparse-Coverage: true"
+        );
+    }
+
     // #151, same reasoning and same mechanism as `put_object_plain`'s:
     // every version of this object writes its stripes' shards under a
     // brand new key, never overwriting a previous version's shards in
@@ -253,6 +290,7 @@ pub async fn put_object_content_dependent(
         units: units_header.to_vec(),
         stripes: stripe_records,
         version,
+        has_sparse_gaps,
     };
 
     // Replicate to *every* known peer, not just the union of this object's
@@ -393,7 +431,11 @@ pub async fn get_object_content_dependent(record: ContentDependentRecord, state:
         }
     }
 
-    Ok(HttpResponse::Ok().body(output))
+    let mut response = HttpResponse::Ok();
+    if record.has_sparse_gaps {
+        response.insert_header(("X-Warpd-Sparse-Coverage", "true"));
+    }
+    Ok(response.body(output))
 }
 
 /// Range-GET for a content-dependent object: `start`/`end` are inclusive
@@ -576,6 +618,40 @@ mod checksum_tests {
 
         let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_false_for_full_coverage() {
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        assert!(!has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_true_for_a_gap_at_the_end() {
+        // Same case verify_allows_a_sparse_units_header_... accepts as
+        // legitimate -- this is what makes that acceptance observable.
+        let units = vec![unit("u0", 0, 5)];
+        assert!(has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_true_for_a_gap_in_the_middle() {
+        let units = vec![unit("u0", 0, 3), unit("u1", 7, 3)];
+        assert!(has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_true_for_a_gap_at_the_start() {
+        let units = vec![unit("u0", 2, 8)];
+        assert!(has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_false_when_units_are_declared_out_of_order() {
+        // Caller order isn't guaranteed to match offset order; the check
+        // sorts internally rather than assuming it.
+        let units = vec![unit("u1", 5, 5), unit("u0", 0, 5)];
+        assert!(!has_coverage_gaps(&units, 10));
     }
 }
 

@@ -72,6 +72,23 @@ pub struct ContentDependentRecord {
     /// field existed, whose shards are at the old, unversioned key.
     #[serde(default)]
     pub version: String,
+    /// True when the caller's own `units_header` left part of the body
+    /// uncovered (`verify_stripes_reconstruct_original` allows this --
+    /// see its doc -- a legitimate choice for a caller like a row-group
+    /// reader that only ever wants specific columns). A GET zero-fills
+    /// whatever isn't covered, which is fine when it's intentional and
+    /// silent corruption when it isn't (e.g. a client's own offset
+    /// computation missed a Parquet footer). Not rejected at PUT time --
+    /// that would break the legitimate case -- but surfaced instead of
+    /// hidden: logged as a warning at PUT time, and every GET response
+    /// carries an `X-Warpd-Sparse-Coverage: true` header when this is
+    /// set, so "this object returned 200 but isn't fully covered" is
+    /// observable rather than indistinguishable from a healthy object.
+    /// `#[serde(default)]`: false for a record from before this field
+    /// existed, correct either way since the old code path required full
+    /// coverage, so no pre-existing record can actually have a gap.
+    #[serde(default)]
+    pub has_sparse_gaps: bool,
 }
 
 impl ContentDependentRecord {
@@ -268,6 +285,7 @@ mod tests {
                 bins: vec![vec!["u0".into()], vec!["u1".into()], vec![]],
             }],
             version: "v1".to_string(),
+            has_sparse_gaps: false,
         }
     }
 
