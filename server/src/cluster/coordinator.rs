@@ -784,11 +784,24 @@ pub async fn cluster_put_retention(
     record.retain_until = Some(body.retain_until.clone());
     record.legal_hold = body.legal_hold;
 
-    let required_acks = required_write_acks(record.k, record.m);
-    let acked = replicate_location_put(&state, &record, &record.shard_peers.clone()).await;
-    if acked < required_acks {
+    // #156 (point 2): this used to replicate only to `record.shard_peers`
+    // (a quorum subset) -- but cluster_delete_object enforces retention by
+    // checking whatever plain record *this* coordinator happens to have
+    // locally, and any peer can end up coordinating a DELETE, not just
+    // shard holders. A peer outside `shard_peers` that received the
+    // object's original PUT (which does replicate to every peer, see
+    // put_object_plain) kept its stale, pre-lock copy of the record
+    // forever, so a DELETE routed through it saw no retention_mode at all
+    // and succeeded. Replicating to every peer, and requiring every peer
+    // to ack -- same reasoning and same pattern as
+    // cluster_put_bucket_config just above: this is a fact every
+    // coordinator must agree on, not a write quorum is enough for.
+    let peers = state.membership.peers();
+    let acked = replicate_location_put(&state, &record, &peers).await;
+    if acked < peers.len() {
         return Err(ErrorInternalServerError(format!(
-            "retention update quorum not met: {acked}/{required_acks} peers updated the record"
+            "retention update requires every peer to ack: {acked}/{} acknowledged",
+            peers.len()
         )));
     }
 
