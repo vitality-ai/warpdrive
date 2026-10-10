@@ -151,8 +151,14 @@ impl TcpPeerClient {
         let idle_stream = pool.idle.lock().await.pop_front();
         let stream = match idle_stream {
             Some(s) => s,
-            None => TcpStream::connect(endpoint)
+            // #162: a bare TcpStream::connect has no timeout, so a
+            // black-holed peer hangs this forever. A connect that never
+            // returns also never releases the semaphore permit acquired
+            // above, so it would eventually exhaust this peer's whole
+            // pool, not just this one call.
+            None => tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(endpoint))
                 .await
+                .map_err(|_| ErrorBadGateway(format!("tcp connect to {endpoint} timed out")))?
                 .map_err(|e| ErrorBadGateway(format!("tcp connect to {endpoint} failed: {e}")))?,
         };
         Ok((stream, permit))
@@ -168,19 +174,28 @@ impl TcpPeerClient {
         let endpoint = tcp_endpoint_for(peer)?;
         let (mut stream, permit) = self.borrow(&endpoint).await?;
 
-        if let Err(e) = write_framed(&mut stream, request).await {
-            // Don't return a broken connection to the pool; let it (and
-            // its permit) drop, freeing the slot for a fresh connection.
-            return Err(ErrorBadGateway(format!("tcp write to {peer} failed: {e}")));
+        // #162: write_framed/read_framed had no timeout either, so a peer
+        // that accepted the TCP connection but then never responds (a
+        // real "gray failure," not just a closed port) would hold this
+        // pool permit forever. Both wrapped the same way as connect
+        // above; the permit and stream are dropped (not returned to the
+        // pool) on any error path here, same as before.
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), write_framed(&mut stream, request)).await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(ErrorBadGateway(format!("tcp write to {peer} failed: {e}"))),
+            Err(_) => return Err(ErrorBadGateway(format!("tcp write to {peer} timed out"))),
         }
 
-        let read_result = read_framed(&mut stream).await;
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(10), read_framed(&mut stream)).await;
         match read_result {
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 self.release(&endpoint, stream, permit).await;
                 Ok(resp)
             }
-            Err(e) => Err(ErrorBadGateway(format!("tcp read from {peer} failed: {e}"))),
+            Ok(Err(e)) => Err(ErrorBadGateway(format!("tcp read from {peer} failed: {e}"))),
+            Err(_) => Err(ErrorBadGateway(format!("tcp read from {peer} timed out"))),
         }
     }
 }
@@ -301,10 +316,23 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             let shard_idx = req.shard_idx() as usize;
             let data = req.data().map(|d| d.bytes().to_vec()).unwrap_or_default();
 
-            let result = store_shard(&bucket, &key, shard_idx, &data);
+            // #161: same reasoning as the gRPC server side -- store_shard
+            // is synchronous file I/O plus a Bitcask log append, and this
+            // whole function runs on a tokio worker thread (one task per
+            // connection). Only the blocking call itself is moved off
+            // that thread; `fbb` (not Send-friendly to move around) stays
+            // here and builds the response from the result afterward,
+            // unchanged from before.
+            // actix_web::Error isn't Send, so the error is turned into a
+            // plain String inside the closure before crossing the thread
+            // boundary (spawn_blocking's result must be Send + 'static).
+            let result: Result<(), String> =
+                tokio::task::spawn_blocking(move || store_shard(&bucket, &key, shard_idx, &data).map_err(|e| e.to_string()))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("shard store task panicked: {e}")));
             let (ok, error) = match &result {
                 Ok(()) => (true, None),
-                Err(e) => (false, Some(fbb.create_string(&e.to_string()))),
+                Err(e) => (false, Some(fbb.create_string(e))),
             };
             let resp = PutShardResponse::create(&mut fbb, &PutShardResponseArgs { ok, error });
             let out = Envelope::create(&mut fbb, &EnvelopeArgs { body_type: Body::PutShardResponse, body: Some(resp.as_union_value()) });
@@ -316,7 +344,11 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             let key = req.key().unwrap_or_default().to_string();
             let shard_idx = req.shard_idx() as usize;
 
-            match load_shard(&bucket, &key, shard_idx) {
+            let result: Result<Vec<u8>, String> =
+                tokio::task::spawn_blocking(move || load_shard(&bucket, &key, shard_idx).map_err(|e| e.to_string()))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("shard load task panicked: {e}")));
+            match result {
                 Ok(data) => {
                     let data_off = fbb.create_vector(&data);
                     let resp = GetShardResponse::create(&mut fbb, &GetShardResponseArgs { ok: true, error: None, data: Some(data_off) });
@@ -324,7 +356,7 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
                     fbb.finish(out, None);
                 }
                 Err(e) => {
-                    let error = Some(fbb.create_string(&e.to_string()));
+                    let error = Some(fbb.create_string(&e));
                     let resp = GetShardResponse::create(&mut fbb, &GetShardResponseArgs { ok: false, error, data: None });
                     let out = Envelope::create(&mut fbb, &EnvelopeArgs { body_type: Body::GetShardResponse, body: Some(resp.as_union_value()) });
                     fbb.finish(out, None);

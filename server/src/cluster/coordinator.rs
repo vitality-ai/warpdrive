@@ -10,11 +10,11 @@
 //! actually true (see the architecture doc for why recomputing on every
 //! read would break that guarantee).
 
-use actix_web::error::{ErrorBadRequest, ErrorForbidden, ErrorInternalServerError, ErrorNotFound};
+use actix_web::error::{ErrorBadRequest, ErrorForbidden, ErrorInternalServerError, ErrorNotFound, ErrorPayloadTooLarge};
 use actix_web::{web, Error, HttpResponse};
 use futures::future::join_all;
 use log::{info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ use super::packing::StripePacker;
 use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
 use super::pushdown::ColumnCodec;
+use super::shard_storage::{new_version_id, versioned_key};
 use crate::s3::handlers::common::{parse_range_header, RangeResult};
 use base64::Engine;
 
@@ -159,13 +160,8 @@ pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str
         let bucket = bucket.to_string();
         let key = key.to_string();
         async move {
-            let url = format!(
-                "{}/cluster/_internal/location/{}/{}",
-                peer.trim_end_matches('/'),
-                bucket,
-                key
-            );
-            match client.delete(&url).send().await {
+            let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
+            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     warn!("location tombstone replication to {peer} returned {}", r.status());
@@ -194,13 +190,8 @@ pub(crate) async fn replicate_content_location_delete(state: &ClusterState, buck
         let bucket = bucket.to_string();
         let key = key.to_string();
         async move {
-            let url = format!(
-                "{}/cluster/_internal/content_location/{}/{}",
-                peer.trim_end_matches('/'),
-                bucket,
-                key
-            );
-            match client.delete(&url).send().await {
+            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
+            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     warn!("content-location tombstone replication to {peer} returned {}", r.status());
@@ -246,6 +237,16 @@ pub async fn cluster_put_object(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
+    // #150: `packed.rs::stripe_key` reserves a leading NUL byte to keep a
+    // content-dependent object's per-stripe shard keys structurally
+    // disjoint from any plain object's key, on the assumption that a real
+    // key never starts with one. Enforced here, once, at the only path
+    // that can ever create a new mapping for a key -- rather than leaving
+    // it as an unenforced assumption -- so that assumption actually holds.
+    if key.contains('\0') {
+        return Err(ErrorBadRequest("object key must not contain a NUL byte"));
+    }
+
     // Content-dependent placement is a *bucket*-level decision
     // (bucket_config.rs), the same as every other bucket setting in this
     // project (versioning, ACL, retention) — not something a client opts
@@ -258,6 +259,18 @@ pub async fn cluster_put_object(
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     };
+
+    // An empty body can never be packed meaningfully (every bin would be
+    // zero-length, which `reed_solomon_erasure` rejects outright, 500ing
+    // what should be a trivially-valid empty-object PUT). There's also
+    // nothing to gain from packing zero bytes. Short-circuit to plain
+    // before any packer runs, the same way the plain path's own encoder
+    // already floors shard length at 1 byte for this exact case.
+    if body.is_empty() {
+        return put_object_plain(&bucket, &key, &body, &state)
+            .await
+            .map(|r| attach_placement_headers(r, "plain", None));
+    }
 
     // For a configured bucket, the header's job narrows to two things:
     // supplying real unit boundaries when the client has them, and acting
@@ -362,6 +375,22 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         )));
     }
 
+    // #159: a shard this transport can't carry used to fail silently deep
+    // inside `PeerClient::put_shard` on every peer, surfacing only as
+    // "write quorum not met: 0/N" with no hint why every single peer
+    // refused. Checked upfront, against the active transport's own stated
+    // limit, so an oversized object gets one clear error instead.
+    let shard_len = body.len().div_ceil(k).max(1);
+    if let Some(max) = state.peer_client.max_shard_size() {
+        if shard_len > max {
+            return Err(ErrorPayloadTooLarge(format!(
+                "object too large for RS({k},{m}): each shard would be {shard_len} bytes, \
+                 over this transport's {max}-byte limit (raise WARPDRIVE_GRPC_MAX_MESSAGE_SIZE, \
+                 pick a larger k, or switch WARPDRIVE_PEER_TRANSPORT to http/tcp)"
+            )));
+        }
+    }
+
     // Placement resolved fresh, against the peer list as it is *right now*.
     // This is the only place ComputedPlacement is ever called for this key.
     let chosen = state.placement.place(&bucket, &key, &peers, k, m);
@@ -375,6 +404,16 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
 
     let required_acks = required_write_acks(k, m);
 
+    // #151: every version of an object writes its shards under a brand
+    // new key (`versioned_key`), never overwriting the previous version's
+    // shards in place. This is what actually prevents corruption on a
+    // failed or concurrent overwrite -- the pin below is only flipped to
+    // this `version` after quorum, so until (and unless) that happens, a
+    // reader still using the *old* pin keeps reading the old version's
+    // shards, completely untouched by this write, however it turns out.
+    let version = new_version_id();
+    let wire_key = versioned_key(&key, &version);
+
     let t0 = std::time::Instant::now();
     let puts = chosen
         .iter()
@@ -384,9 +423,9 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         .map(|(idx, (peer, shard))| {
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.clone();
-            let key = key.clone();
+            let wire_key = wire_key.clone();
             async move {
-                let res = client.put_shard(&peer, &bucket, &key, idx, shard).await;
+                let res = client.put_shard(&peer, &bucket, &wire_key, idx, shard).await;
                 if let Err(ref e) = res {
                     warn!("put_shard idx={idx} peer={peer} failed: {e}");
                 }
@@ -419,6 +458,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         k,
         m,
         original_len: encoded.original_len,
+        version,
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
@@ -439,12 +479,26 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // overhead cross the threshold this time where it didn't before. GET
     // checks `content_location_store` first, so if that stale record is
     // left in place a client could PUT successfully here and still read
-    // back the *old* packed bytes on the next GET. Clear it, best-effort:
-    // a plain PUT having already satisfied its own quorum is the operation
-    // that should be considered to have succeeded either way.
-    if state.content_location_store.get(&bucket, &key).is_some() {
-        let _ = state.content_location_store.delete(&bucket, &key);
-        replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    // back the *old* packed bytes on the next GET.
+    //
+    // Broadcast this tombstone unconditionally, not gated on a local
+    // `.is_some()` check: this *coordinator* only needed quorum to receive
+    // the original packed pin, not all of it, so it may have no local copy
+    // even though other peers still do. Skipping the broadcast on a local
+    // miss would leave those other peers serving stale packed bytes
+    // forever. Delete is idempotent on a receiver that has nothing to
+    // delete, so there's no cost to always sending it (see issue #153 and
+    // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
+    // every other write here: a PUT that can't confirm the stale pin was
+    // actually cleared cluster-wide is treated as not fully succeeded.
+    let _ = state.content_location_store.delete(&bucket, &key);
+    let cleanup_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    if cleanup_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
+             {cleanup_acked}/{required_acks} peers acknowledged the tombstone (a GET on an unacknowledged \
+             peer may still return the old packed bytes)"
+        )));
     }
 
     state.timing.total.record(request_start.elapsed());
@@ -497,11 +551,15 @@ pub async fn cluster_get_object(
         let range_result = parse_range_header(&req, total_len);
         return match range_result {
             RangeResult::Valid(start, end) => {
+                let has_sparse_gaps = record.has_sparse_gaps;
                 let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
-                Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
-                    .insert_header(("Accept-Ranges", "bytes"))
-                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
-                    .body(data))
+                let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
+                resp.insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")));
+                if has_sparse_gaps {
+                    resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
+                }
+                Ok(resp.body(data))
             }
             RangeResult::Unsatisfiable => Err(
                 actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
@@ -525,6 +583,16 @@ pub async fn cluster_get_object(
         .ok_or_else(|| ErrorNotFound("object not found"))?;
     let total_len = record.original_len as u64;
 
+    // #151: an empty `version` means this pin predates the field
+    // (`#[serde(default)]`) -- its shards are at the old, unversioned
+    // `shard_key(bucket, key, idx)`, so fetch with the bare key in that
+    // case rather than a `versioned_key` that was never written.
+    let wire_key = if record.version.is_empty() {
+        key.clone()
+    } else {
+        versioned_key(&key, &record.version)
+    };
+
     // No sub-object structure to be selective about here: a Range request
     // still requires a full fan-out and full EC decode, then an in-memory
     // slice. This is the expected, unoptimized baseline a Range-GET demo
@@ -532,9 +600,9 @@ pub async fn cluster_get_object(
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = bucket.clone();
-        let key = key.clone();
+        let wire_key = wire_key.clone();
         async move {
-            match client.get_shard(&peer, &bucket, &key, idx).await {
+            match client.get_shard(&peer, &bucket, &wire_key, idx).await {
                 Ok(data) => Some((idx, data)),
                 Err(e) => {
                     warn!("get_shard idx={idx} peer={peer} failed: {e}");
@@ -619,19 +687,23 @@ pub async fn cluster_delete_object(
 
     // A key is either plain (`LocationStore`) or content-dependent/packed
     // (`ContentLocationStore`) — decided once, at PUT time, by which path
-    // handled it. DELETE used to only ever check `LocationStore`, so a
-    // packed object (which never has a `LocationStore` entry) returned 404
-    // and was never actually removed. Check both; a key can even have a
-    // *stale* entry in the other store left over from an earlier overwrite
-    // that changed which path it took (see `put_object_plain`'s and
-    // `put_object_content_dependent`'s overwrite handling) — clear both
-    // unconditionally rather than assuming only one is ever present.
+    // handled it. A key can even have a *stale* entry in the other store
+    // left over from an earlier overwrite that changed which path it took
+    // (see `put_object_plain`'s and `put_object_content_dependent`'s
+    // overwrite handling).
     let plain_record = state.location_store.get(&bucket, &key);
     let packed_record = state.content_location_store.get(&bucket, &key);
 
-    if plain_record.is_none() && packed_record.is_none() {
-        return Ok(HttpResponse::NotFound().finish());
-    }
+    // Deliberately *not* a 404 short-circuit when both are locally absent:
+    // this coordinator only needed quorum to receive either pin, not all
+    // of it, so it can have neither locally while the object is still
+    // genuinely readable from other peers. Returning 404 here would leave
+    // those peers' copies untouched forever. Broadcast both tombstones
+    // unconditionally below instead (idempotent on a receiver with
+    // nothing to delete) and let that be authoritative, the same fix
+    // applied to the overwrite-cleanup paths above (see issue #153).
+    // Matches real S3 semantics too: DELETE is idempotent, not an error on
+    // a key that doesn't exist.
 
     // Object lock enforcement: one record, one lookup, no distributed lock
     // manager (see location_store.rs and the architecture doc). Retention
@@ -661,23 +733,25 @@ pub async fn cluster_delete_object(
     // hold a shard).
     let peers = state.membership.peers();
 
-    if let Some(record) = &plain_record {
-        let required_acks = required_write_acks(record.k, record.m);
-        let acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
-        if acked < required_acks {
-            return Err(ErrorInternalServerError(format!(
-                "tombstone quorum not met: {acked}/{required_acks} peers removed the placement record"
-            )));
-        }
-    }
-    if let Some(record) = &packed_record {
-        let required_acks = required_write_acks(record.k, record.m);
-        let acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
-        if acked < required_acks {
-            return Err(ErrorInternalServerError(format!(
-                "tombstone quorum not met: {acked}/{required_acks} peers removed the content-dependent placement record"
-            )));
-        }
+    // k/m for the quorum-ack threshold: whichever record this node
+    // happens to have locally (either is fine, they're cluster-wide
+    // constants in practice), falling back to this node's own default if
+    // it has neither locally, same fallback `put_object_plain` uses to
+    // size a fresh write.
+    let (k, m) = plain_record
+        .as_ref()
+        .map(|r| (r.k, r.m))
+        .or_else(|| packed_record.as_ref().map(|r| (r.k, r.m)))
+        .unwrap_or_else(|| (state.ec.k(), state.ec.m()));
+    let required_acks = required_write_acks(k, m);
+
+    let plain_acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
+    let packed_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    if plain_acked < required_acks || packed_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "tombstone quorum not met: plain {plain_acked}/{required_acks}, \
+             packed {packed_acked}/{required_acks} peers acknowledged"
+        )));
     }
 
     Ok(HttpResponse::Ok().finish())
@@ -714,11 +788,24 @@ pub async fn cluster_put_retention(
     record.retain_until = Some(body.retain_until.clone());
     record.legal_hold = body.legal_hold;
 
-    let required_acks = required_write_acks(record.k, record.m);
-    let acked = replicate_location_put(&state, &record, &record.shard_peers.clone()).await;
-    if acked < required_acks {
+    // #156 (point 2): this used to replicate only to `record.shard_peers`
+    // (a quorum subset) -- but cluster_delete_object enforces retention by
+    // checking whatever plain record *this* coordinator happens to have
+    // locally, and any peer can end up coordinating a DELETE, not just
+    // shard holders. A peer outside `shard_peers` that received the
+    // object's original PUT (which does replicate to every peer, see
+    // put_object_plain) kept its stale, pre-lock copy of the record
+    // forever, so a DELETE routed through it saw no retention_mode at all
+    // and succeeded. Replicating to every peer, and requiring every peer
+    // to ack -- same reasoning and same pattern as
+    // cluster_put_bucket_config just above: this is a fact every
+    // coordinator must agree on, not a write quorum is enough for.
+    let peers = state.membership.peers();
+    let acked = replicate_location_put(&state, &record, &peers).await;
+    if acked < peers.len() {
         return Err(ErrorInternalServerError(format!(
-            "retention update quorum not met: {acked}/{required_acks} peers updated the record"
+            "retention update requires every peer to ack: {acked}/{} acknowledged",
+            peers.len()
         )));
     }
 
@@ -817,12 +904,31 @@ pub async fn cluster_internal_put_location(
     Ok(HttpResponse::Ok().finish())
 }
 
+/// `(bucket, key)` for the internal tombstone-replication endpoints,
+/// sent as a JSON body rather than URL path segments (#149): actix-web
+/// fully percent-*decodes* path parameters, so a key containing `?`,
+/// `#`, or `%` that was embedded unencoded into a path (as this used to
+/// be, via `format!(".../{bucket}/{key}")`) could be reinterpreted as a
+/// query string, a fragment, or a different literal byte sequence by
+/// the time it reached the handler -- silently deleting the pin for a
+/// *different* key than the one that was actually meant. A JSON body
+/// has no such reinterpretation step; this is exactly the same
+/// path-vs-body choice the PUT side of both these stores already made
+/// (`cluster_internal_put_location`/`_content_location` take
+/// `web::Json<LocationRecord>`/`<ContentDependentRecord>`, never a path
+/// param), just applied consistently to DELETE too.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteKeyRequest {
+    pub bucket: String,
+    pub key: String,
+}
+
 /// Receiving side of tombstone replication.
 pub async fn cluster_internal_delete_location(
-    path: web::Path<(String, String)>,
+    body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let (bucket, key) = path.into_inner();
+    let DeleteKeyRequest { bucket, key } = body.into_inner();
     state
         .location_store
         .delete(&bucket, &key)
@@ -833,10 +939,10 @@ pub async fn cluster_internal_delete_location(
 /// Receiving side of content-location tombstone replication — the
 /// multi-stripe counterpart to `cluster_internal_delete_location` above.
 pub async fn cluster_internal_delete_content_location(
-    path: web::Path<(String, String)>,
+    body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let (bucket, key) = path.into_inner();
+    let DeleteKeyRequest { bucket, key } = body.into_inner();
     state
         .content_location_store
         .delete(&bucket, &key)
@@ -876,5 +982,21 @@ mod tests {
         assert_eq!(required_write_acks(9, 6), 9);
         assert_eq!(required_write_acks(4, 4), 5);
         assert_eq!(required_write_acks(4, 2), 4);
+    }
+
+    /// #149: `replicate_location_delete`/`replicate_content_location_delete`
+    /// now send `(bucket, key)` as this JSON body instead of interpolating
+    /// them into a URL path, specifically so a key containing `?`, `#`,
+    /// `%`, space, or `/` reaches the receiving peer's handler as the
+    /// exact bytes the client meant -- a JSON string has no character
+    /// that a URL parser would ever reinterpret as a delimiter.
+    #[test]
+    fn delete_key_request_round_trips_keys_with_url_special_characters() {
+        for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
+            let req = DeleteKeyRequest { bucket: "b".to_string(), key: key.to_string() };
+            let json = serde_json::to_string(&req).unwrap();
+            let decoded: DeleteKeyRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.key, key, "round-trip mismatch for key {key:?}");
+        }
     }
 }

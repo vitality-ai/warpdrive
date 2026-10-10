@@ -61,15 +61,35 @@ pub struct ShardServiceImpl;
 impl ShardService for ShardServiceImpl {
     async fn put_shard(&self, request: Request<PutShardRequest>) -> Result<Response<PutShardResponse>, Status> {
         let req = request.into_inner();
-        store_shard(&req.bucket, &req.key, req.shard_idx as usize, &req.data)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // #161: store_shard/load_shard do synchronous file I/O plus a
+        // Bitcask log append (write lock + writeln! + flush). Calling
+        // them directly inside this async fn runs that blocking work on
+        // a tokio worker thread, stalling every *other* request that
+        // thread could otherwise be servicing for the duration of the
+        // disk I/O -- exactly the kind of thing that caps throughput
+        // below what the hardware can actually do under concurrent load.
+        // spawn_blocking moves it to the dedicated blocking thread pool.
+        // actix_web::Error wraps a `Box<dyn ResponseError>`, which isn't
+        // `Send` -- spawn_blocking's result must be, so the error is
+        // turned into a plain String *inside* the closure, before it
+        // ever has to cross the thread boundary.
+        tokio::task::spawn_blocking(move || {
+            store_shard(&req.bucket, &req.key, req.shard_idx as usize, &req.data).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("shard store task panicked: {e}")))?
+        .map_err(Status::internal)?;
         Ok(Response::new(PutShardResponse {}))
     }
 
     async fn get_shard(&self, request: Request<GetShardRequest>) -> Result<Response<GetShardResponse>, Status> {
         let req = request.into_inner();
-        let data = load_shard(&req.bucket, &req.key, req.shard_idx as usize)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+        let data = tokio::task::spawn_blocking(move || {
+            load_shard(&req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("shard load task panicked: {e}")))?
+        .map_err(Status::not_found)?;
         Ok(Response::new(GetShardResponse { data }))
     }
 }
@@ -183,8 +203,17 @@ impl GrpcPeerClient {
             .get_or_try_init(|| async move {
                 let mut channels = Vec::with_capacity(pool_size);
                 for _ in 0..pool_size {
+                    // #162: a bare Endpoint has no connect timeout and no
+                    // per-RPC timeout. Doubly important here specifically,
+                    // since channel creation runs inside this
+                    // `OnceCell::get_or_try_init` -- a hang on the very
+                    // first connect to a black-holed peer would block
+                    // *every* concurrent caller waiting on that same
+                    // cell, not just the one that triggered it.
                     let endpoint_obj = Endpoint::from_shared(endpoint_for_init.clone())
-                        .map_err(|e| ErrorBadGateway(format!("invalid gRPC endpoint {endpoint_for_init}: {e}")))?;
+                        .map_err(|e| ErrorBadGateway(format!("invalid gRPC endpoint {endpoint_for_init}: {e}")))?
+                        .connect_timeout(std::time::Duration::from_secs(3))
+                        .timeout(std::time::Duration::from_secs(10));
                     let connect_result = endpoint_obj.connect().await;
                     let channel = connect_result
                         .map_err(|e| ErrorBadGateway(format!("gRPC connect to {endpoint_for_init} failed: {e}")))?;
@@ -243,6 +272,14 @@ impl PeerClient for GrpcPeerClient {
             .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} failed: {e}")))?;
         Ok(resp.into_inner().data)
     }
+
+    fn max_shard_size(&self) -> Option<usize> {
+        // Leave real headroom below the hard cap for the rest of the gRPC
+        // message (the `PutShardRequest`'s other fields, protobuf framing)
+        // rather than exactly matching `grpc_max_message_size()` and
+        // tripping the limit on a shard that's merely close to it.
+        Some(grpc_max_message_size().saturating_sub(4096))
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +296,21 @@ mod tests {
             grpc_endpoint_for("http://127.0.0.1:9710/").unwrap(),
             "http://127.0.0.1:10710"
         );
+    }
+
+    /// #159: the whole point of `max_shard_size` is that a caller can check
+    /// *before* encoding/sending anything, so it has to report a real,
+    /// finite number by default, not `None` (which would make the check in
+    /// `coordinator.rs`/`packed.rs` a silent no-op on the default transport).
+    /// Doesn't assert the exact default (another test running in the same
+    /// process could have already set `WARPDRIVE_GRPC_MAX_MESSAGE_SIZE`) —
+    /// only the invariant that actually matters: comfortably under the raw
+    /// `grpc_max_message_size()`, never over it.
+    #[test]
+    fn max_shard_size_leaves_headroom_under_the_raw_grpc_limit() {
+        let client = GrpcPeerClient::new();
+        let reported = client.max_shard_size().expect("gRPC transport must report a finite shard-size cap");
+        assert!(reported < grpc_max_message_size());
+        assert_eq!(reported, grpc_max_message_size() - 4096);
     }
 }

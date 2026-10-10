@@ -3062,6 +3062,7 @@ dependencies = [
  "log-mdc",
  "log4rs",
  "md5",
+ "percent-encoding",
  "prost",
  "protoc-bin-vendored",
  "reed-solomon-erasure",

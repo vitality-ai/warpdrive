@@ -83,7 +83,18 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             BitcaskLocationStore::open(&location_log).expect("failed to open location store log"),
         ),
         peer_client: peer_client_from_env(),
-        location_http: reqwest::Client::new(),
+        // Used for pin/tombstone replication to *every* peer and for
+        // pushdown forwarding (#162): a default reqwest::Client has no
+        // timeout at all, so one unreachable or black-holed peer could
+        // stall every PUT/DELETE/pushdown-query in the cluster
+        // indefinitely. 10s is generous for a same-datacenter metadata
+        // call; a hung peer now fails that one request instead of
+        // hanging the coordinator forever.
+        location_http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("failed to build location_http client"),
         timing: Arc::new(warp_drive::cluster::timing_stats::TimingStats::default()),
         // Registry, not a single packer: a bucket's config (bucket_config.rs)
         // names which entry to use. "fac" is the one shipped implementation;
@@ -189,8 +200,8 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
-            .route("/cluster/_internal/location/{bucket}/{key:.*}", web::delete().to(cluster_internal_delete_location))
-            .route("/cluster/_internal/content_location/{bucket}/{key:.*}", web::delete().to(cluster_internal_delete_content_location))
+            .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))
+            .route("/cluster/_internal/content_location", web::delete().to(cluster_internal_delete_content_location))
             .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
             .route("/cluster/_internal/bucket_config", web::post().to(cluster_internal_put_bucket_config))
             .route("/cluster/_internal/pushdown_filter", web::post().to(cluster_internal_pushdown_filter))

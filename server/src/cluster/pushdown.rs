@@ -36,8 +36,10 @@
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError, ErrorNotFound};
 use actix_web::{web, Error, HttpResponse};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Read;
 
+use super::content_location_store::UnitMeta;
 use super::coordinator::ClusterState;
 
 pub trait ColumnCodec: Send + Sync {
@@ -134,6 +136,11 @@ pub struct PushdownQueryResponse {
 pub struct PushdownFilterInternalRequest {
     pub bucket: String,
     pub key: String,
+    /// See `ContentDependentRecord::version` (#151) — the coordinator
+    /// already has the record, so it fills this in once rather than
+    /// having the peer look the record up itself just to find it.
+    #[serde(default)]
+    pub version: String,
     pub stripe_index: usize,
     pub bin_index: usize,
     pub offset_in_bin: usize,
@@ -180,7 +187,14 @@ pub async fn cluster_internal_pushdown_filter(
 ) -> Result<HttpResponse, Error> {
     let req = body.into_inner();
     let sk = super::packed::stripe_key(&req.key, req.stripe_index);
-    let raw_bin = super::shard_storage::load_shard(&req.bucket, &sk, req.bin_index)?;
+    // #151: empty `version` means the record predates the field -- read
+    // the bare (unversioned) stripe key in that case.
+    let wire_key = if req.version.is_empty() {
+        sk
+    } else {
+        super::shard_storage::versioned_key(&sk, &req.version)
+    };
+    let raw_bin = super::shard_storage::load_shard(&req.bucket, &wire_key, req.bin_index)?;
     let response = evaluate(&raw_bin, &req, &state)?;
     Ok(HttpResponse::Ok().json(response))
 }
@@ -208,10 +222,15 @@ pub async fn cluster_pushdown_query(
         .locate_unit(&body.unit_id)
         .ok_or_else(|| ErrorNotFound("unit_id not found in this object's record"))?;
 
-    let unit = record
-        .units
-        .iter()
-        .find(|u| u.unit_id == body.unit_id)
+    // Built once (#161): with a few hundred to a few thousand units,
+    // re-running `.find()` per preceding unit below (itself inside a loop
+    // over one bin's units) is O(bin_size x total_units) per query instead
+    // of O(bin_size).
+    let units_by_id: HashMap<&str, &UnitMeta> =
+        record.units.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+
+    let unit = *units_by_id
+        .get(body.unit_id.as_str())
         .expect("locate_unit found this unit_id, so it must be in record.units");
 
     // Units are stored in a bin in pack order (see StripeRecord::bins) —
@@ -224,10 +243,8 @@ pub async fn cluster_pushdown_query(
         if uid == &body.unit_id {
             break;
         }
-        let preceding = record
-            .units
-            .iter()
-            .find(|u| &u.unit_id == uid)
+        let preceding = *units_by_id
+            .get(uid.as_str())
             .ok_or_else(|| ErrorInternalServerError("unit id missing from record's unit index"))?;
         offset_in_bin += preceding.len as usize;
     }
@@ -236,6 +253,7 @@ pub async fn cluster_pushdown_query(
     let internal_req = PushdownFilterInternalRequest {
         bucket: bucket.clone(),
         key: key.clone(),
+        version: record.version.clone(),
         stripe_index: stripe_idx,
         bin_index: bin_idx,
         offset_in_bin,

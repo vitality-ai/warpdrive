@@ -15,71 +15,122 @@ use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMe
 use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
 use super::ec::ErasureCoder;
 use super::packing::Stripe;
+use super::shard_storage::{new_version_id, versioned_key};
 
-/// Generic, packer-agnostic correctness check: reconstructs what a GET
-/// would produce from `stripes`' bin layout (assuming every bin decodes
-/// back perfectly, which is EC's job, not this check's) and compares it
-/// byte-for-byte against the real `body`, entirely in memory, before a
-/// single byte is written to the network. Deliberately generic rather than
-/// bespoke per-algorithm validation (checking "did FacPacker's greedy loop
-/// run correctly," say): any `StripePacker` bug — a dropped unit, a
-/// duplicated unit, a unit assigned to the wrong offset — corrupts the
-/// reconstructed object the same way regardless of which packer produced
-/// it, so one mechanism catches all of them. `unpadded_bins` is each
-/// stripe's bins *before* padding to `stripe.capacity`, i.e. exactly the
-/// concatenated unit bytes that went in.
+/// True if `units`' declared byte ranges leave any gap in `[0, body_len)`.
+/// Sorts by offset and walks the ranges once: a gap exists wherever the
+/// next unit's offset is past where coverage has reached so far (either
+/// at the very start, between two units, or after the last one).
+/// `verify_stripes_reconstruct_original` already confirmed every declared
+/// unit occurs exactly once and matches the body, so this only has to
+/// detect what was never declared at all -- not re-check anything that
+/// function already covers.
+fn has_coverage_gaps(units: &[UnitMeta], body_len: usize) -> bool {
+    let mut ranges: Vec<(u64, u64)> = units.iter().map(|u| (u.offset, u.offset + u.len)).collect();
+    ranges.sort_unstable();
+    let mut covered_to = 0u64;
+    for (start, end) in ranges {
+        if start > covered_to {
+            return true;
+        }
+        covered_to = covered_to.max(end);
+    }
+    covered_to < body_len as u64
+}
+
+/// Generic, packer-agnostic correctness check: for every unit the caller
+/// declared in `units_header`, confirms it was packed into exactly one bin
+/// (not zero -- dropped; not more than one -- duplicated) and that the
+/// bytes that bin holds for it match the original object exactly. Any
+/// `StripePacker` bug -- a dropped unit, a duplicated unit, a unit
+/// assigned to the wrong offset -- corrupts the reconstructed object the
+/// same way regardless of which packer produced it, so one mechanism
+/// catches all of them, without being a bespoke check of any one
+/// algorithm's own logic. `unpadded_bins` is each stripe's bins *before*
+/// padding to `stripe.capacity`, i.e. exactly the concatenated unit bytes
+/// that went in.
+///
+/// Deliberately checks per-*unit* occurrence, not whole-*body* byte
+/// coverage: an earlier version required every single byte of the
+/// original object to be covered by some unit, which is wrong whenever a
+/// caller's own `units_header` is legitimately sparse (e.g. row groups
+/// only, no header/footer framing unit) -- that's the caller's choice,
+/// not a packer bug, and the read path already tolerates it by zero-
+/// filling gaps. This version only requires that whatever units the
+/// caller *did* declare are each packed exactly once, correctly. As a
+/// side effect this also catches two declared units whose byte ranges
+/// overlap each other landing in different bins with conflicting content
+/// (the previous coverage-bitmap version silently accepted that), and
+/// it's O(units) extra memory instead of O(body bytes) for the tracking
+/// structure, which matters once an object has a several-hundred-MB body
+/// but only a few hundred units (a real Parquet file, see
+/// parquet_real_offsets.py).
 fn verify_stripes_reconstruct_original(
     body: &[u8],
     units_header: &[UnitMeta],
     stripes: &[Stripe],
     unpadded_bins: &[Vec<Vec<u8>>],
 ) -> Result<(), Error> {
-    let mut output = vec![0u8; body.len()];
-    let mut covered = vec![false; body.len()];
+    let units_by_id: HashMap<&str, &UnitMeta> =
+        units_header.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+    let mut occurrences: HashMap<&str, u32> = units_header.iter().map(|u| (u.unit_id.as_str(), 0)).collect();
 
     for (stripe, bins) in stripes.iter().zip(unpadded_bins.iter()) {
         for (unit_ids, bin_bytes) in stripe.bins.iter().zip(bins.iter()) {
             let mut pos = 0usize;
             for uid in unit_ids {
-                let unit = units_header
-                    .iter()
-                    .find(|u| &u.unit_id == uid)
+                let unit = *units_by_id
+                    .get(uid.as_str())
                     .ok_or_else(|| ErrorInternalServerError("packer returned an unknown unit id"))?;
                 let (start, len) = (unit.offset as usize, unit.len as usize);
                 let end = start + len;
-                output
-                    .get_mut(start..end)
-                    .ok_or_else(|| ErrorInternalServerError("packed unit out of bounds of the original object"))?
-                    .copy_from_slice(
-                        bin_bytes
-                            .get(pos..pos + len)
-                            .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?,
-                    );
-                for c in &mut covered[start..end] {
-                    *c = true;
+                let original = body
+                    .get(start..end)
+                    .ok_or_else(|| ErrorInternalServerError("packed unit out of bounds of the original object"))?;
+                let packed = bin_bytes
+                    .get(pos..pos + len)
+                    .ok_or_else(|| ErrorInternalServerError("bin too short for its own unit index"))?;
+                if original != packed {
+                    return Err(ErrorInternalServerError(
+                        "content-dependent checksum failed: a packed unit's bytes do not match the original object",
+                    ));
                 }
+                *occurrences.get_mut(uid.as_str()).unwrap() += 1;
                 pos += len;
             }
         }
     }
 
-    if covered.iter().any(|c| !c) {
-        return Err(ErrorInternalServerError(
-            "content-dependent checksum failed: packer did not cover every byte of the object exactly once",
-        ));
-    }
-    if output != body {
-        return Err(ErrorInternalServerError(
-            "content-dependent checksum failed: packed stripes do not reconstruct the original object exactly",
-        ));
+    if let Some((bad_id, &count)) = occurrences.iter().find(|(_, &count)| count != 1) {
+        return Err(ErrorInternalServerError(format!(
+            "content-dependent checksum failed: unit {bad_id} appears {count} times across the packer's stripes (expected exactly 1)"
+        )));
     }
     Ok(())
 }
 
 /// Also used by `pushdown.rs`'s peer-local filter handler, which needs to
 /// read exactly the same shard key a stripe's bins were stored under.
+///
+/// Leads with a literal NUL byte: real object keys arrive as HTTP URL
+/// path segments (`/cluster/{bucket}/{key:.*}`), where a raw NUL can't
+/// appear, so no plain object's key can ever start with one -- `coordinator.rs`'s
+/// `cluster_put_object` also rejects any key containing `\0` outright as
+/// of #150, closing the only way a crafted key could get this far with
+/// one anyway. `key` is then length-prefixed, pinning its exact
+/// boundary regardless of its content, and `stripe_index` -- a plain
+/// decimal, never containing `:` -- is the final field, so this is
+/// injective over `(key, stripe_index)` the same way `shard_key` is over
+/// `(bucket, key, shard_idx)`.
+///
+/// Previously `format!("{key}__cdstripe{stripe_index}")`: a *plain*
+/// object literally named e.g. `foo__cdstripe0` produced the exact same
+/// flattened string as stripe 0 of a *packed* object named `foo`, so
+/// writing either one silently overwrote the other's shard-location
+/// pointer (#150's second collision scenario -- plain vs. packed, not
+/// just bucket/key splitting).
 pub(crate) fn stripe_key(key: &str, stripe_index: usize) -> String {
-    format!("{key}__cdstripe{stripe_index}")
+    format!("\0cdstripe:{}:{key}:{stripe_index}", key.len())
 }
 
 /// `stripes` is computed by the caller (`coordinator.rs`'s dispatch), which
@@ -114,6 +165,29 @@ pub async fn put_object_content_dependent(
 
     let required_acks = required_write_acks(k, m);
 
+    // #159, same reasoning as `put_object_plain`'s matching check: every
+    // shard sent for a stripe is exactly `stripe.capacity` bytes (bins are
+    // padded to it before `encode_shards`), so this is checkable before any
+    // stripe's bytes are built or any peer is contacted — one clear error
+    // instead of a late, unexplained per-stripe write-quorum failure after
+    // earlier stripes already succeeded.
+    if let Some(max) = state.peer_client.max_shard_size() {
+        if let Some(oversized) = stripes.iter().map(|s| s.capacity).max().filter(|&cap| cap > max) {
+            return Err(actix_web::error::ErrorPayloadTooLarge(format!(
+                "object too large for RS({k},{m}) under this packing: a stripe's shard would be \
+                 {oversized} bytes, over this transport's {max}-byte limit (raise \
+                 WARPDRIVE_GRPC_MAX_MESSAGE_SIZE, or switch WARPDRIVE_PEER_TRANSPORT to http/tcp)"
+            )));
+        }
+    }
+
+    // Built once, not re-scanned per unit (#161): with a few hundred to a
+    // few thousand units (a real Parquet file's column chunks, or an IVF
+    // index's partitions), an `.iter().find()` per unit inside these
+    // nested loops is O(units) work for *each* unit, O(units^2) overall.
+    let units_by_id: HashMap<&str, &UnitMeta> =
+        units_header.iter().map(|u| (u.unit_id.as_str(), u)).collect();
+
     // Build every stripe's bins *unpadded* first (the exact bytes a GET's
     // reassembly expects to get back out), and verify the whole set
     // reconstructs `body` byte-for-byte before any network call happens —
@@ -125,9 +199,8 @@ pub async fn put_object_content_dependent(
         for bin_unit_ids in &stripe.bins {
             let mut buf = Vec::new();
             for uid in bin_unit_ids {
-                let unit = units_header
-                    .iter()
-                    .find(|u| &u.unit_id == uid)
+                let unit = *units_by_id
+                    .get(uid.as_str())
                     .ok_or_else(|| ErrorInternalServerError("packer returned an unknown unit id"))?;
                 let (start, end) = (unit.offset as usize, (unit.offset + unit.len) as usize);
                 buf.extend_from_slice(
@@ -140,6 +213,30 @@ pub async fn put_object_content_dependent(
         unpadded_bins.push(bins_bytes);
     }
     verify_stripes_reconstruct_original(body, units_header, &stripes, &unpadded_bins)?;
+
+    // Not rejected (see `has_coverage_gaps`'s doc for why sparse coverage
+    // is a legitimate caller choice, not always a bug) -- but not silent
+    // either: a GET of an object with a gap returns 200 with the gap
+    // zero-filled, indistinguishable from a healthy object unless this is
+    // surfaced somewhere. Logged here, and carried on the record so every
+    // GET response can set `X-Warpd-Sparse-Coverage` (see
+    // get_object_content_dependent and get_object_content_dependent_range).
+    let has_sparse_gaps = has_coverage_gaps(units_header, body.len());
+    if has_sparse_gaps {
+        log::warn!(
+            "bucket={bucket} key={key} content-dependent PUT accepted with sparse unit coverage \
+             (declared units don't cover every byte of the body) -- GETs of this object will \
+             zero-fill the gaps and carry X-Warpd-Sparse-Coverage: true"
+        );
+    }
+
+    // #151, same reasoning and same mechanism as `put_object_plain`'s:
+    // every version of this object writes its stripes' shards under a
+    // brand new key, never overwriting a previous version's shards in
+    // place. One version id for the *whole* object (shared by every
+    // stripe), not one per stripe -- a reader always resolves every
+    // stripe's wire key from this same single `record.version`.
+    let version = new_version_id();
 
     let mut stripe_records = Vec::with_capacity(stripes.len());
 
@@ -154,14 +251,20 @@ pub async fn put_object_content_dependent(
             .encode_shards(bins_bytes)
             .map_err(|e| ErrorInternalServerError(e.to_string()))?;
 
+        // Placement itself stays keyed on the plain (unversioned) stripe
+        // key, same as `put_object_plain` keeps placement keyed on the
+        // plain object key: which peers a stripe maps to shouldn't churn
+        // on every overwrite, only the wire key identifying *which*
+        // version's bytes are being read or written at those peers.
         let sk = stripe_key(key, stripe_index);
         let chosen = state.placement.place(bucket, &sk, &peers, k, m);
+        let wire_key = versioned_key(&sk, &version);
 
         let puts = chosen.iter().cloned().zip(all_shards).enumerate().map(|(idx, (peer, shard))| {
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.to_string();
-            let sk = sk.clone();
-            async move { client.put_shard(&peer, &bucket, &sk, idx, shard).await }
+            let wire_key = wire_key.clone();
+            async move { client.put_shard(&peer, &bucket, &wire_key, idx, shard).await }
         });
         let results = join_all(puts).await;
         let acked = results.iter().filter(|r| r.is_ok()).count();
@@ -186,6 +289,8 @@ pub async fn put_object_content_dependent(
         original_len: body.len(),
         units: units_header.to_vec(),
         stripes: stripe_records,
+        version,
+        has_sparse_gaps,
     };
 
     // Replicate to *every* known peer, not just the union of this object's
@@ -208,15 +313,19 @@ pub async fn put_object_content_dependent(
         )));
     }
 
-    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup:
-    // this key may have previously been written plain (e.g. this bucket's
-    // packer/threshold changed, or this particular object's overhead
-    // crossed back under the threshold this time). Clear any stale
-    // `LocationStore` entry so a plain GET path never shadows this fresher
-    // packed write.
-    if state.location_store.get(bucket, key).is_some() {
-        let _ = state.location_store.delete(bucket, key);
-        replicate_location_delete(state, bucket, key, &peers).await;
+    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup,
+    // and the same unconditional-broadcast fix: this *coordinator* only
+    // needed quorum to receive the original plain pin, so it may have no
+    // local copy even though other peers still do. Don't gate the
+    // tombstone broadcast on a local `.is_some()` check (see issue #153).
+    let _ = state.location_store.delete(bucket, key);
+    let cleanup_acked = replicate_location_delete(state, bucket, key, &peers).await;
+    if cleanup_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "wrote the new object, but could not confirm the stale plain pin was cleared cluster-wide: \
+             {cleanup_acked}/{required_acks} peers acknowledged the tombstone (a GET on an unacknowledged \
+             peer may still return the old plain bytes)"
+        )));
     }
 
     Ok(HttpResponse::Ok().finish())
@@ -233,13 +342,21 @@ async fn fetch_and_decode_stripe(
     state: &ClusterState,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let sk = stripe_key(&record.key, stripe_index);
+    // #151: empty `version` means this pin predates the field -- fetch
+    // with the bare (unversioned) stripe key in that case, same fallback
+    // as `cluster_get_object`'s plain path.
+    let wire_key = if record.version.is_empty() {
+        sk
+    } else {
+        versioned_key(&sk, &record.version)
+    };
 
     let t_fetch_start = std::time::Instant::now();
     let gets = stripe.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = record.bucket.clone();
-        let sk = sk.clone();
-        async move { client.get_shard(&peer, &bucket, &sk, idx).await.ok().map(|d| (idx, d)) }
+        let wire_key = wire_key.clone();
+        async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
     });
     let results = join_all(gets).await;
     let fetch_ms = t_fetch_start.elapsed().as_secs_f64() * 1000.0;
@@ -272,8 +389,25 @@ pub async fn get_object_content_dependent(record: ContentDependentRecord, state:
     let units_by_id: HashMap<&str, (u64, u64)> =
         record.units.iter().map(|u| (u.unit_id.as_str(), (u.offset, u.len))).collect();
 
-    for (stripe_index, stripe) in record.stripes.iter().enumerate() {
-        let bins = fetch_and_decode_stripe(&record, stripe_index, stripe, state).await?;
+    // Fetch every stripe concurrently, not one at a time: the Range-GET
+    // path below already learned this lesson (see its own comment, a
+    // real IVF query touched up to 54 of 95 stripes and paid 54
+    // sequential round trips before being fixed). A whole-object GET
+    // touches *every* stripe by definition, so it pays this cost on
+    // every single request, not just a rare wide query, making this the
+    // more important of the two paths to fix.
+    let stripe_fetches = record.stripes.iter().enumerate().map(|(stripe_index, stripe)| {
+        let record_ref = &record;
+        async move {
+            fetch_and_decode_stripe(record_ref, stripe_index, stripe, state)
+                .await
+                .map(|bins| (stripe_index, bins))
+        }
+    });
+    let fetched: Vec<(usize, Vec<Vec<u8>>)> = futures::future::try_join_all(stripe_fetches).await?;
+
+    for (stripe_index, bins) in fetched {
+        let stripe = &record.stripes[stripe_index];
 
         for (bin_idx, unit_ids) in stripe.bins.iter().enumerate() {
             let bin_bytes = &bins[bin_idx];
@@ -297,7 +431,11 @@ pub async fn get_object_content_dependent(record: ContentDependentRecord, state:
         }
     }
 
-    Ok(HttpResponse::Ok().body(output))
+    let mut response = HttpResponse::Ok();
+    if record.has_sparse_gaps {
+        response.insert_header(("X-Warpd-Sparse-Coverage", "true"));
+    }
+    Ok(response.body(output))
 }
 
 /// Range-GET for a content-dependent object: `start`/`end` are inclusive
@@ -451,5 +589,109 @@ mod checksum_tests {
 
         let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn verify_allows_a_sparse_units_header_that_does_not_cover_the_whole_body() {
+        // body is 10 bytes, but the caller only declared a unit for the
+        // first 5 -- legitimate (row groups only, no header/footer framing
+        // unit), not a packer bug. The read path already zero-fills the
+        // uncovered tail; this check must not reject it.
+        let body = b"helloworld".to_vec();
+        let units = vec![unit("u0", 0, 5)];
+        let stripes = vec![Stripe { bins: vec![vec!["u0".to_string()]], capacity: 5 }];
+        let bins = vec![vec![b"hello".to_vec()]];
+
+        assert!(verify_stripes_reconstruct_original(&body, &units, &stripes, &bins).is_ok());
+    }
+
+    #[test]
+    fn verify_fails_when_a_unit_is_packed_into_more_than_one_bin() {
+        let body = b"helloworld".to_vec();
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        // u0 duplicated into both bins of a two-bin stripe; u1 never
+        // packed at all. Byte content is "correct" everywhere it was
+        // written, so a whole-body coverage/equality check alone can miss
+        // this -- only counting occurrences per declared unit catches it.
+        let stripes = vec![stripe_two_bins()];
+        let bins = vec![vec![b"hello".to_vec(), b"hello".to_vec()]];
+
+        let err = verify_stripes_reconstruct_original(&body, &units, &stripes, &bins);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_false_for_full_coverage() {
+        let units = vec![unit("u0", 0, 5), unit("u1", 5, 5)];
+        assert!(!has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_true_for_a_gap_at_the_end() {
+        // Same case verify_allows_a_sparse_units_header_... accepts as
+        // legitimate -- this is what makes that acceptance observable.
+        let units = vec![unit("u0", 0, 5)];
+        assert!(has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_true_for_a_gap_in_the_middle() {
+        let units = vec![unit("u0", 0, 3), unit("u1", 7, 3)];
+        assert!(has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_true_for_a_gap_at_the_start() {
+        let units = vec![unit("u0", 2, 8)];
+        assert!(has_coverage_gaps(&units, 10));
+    }
+
+    #[test]
+    fn has_coverage_gaps_is_false_when_units_are_declared_out_of_order() {
+        // Caller order isn't guaranteed to match offset order; the check
+        // sorts internally rather than assuming it.
+        let units = vec![unit("u1", 5, 5), unit("u0", 0, 5)];
+        assert!(!has_coverage_gaps(&units, 10));
+    }
+}
+
+#[cfg(test)]
+mod stripe_key_tests {
+    use super::*;
+
+    /// #150's "plain vs packed" collision: a plain object literally named
+    /// `foo\0cdstripe:3:foo:0` (what `stripe_key("foo", 0)` used to
+    /// produce before the `\0` prefix) must not collide with stripe 0 of
+    /// a packed object named `foo`. More generally, nothing in the plain
+    /// key namespace (no leading NUL byte, enforced by
+    /// `coordinator.rs::cluster_put_object`) can ever equal any
+    /// `stripe_key` output, since every `stripe_key` output starts with
+    /// one.
+    #[test]
+    fn stripe_key_output_always_starts_with_a_nul_byte() {
+        assert!(stripe_key("foo", 0).starts_with('\0'));
+        assert!(stripe_key("", 0).starts_with('\0'));
+        assert!(stripe_key("foo__cdstripe0", 1).starts_with('\0'));
+    }
+
+    #[test]
+    fn stripe_key_is_injective_over_key_and_stripe_index() {
+        let cases: &[(&str, usize)] = &[
+            ("foo", 0),
+            ("foo", 1),
+            ("foo", 10),
+            ("fo", 10),
+            ("foo:1", 0),
+            ("foo:10", 0),
+        ];
+        for (i, &(k1, s1)) in cases.iter().enumerate() {
+            for &(k2, s2) in &cases[i + 1..] {
+                assert_ne!(
+                    stripe_key(k1, s1),
+                    stripe_key(k2, s2),
+                    "collision between ({k1:?},{s1}) and ({k2:?},{s2})"
+                );
+            }
+        }
     }
 }
