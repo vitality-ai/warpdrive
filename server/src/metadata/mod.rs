@@ -222,6 +222,12 @@ pub trait MetadataStorage: Send + Sync {
     fn get_object_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<Metadata, Error>;
     /// Returns the last_modified of the is_latest=1 row, including delete markers.
     fn get_latest_last_modified(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error>;
+    /// Returns `(version_id, is_delete_marker)` of the is_latest=1 row, including
+    /// delete markers -- unlike `get_metadata`, which maps a delete-marker-current
+    /// key to a plain not-found error with no way to recover its version_id, this
+    /// is what a HEAD/GET on such a key needs to echo `x-amz-delete-marker: true`
+    /// (and the marker's own version id) on its 404, matching real S3.
+    fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error>;
     fn list_object_versions_full(
         &self, user_id: &str, bucket: &str,
         prefix: &str, key_marker: &str, version_id_marker: &str, max_keys: usize,

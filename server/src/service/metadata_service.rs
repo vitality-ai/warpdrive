@@ -210,6 +210,12 @@ impl MetadataService {
         self.store.get_latest_last_modified(&self.user, bucket, key)
     }
 
+    /// Returns `(version_id, is_delete_marker)` of the is_latest=1 row, including
+    /// delete markers.
+    pub fn get_latest_version_marker_info(&self, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
+        self.store.get_latest_version_marker_info(&self.user, bucket, key)
+    }
+
     pub fn list_object_versions_full(
         &self, bucket: &str, prefix: &str, key_marker: &str,
         version_id_marker: &str, max_keys: usize,

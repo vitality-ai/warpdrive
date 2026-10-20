@@ -363,18 +363,23 @@ pub async fn s3_get_object_handler(
     if qmap.contains_key("tagging") {
         return s3_get_object_tagging_inner(&bucket, &key, &req).await;
     }
-    // retention/legal-hold come before versionId — boto3 sends both params together
+    // retention/legal-hold/acl come before versionId — boto3 sends both
+    // params together for a versioned object's ACL
+    // (`test_versioned_object_acl`: `get_object_acl(..., VersionId=vid)`
+    // sends `?acl&versionId=X`); acl was missing from this group, so a
+    // versioned-ACL GET fell into the plain versioned-GetObject branch
+    // instead, ignoring `?acl` entirely.
     if qmap.contains_key("retention") {
         return s3_get_object_retention_inner(&bucket, &key, &req).await;
     }
     if qmap.contains_key("legal-hold") {
         return s3_get_object_legal_hold_inner(&bucket, &key, &req).await;
     }
-    if let Some(vid) = qmap.get("versionId") {
-        return s3_get_object_version_handler(&bucket, &key, vid, &req).await;
-    }
     if qmap.contains_key("acl") {
         return s3_get_object_acl_inner(&bucket, &key, &req).await;
+    }
+    if let Some(vid) = qmap.get("versionId") {
+        return s3_get_object_version_handler(&bucket, &key, vid, &req).await;
     }
     if let Some(pn_str) = qmap.get("partNumber") {
         let pn: i32 = match pn_str.parse::<i32>() {
@@ -647,8 +652,26 @@ pub async fn s3_head_object_handler(
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
     if !db.check_key(&bucket, &key)? {
-        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
-                           "The specified key does not exist", &format!("/{}/{}", bucket, key)));
+        // `check_key` excludes delete markers (a marker-current key doesn't
+        // "exist" for a plain GET/HEAD) -- but real S3 still echoes
+        // `x-amz-delete-marker: true` (and the marker's own version id) on
+        // that 404, so a client can tell "deleted via a marker, older
+        // versions may exist" from "never existed"
+        // (`test_delete_marker_versioned`).
+        let mut not_found = s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                                     "The specified key does not exist", &format!("/{}/{}", bucket, key));
+        if let Ok(Some((vid, true))) = db.get_latest_version_marker_info(&bucket, &key) {
+            not_found.headers_mut().insert(
+                actix_web::http::header::HeaderName::from_static("x-amz-delete-marker"),
+                actix_web::http::header::HeaderValue::from_static("true"),
+            );
+            if !vid.is_empty() {
+                if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&vid) {
+                    not_found.headers_mut().insert(actix_web::http::header::HeaderName::from_static("x-amz-version-id"), hv);
+                }
+            }
+        }
+        return Ok(not_found);
     }
 
     let meta = db.get_object_full(&bucket, &key)?;

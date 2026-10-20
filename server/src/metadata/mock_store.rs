@@ -337,6 +337,14 @@ impl MetadataStorage for MockMetadataStore {
             .and_then(|m| m.last_modified.clone()))
     }
 
+    fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
+        Ok(self.data.lock().unwrap()
+            .get(user_id)
+            .and_then(|u| u.get(bucket))
+            .and_then(|b| b.get(key))
+            .map(|m| (m.version_id.clone().unwrap_or_default(), m.is_delete_marker)))
+    }
+
     fn list_object_versions_full(
         &self, _user_id: &str, _bucket: &str,
         _prefix: &str, _key_marker: &str, _version_id_marker: &str, _max_keys: usize,

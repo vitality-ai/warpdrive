@@ -599,6 +599,10 @@ impl MetadataStorage for SQLiteMetadataStore {
         SQLiteMetadataStore::get_latest_last_modified(self, user_id, bucket, key)
     }
 
+    fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
+        SQLiteMetadataStore::get_latest_version_marker_info(self, user_id, bucket, key)
+    }
+
     fn list_object_versions_full(
         &self, user_id: &str, bucket: &str,
         prefix: &str, key_marker: &str, version_id_marker: &str, max_keys: usize,
@@ -1342,6 +1346,19 @@ impl SQLiteMetadataStore {
             |row| row.get::<_, Option<String>>(0),
         ) {
             Ok(lm) => Ok(lm),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    pub fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
+        let conn = DB_CONN.lock().unwrap();
+        match conn.query_row(
+            "SELECT version_id, is_delete_marker FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND is_latest=1",
+            params![user_id, bucket, key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+        ) {
+            Ok(info) => Ok(Some(info)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
         }

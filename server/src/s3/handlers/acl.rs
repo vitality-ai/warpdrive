@@ -374,6 +374,30 @@ pub(super) async fn s3_put_bucket_acl_inner(bucket: &str, body: &[u8], req: &Htt
 // Object ACL  GET/PUT /s3/{bucket}/{key}?acl
 // ---------------------------------------------------------------------------
 
+/// `?acl` with no `versionId` query param means "the current version" --
+/// on a versioning-enabled bucket that's a real UUID, not the empty string
+/// non-versioned objects use. Resolving it to literal `""` regardless (an
+/// earlier version of this fix did) makes a no-version-specified PUT and
+/// an explicit-current-version GET land on different rows, since the
+/// object's own real data is keyed by its real version id either way
+/// (`test_versioned_object_acl_no_version_specified`: PUT with no
+/// VersionId, then GET with the current version's id explicitly, must see
+/// the same ACL).
+fn resolve_effective_acl_version_id(db: &crate::service::metadata_service::MetadataService, bucket: &str, key: &str, req: &HttpRequest) -> String {
+    let explicit = req.query_string()
+        .split('&')
+        .find_map(|p| p.strip_prefix("versionId="))
+        .map(|v| percent_decode(v))
+        .filter(|v| v != "null");
+    if let Some(vid) = explicit {
+        return vid;
+    }
+    match db.get_latest_version_marker_info(bucket, key) {
+        Ok(Some((vid, _))) => vid,
+        _ => String::new(),
+    }
+}
+
 pub(super) async fn s3_get_object_acl_inner(bucket: &str, key: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
     use crate::s3::auth::authenticate_s3_request;
     use crate::service::metadata_service::MetadataService;
@@ -385,8 +409,9 @@ pub(super) async fn s3_get_object_acl_inner(bucket: &str, key: &str, req: &HttpR
         return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
                            "The specified key does not exist.", &format!("/{}/{}", bucket, key)));
     }
+    let version_id = resolve_effective_acl_version_id(&db, bucket, key, req);
 
-    let (owner_id, grants) = match db.get_object_acl(bucket, key, "") {
+    let (owner_id, grants) = match db.get_object_acl(bucket, key, &version_id) {
         Ok(Some((owner_id, grants_json))) => (owner_id, grants_from_json(&grants_json)),
         _ => (auth_result.user_id.clone(), expand_canned("private", &auth_result.user_id, &auth_result.owner_display_name).unwrap_or_default()),
     };
@@ -406,6 +431,7 @@ pub(super) async fn s3_put_object_acl_inner(bucket: &str, key: &str, body: &[u8]
         return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
                            "The specified key does not exist.", &format!("/{}/{}", bucket, key)));
     }
+    let version_id = resolve_effective_acl_version_id(&db, bucket, key, req);
 
     let body_str = String::from_utf8_lossy(body);
     let grants = match resolve_effective_grants(req, Some(&body_str), &auth_result.user_id, &auth_result.owner_display_name) {
@@ -414,7 +440,7 @@ pub(super) async fn s3_put_object_acl_inner(bucket: &str, key: &str, body: &[u8]
     };
     if let Err(resp) = check_block_public_acls(&db, bucket, &grants) { return Ok(resp); }
 
-    db.set_object_acl(bucket, key, "", &auth_result.user_id, &grants_to_json(&grants))?;
+    db.set_object_acl(bucket, key, &version_id, &auth_result.user_id, &grants_to_json(&grants))?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
 

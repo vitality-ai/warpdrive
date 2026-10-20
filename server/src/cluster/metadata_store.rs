@@ -240,6 +240,10 @@ impl MetadataStorage for ClusterMetadataStore {
         Err(not_supported("versioning"))
     }
 
+    fn get_latest_version_marker_info(&self, _user_id: &str, _bucket: &str, _key: &str) -> Result<Option<(String, bool)>, Error> {
+        Err(not_supported("versioning"))
+    }
+
     fn list_object_versions_full(
         &self, _user_id: &str, _bucket: &str,
         _prefix: &str, _key_marker: &str, _version_id_marker: &str, _max_keys: usize,
