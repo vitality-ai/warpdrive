@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
-use super::content_location_store::{ContentLocationStore, UnitMeta};
+use super::content_location_store::{ContentDependentRecord, ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
 use super::location_store::{LocationRecord, LocationStore, ObjectS3Metadata, UNAUTHENTICATED_USER};
 use super::membership::Membership;
@@ -58,6 +58,23 @@ pub struct ClusterState {
     /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
     /// the codec name a unit was tagged with at PUT time.
     pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
+    /// Phase 4: multipart upload bookkeeping (see `multipart_store.rs`).
+    /// Part *bytes* live in the ordinary plain EC path under a synthetic
+    /// key, fully replicated like any other object write -- this only
+    /// tracks upload/part metadata, and that metadata is **not**
+    /// replicated to peers the way every other write in this file is.
+    /// Known, bounded operational constraint, not an oversight: a real
+    /// multi-node deployment must route every request for one `upload_id`
+    /// (CreateMultipartUpload through CompleteMultipartUpload/Abort) to
+    /// the same coordinator node -- sticky routing per upload, not the
+    /// "any node can serve any request" symmetry the rest of this project
+    /// gives for free. Fails safe if violated (a misrouted request 404s
+    /// with "no such upload," it does not corrupt or silently drop data),
+    /// but it is a real gap against this project's own symmetric-design
+    /// invariant. Replicating this bookkeeping the same way
+    /// `replicate_location_put` does is future work, scoped out here for
+    /// time, not forgotten.
+    pub multipart_store: Arc<dyn super::multipart_store::MultipartStore>,
 }
 
 /// Write succeeds once this many of the `k+m` peers acknowledge: `k`, or
@@ -144,6 +161,32 @@ async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, p
                 }
                 Err(e) => {
                     warn!("location pin replication to {peer} failed: {e}");
+                    false
+                }
+            }
+        }
+    });
+    join_all(puts).await.into_iter().filter(|ok| *ok).count()
+}
+
+/// Content-dependent counterpart of `replicate_location_put` -- same
+/// reasoning, same mechanism, just the other record shape. Used by
+/// Phase 4's tagging support, which (unlike retention) applies to packed
+/// objects too.
+async fn replicate_content_location_put(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
+    let puts = peers.iter().cloned().map(|peer| {
+        let client = state.location_http.clone();
+        let record = record.clone();
+        async move {
+            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
+            match client.post(&url).json(&record).send().await {
+                Ok(r) if r.status().is_success() => true,
+                Ok(r) => {
+                    warn!("content-location pin replication to {peer} returned {}", r.status());
+                    false
+                }
+                Err(e) => {
+                    warn!("content-location pin replication to {peer} failed: {e}");
                     false
                 }
             }
@@ -611,6 +654,194 @@ async fn put_object_plain(
     Ok(HttpResponse::Ok().finish())
 }
 
+/// Fetches and EC-decodes a plain object's full bytes -- the same fetch
+/// loop `cluster_get_object_inner`'s no-range path uses, extracted so
+/// multipart completion (below) can read a part's bytes back without
+/// going through response-building. Only used for parts stored via
+/// `put_object_plain` (see `cluster_upload_part_inner`), so there's no
+/// content-dependent (packed) case to handle here.
+async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>) -> Result<Vec<u8>, Error> {
+    let record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+
+    let wire_key = if record.version.is_empty() {
+        key.to_string()
+    } else {
+        versioned_key(key, &record.version)
+    };
+
+    let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
+        let client = Arc::clone(&state.peer_client);
+        let bucket = bucket.to_string();
+        let wire_key = wire_key.clone();
+        async move { client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
+    });
+    let results = join_all(gets).await;
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; record.shard_peers.len()];
+    for (idx, data) in results.into_iter().flatten() {
+        shards[idx] = Some(data);
+    }
+    let present = shards.iter().filter(|s| s.is_some()).count();
+    if present < record.k {
+        return Err(ErrorInternalServerError(format!("read quorum not met: {present}/{} shards available", record.k)));
+    }
+    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m).map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    decoder.decode(&shards, record.original_len).map_err(|e| ErrorInternalServerError(e.to_string()))
+}
+
+/// Synthetic key for one multipart part's bytes, stored via the ordinary
+/// plain EC path. Same NUL-byte key-space-disjointness scheme as
+/// `packed.rs::stripe_key` (a real object key is rejected if it starts
+/// with `\0`, enforced in `cluster_put_object_inner`), with its own
+/// distinct literal prefix (`mpu` vs. `cdstripe`) so the two synthetic
+/// namespaces can never collide with each other either.
+fn multipart_part_key(upload_id: &str, part_number: i32) -> String {
+    format!("\0mpu:{}:{upload_id}:{part_number}", upload_id.len())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: multipart upload, authenticated-surface support functions.
+// Scope deliberately narrower than single-node's multipart (see
+// `multipart_store.rs`'s own doc): only plain (non-content-dependent)
+// final objects are supported. A content-dependent final object would
+// need re-running the packer over the reassembled bytes, which is real,
+// separate scope -- not attempted here, and not silently dropped either:
+// `cluster_complete_multipart_upload_inner` always writes a plain final
+// object, regardless of the destination bucket's packing config, and
+// says so in its own doc.
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn cluster_create_multipart_upload_inner(
+    user_id: &str, bucket: &str, key: &str, content_type: Option<String>, user_metadata: HashMap<String, String>,
+    state: &web::Data<ClusterState>,
+) -> Result<String, Error> {
+    let upload_id = super::shard_storage::new_version_id();
+    let upload = super::multipart_store::MultipartUpload {
+        upload_id: upload_id.clone(),
+        user_id: user_id.to_string(),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        content_type,
+        user_metadata,
+        initiated_at: super::s3_surface::now_http_date(),
+        status: "in_progress".to_string(),
+    };
+    state.multipart_store.create_upload(upload).map_err(ErrorInternalServerError)?;
+    Ok(upload_id)
+}
+
+/// Stores one part's bytes via the ordinary plain EC path under its
+/// synthetic key, then records its (part_number, etag, size) in the
+/// multipart bookkeeping store. Returns the part's ETag.
+pub(crate) async fn cluster_upload_part_inner(
+    user_id: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
+) -> Result<String, Error> {
+    let upload = state
+        .multipart_store
+        .get_upload(upload_id)
+        .ok_or_else(|| ErrorNotFound("no such upload"))?;
+    if upload.status != "in_progress" {
+        return Err(ErrorBadRequest("upload is not in progress"));
+    }
+
+    let etag = crate::s3::handlers::common::md5_etag(&body);
+    let synthetic_key = multipart_part_key(upload_id, part_number);
+    put_object_plain(user_id, &upload.bucket, &synthetic_key, &body, state, &ObjectS3Metadata::default()).await?;
+
+    state
+        .multipart_store
+        .put_part(upload_id, super::multipart_store::MultipartPart { part_number, etag: etag.clone(), size: body.len() as u64 })
+        .map_err(ErrorInternalServerError)?;
+    Ok(etag)
+}
+
+pub(crate) fn cluster_list_parts_inner(upload_id: &str, state: &web::Data<ClusterState>) -> Result<Vec<super::multipart_store::MultipartPart>, Error> {
+    state.multipart_store.get_upload(upload_id).ok_or_else(|| ErrorNotFound("no such upload"))?;
+    Ok(state.multipart_store.list_parts(upload_id))
+}
+
+/// Reassembles the requested parts in order, writes the result as one
+/// ordinary plain object under the real key (see this section's own doc
+/// on why this is always plain, never re-packed), cleans up part
+/// bookkeeping and their synthetic shard storage, and returns
+/// `(final_etag, total_size)`. `requested` is `(part_number, client-sent
+/// etag)` pairs in the order the client wants them assembled -- each is
+/// validated against the stored part's own etag before use, same check
+/// single-node's `CompleteMultipartUpload` does.
+pub(crate) async fn cluster_complete_multipart_upload_inner(
+    user_id: &str, upload_id: &str, requested: &[(i32, String)], state: &web::Data<ClusterState>,
+) -> Result<(String, u64), Error> {
+    let upload = state
+        .multipart_store
+        .get_upload(upload_id)
+        .ok_or_else(|| ErrorNotFound("no such upload"))?;
+    if upload.status != "in_progress" {
+        return Err(ErrorBadRequest("upload is not in progress"));
+    }
+
+    let stored_parts = state.multipart_store.list_parts(upload_id);
+    let stored_by_number: HashMap<i32, &super::multipart_store::MultipartPart> =
+        stored_parts.iter().map(|p| (p.part_number, p)).collect();
+
+    let mut combined_md5_bytes: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    for (part_number, client_etag) in requested {
+        let stored = stored_by_number
+            .get(part_number)
+            .ok_or_else(|| ErrorBadRequest("one or more of the specified parts could not be found"))?;
+        if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored.etag) {
+            return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
+        }
+        let part_bytes = fetch_plain_object_bytes(user_id, &upload.bucket, &multipart_part_key(upload_id, *part_number), state).await?;
+        if let Ok(raw) = hex::decode(crate::s3::handlers::common::normalize_etag(&stored.etag)) {
+            combined_md5_bytes.extend_from_slice(&raw);
+        }
+        body.extend_from_slice(&part_bytes);
+    }
+
+    // Same composite-ETag formula single-node's CompleteMultipartUpload
+    // uses: md5 of the concatenated per-part md5 bytes, dash, part count.
+    let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
+    let total_size = body.len() as u64;
+
+    let s3_meta = ObjectS3Metadata {
+        etag: Some(final_etag.clone()),
+        content_type: upload.content_type.clone(),
+        last_modified: Some(super::s3_surface::now_http_date()),
+        user_metadata: upload.user_metadata.clone(),
+        ..Default::default()
+    };
+    put_object_plain(user_id, &upload.bucket, &upload.key, &body, state, &s3_meta).await?;
+
+    state.multipart_store.set_status(upload_id, "completed").ok();
+    for (part_number, _) in requested {
+        let _ = state.location_store.delete(user_id, &upload.bucket, &multipart_part_key(upload_id, *part_number));
+    }
+    state.multipart_store.delete_parts(upload_id).ok();
+    state.multipart_store.delete_upload(upload_id).ok();
+
+    Ok((final_etag, total_size))
+}
+
+/// Aborts an in-progress upload: cleans up part bookkeeping and their
+/// synthetic shard storage without writing a final object.
+pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<(), Error> {
+    let upload = state
+        .multipart_store
+        .get_upload(upload_id)
+        .ok_or_else(|| ErrorNotFound("no such upload"))?;
+
+    let parts = state.multipart_store.list_parts(upload_id);
+    for p in &parts {
+        let _ = state.location_store.delete(user_id, &upload.bucket, &multipart_part_key(upload_id, p.part_number));
+    }
+    state.multipart_store.delete_parts(upload_id).ok();
+    state.multipart_store.delete_upload(upload_id).map_err(ErrorInternalServerError)?;
+    Ok(())
+}
+
 /// Diagnostic endpoint: phase-level latency breakdown for `cluster_put_object`,
 /// so a load test can show where time actually goes (added specifically to
 /// answer "where are we slow if we're not saturating anywhere" — see
@@ -1004,6 +1235,14 @@ pub async fn cluster_put_retention(
         return Err(ErrorBadRequest("mode must be GOVERNANCE or COMPLIANCE"));
     }
 
+    // Explicit, not just a fallthrough to "object not found": a packed
+    // object might genuinely exist (in content_location_store) while
+    // simply having no retention support -- that's a different, clearer
+    // error than claiming the key doesn't exist at all.
+    if state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+
     let mut record = state
         .location_store
         .get(UNAUTHENTICATED_USER, &bucket, &key)
@@ -1035,6 +1274,177 @@ pub async fn cluster_put_retention(
     }
 
     Ok(HttpResponse::Ok().finish())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: object tagging, authenticated-surface support functions.
+// ---------------------------------------------------------------------------
+
+/// Sets an object's tags, replicated to every peer (same all-peers-ack
+/// reasoning as `cluster_put_retention` -- any peer can coordinate a
+/// later GET/DELETE, so every peer must agree on the new tag set, not
+/// just a write-quorum subset). Unlike retention, tagging applies to
+/// both plain and content-dependent (packed) records -- tags are a pure
+/// metadata field on either record shape, with no EC/placement
+/// implications, so there's no reason to restrict it to plain objects.
+pub(crate) async fn cluster_put_object_tagging_inner(
+    user_id: &str, bucket: &str, key: &str, tags: Vec<(String, String)>, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let peers = state.membership.peers();
+
+    if let Some(mut record) = state.content_location_store.get(user_id, bucket, key) {
+        record.tags = tags;
+        let acked = replicate_content_location_put(state, &record, &peers).await;
+        if acked < peers.len() {
+            return Err(ErrorInternalServerError(format!(
+                "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+            )));
+        }
+        return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
+    }
+
+    if let Some(mut record) = state.location_store.get(user_id, bucket, key) {
+        record.tags = tags;
+        let acked = replicate_location_put(state, &record, &peers).await;
+        if acked < peers.len() {
+            return Err(ErrorInternalServerError(format!(
+                "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+            )));
+        }
+        return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
+    }
+
+    Err(ErrorNotFound("object not found"))
+}
+
+/// Reads an object's tags -- a pure local lookup, same precedence
+/// (content-dependent checked first) as every other cluster GET-side
+/// read. Not async: no network call needed.
+pub(crate) fn cluster_get_object_tagging(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<Vec<(String, String)>, Error> {
+    if let Some(record) = state.content_location_store.get(user_id, bucket, key) {
+        return Ok(record.tags);
+    }
+    if let Some(record) = state.location_store.get(user_id, bucket, key) {
+        return Ok(record.tags);
+    }
+    Err(ErrorNotFound("object not found"))
+}
+
+/// Clears an object's tags -- same shape as the put side above, just an
+/// empty tag set.
+pub(crate) async fn cluster_delete_object_tagging_inner(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    cluster_put_object_tagging_inner(user_id, bucket, key, Vec::new(), state).await
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: object-lock (retention/legal-hold), authenticated-surface
+// support functions. Plain records only -- `ContentDependentRecord` has
+// no retention/legal_hold fields at all (see `cluster_put_retention`'s
+// own doc on why object-lock was never extended to packed objects); a
+// caller targeting a packed key gets a clear, explicit error instead of
+// a silent no-op that would let a packed object bypass locking entirely.
+// ---------------------------------------------------------------------------
+
+fn packed_object_lock_not_implemented() -> Error {
+    ErrorInternalServerError(
+        "object-lock (retention/legal-hold) is not implemented for content-dependent \
+         (packed) objects -- a documented, carried-forward gap, not a silent no-op",
+    )
+}
+
+/// Sets *only* `retention_mode`/`retain_until`, leaving `legal_hold`
+/// untouched -- the real S3 API treats PutObjectRetention and
+/// PutObjectLegalHold as independent calls; `cluster_put_retention`
+/// (above) is the bare, pre-auth, sentinel-only endpoint that sets both
+/// together and predates this split. Authenticated callers use this
+/// instead.
+pub(crate) async fn cluster_put_object_retention_inner(
+    user_id: &str, bucket: &str, key: &str, mode: &str, retain_until: &str, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if mode != "GOVERNANCE" && mode != "COMPLIANCE" {
+        return Err(ErrorBadRequest("mode must be GOVERNANCE or COMPLIANCE"));
+    }
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let mut record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    record.retention_mode = Some(mode.to_string());
+    record.retain_until = Some(retain_until.to_string());
+
+    let peers = state.membership.peers();
+    let acked = replicate_location_put(state, &record, &peers).await;
+    if acked < peers.len() {
+        return Err(ErrorInternalServerError(format!(
+            "retention update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+        )));
+    }
+    Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+}
+
+/// Sets *only* `legal_hold`, leaving `retention_mode`/`retain_until`
+/// untouched -- the real S3 API treats PutObjectLegalHold and
+/// PutObjectRetention as independent calls; `cluster_put_retention`
+/// (above) sets both together and predates this split.
+pub(crate) async fn cluster_put_object_legal_hold_inner(
+    user_id: &str, bucket: &str, key: &str, legal_hold: bool, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let mut record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    record.legal_hold = legal_hold;
+
+    let peers = state.membership.peers();
+    let acked = replicate_location_put(state, &record, &peers).await;
+    if acked < peers.len() {
+        return Err(ErrorInternalServerError(format!(
+            "legal-hold update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+        )));
+    }
+    Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+}
+
+/// Returns `(mode, retain_until)` if the plain object has an active
+/// retention record, `Ok(None)` if it exists but has none set, `Err` if
+/// the key doesn't exist or resolves to a packed object.
+pub(crate) fn cluster_get_object_retention(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<Option<(String, String)>, Error> {
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    Ok(match (record.retention_mode, record.retain_until) {
+        (Some(mode), Some(until)) => Some((mode, until)),
+        _ => None,
+    })
+}
+
+/// Returns whether legal hold is currently set on the plain object.
+pub(crate) fn cluster_get_object_legal_hold(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<bool, Error> {
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    Ok(record.legal_hold)
 }
 
 #[derive(Debug, Deserialize)]

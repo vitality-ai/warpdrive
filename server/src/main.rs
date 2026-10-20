@@ -30,7 +30,7 @@ use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pus
 use warp_drive::cluster::s3_surface::{
     cluster_s3_delete_object_authenticated, cluster_s3_get_object_authenticated,
     cluster_s3_head_object, cluster_s3_head_object_authenticated,
-    cluster_s3_list_objects, cluster_s3_put_object_authenticated,
+    cluster_s3_list_objects, cluster_s3_multipart_post_authenticated, cluster_s3_put_object_authenticated,
 };
 use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
@@ -130,6 +130,12 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
             m
         },
+        multipart_store: Arc::new(
+            warp_drive::cluster::multipart_store::BitcaskMultipartStore::open(
+                std::env::var("WARPDRIVE_MULTIPART_LOG").unwrap_or_else(|_| "cluster_multipart.log".to_string()),
+            )
+            .expect("failed to open multipart store log"),
+        ),
     };
     web::Data::new(state)
 }
@@ -228,6 +234,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_s3_put_object_authenticated))
             .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_s3_get_object_authenticated))
             .route("/cluster/s3/{bucket}/{key:.*}", web::delete().to(cluster_s3_delete_object_authenticated))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::post().to(cluster_s3_multipart_post_authenticated))
             .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))
             .route("/cluster/{bucket}/{key:.*}", web::get().to(cluster_get_object))
             .route("/cluster/{bucket}/{key:.*}", web::delete().to(cluster_delete_object))

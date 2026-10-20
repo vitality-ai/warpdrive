@@ -14,6 +14,7 @@ pub mod tcp_peer_client;
 pub mod location_store;
 pub mod content_location_store;
 pub mod metadata_store;
+pub mod multipart_store;
 pub mod bucket_config;
 pub mod coordinator;
 pub mod packed;

@@ -7,7 +7,7 @@ use super::common::*;
 // Tagging helpers
 // ---------------------------------------------------------------------------
 
-pub(super) fn parse_url_tags(s: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_url_tags(s: &str) -> Vec<(String, String)> {
     s.split('&').filter_map(|pair| {
         if pair.is_empty() { return None; }
         let mut parts = pair.splitn(2, '=');
@@ -17,7 +17,7 @@ pub(super) fn parse_url_tags(s: &str) -> Vec<(String, String)> {
     }).collect()
 }
 
-pub(super) fn parse_tag_xml(xml: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_tag_xml(xml: &str) -> Vec<(String, String)> {
     extract_all_xml_tags(xml, "Tag").into_iter().filter_map(|block| {
         let k = extract_xml_tag(&block, "Key")?;
         let v = extract_xml_tag(&block, "Value").unwrap_or_default();
@@ -25,7 +25,7 @@ pub(super) fn parse_tag_xml(xml: &str) -> Vec<(String, String)> {
     }).collect()
 }
 
-pub(super) fn validate_tags(tags: &[(String, String)], resource: &str) -> Result<(), HttpResponse> {
+pub(crate) fn validate_tags(tags: &[(String, String)], resource: &str) -> Result<(), HttpResponse> {
     if tags.len() > 10 {
         return Err(s3_error(StatusCode::BAD_REQUEST, "InvalidTag",
                             "Object tag count cannot be greater than 10", resource));
@@ -43,7 +43,7 @@ pub(super) fn validate_tags(tags: &[(String, String)], resource: &str) -> Result
     Ok(())
 }
 
-pub(super) fn tags_to_xml(tags: &[(String, String)]) -> String {
+pub(crate) fn tags_to_xml(tags: &[(String, String)]) -> String {
     let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging><TagSet>".to_string();
     for (k, v) in tags {
         xml.push_str(&format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>",

@@ -96,4 +96,60 @@ mod tests {
         let b = policy.place("bucket1", "key2", &p, 3, 2);
         assert_ne!(a, b);
     }
+
+    /// Phase 5 regression gate for the extensibility claim this module's
+    /// own doc makes ("a second implementation... can be dropped in
+    /// later without changing coordinator.rs"). A second, deliberately
+    /// non-realistic policy (fixed reverse-order, not content-aware or
+    /// churn-minimizing like `ComputedPlacement`) is implemented here,
+    /// with zero changes to `coordinator.rs` -- it only ever calls
+    /// `state.placement.place(...)` through the `Arc<dyn PlacementPolicy>`
+    /// trait object on `ClusterState`, never `ComputedPlacement` by name,
+    /// so any implementation of this trait is interchangeable there by
+    /// construction. This proves the policy itself is genuinely
+    /// pluggable and produces correct (just different) output, not that
+    /// `coordinator.rs` was touched to accommodate it.
+    ///
+    /// Not covered here: a full round trip through `put_object_plain`
+    /// itself needs real peer HTTP servers (location-pin replication
+    /// makes real network calls to every peer and requires all of them
+    /// to ack) -- out of reach for an in-process unit test without new
+    /// mock-server infrastructure. That's a real gap in test depth, not
+    /// papered over: this test instead proves extensibility at the
+    /// `PlacementPolicy`/`ClusterState` boundary, which is the actual
+    /// mechanism the claim rests on.
+    struct ReversePlacement;
+    impl PlacementPolicy for ReversePlacement {
+        fn place(&self, _bucket: &str, _key: &str, peers: &[String], k: usize, m: usize) -> Vec<String> {
+            let mut reversed: Vec<String> = peers.iter().rev().cloned().collect();
+            reversed.truncate(k + m);
+            reversed
+        }
+    }
+
+    #[test]
+    fn a_second_placement_policy_drops_in_with_zero_coordinator_changes() {
+        let p = peers(6);
+
+        let computed = ComputedPlacement::new().place("bucket1", "key1", &p, 3, 2);
+        let reversed = ReversePlacement.place("bucket1", "key1", &p, 3, 2);
+
+        // Correct per its own (trivial) algorithm...
+        assert_eq!(reversed, vec![p[5].clone(), p[4].clone(), p[3].clone(), p[2].clone(), p[1].clone()]);
+        assert_eq!(reversed.len(), 5);
+        // ...and genuinely a different policy, not accidentally
+        // reimplementing ComputedPlacement's own HRW scoring.
+        assert_ne!(computed, reversed);
+
+        // The actual extensibility proof: both are usable, interchangeably,
+        // anywhere `coordinator.rs` holds an `Arc<dyn PlacementPolicy>`
+        // (e.g. `ClusterState::placement`) -- neither this cast nor
+        // `coordinator.rs` needed to change for the second policy to
+        // compile and run here.
+        let policies: Vec<std::sync::Arc<dyn PlacementPolicy>> =
+            vec![std::sync::Arc::new(ComputedPlacement::new()), std::sync::Arc::new(ReversePlacement)];
+        for policy in &policies {
+            assert_eq!(policy.place("bucket1", "key1", &p, 3, 2).len(), 5);
+        }
+    }
 }

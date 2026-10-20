@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use crate::service::metadata_service::MetadataService;
 
-pub(super) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 pub(super) const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Empty body that reports a custom Content-Length for HEAD responses.
@@ -237,7 +237,7 @@ pub(crate) fn s3_precondition_failed(resource: &str) -> HttpResponse {
 }
 
 /// Extract the text content of the first occurrence of `<tag>…</tag>` in `src`.
-pub(super) fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
+pub(crate) fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
     let start = src.find(&open)? + open.len();
@@ -246,7 +246,7 @@ pub(super) fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
 }
 
 /// Extract text content of ALL occurrences of `<tag>…</tag>` in `src`.
-pub(super) fn extract_all_xml_tags(src: &str, tag: &str) -> Vec<String> {
+pub(crate) fn extract_all_xml_tags(src: &str, tag: &str) -> Vec<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
     let mut results = Vec::new();
@@ -277,7 +277,7 @@ pub(super) fn parse_http_date(s: &str) -> Option<i64> {
     None
 }
 
-pub(super) fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -297,7 +297,7 @@ pub(super) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub(super) fn req_query_map(req: &HttpRequest) -> std::collections::HashMap<String, String> {
+pub(crate) fn req_query_map(req: &HttpRequest) -> std::collections::HashMap<String, String> {
     actix_web::web::Query::<std::collections::HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner())
         .unwrap_or_default()

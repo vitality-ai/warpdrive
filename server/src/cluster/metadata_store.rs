@@ -251,16 +251,26 @@ impl MetadataStorage for ClusterMetadataStore {
         Err(not_supported("object tagging"))
     }
 
-    fn get_object_tags(&self, _user_id: &str, _bucket: &str, _key: &str) -> Result<Vec<(String, String)>, Error> {
-        Err(not_supported("object tagging"))
+    // Phase 4: real read, now that `tags` is a field on both record
+    // shapes (see `coordinator.rs`'s tagging functions for the write
+    // side, which lives there instead of behind this trait -- same
+    // reasoning as every other write-shaped method in this file).
+    fn get_object_tags(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Vec<(String, String)>, Error> {
+        if let Some(record) = self.content_location_store.get(user_id, bucket, object_id) {
+            return Ok(record.tags);
+        }
+        if let Some(record) = self.location_store.get(user_id, bucket, object_id) {
+            return Ok(record.tags);
+        }
+        Err(Self::not_found(bucket, object_id))
     }
 
     fn delete_object_tags(&self, _user_id: &str, _bucket: &str, _key: &str) -> Result<(), Error> {
         Err(not_supported("object tagging"))
     }
 
-    fn get_object_tag_count(&self, _user_id: &str, _bucket: &str, _key: &str) -> Result<i64, Error> {
-        Err(not_supported("object tagging"))
+    fn get_object_tag_count(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<i64, Error> {
+        Ok(self.get_object_tags(user_id, bucket, object_id)?.len() as i64)
     }
 
     fn set_bucket_tags(&self, _bucket: &str, _tags: &[(String, String)]) -> Result<(), Error> {
@@ -496,6 +506,24 @@ mod tests {
     fn bucket_exists_is_always_true_no_registry_in_cluster_mode() {
         let s = store();
         assert!(s.bucket_exists("u1", "any-bucket-name").unwrap());
+    }
+
+    #[test]
+    fn get_object_tags_reads_the_real_tags_field() {
+        let s = store();
+        let mut rec = sample_record("u1", "b1", "k1", 10);
+        rec.tags = vec![("env".to_string(), "prod".to_string())];
+        s.location_store.put(rec).unwrap();
+
+        let tags = s.get_object_tags("u1", "b1", "k1").unwrap();
+        assert_eq!(tags, vec![("env".to_string(), "prod".to_string())]);
+        assert_eq!(s.get_object_tag_count("u1", "b1", "k1").unwrap(), 1);
+    }
+
+    #[test]
+    fn get_object_tags_not_found_for_missing_key() {
+        let s = store();
+        assert!(s.get_object_tags("u1", "b1", "missing").is_err());
     }
 
     #[test]
