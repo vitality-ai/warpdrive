@@ -387,4 +387,35 @@ is real, scoped, well-understood follow-up work, not a vague TODO.
 Fleet-wide, reverted to the last committed (no-fsync, pre-tonight's-fsync-
 experiment) binary so the live GCP cluster matches what's actually in git --
 not something faster-but-undocumented running live while the repo says
-otherwise.
+otherwise. Spot-checked after redeploy: 730.9 req/s at concurrency 64
+(within normal run-to-run noise of the earlier 811.9 req/s on these shared-
+core VMs), confirming the revert landed correctly.
+
+## 2026-10-21 22:3x — Where the remaining per-request time actually goes
+
+The codebase already has a timing-stats endpoint
+(`/cluster/_internal/timing`, `/cluster/_internal/shard_timing`) -- used it
+instead of guessing. Real numbers after a concurrency=64 run (n=15,065
+requests):
+
+```
+encode_avg_ms=0.012              (EC encoding -- negligible)
+shard_fanout_avg_ms=46.983        (max 1044.132)   <- dominant cost
+location_replicate_avg_ms=15.044  (max 137.236)
+total_avg_ms=77.873               (max 1046.706)
+
+storage_write_avg_ms=0.040  (max 23.201)   <- receiving peer's actual disk write
+meta_put_avg_ms=0.083       (max 1016.528) <- receiving peer's shard-meta append
+```
+
+`shard_fanout` (waiting on all k+m peers' shard-write RPCs) is ~60% of total
+request time, and it's not explained by the receiving side's own work --
+each peer's actual disk write + meta append average under 0.15ms combined.
+The real cost is request-processing overhead on 5 concurrently-loaded peers
+(SigV4 verification, checksum computation, HTTP/transport handling) under
+the same CPU contention `vmstat` already showed earlier tonight, not a
+single fixable function. This doesn't point to a cheap, safe further win --
+cutting it meaningfully would mean reducing fixed per-RPC overhead (auth/
+checksum cost per shard call) or further parallelism, both bigger-scope than
+what's safe to change blind overnight. Treating this as context for a future
+session, not something to chase further right now.
