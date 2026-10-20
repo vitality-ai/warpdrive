@@ -62,17 +62,17 @@ be running beforehand. See `server/tests/chaos/README.md` for details.
 ### `scenario_test.py` -- 13/13 passed
 
 - RS(3,2) write/read succeeded with 0, 1, or 2 of 4 non-entry peers
-  killed (tolerates up to `m=2`, as designed).
-- Write **correctly and cleanly failed** (never silently succeeded with
-  an incomplete quorum) with 3 or 4 peers down.
-- A deliberately corrupted on-disk shard was never served as correct
-  data: every post-corruption read was either reconstructed exactly or
-  rejected with a `500` (the read-side checksum verification added
-  earlier this session actually doing its job under real corruption,
-  not just in the isolated test that motivated it).
-- Killing 1 of 5 peers mid-write (timed to land while the write is
-  actually in flight, not before it starts) never corrupted the write;
-  the object read back byte-identical afterward.
+  killed, matching the designed `m=2` tolerance.
+- With 3 or 4 peers down, writes failed cleanly with an explicit error
+  -- the correct behavior once quorum can't be met.
+- Every post-corruption read of a deliberately corrupted on-disk shard
+  came back either exactly reconstructed or rejected with a `500` --
+  the read-side checksum verification added earlier this session doing
+  its job under real corruption, confirming the earlier isolated test
+  for real.
+- Killing 1 of 5 peers mid-write, timed to land while the write was
+  actually in flight, still produced a byte-identical object on
+  read-back.
 
 ### `jepsen_style_test.py` -- 0 consistency violations across 9,215 operations
 

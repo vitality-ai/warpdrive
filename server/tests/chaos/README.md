@@ -1,10 +1,10 @@
 # Cluster chaos/fault-tolerance tests
 
-Fault-injection tests against a real local multi-node WarpDrive cluster
-(not mocked, not single-node) -- each one starts its own 5-node RS(3,2)
-cluster, injects real faults (process kills, on-disk byte corruption),
-and checks that the cluster's quorum/erasure-coding guarantees actually
-hold. See [docs/CHAOS-TESTING.md](../../../docs/CHAOS-TESTING.md) for
+Fault-injection tests against a real local 5-node RS(3,2) WarpDrive
+cluster -- each one starts its own cluster, injects real faults
+(process kills, on-disk byte corruption), and checks that the
+cluster's quorum/erasure-coding guarantees actually hold. See
+[docs/CHAOS-TESTING.md](../../../docs/CHAOS-TESTING.md) for
 methodology, what these runs have found so far, and what they
 deliberately do not cover yet.
 
