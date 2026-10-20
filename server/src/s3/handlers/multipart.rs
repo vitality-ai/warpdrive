@@ -165,8 +165,12 @@ pub async fn s3_upload_part_handler(
     let upload_id = query.get("uploadId")
         .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?.clone();
 
-    let part_number: i32 = part_number_str.parse()
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;
+    let part_number: i32 = match part_number_str.parse() {
+        Ok(n) if (1..=10000).contains(&n) => n,
+        _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                "Part number must be an integer between 1 and 10000, inclusive",
+                                &format!("/{}/{}", bucket, key))),
+    };
 
     let auth_result = authenticate_s3_request(&req).await?;
     let db = MetadataService::new(&auth_result.user_id)?;
@@ -332,8 +336,12 @@ pub async fn s3_upload_part_copy_handler(
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3)?;
 
-    let part_number_i32: i32 = part_number.parse()
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;
+    let part_number_i32: i32 = match part_number.parse() {
+        Ok(n) if (1..=10000).contains(&n) => n,
+        _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                "Part number must be an integer between 1 and 10000, inclusive",
+                                &format!("/{}/{}", bucket, key))),
+    };
 
     match db.get_multipart_upload(&upload_id)? {
         Some(row) if row.status == "in_progress" => {}
