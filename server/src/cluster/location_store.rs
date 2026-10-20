@@ -17,14 +17,30 @@
 //! actually true, not just asserted.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+/// Sentinel `user_id` for every request that arrives with no authenticated
+/// identity -- which today is *every* request on the bare, pre-Phase-3
+/// `/cluster/{bucket}/{key}` routes (`authenticate_s3_request` is never
+/// called from them). An empty string can never collide with a real S3
+/// access-key-style user id, so this namespace stays cleanly separate from
+/// whatever real per-tenant user ids Phase 3's shared-handler routes start
+/// supplying. `#[serde(default)]` on `LocationRecord::user_id` means every
+/// record written before this field existed also reads back as this same
+/// sentinel, which is correct: that data *was* written with no tenant
+/// concept at all.
+pub const UNAUTHENTICATED_USER: &str = "";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocationRecord {
+    /// See `UNAUTHENTICATED_USER`. `#[serde(default)]`: empty for a record
+    /// written before this field existed.
+    #[serde(default)]
+    pub user_id: String,
     pub bucket: String,
     pub key: String,
     /// Index i = the peer holding shard i (data shards first, then parity).
@@ -47,18 +63,45 @@ pub struct LocationRecord {
     pub retention_mode: Option<String>, // "GOVERNANCE" | "COMPLIANCE"
     pub retain_until: Option<String>,   // RFC3339
     pub legal_hold: bool,
+    /// MD5 ETag in double quotes, same shape as single-node's
+    /// `metadata::Metadata::etag`. `#[serde(default)]`: `None` for a record
+    /// written before this field existed.
+    #[serde(default)]
+    pub etag: Option<String>,
+    /// MIME type supplied on PUT via `Content-Type`.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// RFC 2616 date string set on PUT -- same format single-node's
+    /// `common.rs::last_modified_now` produces.
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    /// `x-amz-meta-*` headers, header name without the prefix.
+    #[serde(default)]
+    pub user_metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub expires: Option<String>,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_value: Option<String>,
+    #[serde(default)]
+    pub checksum_type: Option<String>,
 }
 
 pub trait LocationStore: Send + Sync {
     fn put(&self, record: LocationRecord) -> io::Result<()>;
-    fn get(&self, bucket: &str, key: &str) -> Option<LocationRecord>;
-    fn delete(&self, bucket: &str, key: &str) -> io::Result<()>;
+    fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord>;
+    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()>;
     /// Keys (with their byte size) in `bucket` whose key starts with
     /// `prefix` — the minimal S3 ListObjectsV2 surface needs this (object
     /// stores speaking the real S3 protocol, like Lance's client, list a
     /// dataset's files; the raw `/cluster/{bucket}/{key}` API never needed
     /// this since callers always know their own key).
-    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
+    fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
     /// Rewrites the log to hold only the current live entries (one line
     /// per in-memory index entry, no tombstones -- there's nothing left
     /// for them to cancel out once the dead entries they were cancelling
@@ -70,15 +113,18 @@ pub trait LocationStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
-/// Length-prefixes `bucket` so its exact boundary is always recoverable
-/// regardless of what bytes `bucket` or `key` contain -- `key` is the
-/// last field, so it doesn't need its own length prefix, it's simply
-/// "whatever comes after bucket's prefix." Previously `format!("{bucket}/{key}")`:
-/// bucket `a/b` + key `c` and bucket `a` + key `b/c` both produced `a/b/c`,
-/// the same cross-bucket/key collision as `shard_key`'s (#150) in this
-/// store's own index.
-fn record_key(bucket: &str, key: &str) -> String {
-    format!("{}:{}:{}", bucket.len(), bucket, key)
+/// Length-prefixes `user_id` and `bucket` so their exact boundaries are
+/// always recoverable regardless of what bytes any of the three fields
+/// contain -- `key` is last, so it doesn't need its own length prefix,
+/// it's simply "whatever comes after bucket's prefix." Previously (#150,
+/// before `user_id` existed) `format!("{bucket}/{key}")`: bucket `a/b` +
+/// key `c` and bucket `a` + key `b/c` both produced `a/b/c`. Adding
+/// `user_id` the same unprefixed way would reopen that exact bug one level
+/// up (two tenants' bucket/key pairs colliding across a `user_id` boundary
+/// instead of a bucket boundary), so it gets the same length-prefix
+/// treatment, not a bare separator.
+fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
+    format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
 }
 
 /// Append-only log of JSON-lines `(record_key, Option<LocationRecord>)`
@@ -168,7 +214,7 @@ impl BitcaskLocationStore {
 
 impl LocationStore for BitcaskLocationStore {
     fn put(&self, record: LocationRecord) -> io::Result<()> {
-        let rk = record_key(&record.bucket, &record.key);
+        let rk = record_key(&record.user_id, &record.bucket, &record.key);
         let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // #155: held across both the append and the index update, so a
@@ -180,12 +226,12 @@ impl LocationStore for BitcaskLocationStore {
         Ok(())
     }
 
-    fn get(&self, bucket: &str, key: &str) -> Option<LocationRecord> {
-        self.index.read().unwrap().get(&record_key(bucket, key)).cloned()
+    fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord> {
+        self.index.read().unwrap().get(&record_key(user_id, bucket, key)).cloned()
     }
 
-    fn delete(&self, bucket: &str, key: &str) -> io::Result<()> {
-        let rk = record_key(bucket, key);
+    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
+        let rk = record_key(user_id, bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<LocationRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let _write_guard = self.write_lock.lock().unwrap();
@@ -194,8 +240,8 @@ impl LocationStore for BitcaskLocationStore {
         Ok(())
     }
 
-    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
-        let bucket_prefix = format!("{}:{}:", bucket.len(), bucket);
+    fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
+        let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
         // A BTreeMap range starting *at* the prefix (an O(log n) binary
         // search, not a linear scan from the beginning) then taken only
@@ -251,7 +297,12 @@ mod tests {
     use super::*;
 
     fn sample(bucket: &str, key: &str) -> LocationRecord {
+        sample_for("u1", bucket, key)
+    }
+
+    fn sample_for(user_id: &str, bucket: &str, key: &str) -> LocationRecord {
         LocationRecord {
+            user_id: user_id.to_string(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             shard_peers: vec!["http://node0:9710".into(), "http://node1:9710".into()],
@@ -262,6 +313,16 @@ mod tests {
             retention_mode: None,
             retain_until: None,
             legal_hold: false,
+            etag: None,
+            content_type: None,
+            last_modified: None,
+            user_metadata: HashMap::new(),
+            cache_control: None,
+            expires: None,
+            content_encoding: None,
+            checksum_algorithm: None,
+            checksum_value: None,
+            checksum_type: None,
         }
     }
 
@@ -269,7 +330,36 @@ mod tests {
     /// `a/b` + key `c` must not collide with bucket `a` + key `b/c`.
     #[test]
     fn record_key_does_not_collide_when_a_separator_moves_across_the_bucket_key_boundary() {
-        assert_ne!(record_key("a/b", "c"), record_key("a", "b/c"));
+        assert_ne!(record_key("u1", "a/b", "c"), record_key("u1", "a", "b/c"));
+    }
+
+    /// The tenant-isolation fix's core invariant: two different users
+    /// writing the exact same `(bucket, key)` must land in two distinct
+    /// records, not collide onto one -- see `record_key`'s own doc.
+    #[test]
+    fn record_key_does_not_collide_across_different_users_for_the_same_bucket_and_key() {
+        assert_ne!(record_key("alice", "shared-bucket", "k"), record_key("bob", "shared-bucket", "k"));
+    }
+
+    #[test]
+    fn two_users_writing_the_same_bucket_and_key_get_independent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitcaskLocationStore::open(dir.path().join("loc.log")).unwrap();
+
+        let mut alice_rec = sample_for("alice", "logs", "k1");
+        alice_rec.original_len = 111;
+        let mut bob_rec = sample_for("bob", "logs", "k1");
+        bob_rec.original_len = 222;
+
+        store.put(alice_rec.clone()).unwrap();
+        store.put(bob_rec.clone()).unwrap();
+
+        assert_eq!(store.get("alice", "logs", "k1").unwrap(), alice_rec);
+        assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec);
+
+        store.delete("alice", "logs", "k1").unwrap();
+        assert!(store.get("alice", "logs", "k1").is_none());
+        assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec, "deleting alice's record must not touch bob's");
     }
 
     #[test]
@@ -277,7 +367,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BitcaskLocationStore::open(dir.path().join("loc.log")).unwrap();
         store.put(sample("b1", "k1")).unwrap();
-        let got = store.get("b1", "k1").unwrap();
+        let got = store.get("u1", "b1", "k1").unwrap();
         assert_eq!(got, sample("b1", "k1"));
     }
 
@@ -292,8 +382,8 @@ mod tests {
         }
         // Simulate a process restart: reopen from the same log path.
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
-        assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
-        assert_eq!(reopened.get("b1", "k2").unwrap(), sample("b1", "k2"));
+        assert_eq!(reopened.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
+        assert_eq!(reopened.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
     }
 
     #[test]
@@ -303,11 +393,11 @@ mod tests {
         {
             let store = BitcaskLocationStore::open(&log_path).unwrap();
             store.put(sample("b1", "k1")).unwrap();
-            store.delete("b1", "k1").unwrap();
-            assert!(store.get("b1", "k1").is_none());
+            store.delete("u1", "b1", "k1").unwrap();
+            assert!(store.get("u1", "b1", "k1").is_none());
         }
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
-        assert!(reopened.get("b1", "k1").is_none());
+        assert!(reopened.get("u1", "b1", "k1").is_none());
     }
 
     /// Same reasoning as `shard_meta_store.rs`'s matching test (#152): a
@@ -326,8 +416,8 @@ mod tests {
             writeln!(f, "[\"b1:k2\",{{\"bucket\":\"b1\"").unwrap();
         }
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
-        assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
-        assert!(reopened.get("b1", "k2").is_none());
+        assert_eq!(reopened.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
+        assert!(reopened.get("u1", "b1", "k2").is_none());
     }
 
     #[test]
@@ -339,7 +429,7 @@ mod tests {
         rec.retain_until = Some("2030-01-01T00:00:00Z".to_string());
         rec.legal_hold = true;
         store.put(rec.clone()).unwrap();
-        assert_eq!(store.get("b1", "locked-key").unwrap(), rec);
+        assert_eq!(store.get("u1", "b1", "locked-key").unwrap(), rec);
     }
 
     #[test]
@@ -354,9 +444,20 @@ mod tests {
         // doesn't spill across bucket boundaries.
         store.put(sample("b1a", "reports/intruder.csv")).unwrap();
 
-        let mut got = store.list("b1", "reports/");
+        let mut got = store.list("u1", "b1", "reports/");
         got.sort();
         assert_eq!(got, vec![("reports/feb.csv".to_string(), 42), ("reports/jan.csv".to_string(), 42)]);
+    }
+
+    #[test]
+    fn list_does_not_spill_across_a_user_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitcaskLocationStore::open(dir.path().join("loc.log")).unwrap();
+        store.put(sample_for("alice", "shared", "k1")).unwrap();
+        store.put(sample_for("bob", "shared", "k1")).unwrap();
+
+        assert_eq!(store.list("alice", "shared", "").len(), 1);
+        assert_eq!(store.list("bob", "shared", "").len(), 1);
     }
 
     #[test]
@@ -367,7 +468,7 @@ mod tests {
 
         store.put(sample("b1", "k1")).unwrap();
         store.put(sample("b1", "k2")).unwrap();
-        store.delete("b1", "k1").unwrap();
+        store.delete("u1", "b1", "k1").unwrap();
         // Overwrite k2 a few times -- each one is another line in the
         // uncompacted log for the same still-live key.
         for _ in 0..5 {
@@ -383,15 +484,15 @@ mod tests {
         );
 
         // Still correct in-process...
-        assert!(store.get("b1", "k1").is_none());
-        assert_eq!(store.get("b1", "k2").unwrap(), sample("b1", "k2"));
+        assert!(store.get("u1", "b1", "k1").is_none());
+        assert_eq!(store.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
 
         // ...and still correct after a reopen, proving the compacted log
         // on disk is itself a complete, valid replacement, not just an
         // in-memory optimization.
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
-        assert!(reopened.get("b1", "k1").is_none());
-        assert_eq!(reopened.get("b1", "k2").unwrap(), sample("b1", "k2"));
+        assert!(reopened.get("u1", "b1", "k1").is_none());
+        assert_eq!(reopened.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
     }
 
     #[test]
@@ -405,10 +506,10 @@ mod tests {
         // that handle is actually live, not left pointing at a file
         // descriptor orphaned by the rename.
         store.put(sample("b1", "k2")).unwrap();
-        assert_eq!(store.get("b1", "k2").unwrap(), sample("b1", "k2"));
+        assert_eq!(store.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
-        assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
-        assert_eq!(reopened.get("b1", "k2").unwrap(), sample("b1", "k2"));
+        assert_eq!(reopened.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
+        assert_eq!(reopened.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
     }
 
     /// #155's core invariant: the in-memory index and the on-disk log can
@@ -439,7 +540,7 @@ mod tests {
                         if (t + i) % 2 == 0 {
                             store.put(sample("b1", "racykey")).unwrap();
                         } else {
-                            let _ = store.delete("b1", "racykey");
+                            let _ = store.delete("u1", "b1", "racykey");
                         }
                     }
                 })
@@ -449,8 +550,8 @@ mod tests {
             h.join().unwrap();
         }
 
-        let live = store.get("b1", "racykey");
-        let replayed = BitcaskLocationStore::open(&log_path).unwrap().get("b1", "racykey");
+        let live = store.get("u1", "b1", "racykey");
+        let replayed = BitcaskLocationStore::open(&log_path).unwrap().get("u1", "b1", "racykey");
         assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

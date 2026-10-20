@@ -36,9 +36,9 @@ pub async fn cluster_s3_head_object(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
 
-    let size = if let Some(record) = state.content_location_store.get(&bucket, &key) {
+    let size = if let Some(record) = state.content_location_store.get(super::location_store::UNAUTHENTICATED_USER, &bucket, &key) {
         record.original_len as u64
-    } else if let Some(record) = state.location_store.get(&bucket, &key) {
+    } else if let Some(record) = state.location_store.get(super::location_store::UNAUTHENTICATED_USER, &bucket, &key) {
         record.original_len as u64
     } else {
         return Err(ErrorNotFound("object not found"));
@@ -74,8 +74,8 @@ pub async fn cluster_s3_list_objects(
     let bucket = path.into_inner();
     let prefix = query.get("prefix").cloned().unwrap_or_default();
 
-    let mut entries = state.location_store.list(&bucket, &prefix);
-    entries.extend(state.content_location_store.list(&bucket, &prefix));
+    let mut entries = state.location_store.list(super::location_store::UNAUTHENTICATED_USER, &bucket, &prefix);
+    entries.extend(state.content_location_store.list(super::location_store::UNAUTHENTICATED_USER, &bucket, &prefix));
     entries.sort();
     entries.dedup();
 

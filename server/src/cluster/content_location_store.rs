@@ -10,7 +10,7 @@
 //! objects never use.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,10 @@ pub struct UnitLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContentDependentRecord {
+    /// See `location_store::UNAUTHENTICATED_USER`. `#[serde(default)]`:
+    /// empty for a record written before this field existed.
+    #[serde(default)]
+    pub user_id: String,
     pub bucket: String,
     pub key: String,
     pub k: usize,
@@ -121,6 +125,28 @@ pub struct ContentDependentRecord {
     /// units-by-id + per-stripe scan in that case rather than failing.
     #[serde(default)]
     pub sorted_unit_locations: Vec<UnitLocation>,
+    /// Same S3-metadata fields as `LocationRecord`, same reasoning and
+    /// same additive `#[serde(default)]` treatment -- see its doc.
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    #[serde(default)]
+    pub user_metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub expires: Option<String>,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_value: Option<String>,
+    #[serde(default)]
+    pub checksum_type: Option<String>,
 }
 
 impl ContentDependentRecord {
@@ -157,11 +183,11 @@ impl ContentDependentRecord {
 
 pub trait ContentLocationStore: Send + Sync {
     fn put(&self, record: ContentDependentRecord) -> io::Result<()>;
-    fn get(&self, bucket: &str, key: &str) -> Option<ContentDependentRecord>;
-    fn delete(&self, bucket: &str, key: &str) -> io::Result<()>;
+    fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord>;
+    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()>;
     /// See `LocationStore::list` — same minimal-S3-surface purpose, for the
     /// content-dependent half of a bucket's objects.
-    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
+    fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
     /// See `LocationStore::compact` — same reasoning and same mechanism
     /// (#163), applied to this store's own log.
     fn compact(&self) -> io::Result<()>;
@@ -169,9 +195,10 @@ pub trait ContentLocationStore: Send + Sync {
 
 /// Length-prefixed, same scheme and same reasoning as `location_store.rs`'s
 /// `record_key` (#150: a plain `/` separator lets bucket `a/b` + key `c`
-/// and bucket `a` + key `b/c` collide onto the same index entry).
-fn record_key(bucket: &str, key: &str) -> String {
-    format!("{}:{}:{}", bucket.len(), bucket, key)
+/// and bucket `a` + key `b/c` collide onto the same index entry; the same
+/// risk applies one level up to `user_id`, so it gets the same treatment).
+fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
+    format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
 }
 
 /// `BTreeMap`, not `HashMap` (#163) — see `location_store.rs`'s matching
@@ -242,7 +269,7 @@ impl BitcaskContentLocationStore {
 
 impl ContentLocationStore for BitcaskContentLocationStore {
     fn put(&self, record: ContentDependentRecord) -> io::Result<()> {
-        let rk = record_key(&record.bucket, &record.key);
+        let rk = record_key(&record.user_id, &record.bucket, &record.key);
         let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // #155: held across both the append and the index update, so a
@@ -258,12 +285,12 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         Ok(())
     }
 
-    fn get(&self, bucket: &str, key: &str) -> Option<ContentDependentRecord> {
-        self.index.read().unwrap().get(&record_key(bucket, key)).cloned()
+    fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord> {
+        self.index.read().unwrap().get(&record_key(user_id, bucket, key)).cloned()
     }
 
-    fn delete(&self, bucket: &str, key: &str) -> io::Result<()> {
-        let rk = record_key(bucket, key);
+    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
+        let rk = record_key(user_id, bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<ContentDependentRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let _write_guard = self.write_lock.lock().unwrap();
@@ -276,8 +303,8 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         Ok(())
     }
 
-    fn list(&self, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
-        let bucket_prefix = format!("{}:{}:", bucket.len(), bucket);
+    fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
+        let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
         self.index
             .read()
@@ -315,7 +342,12 @@ mod tests {
     use super::*;
 
     fn sample(bucket: &str, key: &str) -> ContentDependentRecord {
+        sample_for("u1", bucket, key)
+    }
+
+    fn sample_for(user_id: &str, bucket: &str, key: &str) -> ContentDependentRecord {
         ContentDependentRecord {
+            user_id: user_id.to_string(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             k: 3,
@@ -333,6 +365,16 @@ mod tests {
             version: "v1".to_string(),
             has_sparse_gaps: false,
             sorted_unit_locations: Vec::new(),
+            etag: None,
+            content_type: None,
+            last_modified: None,
+            user_metadata: HashMap::new(),
+            cache_control: None,
+            expires: None,
+            content_encoding: None,
+            checksum_algorithm: None,
+            checksum_value: None,
+            checksum_type: None,
         }
     }
 
@@ -393,7 +435,35 @@ mod tests {
     /// `a/b` + key `c` must not collide with bucket `a` + key `b/c`.
     #[test]
     fn record_key_does_not_collide_when_a_separator_moves_across_the_bucket_key_boundary() {
-        assert_ne!(record_key("a/b", "c"), record_key("a", "b/c"));
+        assert_ne!(record_key("u1", "a/b", "c"), record_key("u1", "a", "b/c"));
+    }
+
+    /// Tenant-isolation fix: two different users writing the exact same
+    /// `(bucket, key)` must not collide onto one record.
+    #[test]
+    fn record_key_does_not_collide_across_different_users_for_the_same_bucket_and_key() {
+        assert_ne!(record_key("alice", "shared-bucket", "k"), record_key("bob", "shared-bucket", "k"));
+    }
+
+    #[test]
+    fn two_users_writing_the_same_bucket_and_key_get_independent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
+
+        let mut alice_rec = sample_for("alice", "logs", "k1");
+        alice_rec.original_len = 111;
+        let mut bob_rec = sample_for("bob", "logs", "k1");
+        bob_rec.original_len = 222;
+
+        store.put(alice_rec.clone()).unwrap();
+        store.put(bob_rec.clone()).unwrap();
+
+        assert_eq!(store.get("alice", "logs", "k1").unwrap(), alice_rec);
+        assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec);
+
+        store.delete("alice", "logs", "k1").unwrap();
+        assert!(store.get("alice", "logs", "k1").is_none());
+        assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec, "deleting alice's record must not touch bob's");
     }
 
     #[test]
@@ -401,7 +471,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
         store.put(sample("b1", "k1")).unwrap();
-        assert_eq!(store.get("b1", "k1").unwrap(), sample("b1", "k1"));
+        assert_eq!(store.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
     }
 
     #[test]
@@ -413,7 +483,7 @@ mod tests {
             store.put(sample("b1", "k1")).unwrap();
         }
         let reopened = BitcaskContentLocationStore::open(&log_path).unwrap();
-        assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
+        assert_eq!(reopened.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
     }
 
     #[test]
@@ -421,8 +491,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
         store.put(sample("b1", "k1")).unwrap();
-        store.delete("b1", "k1").unwrap();
-        assert!(store.get("b1", "k1").is_none());
+        store.delete("u1", "b1", "k1").unwrap();
+        assert!(store.get("u1", "b1", "k1").is_none());
     }
 
     /// Same reasoning as `shard_meta_store.rs`'s matching test (#152): a
@@ -441,8 +511,8 @@ mod tests {
             writeln!(f, "[\"b1:k2\",{{\"bucket\":\"b1\"").unwrap();
         }
         let reopened = BitcaskContentLocationStore::open(&log_path).unwrap();
-        assert_eq!(reopened.get("b1", "k1").unwrap(), sample("b1", "k1"));
-        assert!(reopened.get("b1", "k2").is_none());
+        assert_eq!(reopened.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
+        assert!(reopened.get("u1", "b1", "k2").is_none());
     }
 
     #[test]
@@ -466,7 +536,7 @@ mod tests {
         // `take_while` could leak this in or cut off real matches early.
         store.put(sample("b1z", "reports/mar")).unwrap();
 
-        let mut got = store.list("b1", "reports/");
+        let mut got = store.list("u1", "b1", "reports/");
         got.sort();
         assert_eq!(
             got,
@@ -482,7 +552,7 @@ mod tests {
         store.put(sample("b1", "keep")).unwrap();
         for i in 0..20 {
             store.put(sample("b1", &format!("churn{i}"))).unwrap();
-            store.delete("b1", &format!("churn{i}")).unwrap();
+            store.delete("u1", "b1", &format!("churn{i}")).unwrap();
         }
         let size_before = std::fs::metadata(&log_path).unwrap().len();
 
@@ -491,16 +561,16 @@ mod tests {
         let size_after = std::fs::metadata(&log_path).unwrap().len();
         assert!(size_after < size_before, "compact should shrink the log file");
 
-        assert_eq!(store.get("b1", "keep").unwrap(), sample("b1", "keep"));
+        assert_eq!(store.get("u1", "b1", "keep").unwrap(), sample("b1", "keep"));
         for i in 0..20 {
-            assert!(store.get("b1", &format!("churn{i}")).is_none());
+            assert!(store.get("u1", "b1", &format!("churn{i}")).is_none());
         }
 
         // Correctness survives a real reopen, not just the in-memory index.
         let reopened = BitcaskContentLocationStore::open(&log_path).unwrap();
-        assert_eq!(reopened.get("b1", "keep").unwrap(), sample("b1", "keep"));
+        assert_eq!(reopened.get("u1", "b1", "keep").unwrap(), sample("b1", "keep"));
         for i in 0..20 {
-            assert!(reopened.get("b1", &format!("churn{i}")).is_none());
+            assert!(reopened.get("u1", "b1", &format!("churn{i}")).is_none());
         }
     }
 
@@ -511,8 +581,8 @@ mod tests {
         store.put(sample("b1", "k1")).unwrap();
         store.compact().unwrap();
         store.put(sample("b1", "k2")).unwrap();
-        assert_eq!(store.get("b1", "k1").unwrap(), sample("b1", "k1"));
-        assert_eq!(store.get("b1", "k2").unwrap(), sample("b1", "k2"));
+        assert_eq!(store.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
+        assert_eq!(store.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
     }
 
     /// Same invariant and same reasoning as `location_store.rs`'s matching
@@ -535,7 +605,7 @@ mod tests {
                         if (t + i) % 2 == 0 {
                             store.put(sample("b1", "racykey")).unwrap();
                         } else {
-                            let _ = store.delete("b1", "racykey");
+                            let _ = store.delete("u1", "b1", "racykey");
                         }
                     }
                 })
@@ -545,8 +615,8 @@ mod tests {
             h.join().unwrap();
         }
 
-        let live = store.get("b1", "racykey");
-        let replayed = BitcaskContentLocationStore::open(&log_path).unwrap().get("b1", "racykey");
+        let live = store.get("u1", "b1", "racykey");
+        let replayed = BitcaskContentLocationStore::open(&log_path).unwrap().get("u1", "b1", "racykey");
         assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

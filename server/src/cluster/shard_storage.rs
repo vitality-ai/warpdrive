@@ -32,11 +32,6 @@ use super::timing_stats::Phase;
 use crate::storage::config::StorageConfig;
 use crate::storage::Storage;
 
-/// Reserved user_id namespace for internal cluster shard storage — keeps
-/// shard files physically isolated from any real tenant's own storage
-/// directory (user_id is the top-level directory under STORAGE_DIRECTORY).
-pub const CLUSTER_SHARD_USER: &str = "__cluster__";
-
 lazy_static! {
     static ref SHARD_META_STORE: Arc<dyn ShardMetaStore> = {
         let log_path = std::env::var("WARPDRIVE_SHARD_META_LOG").unwrap_or_else(|_| "shard_meta.log".to_string());
@@ -130,16 +125,24 @@ pub fn versioned_key(key: &str, version: &str) -> String {
     format!("{key}:{version}")
 }
 
-pub fn shard_key(bucket: &str, key: &str, shard_idx: usize) -> String {
-    format!("{}:{}:{}:{}", bucket.len(), bucket, key, shard_idx)
+/// Length-prefixes `user_id` too, same reasoning as `bucket`'s own prefix
+/// (#150) and the same tenant-isolation fix applied one level up in
+/// `location_store.rs`/`content_location_store.rs`: the `(offset, size)`
+/// this key maps to in `SHARD_META_STORE` is only meaningful within the
+/// one physical file `store().write(user_id, bucket, ...)` wrote it into,
+/// so two different users' shards for the same `(bucket, key, shard_idx)`
+/// must not collide onto the same `SHARD_META_STORE` entry even though
+/// they land in different physical files.
+pub fn shard_key(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> String {
+    format!("{}:{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key, shard_idx)
 }
 
-pub fn store_shard(bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), Error> {
+pub fn store_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), Error> {
     let request_start = Instant::now();
-    let sk = shard_key(bucket, key, shard_idx);
+    let sk = shard_key(user_id, bucket, key, shard_idx);
 
     let t0 = Instant::now();
-    let (offset, size) = store().write(CLUSTER_SHARD_USER, bucket, data)?;
+    let (offset, size) = store().write(user_id, bucket, data)?;
     SERVER_TIMING.storage_write.record(t0.elapsed());
 
     let t0 = Instant::now();
@@ -152,12 +155,12 @@ pub fn store_shard(bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Re
     Ok(())
 }
 
-pub fn load_shard(bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
-    let sk = shard_key(bucket, key, shard_idx);
+pub fn load_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
+    let sk = shard_key(user_id, bucket, key, shard_idx);
     let (offset, size) = SHARD_META_STORE
         .get(&sk)
         .ok_or_else(|| ErrorNotFound("shard key does not exist"))?;
-    store().read(CLUSTER_SHARD_USER, bucket, offset, size)
+    store().read(user_id, bucket, offset, size)
 }
 
 #[cfg(test)]
@@ -167,15 +170,29 @@ mod tests {
     #[test]
     fn store_then_load_round_trips() {
         let data = b"gRPC-path shard bytes, no SQLite mutex on this path anymore".to_vec();
-        store_shard("shardtest-bucket", "shardtest-key", 0, &data).unwrap();
-        let loaded = load_shard("shardtest-bucket", "shardtest-key", 0).unwrap();
+        store_shard("u1", "shardtest-bucket", "shardtest-key", 0, &data).unwrap();
+        let loaded = load_shard("u1", "shardtest-bucket", "shardtest-key", 0).unwrap();
         assert_eq!(loaded, data);
     }
 
     #[test]
     fn missing_shard_returns_not_found() {
-        let err = load_shard("shardtest-bucket", "never-written-key", 0).unwrap_err();
+        let err = load_shard("u1", "shardtest-bucket", "never-written-key", 0).unwrap_err();
         assert_eq!(err.as_response_error().status_code(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Tenant-isolation fix's core invariant at the shard-bytes layer:
+    /// two different users' shards for the exact same `(bucket, key,
+    /// shard_idx)` must not collide.
+    #[test]
+    fn two_users_storing_the_same_shard_key_get_independent_bytes() {
+        let alice_data = b"alice's shard bytes".to_vec();
+        let bob_data = b"bob's shard bytes, different content".to_vec();
+        store_shard("alice", "shared-bucket", "k1", 0, &alice_data).unwrap();
+        store_shard("bob", "shared-bucket", "k1", 0, &bob_data).unwrap();
+
+        assert_eq!(load_shard("alice", "shared-bucket", "k1", 0).unwrap(), alice_data);
+        assert_eq!(load_shard("bob", "shared-bucket", "k1", 0).unwrap(), bob_data);
     }
 
     /// #151: two overwrites of the same key must get distinct versioned
@@ -208,11 +225,11 @@ mod tests {
         let old_key = versioned_key("versiontest-key", "v1");
         let new_key = versioned_key("versiontest-key", "v2");
 
-        store_shard("versiontest-bucket", &old_key, 0, &old_data).unwrap();
-        store_shard("versiontest-bucket", &new_key, 0, &new_data).unwrap();
+        store_shard("u1", "versiontest-bucket", &old_key, 0, &old_data).unwrap();
+        store_shard("u1", "versiontest-bucket", &new_key, 0, &new_data).unwrap();
 
-        assert_eq!(load_shard("versiontest-bucket", &old_key, 0).unwrap(), old_data);
-        assert_eq!(load_shard("versiontest-bucket", &new_key, 0).unwrap(), new_data);
+        assert_eq!(load_shard("u1", "versiontest-bucket", &old_key, 0).unwrap(), old_data);
+        assert_eq!(load_shard("u1", "versiontest-bucket", &new_key, 0).unwrap(), new_data);
     }
 
     /// #150: the exact collision from the issue's repro -- a bucket/key
@@ -220,26 +237,35 @@ mod tests {
     /// as the separator.
     #[test]
     fn shard_key_does_not_collide_when_a_separator_moves_across_the_bucket_key_boundary() {
-        assert_ne!(shard_key("a__b", "c", 0), shard_key("a", "b__c", 0));
+        assert_ne!(shard_key("u1", "a__b", "c", 0), shard_key("u1", "a", "b__c", 0));
+    }
+
+    /// Same collision, one level up: two different users must not collide
+    /// even when their (bucket, key, shard_idx) are identical.
+    #[test]
+    fn shard_key_does_not_collide_across_different_users() {
+        assert_ne!(shard_key("alice", "b", "k", 0), shard_key("bob", "b", "k", 0));
     }
 
     #[test]
-    fn shard_key_is_injective_over_bucket_key_and_shard_idx() {
-        let cases: &[(&str, &str, usize)] = &[
-            ("a", "b", 0),
-            ("a", "b", 1),
-            ("a", "bb", 0),
-            ("aa", "b", 0),
-            ("a:1", "b", 1),
-            ("a", "1:b", 1),
-            ("a:b", "1", 1),
+    fn shard_key_is_injective_over_user_bucket_key_and_shard_idx() {
+        let cases: &[(&str, &str, &str, usize)] = &[
+            ("u1", "a", "b", 0),
+            ("u1", "a", "b", 1),
+            ("u1", "a", "bb", 0),
+            ("u1", "aa", "b", 0),
+            ("u1", "a:1", "b", 1),
+            ("u1", "a", "1:b", 1),
+            ("u1", "a:b", "1", 1),
+            ("u2", "a", "b", 0),
+            ("u1:2", "a", "b", 0),
         ];
-        for (i, &(b1, k1, i1)) in cases.iter().enumerate() {
-            for &(b2, k2, i2) in &cases[i + 1..] {
+        for (i, &(u1, b1, k1, i1)) in cases.iter().enumerate() {
+            for &(u2, b2, k2, i2) in &cases[i + 1..] {
                 assert_ne!(
-                    shard_key(b1, k1, i1),
-                    shard_key(b2, k2, i2),
-                    "collision between ({b1:?},{k1:?},{i1}) and ({b2:?},{k2:?},{i2})"
+                    shard_key(u1, b1, k1, i1),
+                    shard_key(u2, b2, k2, i2),
+                    "collision between ({u1:?},{b1:?},{k1:?},{i1}) and ({u2:?},{b2:?},{k2:?},{i2})"
                 );
             }
         }

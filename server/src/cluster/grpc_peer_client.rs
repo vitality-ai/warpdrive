@@ -74,7 +74,7 @@ impl ShardService for ShardServiceImpl {
         // turned into a plain String *inside* the closure, before it
         // ever has to cross the thread boundary.
         tokio::task::spawn_blocking(move || {
-            store_shard(&req.bucket, &req.key, req.shard_idx as usize, &req.data).map_err(|e| e.to_string())
+            store_shard(&req.user_id, &req.bucket, &req.key, req.shard_idx as usize, &req.data).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("shard store task panicked: {e}")))?
@@ -85,7 +85,7 @@ impl ShardService for ShardServiceImpl {
     async fn get_shard(&self, request: Request<GetShardRequest>) -> Result<Response<GetShardResponse>, Status> {
         let req = request.into_inner();
         let data = tokio::task::spawn_blocking(move || {
-            load_shard(&req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
+            load_shard(&req.user_id, &req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| Status::internal(format!("shard load task panicked: {e}")))?
@@ -241,7 +241,7 @@ impl Default for GrpcPeerClient {
 
 #[async_trait]
 impl PeerClient for GrpcPeerClient {
-    async fn put_shard(&self, peer: &str, bucket: &str, key: &str, shard_idx: usize, data: Vec<u8>) -> Result<(), Error> {
+    async fn put_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: Vec<u8>) -> Result<(), Error> {
         let t0 = std::time::Instant::now();
         let mut client = self.client_for(peer).await?;
         CLIENT_TIMING.channel_lookup.record(t0.elapsed());
@@ -253,6 +253,7 @@ impl PeerClient for GrpcPeerClient {
                 key: key.to_string(),
                 shard_idx: shard_idx as u32,
                 data,
+                user_id: user_id.to_string(),
             })
             .await;
         CLIENT_TIMING.rpc_call.record(t0.elapsed());
@@ -260,13 +261,14 @@ impl PeerClient for GrpcPeerClient {
         Ok(())
     }
 
-    async fn get_shard(&self, peer: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
+    async fn get_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
         let mut client = self.client_for(peer).await?;
         let resp = client
             .get_shard(GetShardRequest {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 shard_idx: shard_idx as u32,
+                user_id: user_id.to_string(),
             })
             .await
             .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} failed: {e}")))?;

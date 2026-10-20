@@ -14,6 +14,7 @@ use std::sync::Arc;
 use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMeta};
 use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
 use super::ec::ErasureCoder;
+use super::location_store::UNAUTHENTICATED_USER;
 use super::packing::Stripe;
 use super::shard_storage::{new_version_id, versioned_key};
 
@@ -277,7 +278,7 @@ pub async fn put_object_content_dependent(
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.to_string();
             let wire_key = wire_key.clone();
-            async move { client.put_shard(&peer, &bucket, &wire_key, idx, shard).await }
+            async move { client.put_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx, shard).await }
         });
         let results = join_all(puts).await;
         let acked = results.iter().filter(|r| r.is_ok()).count();
@@ -295,6 +296,7 @@ pub async fn put_object_content_dependent(
     }
 
     let record = ContentDependentRecord {
+        user_id: UNAUTHENTICATED_USER.to_string(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         k,
@@ -305,6 +307,16 @@ pub async fn put_object_content_dependent(
         version,
         has_sparse_gaps,
         sorted_unit_locations,
+        etag: None,
+        content_type: None,
+        last_modified: None,
+        user_metadata: std::collections::HashMap::new(),
+        cache_control: None,
+        expires: None,
+        content_encoding: None,
+        checksum_algorithm: None,
+        checksum_value: None,
+        checksum_type: None,
     };
 
     // Replicate to *every* known peer, not just the union of this object's
@@ -332,7 +344,7 @@ pub async fn put_object_content_dependent(
     // needed quorum to receive the original plain pin, so it may have no
     // local copy even though other peers still do. Don't gate the
     // tombstone broadcast on a local `.is_some()` check (see issue #153).
-    let _ = state.location_store.delete(bucket, key);
+    let _ = state.location_store.delete(UNAUTHENTICATED_USER, bucket, key);
     let cleanup_acked = replicate_location_delete(state, bucket, key, &peers).await;
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
@@ -370,7 +382,7 @@ async fn fetch_and_decode_stripe(
         let bucket = record.bucket.clone();
         let wire_key = wire_key.clone();
         let peer = stripe.shard_peers[idx].clone();
-        async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
+        async move { client.get_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
     };
 
     // Same bug as `coordinator.rs`'s plain GET had, same fix: this used to

@@ -194,7 +194,7 @@ pub async fn cluster_internal_pushdown_filter(
     } else {
         super::shard_storage::versioned_key(&sk, &req.version)
     };
-    let raw_bin = super::shard_storage::load_shard(&req.bucket, &wire_key, req.bin_index)?;
+    let raw_bin = super::shard_storage::load_shard(super::location_store::UNAUTHENTICATED_USER, &req.bucket, &wire_key, req.bin_index)?;
     let response = evaluate(&raw_bin, &req, &state)?;
     Ok(HttpResponse::Ok().json(response))
 }
@@ -215,7 +215,7 @@ pub async fn cluster_pushdown_query(
 
     let record = state
         .content_location_store
-        .get(&bucket, &key)
+        .get(super::location_store::UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("no content-dependent record for this key"))?;
 
     let (stripe_idx, bin_idx) = record

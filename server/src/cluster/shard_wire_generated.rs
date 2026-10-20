@@ -125,6 +125,7 @@ impl<'a> PutShardRequest<'a> {
   pub const VT_KEY: ::flatbuffers::VOffsetT = 6;
   pub const VT_SHARD_IDX: ::flatbuffers::VOffsetT = 8;
   pub const VT_DATA: ::flatbuffers::VOffsetT = 10;
+  pub const VT_USER_ID: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -136,6 +137,7 @@ impl<'a> PutShardRequest<'a> {
     args: &'args PutShardRequestArgs<'args>
   ) -> ::flatbuffers::WIPOffset<PutShardRequest<'bldr>> {
     let mut builder = PutShardRequestBuilder::new(_fbb);
+    if let Some(x) = args.user_id { builder.add_user_id(x); }
     if let Some(x) = args.data { builder.add_data(x); }
     builder.add_shard_idx(args.shard_idx);
     if let Some(x) = args.key { builder.add_key(x); }
@@ -172,6 +174,13 @@ impl<'a> PutShardRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(PutShardRequest::VT_DATA, None)}
   }
+  #[inline]
+  pub fn user_id(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(PutShardRequest::VT_USER_ID, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for PutShardRequest<'_> {
@@ -184,6 +193,7 @@ impl ::flatbuffers::Verifiable for PutShardRequest<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, false)?
      .visit_field::<u32>("shard_idx", Self::VT_SHARD_IDX, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("data", Self::VT_DATA, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("user_id", Self::VT_USER_ID, false)?
      .finish();
     Ok(())
   }
@@ -193,6 +203,7 @@ pub struct PutShardRequestArgs<'a> {
     pub key: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub shard_idx: u32,
     pub data: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub user_id: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for PutShardRequestArgs<'a> {
   #[inline]
@@ -202,6 +213,7 @@ impl<'a> Default for PutShardRequestArgs<'a> {
       key: None,
       shard_idx: 0,
       data: None,
+      user_id: None,
     }
   }
 }
@@ -228,6 +240,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> PutShardRequestBuilder<'a, 'b
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(PutShardRequest::VT_DATA, data);
   }
   #[inline]
+  pub fn add_user_id(&mut self, user_id: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(PutShardRequest::VT_USER_ID, user_id);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> PutShardRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     PutShardRequestBuilder {
@@ -249,6 +265,7 @@ impl ::core::fmt::Debug for PutShardRequest<'_> {
       ds.field("key", &self.key());
       ds.field("shard_idx", &self.shard_idx());
       ds.field("data", &self.data());
+      ds.field("user_id", &self.user_id());
       ds.finish()
   }
 }
@@ -384,6 +401,7 @@ impl<'a> GetShardRequest<'a> {
   pub const VT_BUCKET: ::flatbuffers::VOffsetT = 4;
   pub const VT_KEY: ::flatbuffers::VOffsetT = 6;
   pub const VT_SHARD_IDX: ::flatbuffers::VOffsetT = 8;
+  pub const VT_USER_ID: ::flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -395,6 +413,7 @@ impl<'a> GetShardRequest<'a> {
     args: &'args GetShardRequestArgs<'args>
   ) -> ::flatbuffers::WIPOffset<GetShardRequest<'bldr>> {
     let mut builder = GetShardRequestBuilder::new(_fbb);
+    if let Some(x) = args.user_id { builder.add_user_id(x); }
     builder.add_shard_idx(args.shard_idx);
     if let Some(x) = args.key { builder.add_key(x); }
     if let Some(x) = args.bucket { builder.add_bucket(x); }
@@ -423,6 +442,13 @@ impl<'a> GetShardRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u32>(GetShardRequest::VT_SHARD_IDX, Some(0)).unwrap()}
   }
+  #[inline]
+  pub fn user_id(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(GetShardRequest::VT_USER_ID, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for GetShardRequest<'_> {
@@ -434,6 +460,7 @@ impl ::flatbuffers::Verifiable for GetShardRequest<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("bucket", Self::VT_BUCKET, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, false)?
      .visit_field::<u32>("shard_idx", Self::VT_SHARD_IDX, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("user_id", Self::VT_USER_ID, false)?
      .finish();
     Ok(())
   }
@@ -442,6 +469,7 @@ pub struct GetShardRequestArgs<'a> {
     pub bucket: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub key: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub shard_idx: u32,
+    pub user_id: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for GetShardRequestArgs<'a> {
   #[inline]
@@ -450,6 +478,7 @@ impl<'a> Default for GetShardRequestArgs<'a> {
       bucket: None,
       key: None,
       shard_idx: 0,
+      user_id: None,
     }
   }
 }
@@ -472,6 +501,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> GetShardRequestBuilder<'a, 'b
     self.fbb_.push_slot::<u32>(GetShardRequest::VT_SHARD_IDX, shard_idx, 0);
   }
   #[inline]
+  pub fn add_user_id(&mut self, user_id: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(GetShardRequest::VT_USER_ID, user_id);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> GetShardRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     GetShardRequestBuilder {
@@ -492,6 +525,7 @@ impl ::core::fmt::Debug for GetShardRequest<'_> {
       ds.field("bucket", &self.bucket());
       ds.field("key", &self.key());
       ds.field("shard_idx", &self.shard_idx());
+      ds.field("user_id", &self.user_id());
       ds.finish()
   }
 }

@@ -21,7 +21,7 @@ use crate::util::flatbuffer_store_generated::store::{
     FileData, FileDataArgs, FileDataList, FileDataListArgs,
 };
 
-use super::shard_storage::{shard_key, CLUSTER_SHARD_USER};
+use super::shard_storage::shard_key;
 
 fn encode_single_file_flatbuffer(data: &[u8]) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
@@ -51,6 +51,7 @@ pub trait PeerClient: Send + Sync {
     async fn put_shard(
         &self,
         peer: &str,
+        user_id: &str,
         bucket: &str,
         key: &str,
         shard_idx: usize,
@@ -60,6 +61,7 @@ pub trait PeerClient: Send + Sync {
     async fn get_shard(
         &self,
         peer: &str,
+        user_id: &str,
         bucket: &str,
         key: &str,
         shard_idx: usize,
@@ -102,12 +104,13 @@ impl PeerClient for HttpPeerClient {
     async fn put_shard(
         &self,
         peer: &str,
+        user_id: &str,
         bucket: &str,
         key: &str,
         shard_idx: usize,
         data: Vec<u8>,
     ) -> Result<(), Error> {
-        let sk = shard_key(bucket, key, shard_idx);
+        let sk = shard_key(user_id, bucket, key, shard_idx);
         // #149: actix-web fully percent-*decodes* path parameters, so an
         // unencoded `sk` containing `?`, `#`, or `%` could be
         // reinterpreted as a query string, a fragment, or a different
@@ -123,10 +126,17 @@ impl PeerClient for HttpPeerClient {
         let url = format!("{}/put/{}", peer.trim_end_matches('/'), encoded_sk);
         let body = encode_single_file_flatbuffer(&data);
 
+        // Tenant-isolation fix: this used to hardcode a reserved
+        // "__cluster__" user namespace here; the real `user_id` now
+        // reaches the receiving peer's native `/put/{key}` handler the
+        // same way a direct single-node client request would (that
+        // handler's own `Storage`/`MetadataService` layer is already
+        // keyed by this header's value, see `api::put`), so shard bytes
+        // land in the correct per-tenant storage directory.
         let resp = self
             .client
             .post(&url)
-            .header("User", CLUSTER_SHARD_USER)
+            .header("User", user_id)
             .header("Bucket", bucket)
             .body(body)
             .send()
@@ -146,11 +156,12 @@ impl PeerClient for HttpPeerClient {
     async fn get_shard(
         &self,
         peer: &str,
+        user_id: &str,
         bucket: &str,
         key: &str,
         shard_idx: usize,
     ) -> Result<Vec<u8>, Error> {
-        let sk = shard_key(bucket, key, shard_idx);
+        let sk = shard_key(user_id, bucket, key, shard_idx);
         // #149: same reasoning as `put_shard` above.
         let encoded_sk = utf8_percent_encode(&sk, NON_ALPHANUMERIC).to_string();
         let url = format!("{}/get/{}", peer.trim_end_matches('/'), encoded_sk);
@@ -158,7 +169,7 @@ impl PeerClient for HttpPeerClient {
         let resp = self
             .client
             .get(&url)
-            .header("User", CLUSTER_SHARD_USER)
+            .header("User", user_id)
             .header("Bucket", bucket)
             .send()
             .await
@@ -193,10 +204,10 @@ mod tests {
 
     #[test]
     fn shard_key_is_stable_and_distinct_per_index() {
-        let a = shard_key("mybucket", "mykey", 0);
-        let b = shard_key("mybucket", "mykey", 1);
+        let a = shard_key("u1", "mybucket", "mykey", 0);
+        let b = shard_key("u1", "mybucket", "mykey", 1);
         assert_ne!(a, b);
-        assert_eq!(a, shard_key("mybucket", "mykey", 0));
+        assert_eq!(a, shard_key("u1", "mybucket", "mykey", 0));
     }
 
     /// #149: `shard_key` output embeds the user's bucket and key
@@ -212,7 +223,7 @@ mod tests {
     #[test]
     fn percent_encoding_a_shard_key_round_trips_through_decoding() {
         for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
-            let sk = shard_key("bucket", key, 0);
+            let sk = shard_key("u1", "bucket", key, 0);
             let encoded = utf8_percent_encode(&sk, NON_ALPHANUMERIC).to_string();
             // Every byte that isn't alphanumeric became a `%XX` escape, so
             // none of the raw reserved characters that caused the

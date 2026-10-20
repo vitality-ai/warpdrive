@@ -21,7 +21,7 @@ use std::sync::Arc;
 use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
 use super::content_location_store::{ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
-use super::location_store::{LocationRecord, LocationStore};
+use super::location_store::{LocationRecord, LocationStore, UNAUTHENTICATED_USER};
 use super::membership::Membership;
 use super::packing::StripePacker;
 use super::peer_client::PeerClient;
@@ -488,7 +488,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             async move {
-                let res = client.put_shard(&peer, &bucket, &wire_key, idx, shard).await;
+                let res = client.put_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx, shard).await;
                 if let Err(ref e) = res {
                     warn!("put_shard idx={idx} peer={peer} failed: {e}");
                 }
@@ -515,6 +515,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // with the pin, making "any node can serve GET" actually true rather
     // than only true for the k+m peers that happened to hold shards.
     let record = LocationRecord {
+        user_id: UNAUTHENTICATED_USER.to_string(),
         bucket: bucket.clone(),
         key: key.clone(),
         shard_peers: chosen.clone(),
@@ -525,6 +526,16 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
+        etag: None,
+        content_type: None,
+        last_modified: None,
+        user_metadata: std::collections::HashMap::new(),
+        cache_control: None,
+        expires: None,
+        content_encoding: None,
+        checksum_algorithm: None,
+        checksum_value: None,
+        checksum_type: None,
     };
 
     let t0 = std::time::Instant::now();
@@ -554,7 +565,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
     // every other write here: a PUT that can't confirm the stale pin was
     // actually cleared cluster-wide is treated as not fully succeeded.
-    let _ = state.content_location_store.delete(&bucket, &key);
+    let _ = state.content_location_store.delete(UNAUTHENTICATED_USER, &bucket, &key);
     let cleanup_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
@@ -605,7 +616,7 @@ pub async fn cluster_get_object(
     // shape — many stripes, not one shard set). Check there first: cheap,
     // and a key is either content-dependent or not, decided once at PUT
     // time by header presence.
-    if let Some(record) = state.content_location_store.get(&bucket, &key) {
+    if let Some(record) = state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key) {
         let total_len = record.original_len as u64;
         // Range-aware fetch only reaches the stripes whose units actually
         // overlap the requested bytes (see packed.rs) — this is the whole
@@ -642,7 +653,7 @@ pub async fn cluster_get_object(
     // Never recompute placement here — look up the pin from write time.
     let record = state
         .location_store
-        .get(&bucket, &key)
+        .get(UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
     let total_len = record.original_len as u64;
 
@@ -677,7 +688,7 @@ pub async fn cluster_get_object(
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             let peer = record.shard_peers[idx].clone();
-            async move { client.get_shard(&peer, &bucket, &wire_key, idx).await.ok() }
+            async move { client.get_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx).await.ok() }
         });
         let partial_results = join_all(partial_gets).await;
 
@@ -707,7 +718,7 @@ pub async fn cluster_get_object(
         let bucket = bucket.clone();
         let wire_key = wire_key.clone();
         async move {
-            match client.get_shard(&peer, &bucket, &wire_key, idx).await {
+            match client.get_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx).await {
                 Ok(data) => Some((idx, data)),
                 Err(e) => {
                     warn!("get_shard idx={idx} peer={peer} failed: {e}");
@@ -783,7 +794,7 @@ pub async fn cluster_content_record(
     let (bucket, key) = path.into_inner();
     let record = state
         .content_location_store
-        .get(&bucket, &key)
+        .get(UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("no content-dependent record for this key"))?;
     Ok(HttpResponse::Ok().json(record))
 }
@@ -800,8 +811,8 @@ pub async fn cluster_delete_object(
     // left over from an earlier overwrite that changed which path it took
     // (see `put_object_plain`'s and `put_object_content_dependent`'s
     // overwrite handling).
-    let plain_record = state.location_store.get(&bucket, &key);
-    let packed_record = state.content_location_store.get(&bucket, &key);
+    let plain_record = state.location_store.get(UNAUTHENTICATED_USER, &bucket, &key);
+    let packed_record = state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key);
 
     // Deliberately *not* a 404 short-circuit when both are locally absent:
     // this coordinator only needed quorum to receive either pin, not all
@@ -894,7 +905,7 @@ pub async fn cluster_put_retention(
 
     let mut record = state
         .location_store
-        .get(&bucket, &key)
+        .get(UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
 
     record.retention_mode = Some(body.mode.clone());
@@ -1044,7 +1055,7 @@ pub async fn cluster_internal_delete_location(
     let DeleteKeyRequest { bucket, key } = body.into_inner();
     state
         .location_store
-        .delete(&bucket, &key)
+        .delete(UNAUTHENTICATED_USER, &bucket, &key)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
 }
@@ -1058,7 +1069,7 @@ pub async fn cluster_internal_delete_content_location(
     let DeleteKeyRequest { bucket, key } = body.into_inner();
     state
         .content_location_store
-        .delete(&bucket, &key)
+        .delete(UNAUTHENTICATED_USER, &bucket, &key)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
 }

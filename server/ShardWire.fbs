@@ -10,6 +10,10 @@ table PutShardRequest {
   key: string;
   shard_idx: uint32;
   data: [ubyte];
+  // Tenant-isolation fix: empty string means the unauthenticated/legacy
+  // namespace (see location_store::UNAUTHENTICATED_USER). Every caller
+  // sets this explicitly.
+  user_id: string;
 }
 
 table PutShardResponse {
@@ -21,6 +25,7 @@ table GetShardRequest {
   bucket: string;
   key: string;
   shard_idx: uint32;
+  user_id: string;
 }
 
 table GetShardResponse {
