@@ -147,6 +147,10 @@ pub struct ContentDependentRecord {
     pub checksum_value: Option<String>,
     #[serde(default)]
     pub checksum_type: Option<String>,
+    /// S3 object tags, same shape and same `#[serde(default)]` reasoning
+    /// as `LocationRecord::tags`.
+    #[serde(default)]
+    pub tags: Vec<(String, String)>,
 }
 
 impl ContentDependentRecord {
@@ -375,6 +379,7 @@ mod tests {
             checksum_algorithm: None,
             checksum_value: None,
             checksum_type: None,
+            tags: Vec::new(),
         }
     }
 

@@ -319,6 +319,7 @@ pub async fn put_object_content_dependent(
         checksum_algorithm: s3_meta.checksum_algorithm.clone(),
         checksum_value: s3_meta.checksum_value.clone(),
         checksum_type: s3_meta.checksum_type.clone(),
+        tags: Vec::new(),
     };
 
     // Replicate to *every* known peer, not just the union of this object's

@@ -562,6 +562,11 @@ async fn put_object_plain(
         checksum_algorithm: s3_meta.checksum_algorithm.clone(),
         checksum_value: s3_meta.checksum_value.clone(),
         checksum_type: s3_meta.checksum_type.clone(),
+        // A PUT (full overwrite) starts a conceptually new object version
+        // with no tags, same as real S3 -- tags are (re-)applied via a
+        // separate PutObjectTagging call, never inherited from whatever
+        // the previous version had.
+        tags: Vec::new(),
     };
 
     let t0 = std::time::Instant::now();

@@ -113,6 +113,11 @@ pub struct LocationRecord {
     pub checksum_value: Option<String>,
     #[serde(default)]
     pub checksum_type: Option<String>,
+    /// S3 object tags (`PutObjectTagging`/`GetObjectTagging`), same shape
+    /// as single-node's tag storage. `#[serde(default)]`: empty for a
+    /// record written before this field existed.
+    #[serde(default)]
+    pub tags: Vec<(String, String)>,
 }
 
 pub trait LocationStore: Send + Sync {
@@ -346,6 +351,7 @@ mod tests {
             checksum_algorithm: None,
             checksum_value: None,
             checksum_type: None,
+            tags: Vec::new(),
         }
     }
 

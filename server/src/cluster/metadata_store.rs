@@ -423,6 +423,7 @@ mod tests {
             checksum_algorithm: meta.checksum_algorithm,
             checksum_value: meta.checksum_value,
             checksum_type: meta.checksum_type,
+            tags: Vec::new(),
         }
     }
 
