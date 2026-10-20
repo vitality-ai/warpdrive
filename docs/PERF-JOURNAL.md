@@ -196,3 +196,195 @@ itself (EC encode, JSON serialize/deserialize of LocationRecord on every
 replication call, SigV4 verify) can come down further -- that would raise this
 ceiling independent of node count, which matters since node count is
 quota-capped here.
+
+## 2026-10-21 22:0x — Getting MinIO running on the same 5 nodes (several dead ends)
+
+MinIO no longer ships prebuilt Linux binaries (`dl.min.io`'s old release path
+now returns HTTP 410; GitHub releases only attach `warp-rdma` tarballs, not
+plain `minio`; Homebrew itself builds from source now and flags the formula
+"deprecated because it has an archived upstream repository"). Cross-compiling
+it locally for linux/amd64 hit a real wall: the Mac is at ~99% disk capacity
+(1.1-1.2GB free, pre-existing, not from tonight's work -- confirmed no local
+Time Machine snapshots are holding the space hostage, it's just genuinely
+nearly full) and the build failed with "no space left on device". Freed what
+this session's own disposable `/tmp/wd-*` scratch dirs held (~2.3GB) but it
+barely moved the needle, so abandoned the local build rather than risk
+filling the user's disk further -- flagging this for the user to address
+when they're back, since it'll block anything else that needs real build
+headroom on the Mac.
+
+Built on GCP instead (node-0's separate 20GB boot disk has 13GB free,
+unaffected by the Mac's problem): installed Go 1.24 + git on node-0,
+temporarily resized it to e2-standard-8 (stopping chaos-node-3/4 first to
+stay inside the 12-vCPU quota, same trick as the original chaos-testing
+cross-build), cloned `minio/minio` at its last tagged release and built with
+plain `go build .` -- worked cleanly. Copied the 151MB binary to all 5 nodes,
+resized node-0 back to e2-small, brought node-3/4 back up, restarted WarpDrive
+everywhere to confirm the fleet was still healthy before tearing it down for
+the MinIO run.
+
+Then three real, sequential bugs/misconfigurations before distributed MinIO
+actually came up, each worth recording since they're the kind of thing that
+looks like "it doesn't work" when it's really a specific, fixable cause:
+
+1. **Self-inflicted `pkill` footgun.** Used `pkill -9 -f 'minio_bin'` to stop
+   the old process before restarting -- `pkill -f` matches the full command
+   line of every process, including the very shell invoking `pkill -f
+   'minio_bin'` itself (its own argv literally contains the substring
+   "minio_bin"), so it killed the SSH session running the command, which
+   surfaced as an opaque `ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited
+   with return code [255]` with no useful detail. Fixed by switching to
+   `pkill -9 -x minio_bin` (exact process-name match, not full command line).
+2. **Firewall.** `allow-warpdrive-internal` (from the chaos-testing session)
+   only opened WarpDrive's own port ranges (9710-11730), never MinIO's 9000.
+   Distributed-mode MinIO dials every endpoint, including its own, over the
+   real network (not loopback) -- so this surfaced as "drive not found" for
+   every single endpoint, even a node's own local one. Added
+   `allow-minio-internal` (tcp:9000-9010, same internal /20 source range).
+3. **MinIO's root-drive safety guard.** Even after the firewall fix, still
+   "drive not found" -- the actual error, visible only at the top of the log
+   (not in the repeating retry spam `tail` was showing): "drive is part of
+   root drive, will not be used, please investigate". These e2-small VMs have
+   a single 20GB boot disk, no separate attached disk, so `/home/cj/miniodata`
+   lives on the root partition -- MinIO refuses to use root-partition paths
+   in distributed mode by default (a real production safety feature, so a
+   multi-drive deployment can't accidentally fill the OS disk). MinIO ships
+   exactly this escape hatch for ephemeral test/CI environments:
+   `MINIO_CI_CD=1`. Set it, and the cluster formatted and came up immediately
+   ("Formatting 1st pool, 1 set(s), 5 drives per set").
+
+Distributed MinIO is now live on the same 5 nodes WarpDrive was just
+benchmarked on. Running `warp` next for the real comparison.
+
+## 2026-10-21 22:1x — Real `warp` numbers, and an IMPORTANT caveat on why
+
+`warp put`, 4KB objects, against all 5 MinIO nodes (warp's own built-in
+multi-host round-robin, same mechanism used for WarpDrive's 5-way spread):
+
+```
+concurrency=64:  394.6 obj/s  (50%: 116.9ms, 99%: 465.2ms)
+concurrency=128: 323.7 obj/s  (50%: 319.2ms, 99%: 739.5ms)
+concurrency=640: 380.2 obj/s  (50%: 1653.1ms, 99%: 3398.2ms)
+```
+
+Flat at ~320-395 obj/s regardless of concurrency -- the same
+flat-despite-more-load saturation signature seen with WarpDrive earlier,
+meaning this is MinIO's real ceiling on this hardware, not a fluke.
+
+**Head-to-head on identical 5x e2-small hardware, 4KB objects:**
+```
+MinIO (distributed, 5 nodes):        ~320-395 obj/s
+WarpDrive (single coordinator):       812-890 req/s   (~2.2x)
+WarpDrive (spread across 5 nodes):    2,416 req/s      (~6.5x)
+```
+
+WarpDrive is ahead by a real, repeatable margin on this hardware. **But**
+checked `vmstat` on a MinIO node during its run and it told a different story
+than WarpDrive's: MinIO was NOT CPU-bound (~30-40% total CPU) -- it showed
+real I/O wait (16-28% `wa`) and heavy block-out traffic (18-25k `bo`/sec),
+the signature of something actually hitting disk hard, consistent with real
+fsync'd/durable writes. WarpDrive's node, under its own load, showed ~0% I/O
+wait throughout every run tonight.
+
+That sent me back to check whether WarpDrive's write paths fsync at all, and
+the honest answer is **no, nowhere**: already knew `BitcaskLocationStore`'s
+log append doesn't (confirmed earlier tonight, plain unbuffered `File`,
+`.flush()` is a no-op on it). Just confirmed the same is true of the actual
+*object byte* storage path too -- `server/src/storage/local_store.rs`'s
+`write()` (`file.write_all_at(data, offset)`) and
+`server/src/cluster/shard_storage.rs`'s `store_shard` have no `fsync`/
+`sync_all`/`sync_data` call anywhere. This is **not** something introduced
+by tonight's perf work -- it predates this session, and it's true of both
+single-node and cluster, for both metadata and actual object bytes. Every
+write WarpDrive currently acknowledges as successful is only as durable as
+the OS page cache until some unrelated future flush happens to write it back;
+a crash or power loss before that can lose an acknowledged write.
+
+This matters a lot more than tonight's benchmark: per
+[[feedback-safety-durability-priority]] (never trade off replication/
+consistency for deadline pressure, even documented -- find the design that
+avoids the gap), this is not a tradeoff to quietly keep because it makes the
+MinIO comparison look better. Part of tonight's throughput lead is real
+architecture (fewer serialized round trips, spread coordination), and part
+of it may be an apples-to-oranges comparison against a store that pays a
+real durability cost WarpDrive currently doesn't pay at all. **Flagging this
+prominently rather than fixing it unilaterally tonight**: this is a
+cross-cutting change (every write path, single-node and cluster, with real
+perf implications for the Oct 22 release) that deserves a real decision, not
+a 2am blanket `fsync()` that might just trade today's good numbers for a
+worse, panicked story tomorrow. The right fix is very likely a group-commit
+design (batch concurrent writers' fsyncs into one periodic flush, so
+durability is restored without serializing each request to its own full
+fsync latency) rather than a naive per-write fsync -- that's the "find the
+design that avoids the gap" version of this, not just flipping a switch.
+Not implemented tonight; raising it as the top item to discuss, separate
+from (and more important than) the MinIO comparison itself.
+
+## 2026-10-21 22:2x — Measured the real cost: naive fsync should NOT ship as-is
+
+Added real `fsync` (`sync_data()`) to all four write paths that lacked it:
+`storage/local_store.rs::write` (the shared per-bucket file both single-node
+and every cluster shard write goes through), and the three Bitcask-style
+append logs (`location_store.rs`, `content_location_store.rs`,
+`shard_meta_store.rs`). 166 tests still pass -- and the lib test suite's own
+runtime jumped from 0.06s to 6.86s, which is itself a useful confirmation
+the fsync calls are real and not silently no-ops.
+
+Rebuilt, deployed fleet-wide, re-ran the identical benchmarks (client
+confirmed idle via `top` first):
+
+```
+                        no-fsync (tonight)    with real fsync      change
+single coordinator,
+  concurrency=64:       811.9 req/s           137.1 req/s          -83%  (5.9x slower)
+single coordinator,
+  concurrency=256:      834.7 req/s           154.1 req/s          -82%  (5.4x slower)
+5-way spread:           2,416.4 req/s         258.7 req/s          -89%  (9.3x slower),
+                                                1 error (quorum 1/3 --
+                                                a request timed out under
+                                                the added latency)
+```
+
+**With real durability, naive per-write fsync puts WarpDrive at 137-259
+req/s -- below MinIO's own ~320-395 obj/s ceiling on this identical
+hardware.** The naive fix doesn't just shrink the margin, it inverts the
+result. This matches the mechanism predicted earlier: a single PUT already
+triggers up to 15 outbound peer calls (5 shard + 5 location-pin + 5
+content-location-cleanup), and with the fix from earlier tonight those run
+concurrently in groups of 5 -- but each of those 5 peers now does a real,
+serialized disk fsync before acking, and GCP persistent-disk fsync latency
+on these e2-small boundary volumes is apparently steep enough that it
+dominates everything else, compounded across every peer in every group.
+
+**Decision: did not commit the naive fsync version.** Shipping it would
+trade a real, measured performance regression below the competitor for
+safety -- the *correct* tradeoff per [[feedback-safety-durability-priority]]
+would be to accept that regression if it were the only way to get real
+durability, but it isn't: the right fix is restoring durability *and* speed
+by batching concurrent writers' fsyncs (group commit), not accepting a
+~6-9x slowdown as the cost of correctness. The four files above are left
+modified but **uncommitted** in the working tree (stashed locally via `git
+stash` to redeploy the last-known-good committed binary fleet-wide without
+losing the diff) -- they're real, correct, and exactly where a group-commit
+implementation would start from, just not what should ship on their own.
+
+**Concrete next step, not done tonight:** a group-commit writer for each of
+these four stores. All four are already single shared files that many
+concurrent requests append to (`local_store.rs`'s per-`(user,bucket)` file,
+and the three Bitcask logs) -- exactly the structure group commit needs:
+one background task per file does the actual `fsync`, and concurrent
+writers that land within the same short window (e.g. a few hundred
+microseconds, or "however many arrived since the last fsync completed")
+share that single fsync call instead of each paying for their own. This is
+standard practice in WAL-based databases (Postgres, MySQL/InnoDB, most
+LSM-tree engines) for exactly this reason. Expected effect: durability
+restored for all four stores, while the per-fsync cost is amortized across
+however many concurrent writers are in flight rather than paid in full by
+every single request -- should recover most or all of tonight's speed
+numbers while keeping the correctness guarantee a real system needs. This
+is real, scoped, well-understood follow-up work, not a vague TODO.
+
+Fleet-wide, reverted to the last committed (no-fsync, pre-tonight's-fsync-
+experiment) binary so the live GCP cluster matches what's actually in git --
+not something faster-but-undocumented running live while the repo says
+otherwise.
