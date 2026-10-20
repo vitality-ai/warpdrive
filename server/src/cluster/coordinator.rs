@@ -900,19 +900,19 @@ pub async fn cluster_get_object(
     cluster_get_object_inner(UNAUTHENTICATED_USER, bucket, key, &req, &state).await
 }
 
-/// `(header-name, value)` to echo on a GET/HEAD response when the client
-/// sent `x-amz-checksum-mode: ENABLED` and the record actually has a
-/// stored checksum -- same opt-in convention single-node's
-/// `s3_get_object_handler`/`s3_head_object_handler` use.
 /// Shared by both GET read paths (plain and FAC): a reconstructed object
 /// must never reach the client if it doesn't match its stored checksum --
 /// that's what actually catches post-write corruption (bit-rot, an
 /// EC-reconstruction bug, a shard silently corrupted on one peer but
 /// still accepted by read-quorum), as opposed to only checking a
 /// client-sent checksum once at write time. A record with no stored
-/// checksum (predates this feature, `#[serde(default)]`) or an
-/// unrecognized algorithm string passes through untouched rather than
-/// failing closed on data that was never checksummed to begin with.
+/// checksum passes through untouched instead of failing closed: the one
+/// real path that produces this today is the bare, unauthenticated
+/// `/cluster/{bucket}/{key}` route (`cluster_put_object` passes
+/// `ObjectS3Metadata::default()`, which never computes one), not old
+/// data from before this feature existed -- this project has no
+/// production deployment yet, so there's no such data to be compatible
+/// with. Same passthrough for an unrecognized algorithm string.
 fn verify_object_checksum(
     bucket: &str, key: &str, data: &[u8], stored_checksum: &Option<(String, String)>,
 ) -> Result<(), Error> {
@@ -928,6 +928,10 @@ fn verify_object_checksum(
     }
 }
 
+/// `(header-name, value)` to echo on a GET/HEAD response when the client
+/// sent `x-amz-checksum-mode: ENABLED` and the record actually has a
+/// stored checksum -- same opt-in convention single-node's
+/// `s3_get_object_handler`/`s3_head_object_handler` use.
 fn checksum_response_header(
     req: &actix_web::HttpRequest, checksum_algorithm: &Option<String>, checksum_value: &Option<String>,
 ) -> Option<(String, String)> {
@@ -1752,12 +1756,6 @@ mod tests {
         assert!(decode_aws_chunked_payload(&raw).is_err());
     }
 
-    /// #149: `replicate_location_delete`/`replicate_content_location_delete`
-    /// now send `(bucket, key)` as this JSON body instead of interpolating
-    /// them into a URL path, specifically so a key containing `?`, `#`,
-    /// `%`, space, or `/` reaches the receiving peer's handler as the
-    /// exact bytes the client meant -- a JSON string has no character
-    /// that a URL parser would ever reinterpret as a delimiter.
     /// The real safety property added this release: a reconstructed
     /// object that doesn't match its stored checksum must never reach
     /// the client. Tested directly against `verify_object_checksum`
@@ -1795,13 +1793,20 @@ mod tests {
     }
 
     #[test]
-    fn verify_object_checksum_passes_through_when_no_checksum_was_ever_stored() {
-        // Old-format records (predate this feature, `#[serde(default)]`)
-        // must not fail closed on data nothing ever checksummed.
-        let data = b"legacy object with no checksum field".to_vec();
+    fn verify_object_checksum_passes_through_for_the_bare_unauthenticated_route() {
+        // `/cluster/{bucket}/{key}` never computes a checksum
+        // (`ObjectS3Metadata::default()`) -- must not fail closed on data
+        // nothing ever checksummed.
+        let data = b"object written through the bare pre-auth route".to_vec();
         assert!(verify_object_checksum("b", "k", &data, &None).is_ok());
     }
 
+    /// #149: `replicate_location_delete`/`replicate_content_location_delete`
+    /// now send `(bucket, key)` as this JSON body instead of interpolating
+    /// them into a URL path, specifically so a key containing `?`, `#`,
+    /// `%`, space, or `/` reaches the receiving peer's handler as the
+    /// exact bytes the client meant -- a JSON string has no character
+    /// that a URL parser would ever reinterpret as a delimiter.
     #[test]
     fn delete_key_request_round_trips_keys_with_url_special_characters() {
         for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
