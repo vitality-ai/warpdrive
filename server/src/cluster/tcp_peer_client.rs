@@ -26,7 +26,7 @@ use actix_web::Error;
 use async_trait::async_trait;
 use flatbuffers::FlatBufferBuilder;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex as StdMutex;
+use parking_lot::Mutex as StdMutex;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -129,7 +129,7 @@ impl TcpPeerClient {
     }
 
     fn pool_for(&self, endpoint: &str) -> Arc<PeerPool> {
-        let mut pools = self.pools.lock().unwrap();
+        let mut pools = self.pools.lock();
         let pool_size = self.pool_size;
         Arc::clone(pools.entry(endpoint.to_string()).or_insert_with(|| {
             Arc::new(PeerPool {

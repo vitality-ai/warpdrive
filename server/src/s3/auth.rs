@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use log::{debug, warn};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 lazy_static! {
@@ -161,13 +161,12 @@ async fn fetch_credential_bundle_from_console(
 }
 
 fn invalidate_s3_credential_cache(access_key: &str) {
-    if let Ok(mut cache) = CREDENTIAL_CACHE.write() {
-        if cache.remove(access_key).is_some() {
-            debug!(
-                "S3 credential cache INVALIDATED access_key={}",
-                access_key_log_prefix(access_key)
-            );
-        }
+    let mut cache = CREDENTIAL_CACHE.write();
+    if cache.remove(access_key).is_some() {
+        debug!(
+            "S3 credential cache INVALIDATED access_key={}",
+            access_key_log_prefix(access_key)
+        );
     }
 }
 
@@ -183,7 +182,7 @@ async fn load_or_refresh_credential_bundle(
 ) -> Result<(String, String, HashSet<String>, bool), Error> {
     let cache_key = access_key.to_string();
     {
-        let cached = CREDENTIAL_CACHE.read().map_err(|_| ErrorUnauthorized("Cache lock"))?;
+        let cached = CREDENTIAL_CACHE.read();
         if let Some(c) = cached.get(&cache_key) {
             if c.expires_at > Instant::now() {
                 debug!(
@@ -211,7 +210,7 @@ async fn load_or_refresh_credential_bundle(
     let allowed_buckets: HashSet<String> = names.into_iter().collect();
 
     let expires_at = Instant::now() + Duration::from_secs(cache_ttl_secs);
-    let mut cache = CREDENTIAL_CACHE.write().map_err(|_| ErrorUnauthorized("Cache lock"))?;
+    let mut cache = CREDENTIAL_CACHE.write();
     cache.insert(
         cache_key,
         CachedCredential {

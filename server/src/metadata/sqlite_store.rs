@@ -10,7 +10,7 @@ pub use crate::metadata::{
     DeletionEvent, MultipartUploadRow, MultipartPartRow, ObjectLockRow,
 };
 use crate::util::serializer::serialize_offset_size;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{params, Connection};
 use std::sync::Arc;
@@ -254,7 +254,7 @@ impl MetadataStorage for SQLiteMetadataStore {
         let user_metadata_json = serde_json::to_string(&metadata.user_metadata)
             .unwrap_or_else(|_| "{}".to_string());
 
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3 AND version_id = ''",
             params![user_id, bucket, object_id],
@@ -293,7 +293,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT offset_size_list, etag, size, content_type, last_modified, user_metadata,
                     cache_control, expires, content_encoding, version_id, is_delete_marker,
@@ -364,7 +364,7 @@ impl MetadataStorage for SQLiteMetadataStore {
 
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error> {
         // Hard-delete all rows for this key (used by CompleteMultipartUpload overwrite and internal cleanup).
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
             params![user_id, bucket, object_id],
@@ -373,7 +373,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT key FROM objects
              WHERE user = ?1 AND bucket = ?2 AND is_latest = 1 AND is_delete_marker = 0
@@ -392,7 +392,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM objects
              WHERE user = ?1 AND bucket = ?2 AND key = ?3 AND is_latest = 1 AND is_delete_marker = 0",
@@ -408,7 +408,7 @@ impl MetadataStorage for SQLiteMetadataStore {
         let user_metadata_json = serde_json::to_string(&metadata.user_metadata)
             .unwrap_or_else(|_| "{}".to_string());
 
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE objects SET
                 offset_size_list = ?1,
@@ -435,7 +435,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE objects SET key = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
             params![new_object_id, user_id, bucket, old_object_id],
@@ -448,7 +448,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn list_buckets_with_stats(&self, user_id: &str) -> Result<Vec<BucketStats>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         // LEFT JOIN so empty buckets still appear in the result
         let mut stmt = conn.prepare(
             "SELECT b.name,
@@ -480,7 +480,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn create_bucket(&self, user_id: &str, bucket: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR IGNORE INTO buckets (user, name) VALUES (?1, ?2)",
             params![user_id, bucket],
@@ -489,7 +489,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn delete_bucket(&self, user_id: &str, bucket: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM buckets WHERE user = ?1 AND name = ?2",
             params![user_id, bucket],
@@ -498,7 +498,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn bucket_exists(&self, user_id: &str, bucket: &str) -> Result<bool, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT COUNT(*) FROM buckets WHERE user = ?1 AND name = ?2",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -508,7 +508,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn list_all_buckets_for_user(&self, user_id: &str) -> Result<Vec<String>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT name FROM buckets WHERE user = ?1 ORDER BY name",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -522,7 +522,7 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 
     fn bucket_object_stats(&self, user_id: &str, bucket: &str) -> Result<(u64, u64), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM objects
              WHERE user = ?1 AND bucket = ?2 AND is_latest = 1 AND is_delete_marker = 0",
@@ -776,7 +776,7 @@ impl MetadataStorage for SQLiteMetadataStore {
 impl SQLiteMetadataStore {
     pub fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         let offset_size_bytes = serialize_offset_size(&offset_size_list.to_vec())?;
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, bucket, key, offset_size_bytes],
@@ -786,7 +786,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, bucket, key, offset_size_list, created_at
              FROM deletion_queue
@@ -817,7 +817,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE deletion_queue SET processed = TRUE WHERE id = ?1",
             params![id],
@@ -826,7 +826,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let count = conn.execute(
             "DELETE FROM deletion_queue WHERE processed = TRUE AND created_at < datetime('now', '-7 days')",
             [],
@@ -839,7 +839,7 @@ impl SQLiteMetadataStore {
 /// CORS and bucket location operations
 impl SQLiteMetadataStore {
     pub fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR REPLACE INTO bucket_cors (bucket, cors_xml) VALUES (?1, ?2)",
             params![bucket, cors_xml],
@@ -848,7 +848,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare("SELECT cors_xml FROM bucket_cors WHERE bucket = ?1")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         let result = stmt.query_row(params![bucket], |row| row.get::<_, String>(0));
@@ -860,14 +860,14 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute("DELETE FROM bucket_cors WHERE bucket = ?1", params![bucket])
             .map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
     }
 
     pub fn set_bucket_location(&self, user_id: &str, bucket: &str, location: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE buckets SET location = ?1 WHERE user = ?2 AND name = ?3",
             params![location, user_id, bucket],
@@ -876,7 +876,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_bucket_location(&self, user_id: &str, bucket: &str) -> Result<String, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare("SELECT location FROM buckets WHERE user = ?1 AND name = ?2")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         let result = stmt.query_row(params![user_id, bucket], |row| row.get::<_, Option<String>>(0));
@@ -892,7 +892,7 @@ impl SQLiteMetadataStore {
 impl SQLiteMetadataStore {
     /// Replace all tags for an object (atomic delete-then-insert within one lock).
     pub fn set_object_tags(&self, user_id: &str, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3",
             params![user_id, bucket, key],
@@ -907,7 +907,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT tag_key, tag_value FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3 ORDER BY tag_key",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -922,7 +922,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3",
             params![user_id, bucket, key],
@@ -931,7 +931,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_object_tag_count(&self, user_id: &str, bucket: &str, key: &str) -> Result<i64, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM object_tags WHERE user_id = ?1 AND bucket = ?2 AND key = ?3",
             params![user_id, bucket, key],
@@ -941,7 +941,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute("DELETE FROM bucket_tags WHERE bucket = ?1", params![bucket])
             .map_err(actix_web::error::ErrorInternalServerError)?;
         for (k, v) in tags {
@@ -954,7 +954,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT tag_key, tag_value FROM bucket_tags WHERE bucket = ?1 ORDER BY tag_key",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -969,14 +969,14 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_bucket_tags(&self, bucket: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute("DELETE FROM bucket_tags WHERE bucket = ?1", params![bucket])
             .map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
     }
 
     pub fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE multipart_uploads SET tagging = ?1 WHERE upload_id = ?2",
             params![tagging, upload_id],
@@ -985,7 +985,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let result: rusqlite::Result<Option<String>> = conn.query_row(
             "SELECT tagging FROM multipart_uploads WHERE upload_id = ?1",
             params![upload_id],
@@ -1002,7 +1002,7 @@ impl SQLiteMetadataStore {
 /// ACL: bucket/object grant storage + Block Public Access flags
 impl SQLiteMetadataStore {
     pub fn set_bucket_acl(&self, bucket: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR REPLACE INTO bucket_acl (bucket, owner_id, grants_json) VALUES (?1, ?2, ?3)",
             params![bucket, owner_id, grants_json],
@@ -1011,7 +1011,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_bucket_acl(&self, bucket: &str) -> Result<Option<(String, String)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare("SELECT owner_id, grants_json FROM bucket_acl WHERE bucket = ?1")
             .map_err(actix_web::error::ErrorInternalServerError)?;
         let result = stmt.query_row(params![bucket], |row| {
@@ -1025,7 +1025,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_object_acl(&self, bucket: &str, key: &str, version_id: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR REPLACE INTO object_acl (bucket, key, version_id, owner_id, grants_json) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![bucket, key, version_id, owner_id, grants_json],
@@ -1034,7 +1034,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_object_acl(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<(String, String)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT owner_id, grants_json FROM object_acl WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -1049,7 +1049,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_public_access_block(&self, bucket: &str, block_public_acls: bool, ignore_public_acls: bool, block_public_policy: bool, restrict_public_buckets: bool) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR REPLACE INTO public_access_block
                 (bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets)
@@ -1061,7 +1061,7 @@ impl SQLiteMetadataStore {
 
     /// Returns (block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets).
     pub fn get_public_access_block(&self, bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets
              FROM public_access_block WHERE bucket = ?1",
@@ -1077,7 +1077,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_public_access_block(&self, bucket: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute("DELETE FROM public_access_block WHERE bucket = ?1", params![bucket])
             .map_err(actix_web::error::ErrorInternalServerError)?;
         Ok(())
@@ -1087,7 +1087,7 @@ impl SQLiteMetadataStore {
 /// Versioning operations
 impl SQLiteMetadataStore {
     pub fn get_versioning_state(&self, bucket: &str) -> Result<String, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let result: rusqlite::Result<Option<String>> = conn.query_row(
             "SELECT versioning_state FROM buckets WHERE name = ?1",
             params![bucket],
@@ -1101,7 +1101,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_versioning_state(&self, user_id: &str, bucket: &str, state: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE buckets SET versioning_state = ?1 WHERE user = ?2 AND name = ?3",
             params![state, user_id, bucket],
@@ -1124,7 +1124,7 @@ impl SQLiteMetadataStore {
         let user_metadata_json = serde_json::to_string(&metadata.user_metadata)
             .unwrap_or_else(|_| "{}".to_string());
 
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
 
         match versioning.as_str() {
             "disabled" => {
@@ -1235,7 +1235,7 @@ impl SQLiteMetadataStore {
     /// Versioning-aware DELETE (no explicit versionId).
     pub fn delete_object_v2(&self, user_id: &str, bucket: &str, key: &str) -> Result<VersioningDeleteResult, Error> {
         let versioning = self.get_versioning_state(bucket)?;
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
 
         match versioning.as_str() {
             "disabled" => {
@@ -1285,7 +1285,7 @@ impl SQLiteMetadataStore {
     /// Permanently delete a specific version (DELETE ?versionId=x).
     /// Returns info about what was deleted.
     pub fn delete_specific_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<DeleteSpecificResult, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
 
         // "null" from the client matches both '' (versioning never enabled) and 'null' (suspended null-version).
         let effective_vid: &str = if version_id == "null" {
@@ -1339,7 +1339,7 @@ impl SQLiteMetadataStore {
 
     /// Returns the `last_modified` of the `is_latest=1` row for a key, including delete markers.
     pub fn get_latest_last_modified(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         match conn.query_row(
             "SELECT last_modified FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND is_latest=1",
             params![user_id, bucket, key],
@@ -1352,7 +1352,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         match conn.query_row(
             "SELECT version_id, is_delete_marker FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND is_latest=1",
             params![user_id, bucket, key],
@@ -1366,7 +1366,7 @@ impl SQLiteMetadataStore {
 
     /// Fetch a specific version of an object.
     pub fn get_object_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<Metadata, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         // "null" matches '' (versioning never enabled) or 'null' (suspended null-version).
         let effective_vid: &str = if version_id == "null" {
             let exists_empty: bool = conn.query_row(
@@ -1444,7 +1444,7 @@ impl SQLiteMetadataStore {
         &self, user_id: &str, bucket: &str,
         prefix: &str, key_marker: &str, version_id_marker: &str, max_keys: usize,
     ) -> Result<(Vec<VersionRow>, bool, String, String), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT key, version_id, is_delete_marker, etag, size, last_modified, is_latest
              FROM objects
@@ -1502,7 +1502,7 @@ impl SQLiteMetadataStore {
         checksum_algorithm: &str, checksum_type: &str,
         object_lock_mode: &str, object_lock_retain_until: &str, object_lock_legal_hold: &str,
     ) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR IGNORE INTO multipart_uploads
              (upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at,
@@ -1517,7 +1517,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUploadRow>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
                     initiated_at, status, final_etag, checksum_algorithm, checksum_type,
@@ -1550,7 +1550,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn mark_multipart_completed(&self, upload_id: &str, final_etag: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE multipart_uploads SET status = 'completed', final_etag = ?1 WHERE upload_id = ?2",
             params![final_etag, upload_id],
@@ -1559,7 +1559,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM multipart_uploads WHERE upload_id = ?1",
             params![upload_id],
@@ -1568,7 +1568,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_completed_uploads_for_key(&self, bucket: &str, key: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM multipart_uploads WHERE bucket = ?1 AND key = ?2 AND status = 'completed'",
             params![bucket, key],
@@ -1577,7 +1577,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn list_bucket_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadRow>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT upload_id, user_id, bucket, key, content_type, metadata_json,
                     initiated_at, status, final_etag, checksum_algorithm, checksum_type,
@@ -1615,7 +1615,7 @@ impl SQLiteMetadataStore {
         &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
         checksum_value: &str,
     ) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR REPLACE INTO multipart_parts (upload_id, part_number, etag, size, extents_blob, checksum_value)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1625,7 +1625,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn list_multipart_parts(&self, upload_id: &str) -> Result<Vec<MultipartPartRow>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT part_number, etag, size, extents_blob, checksum_value
              FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number",
@@ -1647,7 +1647,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "DELETE FROM multipart_parts WHERE upload_id = ?1",
             params![upload_id],
@@ -1656,7 +1656,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_parts_manifest(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT parts_manifest FROM objects WHERE user = ?1 AND bucket = ?2 AND key = ?3",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
@@ -1671,7 +1671,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_parts_manifest(&self, user_id: &str, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE objects SET parts_manifest = ?1 WHERE user = ?2 AND bucket = ?3 AND key = ?4",
             params![manifest, user_id, bucket, key],
@@ -1682,7 +1682,7 @@ impl SQLiteMetadataStore {
     // --- Object Lock ---
 
     pub fn get_bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let result: rusqlite::Result<i64> = conn.query_row(
             "SELECT object_lock_enabled FROM buckets WHERE name = ?1",
             params![bucket],
@@ -1696,7 +1696,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_bucket_object_lock_enabled(&self, bucket: &str, enabled: bool) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "UPDATE buckets SET object_lock_enabled = ?1 WHERE name = ?2",
             params![if enabled { 1i64 } else { 0i64 }, bucket],
@@ -1705,7 +1705,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn create_bucket_with_lock(&self, user_id: &str, bucket: &str, lock_enabled: bool) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let lock_val = if lock_enabled { 1i64 } else { 0i64 };
         let versioning = if lock_enabled { "enabled" } else { "disabled" };
         conn.execute(
@@ -1717,7 +1717,7 @@ impl SQLiteMetadataStore {
 
     /// Returns None if no config set; Some((mode, days, years)) otherwise.
     pub fn get_object_lock_config(&self, bucket: &str) -> Result<Option<(String, Option<i64>, Option<i64>)>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let result = conn.query_row(
             "SELECT mode, days, years FROM object_lock_config WHERE bucket = ?1",
             params![bucket],
@@ -1735,7 +1735,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn put_object_lock_config(&self, bucket: &str, mode: &str, days: Option<i64>, years: Option<i64>) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT OR REPLACE INTO object_lock_config (bucket, mode, days, years) VALUES (?1, ?2, ?3, ?4)",
             params![bucket, mode, days, years],
@@ -1744,7 +1744,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn get_object_lock(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<ObjectLockRow>, Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         let result = conn.query_row(
             "SELECT mode, retain_until_date, legal_hold FROM object_lock WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
             params![bucket, key, version_id],
@@ -1765,7 +1765,7 @@ impl SQLiteMetadataStore {
         &self, bucket: &str, key: &str, version_id: &str,
         mode: Option<&str>, retain_until_date: Option<&str>, legal_hold: Option<&str>,
     ) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         // INSERT uses COALESCE(?6, 'OFF') so a fresh row defaults legal_hold to 'OFF'.
         // ON CONFLICT uses COALESCE(?6, legal_hold) so None (NULL) preserves the existing value.
         conn.execute(
@@ -1781,7 +1781,7 @@ impl SQLiteMetadataStore {
     }
 
     pub fn set_object_legal_hold(&self, bucket: &str, key: &str, version_id: &str, status: &str) -> Result<(), Error> {
-        let conn = DB_CONN.lock().unwrap();
+        let conn = DB_CONN.lock();
         conn.execute(
             "INSERT INTO object_lock (bucket, key, version_id, legal_hold)
              VALUES (?1, ?2, ?3, ?4)

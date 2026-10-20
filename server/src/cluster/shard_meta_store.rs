@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 pub trait ShardMetaStore: Send + Sync {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()>;
@@ -66,7 +66,7 @@ pub struct BitcaskShardMetaStore {
     /// concurrent put/delete for the same shard key can apply to the log
     /// and the index in different orders, so a restart (log replay only)
     /// can disagree with what the live index had.
-    write_lock: std::sync::Mutex<()>,
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl BitcaskShardMetaStore {
@@ -116,7 +116,7 @@ impl BitcaskShardMetaStore {
             log_path,
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
-            write_lock: std::sync::Mutex::new(()),
+            write_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -132,39 +132,39 @@ impl ShardMetaStore for BitcaskShardMetaStore {
         // #155: held across both the append and the index update, so a
         // concurrent put/delete for the same shard key can never apply to
         // the log and the index in different orders.
-        let _write_guard = self.write_lock.lock().unwrap();
+        let _write_guard = self.write_lock.lock();
         {
-            let mut f = self.log_file.write().unwrap();
+            let mut f = self.log_file.write();
             writeln!(f, "{line}")?;
             f.flush()?;
         }
-        self.index.write().unwrap().insert(shard_key.to_string(), (offset, size));
+        self.index.write().insert(shard_key.to_string(), (offset, size));
         Ok(())
     }
 
     fn get(&self, shard_key: &str) -> Option<(u64, u64)> {
-        self.index.read().unwrap().get(shard_key).copied()
+        self.index.read().get(shard_key).copied()
     }
 
     fn delete(&self, shard_key: &str) -> io::Result<()> {
         let line = serde_json::to_string(&(shard_key, Option::<(u64, u64)>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let _write_guard = self.write_lock.lock().unwrap();
+        let _write_guard = self.write_lock.lock();
         {
-            let mut f = self.log_file.write().unwrap();
+            let mut f = self.log_file.write();
             writeln!(f, "{line}")?;
             f.flush()?;
         }
-        self.index.write().unwrap().remove(shard_key);
+        self.index.write().remove(shard_key);
         Ok(())
     }
 
     fn compact(&self) -> io::Result<()> {
         // #155: same `write_lock` as `put`/`delete`, so compaction can't
         // interleave with either.
-        let _write_guard = self.write_lock.lock().unwrap();
-        let index = self.index.read().unwrap();
-        let mut log_file = self.log_file.write().unwrap();
+        let _write_guard = self.write_lock.lock();
+        let index = self.index.read();
+        let mut log_file = self.log_file.write();
         let tmp_path = self.log_path.with_extension("compact.tmp");
         {
             let mut tmp = File::create(&tmp_path)?;

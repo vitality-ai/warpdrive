@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 /// Sentinel `user_id` for every request that arrives with no authenticated
 /// identity -- which today is *every* request on the bare, pre-Phase-3
@@ -178,7 +178,7 @@ pub struct BitcaskLocationStore {
     /// update sequence in every mutating method (`put`, `delete`,
     /// `compact`), so the two data structures can never apply writes in
     /// different orders from each other.
-    write_lock: std::sync::Mutex<()>,
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl BitcaskLocationStore {
@@ -225,7 +225,7 @@ impl BitcaskLocationStore {
             log_path,
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
-            write_lock: std::sync::Mutex::new(()),
+            write_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -234,7 +234,7 @@ impl BitcaskLocationStore {
     }
 
     fn append_line(&self, line: &str) -> io::Result<()> {
-        let mut f = self.log_file.write().unwrap();
+        let mut f = self.log_file.write();
         writeln!(f, "{line}")?;
         f.flush()
     }
@@ -248,23 +248,23 @@ impl LocationStore for BitcaskLocationStore {
         // #155: held across both the append and the index update, so a
         // concurrent put/delete for the same key can never apply to the
         // log and the index in different orders.
-        let _write_guard = self.write_lock.lock().unwrap();
+        let _write_guard = self.write_lock.lock();
         self.append_line(&line)?;
-        self.index.write().unwrap().insert(rk, record);
+        self.index.write().insert(rk, record);
         Ok(())
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord> {
-        self.index.read().unwrap().get(&record_key(user_id, bucket, key)).cloned()
+        self.index.read().get(&record_key(user_id, bucket, key)).cloned()
     }
 
     fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
         let rk = record_key(user_id, bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<LocationRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let _write_guard = self.write_lock.lock().unwrap();
+        let _write_guard = self.write_lock.lock();
         self.append_line(&line)?;
-        self.index.write().unwrap().remove(&rk);
+        self.index.write().remove(&rk);
         Ok(())
     }
 
@@ -279,7 +279,6 @@ impl LocationStore for BitcaskLocationStore {
         // old full-iterate-and-filter did (#163).
         self.index
             .read()
-            .unwrap()
             .range(full_prefix.clone()..)
             .take_while(|(k, _)| k.starts_with(&full_prefix))
             .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
@@ -293,9 +292,9 @@ impl LocationStore for BitcaskLocationStore {
         // mid-rewrite out from under it, and never a snapshot of the
         // index that's already out of sync with what made it into the
         // compacted file.
-        let _write_guard = self.write_lock.lock().unwrap();
-        let index = self.index.read().unwrap();
-        let mut log_file = self.log_file.write().unwrap();
+        let _write_guard = self.write_lock.lock();
+        let index = self.index.read();
+        let mut log_file = self.log_file.write();
 
         let tmp_path = self.log_path.with_extension("compact.tmp");
         {

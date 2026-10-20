@@ -3183,6 +3183,7 @@ dependencies = [
  "log-mdc",
  "log4rs",
  "md5",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "prost",
  "protoc-bin-vendored",

@@ -9,7 +9,8 @@ use actix_web::error::ErrorBadGateway;
 use actix_web::Error;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
@@ -189,7 +190,7 @@ impl GrpcPeerClient {
         let endpoint = grpc_endpoint_for(peer)?;
 
         let cell = {
-            let mut pools = self.pools.lock().unwrap();
+            let mut pools = self.pools.lock();
             Arc::clone(
                 pools
                     .entry(endpoint.clone())

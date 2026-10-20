@@ -5,7 +5,7 @@
 //! automatic rebalancing of already-placed data.
 
 use std::env;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 use super::coordinator::{JoinRequest, JoinResponse};
 
@@ -82,7 +82,7 @@ impl Membership {
     }
 
     pub fn peers(&self) -> Vec<String> {
-        self.peers.read().unwrap().clone()
+        self.peers.read().clone()
     }
 
     /// Add a peer if not already present. Returns the full peer list after
@@ -90,7 +90,7 @@ impl Membership {
     /// it (and, via one broadcast round, every other known peer) converges
     /// on the same set.
     pub fn add_peer(&self, peer: &str) -> Vec<String> {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write();
         if !peers.iter().any(|p| p == peer) {
             peers.push(peer.to_string());
         }
@@ -100,7 +100,7 @@ impl Membership {
     /// Merge a peer list received from another node (e.g. the response to
     /// a `/cluster/join` call) into this node's own list.
     pub fn merge(&self, incoming: &[String]) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write();
         for p in incoming {
             if !peers.iter().any(|existing| existing == p) {
                 peers.push(p.clone());

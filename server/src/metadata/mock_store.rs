@@ -8,7 +8,8 @@ use crate::metadata::{
 use actix_web::Error;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use chrono::Utc;
 
 /// Mock implementation of MetadataStorage for testing. The methods beyond
@@ -65,16 +66,16 @@ impl MockMetadataStore {
     }
 
     pub fn clear(&self) {
-        self.data.lock().unwrap().clear();
-        self.buckets.lock().unwrap().clear();
+        self.data.lock().clear();
+        self.buckets.lock().clear();
     }
 
     pub fn user_count(&self) -> usize {
-        self.data.lock().unwrap().len()
+        self.data.lock().len()
     }
 
     pub fn object_count(&self, user_id: &str) -> usize {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.get(user_id)
             .map(|u| u.values().map(|b| b.len()).sum())
             .unwrap_or(0)
@@ -87,7 +88,7 @@ impl Default for MockMetadataStore {
 
 impl MetadataStorage for MockMetadataStore {
     fn put_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let bucket_data = data
             .entry(user_id.to_string()).or_default()
             .entry(bucket.to_string()).or_default();
@@ -100,7 +101,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.get(user_id)
             .and_then(|u| u.get(bucket))
             .and_then(|b| b.get(object_id))
@@ -111,7 +112,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let removed = data
             .get_mut(user_id)
             .and_then(|u| u.get_mut(bucket))
@@ -127,7 +128,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         let mut keys: Vec<String> = data
             .get(user_id)
             .and_then(|u| u.get(bucket))
@@ -138,7 +139,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         Ok(data.get(user_id)
             .and_then(|u| u.get(bucket))
             .map(|b| b.contains_key(object_id))
@@ -146,7 +147,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let entry = data
             .get_mut(user_id)
             .and_then(|u| u.get_mut(bucket))
@@ -160,7 +161,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let metadata = data
             .get_mut(user_id)
             .and_then(|u| u.get_mut(bucket))
@@ -179,7 +180,7 @@ impl MetadataStorage for MockMetadataStore {
 
     fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         let id = self.deletion_id_counter.fetch_add(1, Ordering::Relaxed);
-        self.deletion_queue.lock().unwrap().push(DeletionEvent {
+        self.deletion_queue.lock().push(DeletionEvent {
             id,
             user_id: user_id.to_string(),
             bucket: bucket.to_string(),
@@ -191,8 +192,8 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn list_buckets_with_stats(&self, user_id: &str) -> Result<Vec<BucketStats>, Error> {
-        let data = self.data.lock().unwrap();
-        let buckets = self.buckets.lock().unwrap();
+        let data = self.data.lock();
+        let buckets = self.buckets.lock();
 
         // All registered buckets, including empty ones
         let registered = buckets.get(user_id).cloned().unwrap_or_default();
@@ -214,28 +215,28 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn create_bucket(&self, user_id: &str, bucket: &str) -> Result<(), Error> {
-        self.buckets.lock().unwrap()
+        self.buckets.lock()
             .entry(user_id.to_string()).or_default()
             .insert(bucket.to_string());
         Ok(())
     }
 
     fn delete_bucket(&self, user_id: &str, bucket: &str) -> Result<(), Error> {
-        self.buckets.lock().unwrap()
+        self.buckets.lock()
             .entry(user_id.to_string()).or_default()
             .remove(bucket);
         Ok(())
     }
 
     fn bucket_exists(&self, user_id: &str, bucket: &str) -> Result<bool, Error> {
-        Ok(self.buckets.lock().unwrap()
+        Ok(self.buckets.lock()
             .get(user_id)
             .map(|s| s.contains(bucket))
             .unwrap_or(false))
     }
 
     fn list_all_buckets_for_user(&self, user_id: &str) -> Result<Vec<String>, Error> {
-        let buckets = self.buckets.lock().unwrap();
+        let buckets = self.buckets.lock();
         let mut names: Vec<String> = buckets.get(user_id)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
@@ -244,7 +245,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn bucket_object_stats(&self, user_id: &str, bucket: &str) -> Result<(u64, u64), Error> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         let (count, bytes) = data.get(user_id)
             .and_then(|u| u.get(bucket))
             .map(|b| {
@@ -257,7 +258,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let old = data
             .entry(user_id.to_string()).or_default()
             .entry(bucket.to_string()).or_default()
@@ -267,12 +268,12 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
-        let q = self.deletion_queue.lock().unwrap();
+        let q = self.deletion_queue.lock();
         Ok(q.iter().take(limit.max(0) as usize).cloned().collect())
     }
 
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
-        self.deletion_queue.lock().unwrap().retain(|e| e.id != id);
+        self.deletion_queue.lock().retain(|e| e.id != id);
         Ok(())
     }
 
@@ -281,39 +282,39 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
-        self.bucket_cors.lock().unwrap().insert(bucket.to_string(), cors_xml.to_string());
+        self.bucket_cors.lock().insert(bucket.to_string(), cors_xml.to_string());
         Ok(())
     }
 
     fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
-        Ok(self.bucket_cors.lock().unwrap().get(bucket).cloned())
+        Ok(self.bucket_cors.lock().get(bucket).cloned())
     }
 
     fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
-        self.bucket_cors.lock().unwrap().remove(bucket);
+        self.bucket_cors.lock().remove(bucket);
         Ok(())
     }
 
     fn set_bucket_location(&self, user_id: &str, bucket: &str, location: &str) -> Result<(), Error> {
-        self.bucket_location.lock().unwrap().insert((user_id.to_string(), bucket.to_string()), location.to_string());
+        self.bucket_location.lock().insert((user_id.to_string(), bucket.to_string()), location.to_string());
         Ok(())
     }
 
     fn get_bucket_location(&self, user_id: &str, bucket: &str) -> Result<String, Error> {
-        Ok(self.bucket_location.lock().unwrap().get(&(user_id.to_string(), bucket.to_string())).cloned().unwrap_or_default())
+        Ok(self.bucket_location.lock().get(&(user_id.to_string(), bucket.to_string())).cloned().unwrap_or_default())
     }
 
     fn get_versioning_state(&self, bucket: &str) -> Result<String, Error> {
-        Ok(self.versioning_state.lock().unwrap().get(bucket).cloned().unwrap_or_else(|| "disabled".to_string()))
+        Ok(self.versioning_state.lock().get(bucket).cloned().unwrap_or_else(|| "disabled".to_string()))
     }
 
     fn set_versioning_state(&self, _user_id: &str, bucket: &str, state: &str) -> Result<(), Error> {
-        self.versioning_state.lock().unwrap().insert(bucket.to_string(), state.to_string());
+        self.versioning_state.lock().insert(bucket.to_string(), state.to_string());
         Ok(())
     }
 
     fn delete_object_v2(&self, user_id: &str, bucket: &str, key: &str) -> Result<VersioningDeleteResult, Error> {
-        self.data.lock().unwrap()
+        self.data.lock()
             .get_mut(user_id)
             .and_then(|u| u.get_mut(bucket))
             .and_then(|b| b.remove(key));
@@ -330,7 +331,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_latest_last_modified(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        Ok(self.data.lock().unwrap()
+        Ok(self.data.lock()
             .get(user_id)
             .and_then(|u| u.get(bucket))
             .and_then(|b| b.get(key))
@@ -338,7 +339,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
-        Ok(self.data.lock().unwrap()
+        Ok(self.data.lock()
             .get(user_id)
             .and_then(|u| u.get(bucket))
             .and_then(|b| b.get(key))
@@ -354,7 +355,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn set_object_tags(&self, user_id: &str, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        self.object_tags.lock().unwrap().insert(
+        self.object_tags.lock().insert(
             (user_id.to_string(), bucket.to_string(), key.to_string()),
             tags.to_vec(),
         );
@@ -362,14 +363,14 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
-        Ok(self.object_tags.lock().unwrap()
+        Ok(self.object_tags.lock()
             .get(&(user_id.to_string(), bucket.to_string(), key.to_string()))
             .cloned()
             .unwrap_or_default())
     }
 
     fn delete_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<(), Error> {
-        self.object_tags.lock().unwrap().remove(&(user_id.to_string(), bucket.to_string(), key.to_string()));
+        self.object_tags.lock().remove(&(user_id.to_string(), bucket.to_string(), key.to_string()));
         Ok(())
     }
 
@@ -378,39 +379,39 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        self.bucket_tags.lock().unwrap().insert(bucket.to_string(), tags.to_vec());
+        self.bucket_tags.lock().insert(bucket.to_string(), tags.to_vec());
         Ok(())
     }
 
     fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
-        Ok(self.bucket_tags.lock().unwrap().get(bucket).cloned().unwrap_or_default())
+        Ok(self.bucket_tags.lock().get(bucket).cloned().unwrap_or_default())
     }
 
     fn delete_bucket_tags(&self, bucket: &str) -> Result<(), Error> {
-        self.bucket_tags.lock().unwrap().remove(bucket);
+        self.bucket_tags.lock().remove(bucket);
         Ok(())
     }
 
     fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error> {
-        self.multipart_tagging.lock().unwrap().insert(upload_id.to_string(), tagging.to_string());
+        self.multipart_tagging.lock().insert(upload_id.to_string(), tagging.to_string());
         Ok(())
     }
 
     fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
-        Ok(self.multipart_tagging.lock().unwrap().get(upload_id).cloned().unwrap_or_default())
+        Ok(self.multipart_tagging.lock().get(upload_id).cloned().unwrap_or_default())
     }
 
     fn set_bucket_acl(&self, bucket: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
-        self.bucket_acl.lock().unwrap().insert(bucket.to_string(), (owner_id.to_string(), grants_json.to_string()));
+        self.bucket_acl.lock().insert(bucket.to_string(), (owner_id.to_string(), grants_json.to_string()));
         Ok(())
     }
 
     fn get_bucket_acl(&self, bucket: &str) -> Result<Option<(String, String)>, Error> {
-        Ok(self.bucket_acl.lock().unwrap().get(bucket).cloned())
+        Ok(self.bucket_acl.lock().get(bucket).cloned())
     }
 
     fn set_object_acl(&self, bucket: &str, key: &str, version_id: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
-        self.object_acl.lock().unwrap().insert(
+        self.object_acl.lock().insert(
             (bucket.to_string(), key.to_string(), version_id.to_string()),
             (owner_id.to_string(), grants_json.to_string()),
         );
@@ -418,11 +419,11 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_object_acl(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<(String, String)>, Error> {
-        Ok(self.object_acl.lock().unwrap().get(&(bucket.to_string(), key.to_string(), version_id.to_string())).cloned())
+        Ok(self.object_acl.lock().get(&(bucket.to_string(), key.to_string(), version_id.to_string())).cloned())
     }
 
     fn set_public_access_block(&self, bucket: &str, block_public_acls: bool, ignore_public_acls: bool, block_public_policy: bool, restrict_public_buckets: bool) -> Result<(), Error> {
-        self.public_access_block.lock().unwrap().insert(
+        self.public_access_block.lock().insert(
             bucket.to_string(),
             (block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets),
         );
@@ -430,11 +431,11 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_public_access_block(&self, bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error> {
-        Ok(self.public_access_block.lock().unwrap().get(bucket).cloned())
+        Ok(self.public_access_block.lock().get(bucket).cloned())
     }
 
     fn delete_public_access_block(&self, bucket: &str) -> Result<(), Error> {
-        self.public_access_block.lock().unwrap().remove(bucket);
+        self.public_access_block.lock().remove(bucket);
         Ok(())
     }
 
@@ -444,7 +445,7 @@ impl MetadataStorage for MockMetadataStore {
         checksum_algorithm: &str, checksum_type: &str,
         object_lock_mode: &str, object_lock_retain_until: &str, object_lock_legal_hold: &str,
     ) -> Result<(), Error> {
-        self.multipart_uploads.lock().unwrap().entry(upload_id.to_string()).or_insert_with(|| MultipartUploadRow {
+        self.multipart_uploads.lock().entry(upload_id.to_string()).or_insert_with(|| MultipartUploadRow {
             upload_id: upload_id.to_string(),
             user_id: user_id.to_string(),
             bucket: bucket.to_string(),
@@ -464,11 +465,11 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUploadRow>, Error> {
-        Ok(self.multipart_uploads.lock().unwrap().get(upload_id).cloned())
+        Ok(self.multipart_uploads.lock().get(upload_id).cloned())
     }
 
     fn mark_multipart_completed(&self, upload_id: &str, final_etag: &str) -> Result<(), Error> {
-        if let Some(row) = self.multipart_uploads.lock().unwrap().get_mut(upload_id) {
+        if let Some(row) = self.multipart_uploads.lock().get_mut(upload_id) {
             row.status = "completed".to_string();
             row.final_etag = Some(final_etag.to_string());
         }
@@ -476,20 +477,20 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), Error> {
-        self.multipart_uploads.lock().unwrap().remove(upload_id);
-        self.multipart_parts.lock().unwrap().remove(upload_id);
+        self.multipart_uploads.lock().remove(upload_id);
+        self.multipart_parts.lock().remove(upload_id);
         Ok(())
     }
 
     fn delete_completed_uploads_for_key(&self, bucket: &str, key: &str) -> Result<(), Error> {
-        self.multipart_uploads.lock().unwrap().retain(|_, row| {
+        self.multipart_uploads.lock().retain(|_, row| {
             !(row.bucket == bucket && row.key == key && row.status == "completed")
         });
         Ok(())
     }
 
     fn list_bucket_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadRow>, Error> {
-        let mut rows: Vec<MultipartUploadRow> = self.multipart_uploads.lock().unwrap()
+        let mut rows: Vec<MultipartUploadRow> = self.multipart_uploads.lock()
             .values()
             .filter(|row| row.bucket == bucket && row.status == "in_progress")
             .cloned()
@@ -502,7 +503,7 @@ impl MetadataStorage for MockMetadataStore {
         &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
         checksum_value: &str,
     ) -> Result<(), Error> {
-        let mut parts = self.multipart_parts.lock().unwrap();
+        let mut parts = self.multipart_parts.lock();
         let entry = parts.entry(upload_id.to_string()).or_default();
         entry.retain(|p| p.part_number != part_number);
         entry.push(MultipartPartRow {
@@ -516,22 +517,22 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn list_multipart_parts(&self, upload_id: &str) -> Result<Vec<MultipartPartRow>, Error> {
-        let mut parts = self.multipart_parts.lock().unwrap().get(upload_id).cloned().unwrap_or_default();
+        let mut parts = self.multipart_parts.lock().get(upload_id).cloned().unwrap_or_default();
         parts.sort_by_key(|p| p.part_number);
         Ok(parts)
     }
 
     fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
-        self.multipart_parts.lock().unwrap().remove(upload_id);
+        self.multipart_parts.lock().remove(upload_id);
         Ok(())
     }
 
     fn get_parts_manifest(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        Ok(self.parts_manifest.lock().unwrap().get(&(user_id.to_string(), bucket.to_string(), key.to_string())).cloned())
+        Ok(self.parts_manifest.lock().get(&(user_id.to_string(), bucket.to_string(), key.to_string())).cloned())
     }
 
     fn set_parts_manifest(&self, user_id: &str, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
-        self.parts_manifest.lock().unwrap().insert(
+        self.parts_manifest.lock().insert(
             (user_id.to_string(), bucket.to_string(), key.to_string()),
             manifest.to_string(),
         );
@@ -539,11 +540,11 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn get_bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, Error> {
-        Ok(self.bucket_object_lock_enabled.lock().unwrap().contains(bucket))
+        Ok(self.bucket_object_lock_enabled.lock().contains(bucket))
     }
 
     fn set_bucket_object_lock_enabled(&self, bucket: &str, enabled: bool) -> Result<(), Error> {
-        let mut set = self.bucket_object_lock_enabled.lock().unwrap();
+        let mut set = self.bucket_object_lock_enabled.lock();
         if enabled { set.insert(bucket.to_string()); } else { set.remove(bucket); }
         Ok(())
     }
@@ -551,22 +552,22 @@ impl MetadataStorage for MockMetadataStore {
     fn create_bucket_with_lock(&self, user_id: &str, bucket: &str, lock_enabled: bool) -> Result<(), Error> {
         self.create_bucket(user_id, bucket)?;
         if lock_enabled {
-            self.bucket_object_lock_enabled.lock().unwrap().insert(bucket.to_string());
+            self.bucket_object_lock_enabled.lock().insert(bucket.to_string());
         }
         Ok(())
     }
 
     fn get_object_lock_config(&self, bucket: &str) -> Result<Option<(String, Option<i64>, Option<i64>)>, Error> {
-        Ok(self.object_lock_config.lock().unwrap().get(bucket).cloned())
+        Ok(self.object_lock_config.lock().get(bucket).cloned())
     }
 
     fn put_object_lock_config(&self, bucket: &str, mode: &str, days: Option<i64>, years: Option<i64>) -> Result<(), Error> {
-        self.object_lock_config.lock().unwrap().insert(bucket.to_string(), (mode.to_string(), days, years));
+        self.object_lock_config.lock().insert(bucket.to_string(), (mode.to_string(), days, years));
         Ok(())
     }
 
     fn get_object_lock(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<ObjectLockRow>, Error> {
-        Ok(self.object_lock_rows.lock().unwrap()
+        Ok(self.object_lock_rows.lock()
             .get(&(bucket.to_string(), key.to_string(), version_id.to_string()))
             .cloned())
     }
@@ -575,7 +576,7 @@ impl MetadataStorage for MockMetadataStore {
         &self, bucket: &str, key: &str, version_id: &str,
         mode: Option<&str>, retain_until_date: Option<&str>, legal_hold: Option<&str>,
     ) -> Result<(), Error> {
-        let mut rows = self.object_lock_rows.lock().unwrap();
+        let mut rows = self.object_lock_rows.lock();
         let entry = rows.entry((bucket.to_string(), key.to_string(), version_id.to_string()))
             .or_insert_with(|| ObjectLockRow { mode: None, retain_until_date: None, legal_hold: "OFF".to_string() });
         if let Some(m) = mode { entry.mode = Some(m.to_string()); }
@@ -585,7 +586,7 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn set_object_legal_hold(&self, bucket: &str, key: &str, version_id: &str, status: &str) -> Result<(), Error> {
-        let mut rows = self.object_lock_rows.lock().unwrap();
+        let mut rows = self.object_lock_rows.lock();
         let entry = rows.entry((bucket.to_string(), key.to_string(), version_id.to_string()))
             .or_insert_with(|| ObjectLockRow { mode: None, retain_until_date: None, legal_hold: "OFF".to_string() });
         entry.legal_hold = status.to_string();

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BucketPlacementConfig {
@@ -72,7 +72,7 @@ pub struct BitcaskBucketConfigStore {
     /// its config at once) could apply to the log and the index in
     /// different orders, so a restart (log replay only) can disagree
     /// with what the live index had.
-    write_lock: std::sync::Mutex<()>,
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl BitcaskBucketConfigStore {
@@ -100,7 +100,7 @@ impl BitcaskBucketConfigStore {
         Ok(Self {
             log_file: RwLock::new(log_file),
             index: RwLock::new(index),
-            write_lock: std::sync::Mutex::new(()),
+            write_lock: parking_lot::Mutex::new(()),
         })
     }
 }
@@ -111,18 +111,18 @@ impl BucketConfigStore for BitcaskBucketConfigStore {
         // #155: held across both the append and the index update, so two
         // concurrent puts for the same bucket can never apply to the log
         // and the index in different orders.
-        let _write_guard = self.write_lock.lock().unwrap();
+        let _write_guard = self.write_lock.lock();
         {
-            let mut f = self.log_file.write().unwrap();
+            let mut f = self.log_file.write();
             writeln!(f, "{line}")?;
             f.flush()?;
         }
-        self.index.write().unwrap().insert(config.bucket.clone(), config);
+        self.index.write().insert(config.bucket.clone(), config);
         Ok(())
     }
 
     fn get(&self, bucket: &str) -> Option<BucketPlacementConfig> {
-        self.index.read().unwrap().get(bucket).cloned()
+        self.index.read().get(bucket).cloned()
     }
 }
 

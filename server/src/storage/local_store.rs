@@ -11,7 +11,8 @@ use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
 use log::{debug, trace, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use lazy_static::lazy_static;
 
 // Per-(user, bucket) next-write-offset, so concurrent writes to DIFFERENT
@@ -30,13 +31,13 @@ lazy_static! {
 fn offset_counter(user_id: &str, bucket: &str, file_path: &PathBuf) -> Arc<AtomicU64> {
     let key = format!("{user_id}/{bucket}");
     {
-        let map = NEXT_OFFSET.lock().unwrap();
+        let map = NEXT_OFFSET.lock();
         if let Some(c) = map.get(&key) {
             return Arc::clone(c);
         }
     }
     let initial = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-    let mut map = NEXT_OFFSET.lock().unwrap();
+    let mut map = NEXT_OFFSET.lock();
     Arc::clone(
         map.entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(initial))),
@@ -72,13 +73,13 @@ lazy_static! {
 fn cached_file(user_id: &str, bucket: &str, file_path: &PathBuf) -> io::Result<Arc<File>> {
     let key = format!("{user_id}/{bucket}");
     {
-        let map = OPEN_FILES.lock().unwrap();
+        let map = OPEN_FILES.lock();
         if let Some(f) = map.get(&key) {
             return Ok(Arc::clone(f));
         }
     }
     let file = OpenOptions::new().create(true).read(true).write(true).open(file_path)?;
-    let mut map = OPEN_FILES.lock().unwrap();
+    let mut map = OPEN_FILES.lock();
     Ok(Arc::clone(
         map.entry(key).or_insert_with(|| Arc::new(file)),
     ))
