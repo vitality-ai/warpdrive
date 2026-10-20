@@ -35,6 +35,29 @@ use std::sync::RwLock;
 /// concept at all.
 pub const UNAUTHENTICATED_USER: &str = "";
 
+/// The S3 metadata a PUT wants set on the record it's about to create --
+/// bundled into one value instead of a 9-argument function signature,
+/// shared between `LocationRecord` and `ContentDependentRecord` since
+/// both carry the identical set of fields (see each one's own doc for why
+/// they're still two separate record *shapes* overall). Built by a
+/// caller that already has the request headers and computed etag (Phase
+/// 3's auth-aware `/cluster/s3/...` handlers); the bare, pre-auth
+/// `/cluster/{bucket}/{key}` routes pass `Default::default()`, preserving
+/// their exact pre-this-change behavior (every field empty/`None`).
+#[derive(Debug, Clone, Default)]
+pub struct ObjectS3Metadata {
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
+    pub last_modified: Option<String>,
+    pub user_metadata: HashMap<String, String>,
+    pub cache_control: Option<String>,
+    pub expires: Option<String>,
+    pub content_encoding: Option<String>,
+    pub checksum_algorithm: Option<String>,
+    pub checksum_value: Option<String>,
+    pub checksum_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocationRecord {
     /// See `UNAUTHENTICATED_USER`. `#[serde(default)]`: empty for a record

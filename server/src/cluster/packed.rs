@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMeta};
 use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
 use super::ec::ErasureCoder;
-use super::location_store::UNAUTHENTICATED_USER;
+use super::location_store::ObjectS3Metadata;
 use super::packing::Stripe;
 use super::shard_storage::{new_version_id, versioned_key};
 
@@ -140,12 +140,14 @@ pub(crate) fn stripe_key(key: &str, stripe_index: usize) -> String {
 /// happens exactly once per PUT, not once for the threshold check and
 /// again here.
 pub async fn put_object_content_dependent(
+    user_id: &str,
     bucket: &str,
     key: &str,
     body: &[u8],
     units_header: &[UnitMeta],
     stripes: Vec<Stripe>,
     state: &ClusterState,
+    s3_meta: &ObjectS3Metadata,
 ) -> Result<HttpResponse, Error> {
     let peers = state.membership.peers();
     if peers.is_empty() {
@@ -278,7 +280,7 @@ pub async fn put_object_content_dependent(
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.to_string();
             let wire_key = wire_key.clone();
-            async move { client.put_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx, shard).await }
+            async move { client.put_shard(&peer, user_id, &bucket, &wire_key, idx, shard).await }
         });
         let results = join_all(puts).await;
         let acked = results.iter().filter(|r| r.is_ok()).count();
@@ -296,7 +298,7 @@ pub async fn put_object_content_dependent(
     }
 
     let record = ContentDependentRecord {
-        user_id: UNAUTHENTICATED_USER.to_string(),
+        user_id: user_id.to_string(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         k,
@@ -307,16 +309,16 @@ pub async fn put_object_content_dependent(
         version,
         has_sparse_gaps,
         sorted_unit_locations,
-        etag: None,
-        content_type: None,
-        last_modified: None,
-        user_metadata: std::collections::HashMap::new(),
-        cache_control: None,
-        expires: None,
-        content_encoding: None,
-        checksum_algorithm: None,
-        checksum_value: None,
-        checksum_type: None,
+        etag: s3_meta.etag.clone(),
+        content_type: s3_meta.content_type.clone(),
+        last_modified: s3_meta.last_modified.clone(),
+        user_metadata: s3_meta.user_metadata.clone(),
+        cache_control: s3_meta.cache_control.clone(),
+        expires: s3_meta.expires.clone(),
+        content_encoding: s3_meta.content_encoding.clone(),
+        checksum_algorithm: s3_meta.checksum_algorithm.clone(),
+        checksum_value: s3_meta.checksum_value.clone(),
+        checksum_type: s3_meta.checksum_type.clone(),
     };
 
     // Replicate to *every* known peer, not just the union of this object's
@@ -344,8 +346,8 @@ pub async fn put_object_content_dependent(
     // needed quorum to receive the original plain pin, so it may have no
     // local copy even though other peers still do. Don't gate the
     // tombstone broadcast on a local `.is_some()` check (see issue #153).
-    let _ = state.location_store.delete(UNAUTHENTICATED_USER, bucket, key);
-    let cleanup_acked = replicate_location_delete(state, bucket, key, &peers).await;
+    let _ = state.location_store.delete(user_id, bucket, key);
+    let cleanup_acked = replicate_location_delete(state, user_id, bucket, key, &peers).await;
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "wrote the new object, but could not confirm the stale plain pin was cleared cluster-wide: \
@@ -377,12 +379,18 @@ async fn fetch_and_decode_stripe(
         versioned_key(&sk, &record.version)
     };
 
+    // The record itself already knows which tenant it belongs to (set at
+    // PUT time) -- shards were written under this same `user_id`, so the
+    // read has to use it too, not a hardcoded namespace, or a real
+    // tenant's shards would be unreadable.
+    let user_id = record.user_id.clone();
     let fetch_one = |idx: usize| {
         let client = Arc::clone(&state.peer_client);
+        let user_id = user_id.clone();
         let bucket = record.bucket.clone();
         let wire_key = wire_key.clone();
         let peer = stripe.shard_peers[idx].clone();
-        async move { client.get_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
+        async move { client.get_shard(&peer, &user_id, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
     };
 
     // Same bug as `coordinator.rs`'s plain GET had, same fix: this used to

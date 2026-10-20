@@ -21,7 +21,7 @@ use std::sync::Arc;
 use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
 use super::content_location_store::{ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
-use super::location_store::{LocationRecord, LocationStore, UNAUTHENTICATED_USER};
+use super::location_store::{LocationRecord, LocationStore, ObjectS3Metadata, UNAUTHENTICATED_USER};
 use super::membership::Membership;
 use super::packing::StripePacker;
 use super::peer_client::PeerClient;
@@ -152,16 +152,17 @@ async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, p
     join_all(puts).await.into_iter().filter(|ok| *ok).count()
 }
 
-/// Replicate a tombstone (delete) for `(bucket, key)` to every peer in
-/// `peers`. Same symmetric-including-self treatment as the put path.
-pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
+/// Replicate a tombstone (delete) for `(user_id, bucket, key)` to every
+/// peer in `peers`. Same symmetric-including-self treatment as the put path.
+pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
     let deletes = peers.iter().cloned().map(|peer| {
         let client = state.location_http.clone();
+        let user_id = user_id.to_string();
         let bucket = bucket.to_string();
         let key = key.to_string();
         async move {
             let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
-            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
+            match client.delete(&url).json(&DeleteKeyRequest { user_id, bucket, key }).send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     warn!("location tombstone replication to {peer} returned {}", r.status());
@@ -184,14 +185,15 @@ pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str
 /// which was possible before: a packed object lived *only* in
 /// `ContentLocationStore`, which DELETE never touched, and a plain overwrite
 /// never cleared the packed pin GET still preferred.
-pub(crate) async fn replicate_content_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
+pub(crate) async fn replicate_content_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
     let deletes = peers.iter().cloned().map(|peer| {
         let client = state.location_http.clone();
+        let user_id = user_id.to_string();
         let bucket = bucket.to_string();
         let key = key.to_string();
         async move {
             let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
-            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
+            match client.delete(&url).json(&DeleteKeyRequest { user_id, bucket, key }).send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     warn!("content-location tombstone replication to {peer} returned {}", r.status());
@@ -266,6 +268,10 @@ fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Bare, pre-auth route: no identity to supply, so every write here lands
+/// in the `UNAUTHENTICATED_USER` namespace and carries no S3 metadata.
+/// Kept exactly as before this split -- see `cluster_put_object_inner`
+/// for the real logic, now also reachable from an authenticated caller.
 pub async fn cluster_put_object(
     path: web::Path<(String, String)>,
     body: web::Bytes,
@@ -273,7 +279,25 @@ pub async fn cluster_put_object(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+    cluster_put_object_inner(
+        UNAUTHENTICATED_USER, bucket, key, body, &req, &state, &ObjectS3Metadata::default(),
+    )
+    .await
+}
 
+/// `user_id`/`s3_meta` are the Phase 3 seam: a bare pre-auth caller passes
+/// `UNAUTHENTICATED_USER`/`Default::default()` (see `cluster_put_object`
+/// above), an authenticated `/cluster/s3/...` caller passes the real
+/// identity and the S3 metadata it parsed from request headers.
+pub(crate) async fn cluster_put_object_inner(
+    user_id: &str,
+    bucket: String,
+    key: String,
+    body: web::Bytes,
+    req: &actix_web::HttpRequest,
+    state: &web::Data<ClusterState>,
+    s3_meta: &ObjectS3Metadata,
+) -> Result<HttpResponse, Error> {
     // Real S3 SDKs (minio-go, used by minio/warp and many other tools)
     // sign PUT bodies with AWS's "streaming payload" scheme when
     // content-length is known up front: `x-amz-content-sha256:
@@ -318,7 +342,7 @@ pub async fn cluster_put_object(
     // same cost as before this feature existed (see the North star's
     // before/after performance check).
     let Some(config) = state.bucket_config_store.get(&bucket) else {
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     };
@@ -330,7 +354,7 @@ pub async fn cluster_put_object(
     // before any packer runs, the same way the plain path's own encoder
     // already floors shard length at 1 byte for this exact case.
     if body.is_empty() {
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     }
@@ -348,7 +372,7 @@ pub async fn cluster_put_object(
         .unwrap_or(false);
     if forced_plain {
         info!("bucket={bucket} key={key} x-warpd-computable-units: false — explicit opt-out of this bucket's custom placement");
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     }
@@ -392,7 +416,7 @@ pub async fn cluster_put_object(
         let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
 
         if overhead <= config.overhead_threshold_pct {
-            return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, stripes, &state)
+            return super::packed::put_object_content_dependent(user_id, &bucket, &key, &body, &units_header, stripes, state, s3_meta)
                 .await
                 .map(|r| attach_placement_headers(r, "packed", Some(overhead)));
         }
@@ -401,7 +425,7 @@ pub async fn cluster_put_object(
              {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
             config.overhead_threshold_pct, config.packer_name
         );
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", Some(overhead)));
     } else {
@@ -412,12 +436,14 @@ pub async fn cluster_put_object(
         );
     }
 
-    put_object_plain(&bucket, &key, &body, &state)
+    put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
         .await
         .map(|r| attach_placement_headers(r, "plain", None))
 }
 
-async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterState) -> Result<HttpResponse, Error> {
+async fn put_object_plain(
+    user_id: &str, bucket: &str, key: &str, body: &[u8], state: &ClusterState, s3_meta: &ObjectS3Metadata,
+) -> Result<HttpResponse, Error> {
     let bucket = bucket.to_string();
     let key = key.to_string();
     let request_start = std::time::Instant::now();
@@ -488,7 +514,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             async move {
-                let res = client.put_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx, shard).await;
+                let res = client.put_shard(&peer, user_id, &bucket, &wire_key, idx, shard).await;
                 if let Err(ref e) = res {
                     warn!("put_shard idx={idx} peer={peer} failed: {e}");
                 }
@@ -515,7 +541,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // with the pin, making "any node can serve GET" actually true rather
     // than only true for the k+m peers that happened to hold shards.
     let record = LocationRecord {
-        user_id: UNAUTHENTICATED_USER.to_string(),
+        user_id: user_id.to_string(),
         bucket: bucket.clone(),
         key: key.clone(),
         shard_peers: chosen.clone(),
@@ -526,16 +552,16 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
-        etag: None,
-        content_type: None,
-        last_modified: None,
-        user_metadata: std::collections::HashMap::new(),
-        cache_control: None,
-        expires: None,
-        content_encoding: None,
-        checksum_algorithm: None,
-        checksum_value: None,
-        checksum_type: None,
+        etag: s3_meta.etag.clone(),
+        content_type: s3_meta.content_type.clone(),
+        last_modified: s3_meta.last_modified.clone(),
+        user_metadata: s3_meta.user_metadata.clone(),
+        cache_control: s3_meta.cache_control.clone(),
+        expires: s3_meta.expires.clone(),
+        content_encoding: s3_meta.content_encoding.clone(),
+        checksum_algorithm: s3_meta.checksum_algorithm.clone(),
+        checksum_value: s3_meta.checksum_value.clone(),
+        checksum_type: s3_meta.checksum_type.clone(),
     };
 
     let t0 = std::time::Instant::now();
@@ -565,8 +591,8 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
     // every other write here: a PUT that can't confirm the stale pin was
     // actually cleared cluster-wide is treated as not fully succeeded.
-    let _ = state.content_location_store.delete(UNAUTHENTICATED_USER, &bucket, &key);
-    let cleanup_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    let _ = state.content_location_store.delete(user_id, &bucket, &key);
+    let cleanup_acked = replicate_content_location_delete(&state, user_id, &bucket, &key, &peers).await;
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
@@ -605,18 +631,28 @@ pub async fn cluster_grpc_client_timing() -> HttpResponse {
         .body(super::grpc_peer_client::CLIENT_TIMING.summary())
 }
 
+/// Bare, pre-auth route -- see `cluster_put_object`'s matching doc.
 pub async fn cluster_get_object(
     path: web::Path<(String, String)>,
     req: actix_web::HttpRequest,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+    cluster_get_object_inner(UNAUTHENTICATED_USER, bucket, key, &req, &state).await
+}
 
+pub(crate) async fn cluster_get_object_inner(
+    user_id: &str,
+    bucket: String,
+    key: String,
+    req: &actix_web::HttpRequest,
+    state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
     // A content-dependent PUT pins into a separate store (different record
     // shape — many stripes, not one shard set). Check there first: cheap,
     // and a key is either content-dependent or not, decided once at PUT
     // time by header presence.
-    if let Some(record) = state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key) {
+    if let Some(record) = state.content_location_store.get(user_id, &bucket, &key) {
         let total_len = record.original_len as u64;
         // Range-aware fetch only reaches the stripes whose units actually
         // overlap the requested bytes (see packed.rs) — this is the whole
@@ -653,7 +689,7 @@ pub async fn cluster_get_object(
     // Never recompute placement here — look up the pin from write time.
     let record = state
         .location_store
-        .get(UNAUTHENTICATED_USER, &bucket, &key)
+        .get(user_id, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
     let total_len = record.original_len as u64;
 
@@ -688,7 +724,7 @@ pub async fn cluster_get_object(
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             let peer = record.shard_peers[idx].clone();
-            async move { client.get_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx).await.ok() }
+            async move { client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await.ok() }
         });
         let partial_results = join_all(partial_gets).await;
 
@@ -718,7 +754,7 @@ pub async fn cluster_get_object(
         let bucket = bucket.clone();
         let wire_key = wire_key.clone();
         async move {
-            match client.get_shard(&peer, UNAUTHENTICATED_USER, &bucket, &wire_key, idx).await {
+            match client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await {
                 Ok(data) => Some((idx, data)),
                 Err(e) => {
                     warn!("get_shard idx={idx} peer={peer} failed: {e}");
@@ -799,20 +835,29 @@ pub async fn cluster_content_record(
     Ok(HttpResponse::Ok().json(record))
 }
 
+/// Bare, pre-auth route -- see `cluster_put_object`'s matching doc.
 pub async fn cluster_delete_object(
     path: web::Path<(String, String)>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+    cluster_delete_object_inner(UNAUTHENTICATED_USER, bucket, key, &state).await
+}
 
+pub(crate) async fn cluster_delete_object_inner(
+    user_id: &str,
+    bucket: String,
+    key: String,
+    state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
     // A key is either plain (`LocationStore`) or content-dependent/packed
     // (`ContentLocationStore`) — decided once, at PUT time, by which path
     // handled it. A key can even have a *stale* entry in the other store
     // left over from an earlier overwrite that changed which path it took
     // (see `put_object_plain`'s and `put_object_content_dependent`'s
     // overwrite handling).
-    let plain_record = state.location_store.get(UNAUTHENTICATED_USER, &bucket, &key);
-    let packed_record = state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key);
+    let plain_record = state.location_store.get(user_id, &bucket, &key);
+    let packed_record = state.content_location_store.get(user_id, &bucket, &key);
 
     // Deliberately *not* a 404 short-circuit when both are locally absent:
     // this coordinator only needed quorum to receive either pin, not all
@@ -865,8 +910,8 @@ pub async fn cluster_delete_object(
         .unwrap_or_else(|| (state.ec.k(), state.ec.m()));
     let required_acks = required_write_acks(k, m);
 
-    let plain_acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
-    let packed_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    let plain_acked = replicate_location_delete(state, user_id, &bucket, &key, &peers).await;
+    let packed_acked = replicate_content_location_delete(state, user_id, &bucket, &key, &peers).await;
     if plain_acked < required_acks || packed_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "tombstone quorum not met: plain {plain_acked}/{required_acks}, \
@@ -1043,6 +1088,12 @@ pub async fn cluster_internal_put_location(
 /// param), just applied consistently to DELETE too.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteKeyRequest {
+    /// `#[serde(default)]`: a tombstone sent by an older peer process that
+    /// predates this field replays as `UNAUTHENTICATED_USER`, matching
+    /// what `LocationRecord`/`ContentDependentRecord`'s own `user_id`
+    /// default to for the same reason.
+    #[serde(default)]
+    pub user_id: String,
     pub bucket: String,
     pub key: String,
 }
@@ -1052,10 +1103,10 @@ pub async fn cluster_internal_delete_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let DeleteKeyRequest { bucket, key } = body.into_inner();
+    let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
     state
         .location_store
-        .delete(UNAUTHENTICATED_USER, &bucket, &key)
+        .delete(&user_id, &bucket, &key)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
 }
@@ -1066,10 +1117,10 @@ pub async fn cluster_internal_delete_content_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let DeleteKeyRequest { bucket, key } = body.into_inner();
+    let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
     state
         .content_location_store
-        .delete(UNAUTHENTICATED_USER, &bucket, &key)
+        .delete(&user_id, &bucket, &key)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
 }
@@ -1157,7 +1208,7 @@ mod tests {
     #[test]
     fn delete_key_request_round_trips_keys_with_url_special_characters() {
         for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
-            let req = DeleteKeyRequest { bucket: "b".to_string(), key: key.to_string() };
+            let req = DeleteKeyRequest { user_id: "u1".to_string(), bucket: "b".to_string(), key: key.to_string() };
             let json = serde_json::to_string(&req).unwrap();
             let decoded: DeleteKeyRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded.key, key, "round-trip mismatch for key {key:?}");
