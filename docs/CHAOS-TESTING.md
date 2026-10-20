@@ -34,16 +34,14 @@ are built around, directly against this project's real local cluster:
 
 This is real value, not a simulation: every fault (a process actually
 dying, a byte actually flipped on disk) is real, and the cluster under
-test is the real binary. What it does *not* yet cover is **real network
-partitions** -- everything here is single-machine, so "a peer is down"
-only ever means "the process is dead," never "the process is alive but
-some nodes can't reach it while others can," asymmetric partitions,
-added latency, or packet loss. Historically, partition-handling bugs
-are where the nastiest real distributed-systems bugs live (this is
-Jepsen's own most common finding across the systems it has tested), and
-this local setup cannot produce that class of fault. That requires real
-separate machines with a real network between them -- see "Next step"
-below.
+test is the real binary. `scenario_test.py` and `jepsen_style_test.py`
+run entirely on one machine, so "a peer is down" only ever means "the
+process is dead" there -- not "the process is alive but some nodes
+can't reach it while others can," which is a different and historically
+nastier class of bug (Jepsen's own most common finding across the
+systems it has tested). `gcp_orchestrator.py` extends the same
+methodology onto 5 real separate GCP VMs specifically to close that gap
+-- see "Real network-partition testing on GCP" below.
 
 ## How to run
 
@@ -54,8 +52,11 @@ python3 scenario_test.py          # ~15s, fast named checks
 python3 jepsen_style_test.py       # 90s, concurrent nemesis + workload + checker
 ```
 
-Both scripts start and stop their own 5-node cluster; nothing needs to
-be running beforehand. See `server/tests/chaos/README.md` for details.
+Both scripts start and stop their own local 5-node cluster; nothing
+needs to be running beforehand. `gcp_orchestrator.py` is different -- it
+drives a real 5-node GCP cluster that must already exist (see "Real
+network-partition testing on GCP" below for setup). See
+`server/tests/chaos/README.md` for details on all four scripts.
 
 ## Results so far (2026-10-21, as of commit `22a0759`)
 
@@ -128,18 +129,79 @@ heuristic.
 - No clock-skew injection, no disk-full/ENOSPC injection, no slow-disk
   injection.
 
-## Next step: real network partitions
+## Real network-partition testing on GCP
 
 Standing up the literal Netflix Chaos Monkey (needs Spinnaker) or the
 literal Jepsen framework (Clojure, needs Docker- or VM-orchestrated
-nodes reached over SSH) is not realistic to get right in a day even
-with infrastructure available -- Spinnaker alone is normally a multi-day
-install, and a trustworthy from-scratch Jepsen nemesis/client/checker
-for a new system is routinely a multi-day-to-multi-week effort even for
-experienced Jepsen authors. What real infrastructure (e.g. GCP VMs)
-*does* unlock that a single Mac cannot: real `iptables`-based network
-partitions between genuinely separate machines over SSH, extending the
-same methodology in `jepsen_style_test.py` with a new nemesis action
-(`partition` / `heal`) in place of local process kill. That is the
-concretely useful next step if cloud resources become available, not a
-rebuild of the existing harness.
+nodes reached over SSH) was not realistic to get right in a day --
+Spinnaker alone is normally a multi-day install, and a trustworthy
+from-scratch Jepsen nemesis/client/checker for a new system is routinely
+a multi-day-to-multi-week effort even for experienced Jepsen authors.
+What real GCP VMs unlock that a single Mac cannot: real `iptables`-based
+network partitions between genuinely separate machines over SSH.
+`gcp_orchestrator.py` extends the exact same methodology as
+`jepsen_style_test.py` (independent nemesis, concurrent workload, full
+history, post-hoc checker) onto 5 real VMs, with a `partition`/`heal`
+nemesis action alongside kill/restart/corrupt.
+
+**Setup** (5 `e2-small` VMs, `chaos-node-0..4`, one zone): the release
+binary was cross-built once on a temporarily-resized larger VM (building
+this project's dependency tree on a 2-vCPU box was impractically slow)
+and copied to all 5 nodes, which then ran at normal `e2-small` size for
+the actual test. `gcp_workload.py` is deployed to and runs on node-0,
+issuing requests against its own `localhost:9710`; `gcp_orchestrator.py`
+runs locally and drives every nemesis action over `gcloud compute ssh`
+(kill/restart a peer's process, add/remove `iptables` DROP rules between
+two real peers, flip a byte in a peer's on-disk shard file).
+
+### Result (2026-10-21): 0 confirmed consistency violations across 20,379 real operations
+
+300-second run, 5 GCP VMs, 23 nemesis events (kills, restarts, on-disk
+corruptions, and genuine `iptables` partitions -- confirmed for real
+before the full run: a partitioned node could not reach its target while
+an unpartitioned third node remained fully reachable, and reachability
+returned cleanly after healing). 12,273 writes (12,256 client-confirmed),
+8,106 reads (8,099 client-confirmed). **0 corruption, 0 stale/lost-update
+violations.**
+
+**Two flags the checker first raised, investigated and resolved as
+expected behavior, not bugs:** two reads of key `k2` returned a value
+("T2-S879-...") that didn't match any *client-confirmed* write. Tracing
+it back: that exact write had been issued, took 10.47 seconds under a
+concurrent real network partition, and the client gave up and logged it
+as failed (`ok: False`) -- but it had in fact landed server-side (RS(3,2)
+quorum didn't require the partitioned peer), and a later read correctly
+observed it. That's the system doing the *correct* thing under an
+ambiguous-outcome timeout -- a write the client couldn't confirm wasn't
+lost -- not a data-loss bug. The checker's bug was treating only
+client-confirmed writes as "things that happened": fixed by adding a
+third outcome category, `UNRESOLVED-AMBIGUOUS-WRITE` (a value matching
+only an unconfirmed write attempt, correctly left unresolved rather than
+asserted either way, since an unconfirmed write's client-logged
+completion time isn't a trustworthy ordering anchor -- exactly the kind
+of ambiguity a real linearizability solver like Knossos/Elle exists to
+settle formally). After the fix, the same two reads land in that
+informational category, and genuine `CORRUPTION`/`STALE` are both zero.
+See `gcp_checker.py`'s own docstring for the three-category design.
+
+### Reproducing
+
+```bash
+gcloud auth login
+gcloud config set project <PROJECT_ID>
+gcloud services enable compute.googleapis.com
+gcloud compute firewall-rules create allow-ssh-chaos --network=default --allow=tcp:22 --target-tags=chaos-node
+gcloud compute firewall-rules create allow-warpdrive-internal --network=default \
+  --allow=tcp:9710-9730,tcp:10710-10730,tcp:11710-11730 --source-ranges=10.128.0.0/20 --target-tags=chaos-node
+gcloud compute instances create chaos-node-0 chaos-node-1 chaos-node-2 chaos-node-3 chaos-node-4 \
+  --zone=us-central1-a --machine-type=e2-small --image-family=debian-12 --image-project=debian-cloud \
+  --tags=chaos-node --boot-disk-size=20GB
+# build the release binary (on a temporarily bigger VM if e2-small is too slow to compile on),
+# copy it + server_log.yaml to ~/warpdrive/server/ on every node, then:
+cd server/tests/chaos
+python3 gcp_orchestrator.py 300
+python3 gcp_checker.py
+```
+
+Project-specific names/IPs/zone are hardcoded at the top of
+`gcp_orchestrator.py` -- adjust them for a different GCP project.
