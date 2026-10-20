@@ -6,7 +6,6 @@ Simple test clients for the CIAOS S3-compatible API.
 
 - `s3_test_client.py` - Basic HTTP client using `requests` library
 - `s3_boto_test.py` - AWS SDK client using `boto3` library  
-- `cluster_checksum_test.py` - Checksum-by-default + read-side corruption detection against the distributed/cluster API (plain and FAC/packed paths)
 - `requirements.txt` - Python dependencies
 
 ## Usage
@@ -15,11 +14,17 @@ Simple test clients for the CIAOS S3-compatible API.
 2. Start the server: `cargo run` (from server directory)
 3. Run tests: `python3 s3_test_client.py` or `python3 s3_boto_test.py`
 
-`cluster_checksum_test.py` targets the cluster API instead of the single-node
-one, so it needs a local multi-node cluster rather than a single `cargo run`:
+The same `s3_boto_test.py` suite also runs against the distributed/cluster
+engine, unchanged, just pointed at the cluster's S3 surface instead of the
+single-node one. Start a cluster the normal way (see
+[docs/user_guide.md](../../../docs/user_guide.md#starting-a-cluster) -- one
+`cargo run` per node with `WARPDRIVE_PEERS` set), then:
 
 ```
-(cd ../.. && cargo build --release --bin warp_drive)
-../../../scripts/launch_local_cluster.sh 5 9710 /tmp/wd-local-cluster
-python3 cluster_checksum_test.py
+WARPDRIVE_S3_PATH=/cluster/s3 python3 s3_boto_test.py
 ```
+
+`WARPDRIVE_SERVER_URL` (default `http://localhost:9710`) points at any node
+in the cluster. No separate test file or setup script for this -- it's the
+same assertions against the same base URL scheme, just a different path
+prefix.

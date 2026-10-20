@@ -14,7 +14,7 @@ use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
 use crate::storage::config::StorageConfig;
 
-use super::checksum::{parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
+use super::checksum::{compute_checksum, parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use super::common::*;
 use super::tagging::{s3_put_object_tagging_inner, s3_get_object_tagging_inner, s3_delete_object_tagging_inner, parse_url_tags, validate_tags};
 use super::versioning::{s3_get_object_version_handler, s3_delete_specific_version_handler};
@@ -217,6 +217,21 @@ pub async fn s3_put_object_handler(
                                &resource));
         }
     }
+
+    // Checksum on by default, not opt-in: a client that never asked for
+    // AWS's checksum feature still gets a real checksum computed and
+    // stored, catching post-write corruption (bit-rot, a storage bug) on
+    // a later GET rather than only validating what the client sent over
+    // the wire. CRC32C, not SHA256 -- this only needs to catch accidental
+    // corruption, not resist a malicious adversary, and CRC32C is
+    // hardware-accelerated (SSE4.2/ARM CRC instructions) where SHA256
+    // isn't, the same tradeoff AWS's own SDKs make by defaulting to it.
+    // A client-supplied checksum (already verified above) is trusted as
+    // given instead of being overridden by a second, redundant one.
+    let checksum_result = match checksum_result {
+        Some(r) => Some(r),
+        None => Some((ChecksumAlgorithm::Crc32c, compute_checksum(&ChecksumAlgorithm::Crc32c, &body_buf))),
+    };
 
     let mut metadata = Metadata::from_offset_size_list(offset_size_list);
     metadata.etag = Some(etag.clone());

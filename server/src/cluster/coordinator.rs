@@ -904,6 +904,30 @@ pub async fn cluster_get_object(
 /// sent `x-amz-checksum-mode: ENABLED` and the record actually has a
 /// stored checksum -- same opt-in convention single-node's
 /// `s3_get_object_handler`/`s3_head_object_handler` use.
+/// Shared by both GET read paths (plain and FAC): a reconstructed object
+/// must never reach the client if it doesn't match its stored checksum --
+/// that's what actually catches post-write corruption (bit-rot, an
+/// EC-reconstruction bug, a shard silently corrupted on one peer but
+/// still accepted by read-quorum), as opposed to only checking a
+/// client-sent checksum once at write time. A record with no stored
+/// checksum (predates this feature, `#[serde(default)]`) or an
+/// unrecognized algorithm string passes through untouched rather than
+/// failing closed on data that was never checksummed to begin with.
+fn verify_object_checksum(
+    bucket: &str, key: &str, data: &[u8], stored_checksum: &Option<(String, String)>,
+) -> Result<(), Error> {
+    let Some((algo_str, expected)) = stored_checksum else { return Ok(()) };
+    let Some(algo) = ChecksumAlgorithm::from_str(algo_str) else { return Ok(()) };
+    if crate::s3::handlers::checksum::verify_checksum(&algo, data, expected) {
+        Ok(())
+    } else {
+        Err(ErrorInternalServerError(format!(
+            "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
+             match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
+        )))
+    }
+}
+
 fn checksum_response_header(
     req: &actix_web::HttpRequest, checksum_algorithm: &Option<String>, checksum_value: &Option<String>,
 ) -> Option<(String, String)> {
@@ -972,21 +996,7 @@ pub(crate) async fn cluster_get_object_inner(
             ),
             RangeResult::None => {
                 let data = super::packed::get_object_content_dependent(record, &state).await?;
-
-                // Same read-side integrity check the plain path applies --
-                // a reconstructed FAC object must never reach the client
-                // if it doesn't match what was written, whether or not the
-                // client asked for AWS's checksum feature.
-                if let Some((algo_str, expected)) = &stored_checksum {
-                    if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
-                        if !crate::s3::handlers::checksum::verify_checksum(&algo, &data, expected) {
-                            return Err(ErrorInternalServerError(format!(
-                                "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
-                                 match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
-                            )));
-                        }
-                    }
-                }
+                verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
 
                 let mut resp = HttpResponse::Ok();
                 resp.insert_header(("Accept-Ranges", "bytes"))
@@ -1137,16 +1147,8 @@ pub(crate) async fn cluster_get_object_inner(
     // again on read. A mismatch means the data this node just
     // reconstructed is not what was written, so it must never reach the
     // client -- fail the request instead of serving it.
-    if let (Some(algo_str), Some(expected)) = (&record.checksum_algorithm, &record.checksum_value) {
-        if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
-            if !crate::s3::handlers::checksum::verify_checksum(&algo, &data, expected) {
-                return Err(ErrorInternalServerError(format!(
-                    "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
-                     match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
-                )));
-            }
-        }
-    }
+    let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
+    verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
 
     match parse_range_header(&req, total_len) {
         RangeResult::Valid(start, end) => {
@@ -1756,6 +1758,50 @@ mod tests {
     /// `%`, space, or `/` reaches the receiving peer's handler as the
     /// exact bytes the client meant -- a JSON string has no character
     /// that a URL parser would ever reinterpret as a delimiter.
+    /// The real safety property added this release: a reconstructed
+    /// object that doesn't match its stored checksum must never reach
+    /// the client. Tested directly against `verify_object_checksum`
+    /// (shared by the plain and FAC GET paths) rather than through a live
+    /// multi-node cluster -- round-tripping actual EC-encoded bytes
+    /// through real peer servers belongs to the Python S3-compat suite
+    /// (`server/tests/python/s3_boto_test.py`, run against both `/s3` and
+    /// `/cluster/s3`); this is the fast, deterministic unit coverage for
+    /// the verification logic itself, independent of transport/placement.
+    #[test]
+    fn verify_object_checksum_accepts_matching_data() {
+        let data = b"the real bytes that were written".to_vec();
+        let checksum = crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &data);
+        let stored = Some((ChecksumAlgorithm::Crc32c.as_str().to_string(), checksum));
+        assert!(verify_object_checksum("b", "k", &data, &stored).is_ok());
+    }
+
+    #[test]
+    fn verify_object_checksum_rejects_corrupted_data() {
+        let original = b"the real bytes that were written".to_vec();
+        let checksum = crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &original);
+        let stored = Some((ChecksumAlgorithm::Crc32c.as_str().to_string(), checksum));
+
+        // Simulates a shard silently corrupted on disk (bit-rot) or a
+        // reconstruction bug: the bytes handed to the client-facing
+        // response are not the bytes the checksum was computed over.
+        let mut corrupted = original.clone();
+        corrupted[10] ^= 0xFF;
+        assert_ne!(corrupted, original);
+
+        let err = verify_object_checksum("b", "k", &corrupted, &stored)
+            .expect_err("corrupted data must be rejected, not served");
+        let msg = err.to_string();
+        assert!(msg.contains("data integrity check failed"), "unexpected error message: {msg}");
+    }
+
+    #[test]
+    fn verify_object_checksum_passes_through_when_no_checksum_was_ever_stored() {
+        // Old-format records (predate this feature, `#[serde(default)]`)
+        // must not fail closed on data nothing ever checksummed.
+        let data = b"legacy object with no checksum field".to_vec();
+        assert!(verify_object_checksum("b", "k", &data, &None).is_ok());
+    }
+
     #[test]
     fn delete_key_request_round_trips_keys_with_url_special_characters() {
         for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
