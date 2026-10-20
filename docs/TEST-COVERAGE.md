@@ -998,4 +998,67 @@ directly, not boto3 — boto3 has no client method for constructing a
 deliberately-malformed signed POST policy). Single-node only; cluster has
 no form-upload surface and this RFC's own doc never claimed one.
 
-**Running total: 515 / 808**
+**Running total: 515 / 808** (this entry's own count — superseded below;
+it was never actually re-run against the real suite, see the correction
+immediately following)
+
+---
+
+## Correction — real Ceph suite actually run, not estimated
+
+The 515/808 figure above (and every running total before it in this file)
+was never produced by `pytest` against the real suite — it was accumulated
+from individual PR descriptions and spot-checks. Actually cloning
+`ceph/s3-tests` and running `test_s3.py` + `test_headers.py` for real
+surfaced two things the estimate had wrong:
+
+1. **The real suite has grown**: `886` tests collect today, not `808`.
+   The 808 baseline this file has used throughout is stale relative to
+   upstream `s3-tests`' `master` branch.
+2. **Several tests this file already counted as passing were not** --
+   a test-harness config mistake (`s3tests.conf`'s `display_name` not
+   matching the server's actual `WARPDRIVE_ADMIN_DISPLAY_NAME` default,
+   `"Warpdrive Admin"`) was masking real passes as failures across the
+   ACL batch, and two real product bugs were caught that no prior
+   spot-check had found: POST Object's `x-amz-checksum-*` field was
+   never actually verified against the uploaded bytes (just stored as an
+   opaque string), and four distinct versioning/ACL bugs (`UploadPartCopy`
+   not parsing `?versionId=` off `x-amz-copy-source`, `GetObjectAcl`/
+   `PutObjectAcl` not even reading `?versionId` and dispatching after
+   `?versionId` instead of before it, `GetObjectAttributes` ignoring
+   `?versionId` and never echoing `x-amz-version-id`, `HeadObject`'s 404
+   missing `x-amz-delete-marker` for a marker-current key). All fixed
+   this session (commits `18cec27`, `6adefcd`).
+
+**Verified final count, this session, against the real cloned suite**:
+**496 / 886** passed, 274 failed, 25 errors, 92 skipped. This is the
+authoritative number going forward -- not the batch-by-batch running
+total above, which undercounts real upstream growth and was never
+re-verified end to end. Of the 299 failures/errors, the large majority
+are already-known, already-documented gaps, not new findings:
+
+| Category | Count | Status |
+|---|---|---|
+| SSE-S3/SSE-C/SSE-KMS | 109 | Not implemented (RFC 2.15-17) |
+| Bucket policy / Block Public Access | 43 | Deferred, Console-coincidence (RFC 2.13) |
+| Bucket logging | 39 | Deprioritized per explicit direction (RFC 2.21) |
+| Lifecycle | 25 | Not implemented (RFC 2.20) |
+| Deprecated SigV2 (`_aws2`) | 21 | Intentionally excluded project-wide |
+| Same-admin-key / no user directory | ~12 | Structural test-env limitation, not a bug |
+| Bucket ownership controls | 5 | Not implemented (RFC 2.12) |
+| Everything else | remainder | Not yet individually triaged |
+
+**Lesson for future batches**: run the real suite (`git clone
+https://github.com/ceph/s3-tests`, `pip install -r requirements.txt && pip
+install -e .`, a `s3tests.conf` with `host=localhost port=9710
+is_secure=False` and `[s3 main]`/`[s3 alt]`/`[s3 tenant]`/`[iam]`/`[iam
+root]`/`[iam alt root]` all pointed at the same admin credentials since
+there's only one real user, `display_name` set to match
+`WARPDRIVE_ADMIN_DISPLAY_NAME` (default `"Warpdrive Admin"`) --
+`S3TEST_CONF=s3tests.conf pytest s3tests/functional/test_s3.py
+s3tests/functional/test_headers.py -q`) before updating this file's
+running total. A replica script or a read of the test source is not a
+substitute for actually running it, even when it's built faithfully from
+the real assertions — this session's own POST Object work proved that:
+reading the source got 32/33 tests right and missed a second assertion
+inside `test_post_object_upload_checksum` entirely.
