@@ -81,7 +81,7 @@ pub(super) fn s3_url_encode(s: &str) -> String {
 }
 
 /// Build an S3-spec XML error response.
-pub(super) fn s3_error(status: StatusCode, code: &str, message: &str, resource: &str) -> HttpResponse {
+pub(crate) fn s3_error(status: StatusCode, code: &str, message: &str, resource: &str) -> HttpResponse {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <Error>\n\
@@ -206,7 +206,7 @@ pub(super) fn range_slices(chunks: &[(u64, u64)], range_start: u64, range_end: u
 
 /// Returns the current timestamp as the canonical last_modified string stored in metadata
 /// and emitted in S3 XML bodies. Format: ISO 8601 (`2026-07-01T12:00:00.000Z`).
-pub(super) fn last_modified_now() -> String {
+pub(crate) fn last_modified_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string()
 }
 
@@ -218,19 +218,19 @@ pub(super) fn last_modified_for_header(s: &str) -> String {
 }
 
 /// Compute MD5 ETag (double-quoted) from accumulated bytes.
-pub(super) fn md5_etag(data: &[u8]) -> String {
+pub(crate) fn md5_etag(data: &[u8]) -> String {
     format!("\"{}\"", hex::encode(md5::compute(data).0))
 }
 
 /// Strip surrounding double quotes from an ETag for comparison.
 #[inline]
-pub(super) fn normalize_etag(etag: &str) -> &str {
+pub(crate) fn normalize_etag(etag: &str) -> &str {
     etag.trim().trim_matches('"')
 }
 
 /// Return a 412 PreconditionFailed S3 error response.
 #[inline]
-pub(super) fn s3_precondition_failed(resource: &str) -> HttpResponse {
+pub(crate) fn s3_precondition_failed(resource: &str) -> HttpResponse {
     s3_error(StatusCode::PRECONDITION_FAILED, "PreconditionFailed",
              "At least one of the pre-conditions you specified did not hold",
              resource)
