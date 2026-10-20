@@ -58,23 +58,14 @@ pub struct ClusterState {
     /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
     /// the codec name a unit was tagged with at PUT time.
     pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
-    /// Phase 4: multipart upload bookkeeping (see `multipart_store.rs`).
-    /// Part *bytes* live in the ordinary plain EC path under a synthetic
-    /// key, fully replicated like any other object write -- this only
-    /// tracks upload/part metadata, and that metadata is **not**
-    /// replicated to peers the way every other write in this file is.
-    /// Known, bounded operational constraint, not an oversight: a real
-    /// multi-node deployment must route every request for one `upload_id`
-    /// (CreateMultipartUpload through CompleteMultipartUpload/Abort) to
-    /// the same coordinator node -- sticky routing per upload, not the
-    /// "any node can serve any request" symmetry the rest of this project
-    /// gives for free. Fails safe if violated (a misrouted request 404s
-    /// with "no such upload," it does not corrupt or silently drop data),
-    /// but it is a real gap against this project's own symmetric-design
-    /// invariant. Replicating this bookkeeping the same way
-    /// `replicate_location_put` does is future work, scoped out here for
-    /// time, not forgotten.
-    pub multipart_store: Arc<dyn super::multipart_store::MultipartStore>,
+    // Phase 4 multipart upload bookkeeping deliberately has no field here:
+    // both the part bytes and the upload "header" (status, content-type,
+    // user-metadata) are ordinary objects through the existing
+    // `location_store`/`put_object_plain` path, replicated to every peer
+    // the same way as any other write -- see `multipart_meta_key`'s own
+    // doc in coordinator.rs for why that, not a separate per-node store,
+    // is what keeps "any node can coordinate any request" true for
+    // multipart too.
 }
 
 /// Write succeeds once this many of the `k+m` peers acknowledge: `k`, or
@@ -695,107 +686,129 @@ async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state:
 /// plain EC path. Same NUL-byte key-space-disjointness scheme as
 /// `packed.rs::stripe_key` (a real object key is rejected if it starts
 /// with `\0`, enforced in `cluster_put_object_inner`), with its own
-/// distinct literal prefix (`mpu` vs. `cdstripe`) so the two synthetic
-/// namespaces can never collide with each other either.
+/// distinct literal prefix (`mpu:` vs. `cdstripe`, and vs. `mpu-meta:`
+/// below) so none of these synthetic namespaces can ever collide.
 fn multipart_part_key(upload_id: &str, part_number: i32) -> String {
     format!("\0mpu:{}:{upload_id}:{part_number}", upload_id.len())
 }
 
+/// Prefix matching every part key for one upload -- `upload_id` is
+/// guaranteed `:`-free (`new_version_id`'s own doc), so splitting a
+/// listed key on its *last* `:` to recover `part_number` is unambiguous,
+/// the same guarantee `shard_key`/`versioned_key` already rely on.
+fn multipart_part_prefix(upload_id: &str) -> String {
+    format!("\0mpu:{}:{upload_id}:", upload_id.len())
+}
+
+/// Synthetic key for an upload's own bookkeeping "header" -- deliberately
+/// an ordinary plain object through the exact same replicated write path
+/// as everything else in this file, not a separate per-node store. Its
+/// *existence* in `location_store` (replicated to every peer, like any
+/// other PUT) means "upload in progress"; its absence means "completed,
+/// aborted, or never existed" -- no separate status field needed. Its
+/// `content_type`/`user_metadata` fields (via `ObjectS3Metadata`, same as
+/// any other object) carry what `CompleteMultipartUpload` needs to set on
+/// the final object. This is what makes multipart bookkeeping visible
+/// from *any* coordinating node, not just the one that happened to
+/// receive `CreateMultipartUpload` -- the same "any node can coordinate
+/// any request" symmetry every other cluster write already has.
+fn multipart_meta_key(upload_id: &str) -> String {
+    format!("\0mpu-meta:{upload_id}")
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4: multipart upload, authenticated-surface support functions.
-// Scope deliberately narrower than single-node's multipart (see
-// `multipart_store.rs`'s own doc): only plain (non-content-dependent)
-// final objects are supported. A content-dependent final object would
-// need re-running the packer over the reassembled bytes, which is real,
-// separate scope -- not attempted here, and not silently dropped either:
-// `cluster_complete_multipart_upload_inner` always writes a plain final
-// object, regardless of the destination bucket's packing config, and
-// says so in its own doc.
+// Scope deliberately narrower than single-node's multipart: only plain
+// (non-content-dependent) final objects are supported. A content-
+// dependent final object would need re-running the packer over the
+// reassembled bytes, which is real, separate scope -- not attempted
+// here, and not silently dropped either: `cluster_complete_multipart_
+// upload_inner` always writes a plain final object, regardless of the
+// destination bucket's packing config, and says so in its own doc.
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn cluster_create_multipart_upload_inner(
-    user_id: &str, bucket: &str, key: &str, content_type: Option<String>, user_metadata: HashMap<String, String>,
+    user_id: &str, bucket: &str, _key: &str, content_type: Option<String>, user_metadata: HashMap<String, String>,
     state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
     let upload_id = super::shard_storage::new_version_id();
-    let upload = super::multipart_store::MultipartUpload {
-        upload_id: upload_id.clone(),
-        user_id: user_id.to_string(),
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        content_type,
-        user_metadata,
-        initiated_at: super::s3_surface::now_http_date(),
-        status: "in_progress".to_string(),
-    };
-    state.multipart_store.create_upload(upload).map_err(ErrorInternalServerError)?;
+    let s3_meta = ObjectS3Metadata { content_type, user_metadata, ..Default::default() };
+    // Empty body: the header carries no bytes of its own, only metadata
+    // on the (fully replicated) LocationRecord it creates.
+    put_object_plain(user_id, bucket, &multipart_meta_key(&upload_id), &[], state, &s3_meta).await?;
     Ok(upload_id)
 }
 
 /// Stores one part's bytes via the ordinary plain EC path under its
-/// synthetic key, then records its (part_number, etag, size) in the
-/// multipart bookkeeping store. Returns the part's ETag.
+/// synthetic key. The part's own `LocationRecord` (etag, size) *is* the
+/// bookkeeping -- replicated the same way as the part's bytes, no
+/// separate index. Returns the part's ETag.
 pub(crate) async fn cluster_upload_part_inner(
-    user_id: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
+    user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
-    let upload = state
-        .multipart_store
-        .get_upload(upload_id)
-        .ok_or_else(|| ErrorNotFound("no such upload"))?;
-    if upload.status != "in_progress" {
-        return Err(ErrorBadRequest("upload is not in progress"));
+    if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
+        return Err(ErrorNotFound("no such upload"));
     }
 
     let etag = crate::s3::handlers::common::md5_etag(&body);
-    let synthetic_key = multipart_part_key(upload_id, part_number);
-    put_object_plain(user_id, &upload.bucket, &synthetic_key, &body, state, &ObjectS3Metadata::default()).await?;
-
-    state
-        .multipart_store
-        .put_part(upload_id, super::multipart_store::MultipartPart { part_number, etag: etag.clone(), size: body.len() as u64 })
-        .map_err(ErrorInternalServerError)?;
+    let s3_meta = ObjectS3Metadata { etag: Some(etag.clone()), ..Default::default() };
+    put_object_plain(user_id, bucket, &multipart_part_key(upload_id, part_number), &body, state, &s3_meta).await?;
     Ok(etag)
 }
 
-pub(crate) fn cluster_list_parts_inner(upload_id: &str, state: &web::Data<ClusterState>) -> Result<Vec<super::multipart_store::MultipartPart>, Error> {
-    state.multipart_store.get_upload(upload_id).ok_or_else(|| ErrorNotFound("no such upload"))?;
-    Ok(state.multipart_store.list_parts(upload_id))
+/// Lists an upload's parts via `LocationStore::list`'s prefix scan --
+/// already replicated, already available on any node -- then one `get`
+/// per listed key to recover its real etag (`list` itself only returns
+/// key+size). Sorted by part number.
+pub(crate) fn cluster_list_parts_inner(user_id: &str, bucket: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<Vec<(i32, String, u64)>, Error> {
+    if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
+        return Err(ErrorNotFound("no such upload"));
+    }
+    let prefix = multipart_part_prefix(upload_id);
+    let mut parts: Vec<(i32, String, u64)> = state
+        .location_store
+        .list(user_id, bucket, &prefix)
+        .into_iter()
+        .filter_map(|(part_key, size)| {
+            let part_number: i32 = part_key.rsplit(':').next()?.parse().ok()?;
+            let record = state.location_store.get(user_id, bucket, &part_key)?;
+            Some((part_number, record.etag.unwrap_or_default(), size))
+        })
+        .collect();
+    parts.sort_by_key(|(n, _, _)| *n);
+    Ok(parts)
 }
 
 /// Reassembles the requested parts in order, writes the result as one
-/// ordinary plain object under the real key (see this section's own doc
-/// on why this is always plain, never re-packed), cleans up part
-/// bookkeeping and their synthetic shard storage, and returns
-/// `(final_etag, total_size)`. `requested` is `(part_number, client-sent
-/// etag)` pairs in the order the client wants them assembled -- each is
-/// validated against the stored part's own etag before use, same check
-/// single-node's `CompleteMultipartUpload` does.
+/// ordinary plain object under `final_key` (see this section's own doc
+/// on why this is always plain, never re-packed), cleans up the header
+/// and part records, and returns `(final_etag, total_size)`. `requested`
+/// is `(part_number, client-sent etag)` pairs in the order the client
+/// wants them assembled -- each is validated against the stored part's
+/// own etag before use, same check single-node's `CompleteMultipartUpload`
+/// does.
 pub(crate) async fn cluster_complete_multipart_upload_inner(
-    user_id: &str, upload_id: &str, requested: &[(i32, String)], state: &web::Data<ClusterState>,
+    user_id: &str, bucket: &str, final_key: &str, upload_id: &str, requested: &[(i32, String)], state: &web::Data<ClusterState>,
 ) -> Result<(String, u64), Error> {
-    let upload = state
-        .multipart_store
-        .get_upload(upload_id)
+    let meta_record = state
+        .location_store
+        .get(user_id, bucket, &multipart_meta_key(upload_id))
         .ok_or_else(|| ErrorNotFound("no such upload"))?;
-    if upload.status != "in_progress" {
-        return Err(ErrorBadRequest("upload is not in progress"));
-    }
-
-    let stored_parts = state.multipart_store.list_parts(upload_id);
-    let stored_by_number: HashMap<i32, &super::multipart_store::MultipartPart> =
-        stored_parts.iter().map(|p| (p.part_number, p)).collect();
 
     let mut combined_md5_bytes: Vec<u8> = Vec::new();
     let mut body: Vec<u8> = Vec::new();
     for (part_number, client_etag) in requested {
-        let stored = stored_by_number
-            .get(part_number)
+        let part_key = multipart_part_key(upload_id, *part_number);
+        let stored = state
+            .location_store
+            .get(user_id, bucket, &part_key)
             .ok_or_else(|| ErrorBadRequest("one or more of the specified parts could not be found"))?;
-        if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored.etag) {
+        let stored_etag = stored.etag.unwrap_or_default();
+        if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored_etag) {
             return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
         }
-        let part_bytes = fetch_plain_object_bytes(user_id, &upload.bucket, &multipart_part_key(upload_id, *part_number), state).await?;
-        if let Ok(raw) = hex::decode(crate::s3::handlers::common::normalize_etag(&stored.etag)) {
+        let part_bytes = fetch_plain_object_bytes(user_id, bucket, &part_key, state).await?;
+        if let Ok(raw) = hex::decode(crate::s3::handlers::common::normalize_etag(&stored_etag)) {
             combined_md5_bytes.extend_from_slice(&raw);
         }
         body.extend_from_slice(&part_bytes);
@@ -808,37 +821,38 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
 
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
-        content_type: upload.content_type.clone(),
+        content_type: meta_record.content_type.clone(),
         last_modified: Some(super::s3_surface::now_http_date()),
-        user_metadata: upload.user_metadata.clone(),
+        user_metadata: meta_record.user_metadata.clone(),
         ..Default::default()
     };
-    put_object_plain(user_id, &upload.bucket, &upload.key, &body, state, &s3_meta).await?;
+    put_object_plain(user_id, bucket, final_key, &body, state, &s3_meta).await?;
 
-    state.multipart_store.set_status(upload_id, "completed").ok();
+    // Local-only cleanup of the now-dead header/part records (no tombstone
+    // replication to peers) -- a storage-reclamation gap, not a
+    // correctness one: this project has no compaction/GC anywhere yet
+    // (see RFC3), so leftover shard bytes on peers already accumulate
+    // the same way for ordinary deletes. Tracked as the same class of
+    // future work, not a new gap introduced here.
+    let _ = state.location_store.delete(user_id, bucket, &multipart_meta_key(upload_id));
     for (part_number, _) in requested {
-        let _ = state.location_store.delete(user_id, &upload.bucket, &multipart_part_key(upload_id, *part_number));
+        let _ = state.location_store.delete(user_id, bucket, &multipart_part_key(upload_id, *part_number));
     }
-    state.multipart_store.delete_parts(upload_id).ok();
-    state.multipart_store.delete_upload(upload_id).ok();
 
     Ok((final_etag, total_size))
 }
 
-/// Aborts an in-progress upload: cleans up part bookkeeping and their
-/// synthetic shard storage without writing a final object.
-pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<(), Error> {
-    let upload = state
-        .multipart_store
-        .get_upload(upload_id)
-        .ok_or_else(|| ErrorNotFound("no such upload"))?;
-
-    let parts = state.multipart_store.list_parts(upload_id);
-    for p in &parts {
-        let _ = state.location_store.delete(user_id, &upload.bucket, &multipart_part_key(upload_id, p.part_number));
+/// Aborts an in-progress upload: cleans up the header and part records
+/// without writing a final object.
+pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<(), Error> {
+    if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
+        return Err(ErrorNotFound("no such upload"));
     }
-    state.multipart_store.delete_parts(upload_id).ok();
-    state.multipart_store.delete_upload(upload_id).map_err(ErrorInternalServerError)?;
+    let prefix = multipart_part_prefix(upload_id);
+    for (part_key, _) in state.location_store.list(user_id, bucket, &prefix) {
+        let _ = state.location_store.delete(user_id, bucket, &part_key);
+    }
+    let _ = state.location_store.delete(user_id, bucket, &multipart_meta_key(upload_id));
     Ok(())
 }
 

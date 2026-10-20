@@ -145,7 +145,7 @@ pub async fn cluster_s3_put_object_authenticated(
         let upload_id = qmap.get("uploadId").cloned().unwrap_or_default();
         let part_number: i32 = qmap.get("partNumber").and_then(|s| s.parse().ok())
             .ok_or_else(|| ErrorBadRequest("partNumber must be an integer"))?;
-        let etag = cluster_upload_part_inner(&user_id, &upload_id, part_number, body, &state).await?;
+        let etag = cluster_upload_part_inner(&user_id, &bucket, &upload_id, part_number, body, &state).await?;
         let mut resp = HttpResponse::Ok();
         if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&etag) {
             resp.insert_header(("ETag", hv));
@@ -302,9 +302,9 @@ pub async fn cluster_s3_get_object_authenticated(
     }
     if let Some(upload_id) = qmap.get("uploadId") {
         if !qmap.contains_key("partNumber") {
-            let parts = cluster_list_parts_inner(upload_id, &state)?;
-            let parts_xml: String = parts.iter().map(|p| {
-                format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><Size>{}</Size></Part>", p.part_number, p.etag, p.size)
+            let parts = cluster_list_parts_inner(&user_id, &bucket, upload_id, &state)?;
+            let parts_xml: String = parts.iter().map(|(part_number, etag, size)| {
+                format!("<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag><Size>{size}</Size></Part>")
             }).collect();
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"{S3_XMLNS}\"><Bucket>{bucket}</Bucket><Key>{key}</Key><UploadId>{upload_id}</UploadId>{parts_xml}</ListPartsResult>",
@@ -338,7 +338,7 @@ pub async fn cluster_s3_delete_object_authenticated(
 
     let qmap = req_query_map(&req);
     if let Some(upload_id) = qmap.get("uploadId") {
-        cluster_abort_multipart_upload_inner(&user_id, upload_id, &state).await?;
+        cluster_abort_multipart_upload_inner(&user_id, &bucket, upload_id, &state).await?;
         return Ok(HttpResponse::NoContent().finish());
     }
     if qmap.contains_key("tagging") {
@@ -460,7 +460,7 @@ pub async fn cluster_s3_multipart_post_authenticated(
         if requested.is_empty() {
             return Err(ErrorBadRequest("the XML you provided was not well-formed or did not validate"));
         }
-        let (final_etag, _size) = cluster_complete_multipart_upload_inner(&user_id, upload_id, &requested, &state).await?;
+        let (final_etag, _size) = cluster_complete_multipart_upload_inner(&user_id, &bucket, &key, upload_id, &requested, &state).await?;
         let xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"{S3_XMLNS}\">\
              <Bucket>{bucket}</Bucket><Key>{key}</Key><ETag>{final_etag}</ETag></CompleteMultipartUploadResult>",

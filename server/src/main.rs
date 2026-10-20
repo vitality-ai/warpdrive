@@ -130,12 +130,6 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
             m
         },
-        multipart_store: Arc::new(
-            warp_drive::cluster::multipart_store::BitcaskMultipartStore::open(
-                std::env::var("WARPDRIVE_MULTIPART_LOG").unwrap_or_else(|_| "cluster_multipart.log".to_string()),
-            )
-            .expect("failed to open multipart store log"),
-        ),
     };
     web::Data::new(state)
 }
