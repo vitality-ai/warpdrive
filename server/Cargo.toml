@@ -60,5 +60,9 @@ name = "load_gen"
 path = "src/bin/load_gen.rs"
 
 [[bin]]
+name = "load_gen_auth"
+path = "src/bin/load_gen_auth.rs"
+
+[[bin]]
 name = "fanout_bench"
 path = "src/bin/fanout_bench.rs"

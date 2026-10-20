@@ -604,16 +604,6 @@ async fn put_object_plain(
         tags: Vec::new(),
     };
 
-    let t0 = std::time::Instant::now();
-    let loc_acked = replicate_location_put(&state, &record, &peers).await;
-    state.timing.location_replicate.record(t0.elapsed());
-    if loc_acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
-            "location pin quorum not met: {loc_acked}/{required_acks} peers stored the placement record \
-             (shard data was written, but the object may not be findable from every node)"
-        )));
-    }
-
     // This key may have previously been written content-dependent (packed)
     // on a bucket whose config later changed, or simply have had its
     // overhead cross the threshold this time where it didn't before. GET
@@ -631,8 +621,29 @@ async fn put_object_plain(
     // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
     // every other write here: a PUT that can't confirm the stale pin was
     // actually cleared cluster-wide is treated as not fully succeeded.
+    //
+    // Run concurrently with the location-pin replication below rather than
+    // after it: the two broadcasts touch different stores/keys (the new
+    // object's placement pin vs. a possibly-nonexistent old packed pin) and
+    // neither's result depends on the other's, so there is no ordering
+    // requirement between them -- only that both finish, and both quorums
+    // are still checked independently afterward. This halves the number of
+    // sequential cross-peer round trips a PUT pays for (was: shard fan-out,
+    // then location-pin quorum, then cleanup-broadcast quorum, each waiting
+    // on the last; now the latter two overlap).
     let _ = state.content_location_store.delete(user_id, &bucket, &key);
-    let cleanup_acked = replicate_content_location_delete(&state, user_id, &bucket, &key, &peers).await;
+    let t0 = std::time::Instant::now();
+    let (loc_acked, cleanup_acked) = tokio::join!(
+        replicate_location_put(&state, &record, &peers),
+        replicate_content_location_delete(&state, user_id, &bucket, &key, &peers),
+    );
+    state.timing.location_replicate.record(t0.elapsed());
+    if loc_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "location pin quorum not met: {loc_acked}/{required_acks} peers stored the placement record \
+             (shard data was written, but the object may not be findable from every node)"
+        )));
+    }
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
