@@ -12,6 +12,7 @@ use crate::service::user_context::UserContext;
 use crate::util::serializer::deserialize_offset_size;
 
 use super::common::*;
+use super::acl::{resolve_effective_grants, grants_to_json};
 
 // ---------------------------------------------------------------------------
 // CopyObject  PUT /s3/{dst_bucket}/{dst_key} with x-amz-copy-source header
@@ -154,6 +155,17 @@ pub async fn s3_copy_object_handler(
     let (copy_vid, copy_old_extents) = db.put_object_full(&dst_bucket, &dst_key, dst_meta)?;
     if !copy_old_extents.is_empty() {
         db.queue_deletion(&dst_bucket, &dst_key, &copy_old_extents).ok();
+    }
+
+    let has_acl_header = req.headers().contains_key("x-amz-acl")
+        || ["x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp", "x-amz-grant-write-acp", "x-amz-grant-full-control"]
+            .iter().any(|h| req.headers().contains_key(*h));
+    if has_acl_header {
+        let dst_vid = copy_vid.as_deref().unwrap_or("");
+        match resolve_effective_grants(&req, None, &auth_result.user_id, &auth_result.owner_display_name) {
+            Ok(grants) => db.set_object_acl(&dst_bucket, &dst_key, dst_vid, &auth_result.user_id, &grants_to_json(&grants))?,
+            Err(resp) => return Ok(resp),
+        }
     }
 
     let xml = format!(

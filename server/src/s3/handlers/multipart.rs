@@ -704,18 +704,20 @@ pub(super) async fn s3_list_multipart_uploads_handler(bucket: &str, req: &HttpRe
     let mut uploads_xml = String::new();
     for upload in &uploads {
         let uid = xml_escape(&upload.user_id);
+        let udn = if upload.user_id == auth_result.user_id { &auth_result.owner_display_name } else { &upload.user_id };
         uploads_xml.push_str(&format!(
             "<Upload>\
               <Key>{key}</Key>\
               <UploadId>{upid}</UploadId>\
-              <Initiator><ID>{uid}</ID><DisplayName>{uid}</DisplayName></Initiator>\
-              <Owner><ID>{uid}</ID><DisplayName>{uid}</DisplayName></Owner>\
+              <Initiator><ID>{uid}</ID><DisplayName>{udn}</DisplayName></Initiator>\
+              <Owner><ID>{uid}</ID><DisplayName>{udn}</DisplayName></Owner>\
               <StorageClass>STANDARD</StorageClass>\
               <Initiated>{init}</Initiated>\
             </Upload>",
             key   = xml_escape(&upload.key),
             upid  = xml_escape(&upload.upload_id),
             uid   = uid,
+            udn   = xml_escape(udn),
             init  = xml_escape(&upload.initiated_at),
         ));
     }

@@ -34,6 +34,9 @@ pub struct MockMetadataStore {
     bucket_object_lock_enabled: Arc<Mutex<HashSet<String>>>,
     object_lock_config: Arc<Mutex<HashMap<String, (String, Option<i64>, Option<i64>)>>>,
     object_lock_rows: Arc<Mutex<HashMap<(String, String, String), ObjectLockRow>>>,
+    bucket_acl: Arc<Mutex<HashMap<String, (String, String)>>>,
+    object_acl: Arc<Mutex<HashMap<(String, String, String), (String, String)>>>,
+    public_access_block: Arc<Mutex<HashMap<String, (bool, bool, bool, bool)>>>,
 }
 
 impl MockMetadataStore {
@@ -55,6 +58,9 @@ impl MockMetadataStore {
             bucket_object_lock_enabled: Arc::new(Mutex::new(HashSet::new())),
             object_lock_config: Arc::new(Mutex::new(HashMap::new())),
             object_lock_rows: Arc::new(Mutex::new(HashMap::new())),
+            bucket_acl: Arc::new(Mutex::new(HashMap::new())),
+            object_acl: Arc::new(Mutex::new(HashMap::new())),
+            public_access_block: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -384,6 +390,44 @@ impl MetadataStorage for MockMetadataStore {
 
     fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
         Ok(self.multipart_tagging.lock().unwrap().get(upload_id).cloned().unwrap_or_default())
+    }
+
+    fn set_bucket_acl(&self, bucket: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
+        self.bucket_acl.lock().unwrap().insert(bucket.to_string(), (owner_id.to_string(), grants_json.to_string()));
+        Ok(())
+    }
+
+    fn get_bucket_acl(&self, bucket: &str) -> Result<Option<(String, String)>, Error> {
+        Ok(self.bucket_acl.lock().unwrap().get(bucket).cloned())
+    }
+
+    fn set_object_acl(&self, bucket: &str, key: &str, version_id: &str, owner_id: &str, grants_json: &str) -> Result<(), Error> {
+        self.object_acl.lock().unwrap().insert(
+            (bucket.to_string(), key.to_string(), version_id.to_string()),
+            (owner_id.to_string(), grants_json.to_string()),
+        );
+        Ok(())
+    }
+
+    fn get_object_acl(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<(String, String)>, Error> {
+        Ok(self.object_acl.lock().unwrap().get(&(bucket.to_string(), key.to_string(), version_id.to_string())).cloned())
+    }
+
+    fn set_public_access_block(&self, bucket: &str, block_public_acls: bool, ignore_public_acls: bool, block_public_policy: bool, restrict_public_buckets: bool) -> Result<(), Error> {
+        self.public_access_block.lock().unwrap().insert(
+            bucket.to_string(),
+            (block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets),
+        );
+        Ok(())
+    }
+
+    fn get_public_access_block(&self, bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error> {
+        Ok(self.public_access_block.lock().unwrap().get(bucket).cloned())
+    }
+
+    fn delete_public_access_block(&self, bucket: &str) -> Result<(), Error> {
+        self.public_access_block.lock().unwrap().remove(bucket);
+        Ok(())
     }
 
     fn create_multipart_upload(

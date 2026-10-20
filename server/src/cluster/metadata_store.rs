@@ -293,6 +293,34 @@ impl MetadataStorage for ClusterMetadataStore {
         Err(not_supported("multipart upload"))
     }
 
+    fn set_bucket_acl(&self, _bucket: &str, _owner_id: &str, _grants_json: &str) -> Result<(), Error> {
+        Err(not_supported("bucket ACL"))
+    }
+
+    fn get_bucket_acl(&self, _bucket: &str) -> Result<Option<(String, String)>, Error> {
+        Err(not_supported("bucket ACL"))
+    }
+
+    fn set_object_acl(&self, _bucket: &str, _key: &str, _version_id: &str, _owner_id: &str, _grants_json: &str) -> Result<(), Error> {
+        Err(not_supported("object ACL"))
+    }
+
+    fn get_object_acl(&self, _bucket: &str, _key: &str, _version_id: &str) -> Result<Option<(String, String)>, Error> {
+        Err(not_supported("object ACL"))
+    }
+
+    fn set_public_access_block(&self, _bucket: &str, _block_public_acls: bool, _ignore_public_acls: bool, _block_public_policy: bool, _restrict_public_buckets: bool) -> Result<(), Error> {
+        Err(not_supported("public access block"))
+    }
+
+    fn get_public_access_block(&self, _bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error> {
+        Err(not_supported("public access block"))
+    }
+
+    fn delete_public_access_block(&self, _bucket: &str) -> Result<(), Error> {
+        Err(not_supported("public access block"))
+    }
+
     fn create_multipart_upload(
         &self, _upload_id: &str, _user_id: &str, _bucket: &str, _key: &str,
         _content_type: Option<&str>, _metadata_json: &str, _initiated_at: &str,

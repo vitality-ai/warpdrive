@@ -701,7 +701,7 @@ test_get_checksum_object_attributes
 ## feat/batch-14-object-lock — Batch 14: S3 Object Lock (WORM)
 
 **Branch:** `feat/batch-14-object-lock`
-**RFC Batch:** Batch 14 (RFC 2.6 — Object Lock)
+**RFC Batch:** Batch 14 (RFC 2.22 — Object Lock)
 **Newly passing:** 39
 
 Key changes:
@@ -818,7 +818,106 @@ test_cors_presigned_put_object
 
 ### Intentionally deferred (2 tests)
 
-- `test_cors_origin_response` — requires public-read ACL (unauthenticated GET → 403 without Batch 10)
+- `test_cors_origin_response` — anonymous GET now correctly returns 200 (Batch 10 public-read ACL), but the CORS `Access-Control-Allow-Origin` header is only applied on `OPTIONS` preflight, not echoed onto the actual `GET`/`PUT` response — separate CORS gap, not an ACL issue
 - `test_cors_origin_wildcard` — same reason
 
 **Running total: 242 / 808**
+
+---
+
+## feat/batch-10-acl — Batch 10: S3 ACL (canned ACLs, header/XML grants, Block Public Access)
+
+**Branch:** ported from stale `origin/feat/batch-10-acl` (PR #147, never merged) onto `distributed-s3-compat-engine`
+**RFC Batch:** Batch 10 (RFC 2.10 — ACL)
+**Newly passing:** 49
+
+Key changes:
+- `bucket_acl` / `object_acl` / `public_access_block` SQLite tables: JSON grant lists keyed by owner; no row = default-private, synthesized at read time
+- `acl.rs` rewritten: canned ACL expansion (`private`/`public-read`/`public-read-write`/`authenticated-read`/`bucket-owner-*`), `x-amz-grant-*` header parsing, arbitrary `AccessControlPolicy` XML body parsing/serialization, Block Public Access CRUD + enforcement, `?policyStatus`
+- `auth.rs`: genuine anonymous request path (`authenticate_s3_request_allow_anonymous`) alongside the existing strict `authenticate_s3_request`, so unrelated call sites keep their original behavior; `WARPDRIVE_ADMIN_DISPLAY_NAME` env var (default `"Warpdrive Admin"`) plus `owner_display_name`/`is_anonymous` on `S3AuthResult`
+- Anonymous GET/HEAD/PUT/ListObjects/ListBuckets gate on stored ACL, checked *before* bucket/key existence so a nonexistent resource never leaks via 404 vs 403 (matches real S3); anonymous `ListBuckets` returns 200 with an empty list rather than an error
+- `x-amz-expected-bucket-owner` now actually validated (previously accepted but ignored)
+- Bad/unrecognized SigV4 credentials now return 403 `AccessDenied` instead of 401 (matches Ceph's `test_list_buckets_invalid_auth`/`test_list_buckets_bad_auth`) — also updated the server's own `s3_integration.rs` expectations to match
+- Fixed a pre-existing bug where `<Owner><DisplayName>` echoed the owner ID instead of the real display name, across `bucket.rs` (ListBuckets), `listing.rs` (ListObjects), `versioning.rs` (ListObjectVersions), and `multipart.rs` (ListMultipartUploads `<Initiator>`/`<Owner>`)
+- Bonus fix: `validate_bucket_name` now rejects IPv4-shaped bucket names and adjacent `.-`/`-.` sequences, matching real S3's legacy DNS-compliant naming rules
+- Bonus fix: GetObject no longer echoes the whole-object `x-amz-checksum-*` header on ranged (`Content-Range`) responses — botocore validates that header against the response body by default, so echoing a whole-object checksum on a partial body broke Range GET tests
+
+This feature was fully implemented and verified on the original `feat/batch-10-acl` branch (49/49 tests against the real Ceph suite, per that branch's own development record) but never merged — it sat on open PR #147 since 2026-08-08. Ported onto this branch the same way PRs #170/#171 were earlier in this effort: diffed the stale commit against the `main` commit it actually diverged from (only 6 commits of drift, much cleaner than the 17-commit-stale #170/#171 case), applied the genuinely-missing delta by hand, skipping anything already superseded.
+
+**Note on verification**: no local checkout of the Ceph `s3-tests` suite was available during this port, so the exact 49-test list below is carried over from the original branch's own record, not independently re-run test-by-test here. What *was* independently verified live against a running server (see commit): canned ACL set/get on both bucket and object, anonymous GET succeeding on a public-read object and correctly 403'ing on a private one, Block Public Access rejecting a public-ACL write and round-tripping its config, and IP-shaped bucket name rejection. `cargo test` (147 lib + 11 `s3_integration.rs`, including 3 updated 401→403 expectations) is zero-regression.
+
+### Tests this batch is expected to newly pass (49, per the original branch's record)
+
+```
+test_bucket_acl_canned
+test_bucket_acl_canned_authenticatedread
+test_bucket_acl_canned_during_create
+test_bucket_acl_canned_publicreadwrite
+test_bucket_acl_default
+test_bucket_acl_revoke_all
+test_bucket_put_bad_canned_acl
+test_put_bucket_acl_grant_group_read
+test_object_acl
+test_object_acl_canned
+test_object_acl_canned_authenticatedread
+test_object_acl_canned_during_create
+test_object_acl_canned_publicreadwrite
+test_object_acl_default
+test_object_acl_full_control_verify_attributes
+test_object_acl_read
+test_object_acl_readacp
+test_object_acl_write
+test_object_acl_writeacp
+test_object_copy_canned_acl
+test_object_copy_not_owned_object_bucket
+test_object_put_acl_mtime
+test_object_anon_put_write_access
+test_object_raw_get
+test_object_raw_get_bucket_acl
+test_object_raw_get_bucket_gone
+test_object_raw_get_object_gone
+test_block_public_put_bucket_acls
+test_block_public_policy_with_principal
+test_put_get_delete_public_block
+test_put_public_block
+test_list_buckets_anonymous
+test_list_buckets_bad_auth
+test_list_buckets_invalid_auth
+test_bucket_list_objects_anonymous
+test_bucket_listv2_objects_anonymous
+test_bucket_list_return_data
+test_bucket_list_special_prefix
+test_multipart_copy_small
+test_multipart_copy_special_names
+test_multipart_copy_multiple_sizes
+test_multipart_copy_without_range
+test_cors_presigned_get_object_tenant
+test_cors_presigned_put_object_tenant
+test_cors_presigned_put_object_tenant_with_acl
+test_cors_presigned_put_object_with_acl
+test_bucket_create_naming_bad_ip
+test_bucket_create_naming_dns_dash_dot
+test_bucket_create_naming_dns_dot_dash
+```
+
+Also re-passing after the checksum-on-range fix (already counted in the 433 baseline, not in the 49 above): `test_ranged_request_response_code`, `test_ranged_big_request_response_code`, `test_ranged_request_skip_leading_bytes_response_code`, `test_ranged_request_return_trailing_bytes_response_code`, `test_list_buckets_paginated`.
+
+### Intentionally deferred
+
+Same-adminkey limitation — `s3-tests.conf`'s `[s3 main]`/`[s3 alt]` share one access key, so `alt_client` always authenticates as the same owner and can never be genuinely denied:
+- `test_access_bucket_private_object_private`, `test_access_bucket_private_objectv2_private`, `test_access_bucket_private_object_publicread`, `test_access_bucket_private_objectv2_publicread`, `test_access_bucket_private_object_publicreadwrite`, `test_access_bucket_private_objectv2_publicreadwrite`, `test_access_bucket_publicread_object_private`, `test_access_bucket_publicread_object_publicread`, `test_access_bucket_publicread_object_publicreadwrite`, `test_access_bucket_publicreadwrite_object_private`, `test_access_bucket_publicreadwrite_object_publicread`, `test_access_bucket_publicreadwrite_object_publicreadwrite`
+- `test_bucket_acl_grant_userid_fullcontrol`, `test_bucket_acl_grant_userid_read`, `test_bucket_acl_grant_userid_readacp`, `test_bucket_acl_grant_userid_write`, `test_bucket_acl_grant_userid_writeacp`
+- `test_ignore_public_acls`
+
+No user directory to resolve grantees against:
+- `test_bucket_acl_grant_nonexist_user` — needs grantee-existence validation
+- `test_bucket_acl_grant_email`, `test_bucket_acl_grant_email_not_exist` — needs an email→canonical-ID directory
+- `test_object_header_acl_grants`, `test_bucket_header_acl_grants` — same shared-adminkey limitation as above (assert on a specific non-owner grantee)
+
+Needs object owner != bucket owner (two real identities):
+- `test_object_acl_canned_bucketownerread`, `test_object_acl_canned_bucketownerfullcontrol`
+
+Needs `PutBucketPolicy` (RFC 2.13, separate batch — see RFC2-s3-compatibility-plan.md's Console-coincidence note on that RFC):
+- `test_get_public_block_deny_bucket_policy`, `test_block_public_policy`, `test_block_public_restrict_public_buckets`, `test_get_publicpolicy_acl_bucket_policy_status`, `test_get_nonpublicpolicy_acl_bucket_policy_status`
+
+**Running total: 482 / 808**

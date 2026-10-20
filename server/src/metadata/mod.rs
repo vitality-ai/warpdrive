@@ -238,6 +238,15 @@ pub trait MetadataStorage: Send + Sync {
     fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error>;
     fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error>;
 
+    // --- ACL ---
+    fn set_bucket_acl(&self, bucket: &str, owner_id: &str, grants_json: &str) -> Result<(), Error>;
+    fn get_bucket_acl(&self, bucket: &str) -> Result<Option<(String, String)>, Error>;
+    fn set_object_acl(&self, bucket: &str, key: &str, version_id: &str, owner_id: &str, grants_json: &str) -> Result<(), Error>;
+    fn get_object_acl(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<(String, String)>, Error>;
+    fn set_public_access_block(&self, bucket: &str, block_public_acls: bool, ignore_public_acls: bool, block_public_policy: bool, restrict_public_buckets: bool) -> Result<(), Error>;
+    fn get_public_access_block(&self, bucket: &str) -> Result<Option<(bool, bool, bool, bool)>, Error>;
+    fn delete_public_access_block(&self, bucket: &str) -> Result<(), Error>;
+
     // --- Multipart upload management ---
     fn create_multipart_upload(
         &self, upload_id: &str, user_id: &str, bucket: &str, key: &str,
