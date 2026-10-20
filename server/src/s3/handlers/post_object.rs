@@ -184,6 +184,19 @@ fn resolve_secret_key(access_key: &str) -> Option<(String, String)> {
     }
 }
 
+/// Form fields are matched by name, not by a single known header -- scan
+/// for whichever `x-amz-checksum-{suffix}` the client actually sent.
+fn find_checksum_field(f: &HashMap<String, String>) -> Option<(crate::s3::handlers::checksum::ChecksumAlgorithm, String)> {
+    use crate::s3::handlers::checksum::ChecksumAlgorithm;
+    for algo in [ChecksumAlgorithm::Sha256, ChecksumAlgorithm::Sha1, ChecksumAlgorithm::Crc32, ChecksumAlgorithm::Crc32c, ChecksumAlgorithm::Crc64Nvme] {
+        let field = format!("x-amz-checksum-{}", algo.header_suffix());
+        if let Some(value) = f.get(&field) {
+            return Some((algo, value.clone()));
+        }
+    }
+    None
+}
+
 fn post_object_error(status: StatusCode, code: &str, message: &str, bucket: &str) -> HttpResponse {
     s3_error(status, code, message, &format!("/{}", bucket))
 }
@@ -369,6 +382,24 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
         bucket_grants.0.clone()
     };
 
+    // An `x-amz-checksum-*` field is policy-pass-through (see the
+    // field_is_policy_checked doc above), not an authorization input --
+    // but once present, it still has to be cryptographically checked
+    // against the real uploaded bytes, same as the regular PUT path does.
+    // `test_post_object_upload_checksum`'s second half proves this: a
+    // garbage `x-amz-checksum-sha256` value must be rejected with 400,
+    // not silently accepted as an opaque string nobody ever verifies.
+    let checksum_field = find_checksum_field(f);
+    if let Some((ref algo, ref expected)) = checksum_field {
+        if !crate::s3::handlers::checksum::verify_checksum(algo, &form.file_bytes, expected) {
+            return Ok(post_object_error(
+                StatusCode::BAD_REQUEST, "BadDigest",
+                "The Content-MD5 or checksum you specified did not match what we received.",
+                &bucket,
+            ));
+        }
+    }
+
     // --- Policy satisfied: store the object, same primitives the regular
     // PUT handler uses (StorageConfig store + MetadataService), not the
     // PUT handler itself, to stay independent of its in-flight ACL-port edits.
@@ -390,6 +421,10 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
     metadata.size = size;
     metadata.content_type = content_type;
     metadata.last_modified = Some(last_modified_now());
+    if let Some((algo, value)) = checksum_field {
+        metadata.checksum_algorithm = Some(algo.as_str().to_string());
+        metadata.checksum_value = Some(value);
+    }
     metadata.user_metadata = user_metadata;
 
     let (version_id, old_extents) = db.put_object_full(&bucket, &key, metadata)?;
