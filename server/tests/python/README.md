@@ -6,6 +6,7 @@ Simple test clients for the CIAOS S3-compatible API.
 
 - `s3_test_client.py` - Basic HTTP client using `requests` library
 - `s3_boto_test.py` - AWS SDK client using `boto3` library  
+- `post_object_test.py` - POST Object (RFC 2.14, HTML form upload) test client; single-node only, uses `requests` directly since the signed-policy-document auth scheme isn't something boto3 has a client method for
 - `requirements.txt` - Python dependencies
 
 ## Usage

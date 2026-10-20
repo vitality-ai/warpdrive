@@ -35,6 +35,7 @@ tonic = "0.11"
 prost = "0.12"
 flate2 = "1.0"
 percent-encoding = "2"
+actix-multipart = "0.6"
 
 [build-dependencies]
 tonic-build = "0.11"

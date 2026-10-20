@@ -14,9 +14,9 @@ use warp_drive::s3::handlers::{
     s3_list_buckets_handler,
     s3_create_bucket_handler,
     s3_delete_bucket_handler,
-    s3_delete_objects_handler,
     s3_multipart_router,
     s3_cors_not_configured_handler,
+    s3_post_bucket_handler,
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
 use warp_drive::cluster::coordinator::{
@@ -240,7 +240,7 @@ async fn main() -> std::io::Result<()> {
             .route("/s3/{bucket}",      web::delete().to(s3_delete_bucket_handler))
             .route("/s3/{bucket}",      web::head().to(s3_head_bucket_handler))
             .route("/s3/{bucket}",      web::get().to(s3_list_objects_handler))
-            .route("/s3/{bucket}",      web::post().to(s3_delete_objects_handler))
+            .route("/s3/{bucket}",      web::post().to(s3_post_bucket_handler))
             .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
             .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
@@ -261,13 +261,13 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}",          web::delete().to(s3_delete_bucket_handler))
             .route("/{bucket}",          web::head().to(s3_head_bucket_handler))
             .route("/{bucket}",          web::get().to(s3_list_objects_handler))
-            .route("/{bucket}",          web::post().to(s3_delete_objects_handler))
+            .route("/{bucket}",          web::post().to(s3_post_bucket_handler))
             // Trailing-slash bucket routes — aws-sdk-rust sends GET /bucket/?list-type=2
             .route("/{bucket}/",         web::put().to(s3_create_bucket_handler))
             .route("/{bucket}/",         web::delete().to(s3_delete_bucket_handler))
             .route("/{bucket}/",         web::head().to(s3_head_bucket_handler))
             .route("/{bucket}/",         web::get().to(s3_list_objects_handler))
-            .route("/{bucket}/",         web::post().to(s3_delete_objects_handler))
+            .route("/{bucket}/",         web::post().to(s3_post_bucket_handler))
             .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
             .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
             .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))

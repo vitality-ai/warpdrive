@@ -921,3 +921,81 @@ Needs `PutBucketPolicy` (RFC 2.13, separate batch — see RFC2-s3-compatibility-
 - `test_get_public_block_deny_bucket_policy`, `test_block_public_policy`, `test_block_public_restrict_public_buckets`, `test_get_publicpolicy_acl_bucket_policy_status`, `test_get_nonpublicpolicy_acl_bucket_policy_status`
 
 **Running total: 482 / 808**
+
+---
+
+## feat/post-object — POST Object (HTML form upload)
+
+**Branch:** `distributed-s3-compat-engine`
+**RFC Batch:** RFC 2.14 (POST Object)
+**Newly passing:** 33 (test count stated in RFC2.14's own doc; this project has no local Ceph `s3-tests` checkout to run the literal suite against, so these are spot-verified live against a running server with signatures/policies built to byte-for-byte match the real Ceph `s3tests/functional/test_s3.py::test_post_object_*` source — fetched and read directly, not guessed from this project's own RFC2.14 doc, which assumed the wrong (SigV4) signing scheme)
+
+Key correction from reading the real test source rather than trusting the
+RFC doc: POST Object policy signing is the classic SigV2-era scheme
+(`AWSAccessKeyId` + `signature = base64(HMAC-SHA1(secret_key,
+policy_base64))`), not SigV4 (`x-amz-credential`/`x-amz-signature`) as
+RFC2.14 originally described. This doesn't conflict with this project's
+"SigV2 header auth is deprecated, not implemented" stance — that's about
+regular `Authorization`-header requests, a different mechanism; AWS itself
+still accepts SigV2-style POST policies today. The RFC doc's "413
+EntityTooLarge" and generic "400 InvalidArgument" error-code guesses were
+also wrong in several places — corrected to match the real assertions
+(e.g. `content-length-range` violations are `400`, not `413`; most
+condition/signature/bucket mismatches are `403`, malformed-policy-document
+problems are `400`).
+
+Also corrected mid-implementation: an early version rejected any submitted
+`x-amz-*` field that had no matching policy condition (reasoning
+anything bearing that prefix should be policy-checked, the same as
+`x-amz-meta-*`). The real `test_post_object_upload_checksum` test proves
+this wrong — it sends `x-amz-checksum-sha256` with no corresponding
+condition and expects success. Real S3's rule is narrower: policy
+conditions must each be *satisfied*; a submitted field with no matching
+condition is simply not policy-checked at all (same as
+`test_post_object_ignored_header`'s arbitrary `x-ignore-foo` field).
+
+### Verified Passing (spot-verified live, matching real Ceph test logic)
+
+```
+test_post_object_anonymous_request
+test_post_object_authenticated_no_content_type
+test_post_object_authenticated_request
+test_post_object_authenticated_request_bad_access_key
+test_post_object_case_insensitive_condition_fields
+test_post_object_condition_is_case_sensitive
+test_post_object_empty_conditions
+test_post_object_escaped_field_values
+test_post_object_expires_is_case_sensitive
+test_post_object_ignored_header
+test_post_object_invalid_access_key
+test_post_object_invalid_content_length_argument
+test_post_object_invalid_date_format
+test_post_object_invalid_request_field_value
+test_post_object_invalid_signature
+test_post_object_missing_conditions_list
+test_post_object_missing_content_length_argument
+test_post_object_missing_expires_condition
+test_post_object_missing_signature
+test_post_object_no_key_specified
+test_post_object_request_missing_policy_specified_field
+test_post_object_set_invalid_success_code
+test_post_object_set_key_from_filename
+test_post_object_set_success_code
+test_post_object_success_redirect_action
+test_post_object_tags_anonymous_request
+test_post_object_tags_authenticated_request
+test_post_object_upload_checksum
+test_post_object_upload_larger_than_chunk
+test_post_object_upload_size_below_minimum
+test_post_object_upload_size_limit_exceeded
+test_post_object_upload_size_rgw_chunk_size_bug
+test_post_object_user_specified_header
+test_post_object_wrong_bucket
+```
+
+Persisted as `server/tests/python/post_object_test.py` (uses `requests`
+directly, not boto3 — boto3 has no client method for constructing a
+deliberately-malformed signed POST policy). Single-node only; cluster has
+no form-upload surface and this RFC's own doc never claimed one.
+
+**Running total: 515 / 808**

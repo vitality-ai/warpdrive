@@ -118,3 +118,30 @@ The following test files from the Ceph suite are explicitly out of scope for War
 | Replication tests | Cross-region replication — future |
 
 **Note:** `test_bucket_logging_requester_assumed_role` (1 test within RFC 2.21) depends on IAM assumed-role context from Vitality Console. It will be skipped until Vitality Console integration is complete.
+
+## Console-coincidence note (RFC 2.13)
+
+Reviewed every still-unimplemented sub-RFC (2.12, 2.13, 2.14, 2.15–2.17, 2.20,
+2.21, 2.23) against this plan's own Out-of-Scope table above and each
+sub-RFC's own doc. Everything except RFC 2.13 is plain WarpDrive-owned
+object-storage work with no Console dependency — just not implemented yet.
+RFC 2.13 (Bucket Policy) is the one real exception: its own doc states
+policy evaluation "applies primarily to anonymous requests and (when
+Vitality Console is connected) non-admin users," and "a policy that denies
+the bucket owner's own access must be rejectable via Console." With this
+project's single hardcoded admin user (see Prerequisite above), a real JSON
+policy engine has little to evaluate — there's no second principal for a
+policy to grant or deny anything meaningful to. Status for RFC 2.13: **deferred,
+documented as "coming soon," not implemented** until Vitality Console
+integration gives it real principals to evaluate against, rather than
+building a policy engine that can only ever see one user.
+
+RFC 2.17 (SSE-KMS) is adjacent but not the same category: it isn't a
+Console dependency, but its own design defers entirely to an external KMS
+endpoint (`WARPDRIVE_KMS_ENDPOINT`/`WARPDRIVE_KMS_KEY_ID`) that doesn't
+exist yet either — same "coming soon, not yet implemented" treatment, for a
+different external-dependency reason.
+
+Bucket logging (RFC 2.21, 113 tests — the single largest remaining chunk)
+has no Console or external dependency; it's simply deprioritized for now
+per explicit direction, not technically blocked.
