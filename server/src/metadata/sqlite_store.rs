@@ -1,6 +1,14 @@
 //! SQLite implementation of MetadataStorage trait
 
 use crate::metadata::{MetadataStorage, Metadata, ObjectId, BucketStats};
+// Row/result types moved to `metadata/mod.rs` (so the trait can reference
+// them without depending on this specific backend) — re-exported here so
+// every existing `sqlite_store::TheType` import path across the codebase
+// keeps compiling unchanged.
+pub use crate::metadata::{
+    VersioningDeleteResult, DeleteSpecificResult, VersionRow,
+    DeletionEvent, MultipartUploadRow, MultipartPartRow, ObjectLockRow,
+};
 use crate::util::serializer::serialize_offset_size;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,32 +26,6 @@ fn generate_version_id() -> String {
     let counter = VERSION_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
     format!("{:016x}{:016x}", ts, counter)
-}
-
-/// Result of a versioning-aware delete (no explicit versionId given).
-pub enum VersioningDeleteResult {
-    /// Versioning disabled — object data removed (or never existed).
-    Deleted,
-    /// Versioning enabled/suspended — a delete marker was created.
-    Marker { version_id: String },
-}
-
-/// Result of permanently deleting a specific version.
-pub struct DeleteSpecificResult {
-    pub found: bool,
-    pub was_delete_marker: bool,
-    pub version_id: String,
-}
-
-/// One entry in a ListObjectVersions response.
-pub struct VersionRow {
-    pub key: String,
-    pub version_id: String,
-    pub is_delete_marker: bool,
-    pub etag: String,
-    pub size: u64,
-    pub last_modified: String,
-    pub is_latest: bool,
 }
 
 fn get_db_path() -> PathBuf {
@@ -513,6 +495,212 @@ impl MetadataStorage for SQLiteMetadataStore {
             Ok((row.get(0)?, row.get(1)?))
         }).map_err(actix_web::error::ErrorInternalServerError)?;
         Ok((count as u64, bytes as u64))
+    }
+
+    // Thin trait-dispatch wrappers, same pattern as `queue_deletion` above:
+    // the real logic lives in the inherent `impl SQLiteMetadataStore`
+    // blocks below, unchanged. These exist only so `MetadataService` can
+    // call through `Arc<dyn MetadataStorage>` instead of constructing a
+    // fresh `SQLiteMetadataStore` per call.
+
+    fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
+        SQLiteMetadataStore::put_object_v2(self, user_id, bucket, key, metadata)
+    }
+
+    fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+        SQLiteMetadataStore::get_pending_deletions(self, limit)
+    }
+
+    fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
+        SQLiteMetadataStore::mark_deletion_processed(self, id)
+    }
+
+    fn cleanup_old_deletions(&self) -> Result<usize, Error> {
+        SQLiteMetadataStore::cleanup_old_deletions(self)
+    }
+
+    fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::set_bucket_cors(self, bucket, cors_xml)
+    }
+
+    fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
+        SQLiteMetadataStore::get_bucket_cors(self, bucket)
+    }
+
+    fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::delete_bucket_cors(self, bucket)
+    }
+
+    fn set_bucket_location(&self, user_id: &str, bucket: &str, location: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::set_bucket_location(self, user_id, bucket, location)
+    }
+
+    fn get_bucket_location(&self, user_id: &str, bucket: &str) -> Result<String, Error> {
+        SQLiteMetadataStore::get_bucket_location(self, user_id, bucket)
+    }
+
+    fn get_versioning_state(&self, bucket: &str) -> Result<String, Error> {
+        SQLiteMetadataStore::get_versioning_state(self, bucket)
+    }
+
+    fn set_versioning_state(&self, user_id: &str, bucket: &str, state: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::set_versioning_state(self, user_id, bucket, state)
+    }
+
+    fn delete_object_v2(&self, user_id: &str, bucket: &str, key: &str) -> Result<VersioningDeleteResult, Error> {
+        SQLiteMetadataStore::delete_object_v2(self, user_id, bucket, key)
+    }
+
+    fn delete_specific_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<DeleteSpecificResult, Error> {
+        SQLiteMetadataStore::delete_specific_version(self, user_id, bucket, key, version_id)
+    }
+
+    fn get_object_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<Metadata, Error> {
+        SQLiteMetadataStore::get_object_version(self, user_id, bucket, key, version_id)
+    }
+
+    fn get_latest_last_modified(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
+        SQLiteMetadataStore::get_latest_last_modified(self, user_id, bucket, key)
+    }
+
+    fn list_object_versions_full(
+        &self, user_id: &str, bucket: &str,
+        prefix: &str, key_marker: &str, version_id_marker: &str, max_keys: usize,
+    ) -> Result<(Vec<VersionRow>, bool, String, String), Error> {
+        SQLiteMetadataStore::list_object_versions_full(self, user_id, bucket, prefix, key_marker, version_id_marker, max_keys)
+    }
+
+    fn set_object_tags(&self, user_id: &str, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
+        SQLiteMetadataStore::set_object_tags(self, user_id, bucket, key, tags)
+    }
+
+    fn get_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
+        SQLiteMetadataStore::get_object_tags(self, user_id, bucket, key)
+    }
+
+    fn delete_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::delete_object_tags(self, user_id, bucket, key)
+    }
+
+    fn get_object_tag_count(&self, user_id: &str, bucket: &str, key: &str) -> Result<i64, Error> {
+        SQLiteMetadataStore::get_object_tag_count(self, user_id, bucket, key)
+    }
+
+    fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
+        SQLiteMetadataStore::set_bucket_tags(self, bucket, tags)
+    }
+
+    fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
+        SQLiteMetadataStore::get_bucket_tags(self, bucket)
+    }
+
+    fn delete_bucket_tags(&self, bucket: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::delete_bucket_tags(self, bucket)
+    }
+
+    fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::set_multipart_tagging(self, upload_id, tagging)
+    }
+
+    fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
+        SQLiteMetadataStore::get_multipart_tagging(self, upload_id)
+    }
+
+    fn create_multipart_upload(
+        &self, upload_id: &str, user_id: &str, bucket: &str, key: &str,
+        content_type: Option<&str>, metadata_json: &str, initiated_at: &str,
+        checksum_algorithm: &str, checksum_type: &str,
+        object_lock_mode: &str, object_lock_retain_until: &str, object_lock_legal_hold: &str,
+    ) -> Result<(), Error> {
+        SQLiteMetadataStore::create_multipart_upload(
+            self, upload_id, user_id, bucket, key, content_type, metadata_json, initiated_at,
+            checksum_algorithm, checksum_type,
+            object_lock_mode, object_lock_retain_until, object_lock_legal_hold,
+        )
+    }
+
+    fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUploadRow>, Error> {
+        SQLiteMetadataStore::get_multipart_upload(self, upload_id)
+    }
+
+    fn mark_multipart_completed(&self, upload_id: &str, final_etag: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::mark_multipart_completed(self, upload_id, final_etag)
+    }
+
+    fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::delete_multipart_upload(self, upload_id)
+    }
+
+    fn delete_completed_uploads_for_key(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::delete_completed_uploads_for_key(self, bucket, key)
+    }
+
+    fn list_bucket_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadRow>, Error> {
+        SQLiteMetadataStore::list_bucket_multipart_uploads(self, bucket)
+    }
+
+    fn upsert_multipart_part(
+        &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
+        checksum_value: &str,
+    ) -> Result<(), Error> {
+        SQLiteMetadataStore::upsert_multipart_part(self, upload_id, part_number, etag, size, extents_blob, checksum_value)
+    }
+
+    fn list_multipart_parts(&self, upload_id: &str) -> Result<Vec<MultipartPartRow>, Error> {
+        SQLiteMetadataStore::list_multipart_parts(self, upload_id)
+    }
+
+    fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::delete_parts_for_upload(self, upload_id)
+    }
+
+    fn get_parts_manifest(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
+        SQLiteMetadataStore::get_parts_manifest(self, user_id, bucket, key)
+    }
+
+    fn set_parts_manifest(&self, user_id: &str, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::set_parts_manifest(self, user_id, bucket, key, manifest)
+    }
+
+    fn get_bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, Error> {
+        SQLiteMetadataStore::get_bucket_object_lock_enabled(self, bucket)
+    }
+
+    fn set_bucket_object_lock_enabled(&self, bucket: &str, enabled: bool) -> Result<(), Error> {
+        SQLiteMetadataStore::set_bucket_object_lock_enabled(self, bucket, enabled)
+    }
+
+    fn create_bucket_with_lock(&self, user_id: &str, bucket: &str, lock_enabled: bool) -> Result<(), Error> {
+        SQLiteMetadataStore::create_bucket_with_lock(self, user_id, bucket, lock_enabled)
+    }
+
+    fn get_object_lock_config(&self, bucket: &str) -> Result<Option<(String, Option<i64>, Option<i64>)>, Error> {
+        SQLiteMetadataStore::get_object_lock_config(self, bucket)
+    }
+
+    fn put_object_lock_config(&self, bucket: &str, mode: &str, days: Option<i64>, years: Option<i64>) -> Result<(), Error> {
+        SQLiteMetadataStore::put_object_lock_config(self, bucket, mode, days, years)
+    }
+
+    fn get_object_lock(&self, bucket: &str, key: &str, version_id: &str) -> Result<Option<ObjectLockRow>, Error> {
+        SQLiteMetadataStore::get_object_lock(self, bucket, key, version_id)
+    }
+
+    fn put_object_lock(
+        &self, bucket: &str, key: &str, version_id: &str,
+        mode: Option<&str>, retain_until_date: Option<&str>, legal_hold: Option<&str>,
+    ) -> Result<(), Error> {
+        SQLiteMetadataStore::put_object_lock(self, bucket, key, version_id, mode, retain_until_date, legal_hold)
+    }
+
+    fn set_object_legal_hold(&self, bucket: &str, key: &str, version_id: &str, status: &str) -> Result<(), Error> {
+        SQLiteMetadataStore::set_object_legal_hold(self, bucket, key, version_id, status)
+    }
+
+    fn check_object_lock_protection(
+        &self, bucket: &str, key: &str, version_id: &str, bypass_governance: bool,
+    ) -> Result<(bool, bool), Error> {
+        SQLiteMetadataStore::check_object_lock_protection(self, bucket, key, version_id, bypass_governance)
     }
 }
 
@@ -1138,49 +1326,6 @@ impl SQLiteMetadataStore {
 
         Ok((page, is_truncated, next_key, next_vid))
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct DeletionEvent {
-    pub id: i64,
-    pub user_id: String,
-    pub bucket: String,
-    pub key: String,
-    pub offset_size_list: Vec<(u64, u64)>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct MultipartUploadRow {
-    pub upload_id: String,
-    pub user_id: String,
-    pub bucket: String,
-    pub key: String,
-    pub content_type: Option<String>,
-    pub metadata_json: String,
-    pub initiated_at: String,
-    pub status: String,
-    pub final_etag: Option<String>,
-    pub checksum_algorithm: String,
-    pub checksum_type: String,
-    pub object_lock_mode: String,
-    pub object_lock_retain_until: String,
-    pub object_lock_legal_hold: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct MultipartPartRow {
-    pub part_number: i32,
-    pub etag: String,
-    pub size: u64,
-    pub extents_blob: Vec<u8>,
-    pub checksum_value: String,
-}
-
-pub struct ObjectLockRow {
-    pub mode: Option<String>,
-    pub retain_until_date: Option<String>,
-    pub legal_hold: String,
 }
 
 /// Multipart upload management

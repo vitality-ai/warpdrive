@@ -46,8 +46,7 @@ impl MetadataService {
     pub fn put_object_full(
         &self, bucket: &str, key: &str, metadata: Metadata,
     ) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().put_object_v2(&self.user, bucket, key, &metadata)
+        METADATA_STORE.put_object_v2(&self.user, bucket, key, &metadata)
     }
 
     /// Read a fully-populated Metadata object (S3 GET / HEAD path).
@@ -129,94 +128,79 @@ impl MetadataService {
     }
 
     pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<crate::metadata::sqlite_store::DeletionEvent>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_pending_deletions(limit)
+        METADATA_STORE.get_pending_deletions(limit)
     }
 
     pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().mark_deletion_processed(id)
+        METADATA_STORE.mark_deletion_processed(id)
     }
 
     pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().cleanup_old_deletions()
+        METADATA_STORE.cleanup_old_deletions()
     }
 
     // --- CORS ---
 
     pub fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_bucket_cors(bucket, cors_xml)
+        METADATA_STORE.set_bucket_cors(bucket, cors_xml)
     }
 
     pub fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_bucket_cors(bucket)
+        METADATA_STORE.get_bucket_cors(bucket)
     }
 
     pub fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_bucket_cors(bucket)
+        METADATA_STORE.delete_bucket_cors(bucket)
     }
 
     // --- Bucket location ---
 
     pub fn set_bucket_location(&self, bucket: &str, location: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_bucket_location(&self.user, bucket, location)
+        METADATA_STORE.set_bucket_location(&self.user, bucket, location)
     }
 
     pub fn get_bucket_location(&self, bucket: &str) -> Result<String, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_bucket_location(&self.user, bucket)
+        METADATA_STORE.get_bucket_location(&self.user, bucket)
     }
 
     // --- Versioning ---
 
     pub fn get_versioning_state(&self, bucket: &str) -> Result<String, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_versioning_state(bucket)
+        METADATA_STORE.get_versioning_state(bucket)
     }
 
     pub fn set_versioning_state(&self, bucket: &str, state: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_versioning_state(&self.user, bucket, state)
+        METADATA_STORE.set_versioning_state(&self.user, bucket, state)
     }
 
     pub fn delete_object_v2(&self, bucket: &str, key: &str)
         -> Result<crate::metadata::sqlite_store::VersioningDeleteResult, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_object_v2(&self.user, bucket, key)
+        METADATA_STORE.delete_object_v2(&self.user, bucket, key)
     }
 
     pub fn delete_specific_version(&self, bucket: &str, key: &str, version_id: &str)
         -> Result<crate::metadata::sqlite_store::DeleteSpecificResult, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_specific_version(&self.user, bucket, key, version_id)
+        METADATA_STORE.delete_specific_version(&self.user, bucket, key, version_id)
     }
 
     pub fn get_object_version(&self, bucket: &str, key: &str, version_id: &str)
         -> Result<crate::metadata::Metadata, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_object_version(&self.user, bucket, key, version_id)
+        METADATA_STORE.get_object_version(&self.user, bucket, key, version_id)
     }
 
     /// Returns the last_modified of the is_latest=1 row, including delete markers.
     pub fn get_latest_last_modified(&self, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_latest_last_modified(&self.user, bucket, key)
+        METADATA_STORE.get_latest_last_modified(&self.user, bucket, key)
     }
 
     pub fn list_object_versions_full(
         &self, bucket: &str, prefix: &str, key_marker: &str,
         version_id_marker: &str, max_keys: usize,
     ) -> Result<(Vec<crate::metadata::sqlite_store::VersionRow>, bool, String, String), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().list_object_versions_full(
+        METADATA_STORE.list_object_versions_full(
             &self.user, bucket, prefix, key_marker, version_id_marker, max_keys,
         )
     }
@@ -224,48 +208,39 @@ impl MetadataService {
     // --- Tagging ---
 
     pub fn set_object_tags(&self, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_object_tags(&self.user, bucket, key, tags)
+        METADATA_STORE.set_object_tags(&self.user, bucket, key, tags)
     }
 
     pub fn get_object_tags(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_object_tags(&self.user, bucket, key)
+        METADATA_STORE.get_object_tags(&self.user, bucket, key)
     }
 
     pub fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_object_tags(&self.user, bucket, key)
+        METADATA_STORE.delete_object_tags(&self.user, bucket, key)
     }
 
     pub fn get_object_tag_count(&self, bucket: &str, key: &str) -> Result<i64, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_object_tag_count(&self.user, bucket, key)
+        METADATA_STORE.get_object_tag_count(&self.user, bucket, key)
     }
 
     pub fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_bucket_tags(bucket, tags)
+        METADATA_STORE.set_bucket_tags(bucket, tags)
     }
 
     pub fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_bucket_tags(bucket)
+        METADATA_STORE.get_bucket_tags(bucket)
     }
 
     pub fn delete_bucket_tags(&self, bucket: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_bucket_tags(bucket)
+        METADATA_STORE.delete_bucket_tags(bucket)
     }
 
     pub fn set_multipart_tagging(&self, upload_id: &str, tagging: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_multipart_tagging(upload_id, tagging)
+        METADATA_STORE.set_multipart_tagging(upload_id, tagging)
     }
 
     pub fn get_multipart_tagging(&self, upload_id: &str) -> Result<String, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_multipart_tagging(upload_id)
+        METADATA_STORE.get_multipart_tagging(upload_id)
     }
 
     // --- Multipart upload management ---
@@ -276,8 +251,7 @@ impl MetadataService {
         checksum_algorithm: &str, checksum_type: &str,
         object_lock_mode: &str, object_lock_retain_until: &str, object_lock_legal_hold: &str,
     ) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().create_multipart_upload(
+        METADATA_STORE.create_multipart_upload(
             upload_id, &self.user, bucket, key, content_type, metadata_json, initiated_at,
             checksum_algorithm, checksum_type,
             object_lock_mode, object_lock_retain_until, object_lock_legal_hold,
@@ -287,114 +261,95 @@ impl MetadataService {
     pub fn get_multipart_upload(&self, upload_id: &str)
         -> Result<Option<crate::metadata::sqlite_store::MultipartUploadRow>, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_multipart_upload(upload_id)
+        METADATA_STORE.get_multipart_upload(upload_id)
     }
 
     pub fn mark_multipart_completed(&self, upload_id: &str, final_etag: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().mark_multipart_completed(upload_id, final_etag)
+        METADATA_STORE.mark_multipart_completed(upload_id, final_etag)
     }
 
     pub fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_multipart_upload(upload_id)
+        METADATA_STORE.delete_multipart_upload(upload_id)
     }
 
     pub fn delete_completed_uploads_for_key(&self, bucket: &str, key: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_completed_uploads_for_key(bucket, key)
+        METADATA_STORE.delete_completed_uploads_for_key(bucket, key)
     }
 
     pub fn list_multipart_uploads_for_bucket(&self, bucket: &str)
         -> Result<Vec<crate::metadata::sqlite_store::MultipartUploadRow>, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().list_bucket_multipart_uploads(bucket)
+        METADATA_STORE.list_bucket_multipart_uploads(bucket)
     }
 
     pub fn upsert_multipart_part(
         &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8],
         checksum_value: &str,
     ) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().upsert_multipart_part(upload_id, part_number, etag, size, extents_blob, checksum_value)
+        METADATA_STORE.upsert_multipart_part(upload_id, part_number, etag, size, extents_blob, checksum_value)
     }
 
     pub fn list_multipart_parts(&self, upload_id: &str)
         -> Result<Vec<crate::metadata::sqlite_store::MultipartPartRow>, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().list_multipart_parts(upload_id)
+        METADATA_STORE.list_multipart_parts(upload_id)
     }
 
     pub fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().delete_parts_for_upload(upload_id)
+        METADATA_STORE.delete_parts_for_upload(upload_id)
     }
 
     pub fn get_parts_manifest(&self, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_parts_manifest(&self.user, bucket, key)
+        METADATA_STORE.get_parts_manifest(&self.user, bucket, key)
     }
 
     pub fn set_parts_manifest(&self, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_parts_manifest(&self.user, bucket, key, manifest)
+        METADATA_STORE.set_parts_manifest(&self.user, bucket, key, manifest)
     }
 
     // --- Object Lock ---
 
     pub fn get_bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_bucket_object_lock_enabled(bucket)
+        METADATA_STORE.get_bucket_object_lock_enabled(bucket)
     }
 
     pub fn set_bucket_object_lock_enabled(&self, bucket: &str, enabled: bool) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_bucket_object_lock_enabled(bucket, enabled)
+        METADATA_STORE.set_bucket_object_lock_enabled(bucket, enabled)
     }
 
     pub fn create_bucket_with_lock(&self, bucket: &str, lock_enabled: bool) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().create_bucket_with_lock(&self.user, bucket, lock_enabled)
+        METADATA_STORE.create_bucket_with_lock(&self.user, bucket, lock_enabled)
     }
 
     pub fn get_object_lock_config(&self, bucket: &str) -> Result<Option<(String, Option<i64>, Option<i64>)>, Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_object_lock_config(bucket)
+        METADATA_STORE.get_object_lock_config(bucket)
     }
 
     pub fn put_object_lock_config(&self, bucket: &str, mode: &str, days: Option<i64>, years: Option<i64>) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().put_object_lock_config(bucket, mode, days, years)
+        METADATA_STORE.put_object_lock_config(bucket, mode, days, years)
     }
 
     pub fn get_object_lock(&self, bucket: &str, key: &str, version_id: &str)
         -> Result<Option<crate::metadata::sqlite_store::ObjectLockRow>, Error>
     {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().get_object_lock(bucket, key, version_id)
+        METADATA_STORE.get_object_lock(bucket, key, version_id)
     }
 
     pub fn put_object_lock(
         &self, bucket: &str, key: &str, version_id: &str,
         mode: Option<&str>, retain_until_date: Option<&str>, legal_hold: Option<&str>,
     ) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().put_object_lock(bucket, key, version_id, mode, retain_until_date, legal_hold)
+        METADATA_STORE.put_object_lock(bucket, key, version_id, mode, retain_until_date, legal_hold)
     }
 
     pub fn set_object_legal_hold(&self, bucket: &str, key: &str, version_id: &str, status: &str) -> Result<(), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().set_object_legal_hold(bucket, key, version_id, status)
+        METADATA_STORE.set_object_legal_hold(bucket, key, version_id, status)
     }
 
     pub fn check_object_lock_protection(
         &self, bucket: &str, key: &str, version_id: &str, bypass_governance: bool,
     ) -> Result<(bool, bool), Error> {
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        SQLiteMetadataStore::new().check_object_lock_protection(bucket, key, version_id, bypass_governance)
+        METADATA_STORE.check_object_lock_protection(bucket, key, version_id, bypass_governance)
     }
 }
 
