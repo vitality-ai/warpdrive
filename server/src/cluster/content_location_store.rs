@@ -51,6 +51,33 @@ pub struct UnitMeta {
     pub metadata: Vec<u8>,
 }
 
+/// One unit's exact location in the stripe/bin layout: which stripe owns
+/// it, which bin within that stripe, and its byte position within that
+/// bin's concatenated (pre-padding) data -- everything needed to copy its
+/// bytes straight out of a fetched stripe's bins, with no unit_id string
+/// lookup of any kind.
+///
+/// Computed once, at PUT time, when bin assignments are already known
+/// (see `packed.rs`'s write path), and stored sorted by `offset` as part
+/// of the persisted record -- not rebuilt, or cached, on every GET. This
+/// mirrors how a real object store (MinIO: `FileInfo.Parts`, computed at
+/// write time) handles the same problem for its own fixed-size erasure
+/// blocks: compute layout once when you already have the information,
+/// store it, do cheap arithmetic/binary-search against the stored result
+/// at read time. Content-dependent packing has no fixed-block-size
+/// shortcut to fall back on (units are grouped by content similarity, not
+/// position), so this field is the equivalent of that stored layout for
+/// this packer class specifically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnitLocation {
+    pub offset: u64,
+    pub end: u64,
+    pub stripe_index: usize,
+    pub bin_idx: usize,
+    pub pos_in_bin: usize,
+    pub len: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContentDependentRecord {
     pub bucket: String,
@@ -89,6 +116,25 @@ pub struct ContentDependentRecord {
     /// coverage, so no pre-existing record can actually have a gap.
     #[serde(default)]
     pub has_sparse_gaps: bool,
+    /// See `UnitLocation`. `#[serde(default)]`: empty means a record
+    /// written before this field existed; callers fall back to the old
+    /// units-by-id + per-stripe scan in that case rather than failing.
+    #[serde(default)]
+    pub sorted_unit_locations: Vec<UnitLocation>,
+}
+
+impl ContentDependentRecord {
+    /// Every unit overlapping `[start, end]` (inclusive), via binary
+    /// search over `sorted_unit_locations` rather than a linear scan.
+    /// Units tile the original object without overlapping each other, so
+    /// the overlapping set is one contiguous run in sorted order: found
+    /// with a binary search for the run's start, then a scan only over
+    /// that run, not all units.
+    pub fn units_overlapping(&self, start: u64, end: u64) -> &[UnitLocation] {
+        let begin = self.sorted_unit_locations.partition_point(|u| u.end <= start);
+        let rel_end = self.sorted_unit_locations[begin..].partition_point(|u| u.offset <= end);
+        &self.sorted_unit_locations[begin..begin + rel_end]
+    }
 }
 
 impl ContentDependentRecord {
@@ -286,7 +332,61 @@ mod tests {
             }],
             version: "v1".to_string(),
             has_sparse_gaps: false,
+            sorted_unit_locations: Vec::new(),
         }
+    }
+
+    fn loc(offset: u64, end: u64, stripe_index: usize, bin_idx: usize, pos_in_bin: usize) -> UnitLocation {
+        UnitLocation { offset, end, stripe_index, bin_idx, pos_in_bin, len: (end - offset) as usize }
+    }
+
+    fn sorted(mut locs: Vec<UnitLocation>) -> Vec<UnitLocation> {
+        locs.sort_by_key(|u| u.offset);
+        locs
+    }
+
+    #[test]
+    fn units_overlapping_finds_the_single_unit_a_selective_range_touches() {
+        let mut record = sample("b", "k");
+        record.sorted_unit_locations = sorted(vec![
+            loc(0, 100, 0, 0, 0),
+            loc(100, 200, 1, 0, 0),
+            loc(200, 300, 2, 0, 0),
+        ]);
+        let got: Vec<usize> = record.units_overlapping(150, 150).iter().map(|u| u.stripe_index).collect();
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn units_overlapping_spans_multiple_units_without_missing_boundaries() {
+        let mut record = sample("b", "k");
+        record.sorted_unit_locations = sorted(vec![
+            loc(0, 10, 0, 0, 0),
+            loc(10, 20, 1, 0, 0),
+            loc(20, 30, 2, 0, 0),
+        ]);
+        // [5, 25] overlaps all three units.
+        let got: Vec<usize> = record.units_overlapping(5, 25).iter().map(|u| u.stripe_index).collect();
+        assert_eq!(got, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn units_overlapping_exact_boundary_goes_to_the_right_unit_only() {
+        let mut record = sample("b", "k");
+        record.sorted_unit_locations = sorted(vec![loc(0, 10, 0, 0, 0), loc(10, 20, 1, 0, 0)]);
+        // end is inclusive, unit end is exclusive: byte 10 belongs to unit 1.
+        let got: Vec<usize> = record.units_overlapping(10, 10).iter().map(|u| u.stripe_index).collect();
+        assert_eq!(got, vec![1]);
+        let got: Vec<usize> = record.units_overlapping(9, 9).iter().map(|u| u.stripe_index).collect();
+        assert_eq!(got, vec![0]);
+    }
+
+    #[test]
+    fn units_overlapping_before_or_after_all_units_finds_nothing() {
+        let mut record = sample("b", "k");
+        record.sorted_unit_locations = sorted(vec![loc(100, 110, 0, 0, 0)]);
+        assert!(record.units_overlapping(0, 50).is_empty());
+        assert!(record.units_overlapping(200, 250).is_empty());
     }
 
     /// #150's exact repro, applied to this store's own index: bucket

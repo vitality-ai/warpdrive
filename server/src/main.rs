@@ -219,6 +219,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))
             .route("/cluster/{bucket}/{key:.*}", web::get().to(cluster_get_object))
             .route("/cluster/{bucket}/{key:.*}", web::delete().to(cluster_delete_object))
+            .route("/cluster/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object))
             // S3-compatible API — prefixed form (/s3/...)
             .route("/s3",               web::get().to(s3_list_buckets_handler))
             .route("/s3/",              web::get().to(s3_list_buckets_handler))
