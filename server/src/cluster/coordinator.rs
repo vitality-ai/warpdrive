@@ -28,7 +28,7 @@ use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
 use super::pushdown::ColumnCodec;
 use super::shard_storage::{new_version_id, versioned_key};
-use crate::s3::handlers::common::{parse_range_header, RangeResult};
+use crate::s3::handlers::common::{metadata_value_header, parse_range_header, RangeResult};
 use base64::Engine;
 
 pub struct ClusterState {
@@ -654,6 +654,13 @@ pub(crate) async fn cluster_get_object_inner(
     // time by header presence.
     if let Some(record) = state.content_location_store.get(user_id, &bucket, &key) {
         let total_len = record.original_len as u64;
+        // Captured before `record` moves into the fetch calls below --
+        // same metadata fields `ClusterMetadataStore::get_metadata` reads,
+        // now also surfaced on the actual GET response.
+        let etag = record.etag.clone();
+        let content_type = record.content_type.clone();
+        let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+        let user_metadata = record.user_metadata.clone();
         // Range-aware fetch only reaches the stripes whose units actually
         // overlap the requested bytes (see packed.rs) — this is the whole
         // reason a DuckDB-style selective Parquet read benefits from
@@ -665,7 +672,13 @@ pub(crate) async fn cluster_get_object_inner(
                 let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
-                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")));
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                    .insert_header(("Last-Modified", last_modified));
+                if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+                if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+                for (k, v) in &user_metadata {
+                    resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+                }
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -681,6 +694,25 @@ pub(crate) async fn cluster_get_object_inner(
                     actix_web::http::header::HeaderName::from_static("accept-ranges"),
                     actix_web::http::header::HeaderValue::from_static("bytes"),
                 );
+                if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&last_modified) {
+                    resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("last-modified"), hv);
+                }
+                if let Some(etag) = &etag {
+                    if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(etag) {
+                        resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("etag"), hv);
+                    }
+                }
+                if let Some(ct) = &content_type {
+                    if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(ct) {
+                        resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("content-type"), hv);
+                    }
+                }
+                for (k, v) in &user_metadata {
+                    resp.headers_mut().insert(
+                        actix_web::http::header::HeaderName::try_from(format!("x-amz-meta-{k}")).map_err(ErrorInternalServerError)?,
+                        metadata_value_header(v),
+                    );
+                }
                 Ok(resp)
             }
         };
@@ -692,6 +724,10 @@ pub(crate) async fn cluster_get_object_inner(
         .get(user_id, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
     let total_len = record.original_len as u64;
+    let etag = record.etag.clone();
+    let content_type = record.content_type.clone();
+    let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+    let user_metadata = record.user_metadata.clone();
 
     // #151: an empty `version` means this pin predates the field
     // (`#[serde(default)]`) -- its shards are at the old, unversioned
@@ -736,11 +772,16 @@ pub(crate) async fn cluster_get_object_inner(
             let local_start = start as usize - first_idx * shard_len;
             let local_end = (end as usize - first_idx * shard_len).min(buf.len() - 1);
             if let Some(slice) = buf.get(local_start..=local_end) {
-                return Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
-                    .insert_header(("Accept-Ranges", "bytes"))
+                let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
+                resp.insert_header(("Accept-Ranges", "bytes"))
                     .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
-                    .insert_header(("Last-Modified", super::s3_surface::now_http_date()))
-                    .body(slice.to_vec()));
+                    .insert_header(("Last-Modified", last_modified.clone()));
+                if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+                if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+                for (k, v) in &user_metadata {
+                    resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+                }
+                return Ok(resp.body(slice.to_vec()));
             }
         }
         // Fall through to the full fetch+decode path below -- a needed
@@ -798,20 +839,30 @@ pub(crate) async fn cluster_get_object_inner(
                 .get(start as usize..=end as usize)
                 .ok_or_else(|| actix_web::error::ErrorRangeNotSatisfiable("range out of bounds"))?
                 .to_vec();
-            Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
-                .insert_header(("Accept-Ranges", "bytes"))
+            let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
+            resp.insert_header(("Accept-Ranges", "bytes"))
                 .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
-                .insert_header(("Last-Modified", super::s3_surface::now_http_date()))
-                .body(slice))
+                .insert_header(("Last-Modified", last_modified));
+            if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+            if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+            for (k, v) in &user_metadata {
+                resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+            }
+            Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
             actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
         ),
         RangeResult::None => {
-            Ok(HttpResponse::Ok()
-                .insert_header(("Accept-Ranges", "bytes"))
-                .insert_header(("Last-Modified", super::s3_surface::now_http_date()))
-                .body(data))
+            let mut resp = HttpResponse::Ok();
+            resp.insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("Last-Modified", last_modified));
+            if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+            if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+            for (k, v) in &user_metadata {
+                resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+            }
+            Ok(resp.body(data))
         }
     }
 }

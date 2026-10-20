@@ -59,7 +59,7 @@ pub(super) fn xml_unescape(s: &str) -> String {
 }
 
 /// Encode a stored metadata value as a HeaderValue for HTTP responses.
-pub(super) fn metadata_value_header(v: &str) -> actix_web::http::header::HeaderValue {
+pub(crate) fn metadata_value_header(v: &str) -> actix_web::http::header::HeaderValue {
     let bytes: Vec<u8> = v.chars()
         .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
         .collect();

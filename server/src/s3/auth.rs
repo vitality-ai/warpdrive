@@ -469,14 +469,25 @@ fn is_list_buckets_request(req: &HttpRequest) -> bool {
 }
 
 /// Extract bucket from request path.
-/// Handles both the warpdrive-prefixed form (/s3/{bucket}/...) and the standard
-/// root form (/{bucket}/...) that Ceph s3-tests and boto3 clients use by default.
+/// Handles the warpdrive-prefixed form (/s3/{bucket}/...), the cluster
+/// surface's form (/cluster/s3/{bucket}/...), and the standard root form
+/// (/{bucket}/...) that Ceph s3-tests and boto3 clients use by default.
 fn extract_bucket_from_path(req: &HttpRequest) -> Result<String, Error> {
     let path = req.path();
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    // Skip the "s3" prefix if present (warpdrive path-style: /s3/{bucket}/...)
-    let bucket_idx = if parts.first().copied() == Some("s3") { 1 } else { 0 };
+    // Skip a leading "cluster" segment (the cluster S3 surface's path
+    // prefix, /cluster/s3/{bucket}/...), then skip "s3" if present
+    // (warpdrive path-style: /s3/{bucket}/... or /cluster/s3/{bucket}/...).
+    // SigV4 verification itself (`verify_sigv4`) uses `req.path()` directly
+    // as the canonical URI, so it's unaffected by this -- this only fixes
+    // which path segment `S3AuthResult.bucket` (used for bucket-level
+    // access checks) reports as the bucket name.
+    let mut idx = if parts.first().copied() == Some("cluster") { 1 } else { 0 };
+    if parts.get(idx).copied() == Some("s3") {
+        idx += 1;
+    }
+    let bucket_idx = idx;
 
     if parts.len() <= bucket_idx || parts[bucket_idx].is_empty() {
         return Ok(String::new()); // list-buckets call

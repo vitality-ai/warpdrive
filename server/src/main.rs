@@ -27,7 +27,11 @@ use warp_drive::cluster::coordinator::{
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
-use warp_drive::cluster::s3_surface::{cluster_s3_head_object, cluster_s3_list_objects};
+use warp_drive::cluster::s3_surface::{
+    cluster_s3_delete_object_authenticated, cluster_s3_get_object_authenticated,
+    cluster_s3_head_object, cluster_s3_head_object_authenticated,
+    cluster_s3_list_objects, cluster_s3_put_object_authenticated,
+};
 use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
 use warp_drive::cluster::location_store::BitcaskLocationStore;
@@ -210,12 +214,20 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
             // Minimal S3-protocol surface (s3_surface.rs) — a distinct "s3/" prefix
             // so it never collides with the generic {bucket}/{key:.*} routes
-            // below; GET/PUT reuse those same handlers directly (same Range
-            // support, same FAC dispatch), only HEAD/LIST are new.
+            // below. Phase 3: PUT/GET/DELETE/HEAD here now go through
+            // authenticate_s3_request (same SigV4 verification single-node
+            // uses) via dedicated *_authenticated handlers that delegate to
+            // the *_inner functions for the actual EC/placement work -- a
+            // deliberate, intended breaking change for this prefix
+            // specifically (it was always documented as "no SigV4
+            // verification... not a production S3 surface"; this is the
+            // upgrade). The bare /cluster/{bucket}/{key:.*} routes below are
+            // untouched and stay fully unauthenticated.
             .route("/cluster/s3/{bucket}", web::get().to(cluster_s3_list_objects))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_put_object))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_get_object))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object_authenticated))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_s3_put_object_authenticated))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_s3_get_object_authenticated))
+            .route("/cluster/s3/{bucket}/{key:.*}", web::delete().to(cluster_s3_delete_object_authenticated))
             .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))
             .route("/cluster/{bucket}/{key:.*}", web::get().to(cluster_get_object))
             .route("/cluster/{bucket}/{key:.*}", web::delete().to(cluster_delete_object))
