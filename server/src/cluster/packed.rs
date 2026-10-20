@@ -444,7 +444,11 @@ async fn fetch_and_decode_stripe(
     decoded
 }
 
-pub async fn get_object_content_dependent(record: ContentDependentRecord, state: &ClusterState) -> Result<HttpResponse, Error> {
+/// Returns the reconstructed object's raw bytes -- no response-building
+/// here (that, including checksum verification against the record, is
+/// the caller's job in `coordinator.rs`, same division of labor
+/// `get_object_content_dependent_range` already uses).
+pub async fn get_object_content_dependent(record: ContentDependentRecord, state: &ClusterState) -> Result<Vec<u8>, Error> {
     let mut output = vec![0u8; record.original_len];
     let units_by_id: HashMap<&str, (u64, u64)> =
         record.units.iter().map(|u| (u.unit_id.as_str(), (u.offset, u.len))).collect();
@@ -491,11 +495,7 @@ pub async fn get_object_content_dependent(record: ContentDependentRecord, state:
         }
     }
 
-    let mut response = HttpResponse::Ok();
-    if record.has_sparse_gaps {
-        response.insert_header(("X-Warpd-Sparse-Coverage", "true"));
-    }
-    Ok(response.body(output))
+    Ok(output)
 }
 
 /// Range-GET for a content-dependent object: `start`/`end` are inclusive

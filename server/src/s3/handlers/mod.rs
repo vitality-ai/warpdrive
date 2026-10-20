@@ -1,6 +1,6 @@
 // handlers/ — S3 request handlers split by concern.
 pub(crate) mod common;
-pub(super) mod checksum;
+pub(crate) mod checksum;
 pub(super) mod cors;
 pub(crate) mod tagging;
 pub(super) mod versioning;

@@ -39,9 +39,10 @@ use super::coordinator::{
 use super::location_store::ObjectS3Metadata;
 use super::metadata_store::ClusterMetadataStore;
 use crate::s3::auth::authenticate_s3_request;
+use crate::s3::handlers::checksum::{compute_checksum, parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use crate::s3::handlers::common::{
-    extract_all_xml_tags, extract_xml_tag, md5_etag, normalize_etag, req_query_map, s3_precondition_failed, HeadBody,
-    S3_XMLNS,
+    extract_all_xml_tags, extract_xml_tag, md5_etag, normalize_etag, req_query_map, s3_error, s3_precondition_failed,
+    HeadBody, S3_XMLNS,
 };
 use crate::s3::handlers::tagging::{parse_tag_xml, parse_url_tags, tags_to_xml, validate_tags};
 use crate::service::metadata_service::MetadataService;
@@ -112,6 +113,18 @@ pub async fn cluster_s3_head_object_authenticated(
     if let Some(exp) = &meta.expires { resp.insert_header(("Expires", exp.as_str())); }
     for (k, v) in &meta.user_metadata {
         resp.insert_header((format!("x-amz-meta-{k}"), crate::s3::handlers::common::metadata_value_header(v)));
+    }
+    // Same x-amz-checksum-mode: ENABLED opt-in as single-node's
+    // s3_head_object_handler, and the same echo-on-request-only
+    // convention (never unconditional).
+    let checksum_mode_enabled = req.headers().get("x-amz-checksum-mode").and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("ENABLED"));
+    if checksum_mode_enabled {
+        if let (Some(algo_str), Some(cksum_val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
+            if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+                resp.insert_header((format!("x-amz-checksum-{}", algo.header_suffix()), cksum_val.as_str()));
+            }
+        }
     }
     if let Ok(tags) = cluster_get_object_tagging(&auth_result.user_id, &bucket, &key, &state) {
         if !tags.is_empty() {
@@ -223,6 +236,45 @@ pub async fn cluster_s3_put_object_authenticated(
         if stripped.is_empty() { None } else { Some(stripped.join(", ")) }
     });
 
+    // Checksum verification -- same functions, same header names, same
+    // BadDigest error single-node's `s3_put_object_handler` uses. A
+    // client-declared checksum that doesn't match the body it actually
+    // sent is rejected before any shard is written, not stored unverified.
+    let checksum_result = parse_checksum_headers(&req);
+    if let Some((ref algo, ref client_value)) = checksum_result {
+        if !verify_checksum(algo, &body, client_value) {
+            let resource = format!("/{bucket}/{key}");
+            return Ok(s3_error(
+                actix_web::http::StatusCode::BAD_REQUEST, "BadDigest",
+                "The Content-MD5 or checksum you specified did not match what we received.",
+                &resource,
+            ));
+        }
+    }
+
+    // Checksum on by default, not opt-in: a client that never asked for
+    // AWS's checksum feature still gets a real checksum computed and
+    // stored here, specifically so `cluster_get_object_inner` has
+    // something to verify reconstructed bytes against later -- this is
+    // WarpDrive's own durability guarantee (catching post-write
+    // corruption: bit-rot, an EC-reconstruction bug, a shard corrupted
+    // between peers), not just AWS checksum-feature protocol compliance,
+    // which stays opt-in for what gets *echoed* to the client. CRC32C,
+    // not SHA256: this only needs to catch accidental corruption, not
+    // resist a malicious adversary, and CRC32C is hardware-accelerated
+    // (SSE4.2/ARM CRC instructions) where SHA256 isn't -- the same
+    // tradeoff AWS's own SDKs make, which default to CRC32C for exactly
+    // this reason. A client-supplied checksum (any of the 5 algorithms,
+    // already verified above) is trusted as-is instead of being
+    // overridden by a second, redundant one.
+    let (checksum_algorithm, checksum_value) = match &checksum_result {
+        Some((algo, value)) => (Some(algo.as_str().to_string()), Some(value.clone())),
+        None => (
+            Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
+            Some(compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
+        ),
+    };
+
     let etag = md5_etag(&body);
     let s3_meta = ObjectS3Metadata {
         etag: Some(etag.clone()),
@@ -232,14 +284,23 @@ pub async fn cluster_s3_put_object_authenticated(
         cache_control,
         expires,
         content_encoding,
-        checksum_algorithm: None,
-        checksum_value: None,
+        checksum_algorithm,
+        checksum_value,
         checksum_type: None,
     };
 
     let bucket2 = bucket.clone();
     let key2 = key.clone();
     let mut resp = cluster_put_object_inner(&user_id, bucket, key, body, &req, &state, &s3_meta).await?;
+    if let Some((ref algo, ref value)) = checksum_result {
+        let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
+        if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(value) {
+            resp.headers_mut().insert(
+                actix_web::http::header::HeaderName::try_from(header_name).map_err(ErrorBadRequest)?,
+                hv,
+            );
+        }
+    }
     if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&etag) {
         resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("etag"), hv);
     }

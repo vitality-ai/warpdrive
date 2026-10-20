@@ -28,6 +28,7 @@ use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
 use super::pushdown::ColumnCodec;
 use super::shard_storage::{new_version_id, versioned_key};
+use crate::s3::handlers::checksum::ChecksumAlgorithm;
 use crate::s3::handlers::common::{metadata_value_header, parse_range_header, RangeResult};
 use base64::Engine;
 
@@ -819,11 +820,19 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
     let total_size = body.len() as u64;
 
+    // Checksum on by default here too, same reasoning (and same CRC32C
+    // choice) as the single-part PUT path (see
+    // `cluster_s3_put_object_authenticated`'s matching comment): a real
+    // checksum over the *reassembled* bytes, so a later GET can verify
+    // the complete object, not just rely on each part having been
+    // individually correct at upload time.
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
         content_type: meta_record.content_type.clone(),
         last_modified: Some(super::s3_surface::now_http_date()),
         user_metadata: meta_record.user_metadata.clone(),
+        checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
+        checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
         ..Default::default()
     };
     put_object_plain(user_id, bucket, final_key, &body, state, &s3_meta).await?;
@@ -891,6 +900,25 @@ pub async fn cluster_get_object(
     cluster_get_object_inner(UNAUTHENTICATED_USER, bucket, key, &req, &state).await
 }
 
+/// `(header-name, value)` to echo on a GET/HEAD response when the client
+/// sent `x-amz-checksum-mode: ENABLED` and the record actually has a
+/// stored checksum -- same opt-in convention single-node's
+/// `s3_get_object_handler`/`s3_head_object_handler` use.
+fn checksum_response_header(
+    req: &actix_web::HttpRequest, checksum_algorithm: &Option<String>, checksum_value: &Option<String>,
+) -> Option<(String, String)> {
+    let enabled = req
+        .headers()
+        .get("x-amz-checksum-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("ENABLED"));
+    if !enabled {
+        return None;
+    }
+    let algo = ChecksumAlgorithm::from_str(checksum_algorithm.as_deref()?)?;
+    Some((format!("x-amz-checksum-{}", algo.header_suffix()), checksum_value.clone()?))
+}
+
 pub(crate) async fn cluster_get_object_inner(
     user_id: &str,
     bucket: String,
@@ -911,6 +939,9 @@ pub(crate) async fn cluster_get_object_inner(
         let content_type = record.content_type.clone();
         let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
         let user_metadata = record.user_metadata.clone();
+        let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
+        let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
+        let has_sparse_gaps = record.has_sparse_gaps;
         // Range-aware fetch only reaches the stripes whose units actually
         // overlap the requested bytes (see packed.rs) — this is the whole
         // reason a DuckDB-style selective Parquet read benefits from
@@ -918,7 +949,6 @@ pub(crate) async fn cluster_get_object_inner(
         let range_result = parse_range_header(&req, total_len);
         return match range_result {
             RangeResult::Valid(start, end) => {
-                let has_sparse_gaps = record.has_sparse_gaps;
                 let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
@@ -929,6 +959,9 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
+                if let Some((name, value)) = &checksum_header {
+                    resp.insert_header((name.as_str(), value.as_str()));
+                }
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -938,32 +971,38 @@ pub(crate) async fn cluster_get_object_inner(
                 actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
             ),
             RangeResult::None => {
-                let resp = super::packed::get_object_content_dependent(record, &state).await?;
-                let mut resp = resp;
-                resp.headers_mut().insert(
-                    actix_web::http::header::HeaderName::from_static("accept-ranges"),
-                    actix_web::http::header::HeaderValue::from_static("bytes"),
-                );
-                if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&last_modified) {
-                    resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("last-modified"), hv);
-                }
-                if let Some(etag) = &etag {
-                    if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(etag) {
-                        resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("etag"), hv);
+                let data = super::packed::get_object_content_dependent(record, &state).await?;
+
+                // Same read-side integrity check the plain path applies --
+                // a reconstructed FAC object must never reach the client
+                // if it doesn't match what was written, whether or not the
+                // client asked for AWS's checksum feature.
+                if let Some((algo_str, expected)) = &stored_checksum {
+                    if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+                        if !crate::s3::handlers::checksum::verify_checksum(&algo, &data, expected) {
+                            return Err(ErrorInternalServerError(format!(
+                                "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
+                                 match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
+                            )));
+                        }
                     }
                 }
-                if let Some(ct) = &content_type {
-                    if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(ct) {
-                        resp.headers_mut().insert(actix_web::http::header::HeaderName::from_static("content-type"), hv);
-                    }
-                }
+
+                let mut resp = HttpResponse::Ok();
+                resp.insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Last-Modified", last_modified));
+                if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+                if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
                 for (k, v) in &user_metadata {
-                    resp.headers_mut().insert(
-                        actix_web::http::header::HeaderName::try_from(format!("x-amz-meta-{k}")).map_err(ErrorInternalServerError)?,
-                        metadata_value_header(v),
-                    );
+                    resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                Ok(resp)
+                if let Some((name, value)) = &checksum_header {
+                    resp.insert_header((name.as_str(), value.as_str()));
+                }
+                if has_sparse_gaps {
+                    resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
+                }
+                Ok(resp.body(data))
             }
         };
     }
@@ -978,6 +1017,7 @@ pub(crate) async fn cluster_get_object_inner(
     let content_type = record.content_type.clone();
     let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
     let user_metadata = record.user_metadata.clone();
+    let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
 
     // #151: an empty `version` means this pin predates the field
     // (`#[serde(default)]`) -- its shards are at the old, unversioned
@@ -1031,6 +1071,9 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
+                if let Some((name, value)) = &checksum_header {
+                    resp.insert_header((name.as_str(), value.as_str()));
+                }
                 return Ok(resp.body(slice.to_vec()));
             }
         }
@@ -1083,6 +1126,28 @@ pub(crate) async fn cluster_get_object_inner(
         .decode(&shards, record.original_len)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
 
+    // Verify the reconstructed object against its stored checksum before
+    // ever returning it -- every object has one by default now (see
+    // `cluster_s3_put_object_authenticated`'s matching comment), not just
+    // objects whose client explicitly requested AWS's checksum feature.
+    // This is what actually catches post-write corruption (bit-rot, a
+    // reconstruction bug, a shard silently corrupted on one peer but
+    // still accepted by read-quorum) -- storing a checksum at write time
+    // is not a safety guarantee by itself if nothing ever checks it
+    // again on read. A mismatch means the data this node just
+    // reconstructed is not what was written, so it must never reach the
+    // client -- fail the request instead of serving it.
+    if let (Some(algo_str), Some(expected)) = (&record.checksum_algorithm, &record.checksum_value) {
+        if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+            if !crate::s3::handlers::checksum::verify_checksum(&algo, &data, expected) {
+                return Err(ErrorInternalServerError(format!(
+                    "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
+                     match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
+                )));
+            }
+        }
+    }
+
     match parse_range_header(&req, total_len) {
         RangeResult::Valid(start, end) => {
             let slice = data
@@ -1098,6 +1163,9 @@ pub(crate) async fn cluster_get_object_inner(
             for (k, v) in &user_metadata {
                 resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
             }
+            if let Some((name, value)) = &checksum_header {
+                resp.insert_header((name.as_str(), value.as_str()));
+            }
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
@@ -1111,6 +1179,9 @@ pub(crate) async fn cluster_get_object_inner(
             if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
             for (k, v) in &user_metadata {
                 resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+            }
+            if let Some((name, value)) = &checksum_header {
+                resp.insert_header((name.as_str(), value.as_str()));
             }
             Ok(resp.body(data))
         }
