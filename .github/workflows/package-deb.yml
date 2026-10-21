@@ -1,0 +1,83 @@
+name: package-deb
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build release binary
+        working-directory: server
+        run: cargo build --release --bin warp_drive
+
+      - name: Build .deb package
+        working-directory: server
+        run: cargo deb --no-build
+
+      - name: Upload .deb as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warpdrive-deb
+          path: server/target/debian/*.deb
+
+      # Publishing to the apt repo (gh-pages: pool/, dists/, conf/) signs the
+      # Release file with the key conf/distributions' SignWith names, using
+      # the repo's existing GPG_PRIVATE_KEY/GPG_PASSPHRASE/GPG_KEY_ID
+      # secrets. The key is passphrase-protected, so reprepro (which shells
+      # out to gpg internally, with no terminal to prompt on) needs the
+      # passphrase preset into a running gpg-agent via gpg-preset-passphrase
+      # before it runs, rather than supplied some other way.
+      - name: Publish to apt repo
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          set -e
+          sudo apt-get install -y reprepro gnupg
+          export GNUPGHOME="$(mktemp -d)"
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "allow-preset-passphrase" >> "$GNUPGHOME/gpg-agent.conf"
+          echo "allow-loopback-pinentry" >> "$GNUPGHOME/gpg-agent.conf"
+          gpgconf --kill gpg-agent
+          gpgconf --launch gpg-agent
+          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEY_ID" | awk '/Keygrip/ {print $3; exit}')
+          GPG_LIBEXEC="$(gpgconf --list-dirs libexecdir)"
+          "$GPG_LIBEXEC/gpg-preset-passphrase" --preset "$KEYGRIP" <<< "$GPG_PASSPHRASE"
+
+          git fetch origin gh-pages
+          git worktree add /tmp/gh-pages-publish origin/gh-pages
+          cp server/target/debian/*.deb /tmp/gh-pages-publish/
+          cd /tmp/gh-pages-publish
+          DEB_FILE=$(ls *.deb)
+          reprepro -b . includedeb stable "$DEB_FILE"
+          rm -f "$DEB_FILE"
+          git add pool dists db
+          if git diff --cached --quiet; then
+            echo "No apt repo changes (package unchanged); nothing to publish."
+            exit 0
+          fi
+          git -c user.name="warpdrive-ci" -c user.email="ci@vitality-ai.github" \
+            commit -m "Publish $DEB_FILE to apt repo (${{ github.sha }})"
+          git push origin HEAD:gh-pages

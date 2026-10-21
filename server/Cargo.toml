@@ -2,6 +2,27 @@
 name = "warp_drive"
 version = "1.0.0-beta"
 edition = "2021"
+description = "Self-hosted S3-compatible object storage server"
+
+[package.metadata.deb]
+name = "warpdrive"
+maintainer = "Tejas ChandraShekarRaju <tchandrashekar@acm.org>"
+copyright = "2026, Vitality AI"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Warpdrive is a self-hosted S3-compatible object storage server.
+Drop-in replacement for AWS S3, works with any S3 SDK out of the box."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/warp_drive", "usr/bin/", "755"],
+    ["server_log.yaml", "var/lib/warpdrive/server_log.yaml", "644"],
+    ["pkg-scripts/warpdrive.env", "etc/warpdrive/warpdrive.env", "640"],
+]
+conf-files = ["/etc/warpdrive/warpdrive.env", "/var/lib/warpdrive/server_log.yaml"]
+maintainer-scripts = "pkg-scripts"
+systemd-units = { unit-scripts = ".", unit-name = "warpdrive", enable = true, start = true }
 
 [dependencies]
 actix-web = "4.11.0"
