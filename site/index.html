@@ -874,35 +874,13 @@ EOF</pre>
         Full distributed engine report with charts →
       </a>
 
-      <div class="bench-note" style="margin-top:32px">
-        <strong>Finding:</strong> a real fsync durability gap was found and fixed (group-commit, not a naive per-write fsync that would have cost 82-89% of throughput), then verified against MinIO deployed on identical hardware. After correcting two methodology gaps caught along the way — the original hardware was disk-bound on both sides, and the two servers were being driven by two different client tools — WarpDrive still beats MinIO 1.5-1.7x on a single node and ~3.0x across the full cluster, both with real fsync'd durability and zero errors.
-      </div>
-
-      <div class="bench-grid">
-        <div class="bench-card">
-          <div class="bench-label">Single node, same client</div>
-          <div class="bench-value">1.5-1.7x<span class="bench-unit">vs MinIO</span></div>
-          <div class="bench-sub">1160/1110 req/s vs 673/752 obj/s</div>
-        </div>
-        <div class="bench-card">
-          <div class="bench-label">5-node spread, same client</div>
-          <div class="bench-value">3.0x<span class="bench-unit">vs MinIO</span></div>
-          <div class="bench-sub">4544 req/s vs 1514 obj/s, aggregate</div>
-        </div>
-        <div class="bench-card">
-          <div class="bench-label">Local SSD vs. pd-standard</div>
-          <div class="bench-value">4.2x<span class="bench-unit">MinIO itself</span></div>
-          <div class="bench-sub">disk, not CPU, was the old ceiling</div>
-        </div>
-        <div class="bench-card">
-          <div class="bench-label">Group-commit durability</div>
-          <div class="bench-value">real<span class="bench-unit">fsync</span></div>
-          <div class="bench-sub">batched, not a timer or per-write cost</div>
-        </div>
-      </div>
-
-      <a class="btn-outline" href="characterization/durability-and-minio.html">
-        Full durability &amp; MinIO comparison with charts →
+      <p class="section-sub" style="margin-top:28px">
+        A write-durability gap (missing fsync on the cluster write path) was found and fixed with a
+        group-commit design, then measured against MinIO on identical hardware with the same client
+        tool against both servers. Methodology, full data, and plots are in the report below.
+      </p>
+      <a class="btn-outline" href="https://github.com/vitality-ai/warpdrive/blob/distributed-s3-compat-engine/docs/durability-and-minio-comparison.md">
+        Durability &amp; MinIO comparison report →
       </a>
     </section>
 
