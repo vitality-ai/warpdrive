@@ -2,6 +2,10 @@
 
 This report covers two related pieces of work on the distributed engine: a write-durability gap that was found and fixed, and a throughput comparison against MinIO, run twice on two different hardware generations.
 
+![The complete story: WarpDrive vs MinIO across hardware and methodology fixes](perf-plots/complete_story.png)
+
+The sections below cover each stage of that chart in detail, in the order the work actually happened.
+
 ## 1. The durability gap
 
 No write path in the server, single-node or cluster, called `fsync` anywhere. An acknowledged write was only as durable as the OS page cache until some later, unrelated flush wrote it back. A crash between those two points could lose a write the client had already been told succeeded.
