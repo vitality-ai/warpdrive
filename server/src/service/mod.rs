@@ -171,9 +171,18 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     
     info!("Total received data size: {} bytes", bytes.len());
 
-    // Write additional FlatBuffers payload chunks to storage
-    let storage_service = StorageService::new();
-    let mut offset_size_list_append = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
+    // Write additional FlatBuffers payload chunks to storage.
+    // web::block: `write_object` now does a real group-committed fsync --
+    // see `storage::group_commit`'s module doc -- so this has to go
+    // through `web::block` the same way `put_service` above does.
+    let context_c = context.clone();
+    let buf = bytes.to_vec();
+    let mut offset_size_list_append = web::block(move || {
+        StorageService::new().write_object(&context_c, &buf, StorageMode::Native).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(ErrorInternalServerError)?;
 
 
     if offset_size_list_append.is_empty() {
@@ -249,9 +258,17 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     info!("Total received data size: {} bytes", bytes.len());
     info!("Starting deserialization");
     
-    // Rewrite with provided FlatBuffers payload
-    let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
+    // Rewrite with provided FlatBuffers payload.
+    // web::block: same reasoning as `append_service`'s matching fix above --
+    // `write_object` now does a real group-committed fsync.
+    let context_c = context.clone();
+    let buf = bytes.to_vec();
+    let offset_size_list = web::block(move || {
+        StorageService::new().write_object(&context_c, &buf, StorageMode::Native).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(ErrorInternalServerError)?;
    
     if offset_size_list.is_empty()  {
         error!("No data in data list with key: {}", key);

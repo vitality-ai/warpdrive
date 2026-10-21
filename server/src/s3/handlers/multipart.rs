@@ -191,8 +191,19 @@ pub async fn s3_upload_part_handler(
     }
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &body, StorageMode::S3)?;
+    // web::block: `Storage::write` now does a real (group-committed) fsync
+    // -- see `storage::group_commit`'s module doc -- so this has to go
+    // through `web::block` the same way `object.rs`'s PUT handler does;
+    // calling it directly here would block this actix worker's whole
+    // event loop for the fsync's duration.
+    let context_c = context.clone();
+    let body_c = body.clone();
+    let offset_size_list = web::block(move || {
+        StorageService::new().write_object(&context_c, &body_c, StorageMode::S3).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
@@ -334,7 +345,16 @@ pub async fn s3_upload_part_copy_handler(
     let part_bytes = storage_service.read_object(&src_context, &read_extents, StorageMode::S3)?;
 
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3)?;
+    // web::block: same reasoning as UploadPart's matching fix -- `write_object`
+    // now does a real group-committed fsync.
+    let dst_context_c = dst_context.clone();
+    let part_bytes_c = part_bytes.clone();
+    let offset_size_list = web::block(move || {
+        StorageService::new().write_object(&dst_context_c, &part_bytes_c, StorageMode::S3).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
 
     let part_number_i32: i32 = match part_number.parse() {
         Ok(n) if (1..=10000).contains(&n) => n,

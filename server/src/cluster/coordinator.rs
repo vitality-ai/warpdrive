@@ -136,29 +136,44 @@ fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderVal
         .collect()
 }
 
-/// Replicate a `LocationRecord` to every peer in `peers` (symmetric,
-/// including this node, via the same internal HTTP call — no special
-/// self-case). Returns how many acknowledged.
-async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
-    let puts = peers.iter().cloned().map(|peer| {
+/// Shared fan-out for every `replicate_*` function below: build one request
+/// per peer (symmetric, including this node, via the same internal HTTP
+/// call -- no special self-case), send them all concurrently, and count
+/// how many succeeded. `build` constructs the actual `RequestBuilder`
+/// (method + body) for a given peer's URL -- the one thing that genuinely
+/// differs between a location/content-location put/delete -- everything
+/// else (fan-out, success/failure counting, the warn! on a bad response or
+/// a transport error) was previously duplicated four times, once per
+/// record-shape/verb combination.
+async fn replicate_to_peers<F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, build: F) -> usize
+where
+    F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+{
+    let requests = peers.iter().map(|peer| {
         let client = state.location_http.clone();
-        let record = record.clone();
+        let url = format!("{}/cluster/_internal/{path_suffix}", peer.trim_end_matches('/'));
+        let req = build(&client, &url);
         async move {
-            let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
-            match client.post(&url).json(&record).send().await {
+            match req.send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
-                    warn!("location pin replication to {peer} returned {}", r.status());
+                    warn!("{label} replication to {peer} returned {}", r.status());
                     false
                 }
                 Err(e) => {
-                    warn!("location pin replication to {peer} failed: {e}");
+                    warn!("{label} replication to {peer} failed: {e}");
                     false
                 }
             }
         }
     });
-    join_all(puts).await.into_iter().filter(|ok| *ok).count()
+    join_all(requests).await.into_iter().filter(|ok| *ok).count()
+}
+
+/// Replicate a `LocationRecord` to every peer in `peers`. Returns how many
+/// acknowledged.
+async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
+    replicate_to_peers(state, peers, "location", "location pin", |client, url| client.post(url).json(record)).await
 }
 
 /// Content-dependent counterpart of `replicate_location_put` -- same
@@ -166,51 +181,14 @@ async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, p
 /// Phase 4's tagging support, which (unlike retention) applies to packed
 /// objects too.
 async fn replicate_content_location_put(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
-    let puts = peers.iter().cloned().map(|peer| {
-        let client = state.location_http.clone();
-        let record = record.clone();
-        async move {
-            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
-            match client.post(&url).json(&record).send().await {
-                Ok(r) if r.status().is_success() => true,
-                Ok(r) => {
-                    warn!("content-location pin replication to {peer} returned {}", r.status());
-                    false
-                }
-                Err(e) => {
-                    warn!("content-location pin replication to {peer} failed: {e}");
-                    false
-                }
-            }
-        }
-    });
-    join_all(puts).await.into_iter().filter(|ok| *ok).count()
+    replicate_to_peers(state, peers, "content_location", "content-location pin", |client, url| client.post(url).json(record)).await
 }
 
 /// Replicate a tombstone (delete) for `(user_id, bucket, key)` to every
-/// peer in `peers`. Same symmetric-including-self treatment as the put path.
+/// peer in `peers`.
 pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
-    let deletes = peers.iter().cloned().map(|peer| {
-        let client = state.location_http.clone();
-        let user_id = user_id.to_string();
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        async move {
-            let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
-            match client.delete(&url).json(&DeleteKeyRequest { user_id, bucket, key }).send().await {
-                Ok(r) if r.status().is_success() => true,
-                Ok(r) => {
-                    warn!("location tombstone replication to {peer} returned {}", r.status());
-                    false
-                }
-                Err(e) => {
-                    warn!("location tombstone replication to {peer} failed: {e}");
-                    false
-                }
-            }
-        }
-    });
-    join_all(deletes).await.into_iter().filter(|ok| *ok).count()
+    let body = DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string() };
+    replicate_to_peers(state, peers, "location", "location tombstone", |client, url| client.delete(url).json(&body)).await
 }
 
 /// Content-location counterpart of `replicate_location_delete` — needed so
@@ -221,27 +199,8 @@ pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &st
 /// `ContentLocationStore`, which DELETE never touched, and a plain overwrite
 /// never cleared the packed pin GET still preferred.
 pub(crate) async fn replicate_content_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
-    let deletes = peers.iter().cloned().map(|peer| {
-        let client = state.location_http.clone();
-        let user_id = user_id.to_string();
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        async move {
-            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
-            match client.delete(&url).json(&DeleteKeyRequest { user_id, bucket, key }).send().await {
-                Ok(r) if r.status().is_success() => true,
-                Ok(r) => {
-                    warn!("content-location tombstone replication to {peer} returned {}", r.status());
-                    false
-                }
-                Err(e) => {
-                    warn!("content-location tombstone replication to {peer} failed: {e}");
-                    false
-                }
-            }
-        }
-    });
-    join_all(deletes).await.into_iter().filter(|ok| *ok).count()
+    let body = DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string() };
+    replicate_to_peers(state, peers, "content_location", "content-location tombstone", |client, url| client.delete(url).json(&body)).await
 }
 
 /// Attaches `x-warpd-placement` (`plain`|`packed`) and, when a packing
@@ -631,7 +590,27 @@ async fn put_object_plain(
     // sequential cross-peer round trips a PUT pays for (was: shard fan-out,
     // then location-pin quorum, then cleanup-broadcast quorum, each waiting
     // on the last; now the latter two overlap).
-    let _ = state.content_location_store.delete(user_id, &bucket, &key);
+    {
+        // web::block: this store's `delete` now does a real group-commit
+        // fsync (see `storage::group_commit`'s module doc) -- calling it
+        // directly here would block this actix worker's whole event loop
+        // for the fsync's duration, same hazard `cluster_internal_delete_*`
+        // were fixed for. Best-effort local cleanup (the actual durability
+        // guarantee is the quorum-checked broadcast below), so a failure
+        // here doesn't fail the PUT, but it's logged rather than silently
+        // discarded -- a real disk error (e.g. out of space) on this node
+        // shouldn't vanish just because the write still succeeded cluster-wide.
+        let store = Arc::clone(&state.content_location_store);
+        let user_id_owned = user_id.to_string();
+        let bucket_owned = bucket.clone();
+        let key_owned = key.clone();
+        let result = web::block(move || store.delete(&user_id_owned, &bucket_owned, &key_owned).map_err(|e| e.to_string())).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("stale content-location pin cleanup failed for {bucket}/{key}: {e}"),
+            Err(e) => log::warn!("stale content-location pin cleanup blocking task failed for {bucket}/{key}: {e}"),
+        }
+    }
     let t0 = std::time::Instant::now();
     let (loc_acked, cleanup_acked) = tokio::join!(
         replicate_location_put(&state, &record, &peers),
@@ -807,8 +786,14 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
         .get(user_id, bucket, &multipart_meta_key(upload_id))
         .ok_or_else(|| ErrorNotFound("no such upload"))?;
 
-    let mut combined_md5_bytes: Vec<u8> = Vec::new();
-    let mut body: Vec<u8> = Vec::new();
+    // Validate every part up front (cheap local index lookups, no network),
+    // bailing out on the first missing/mismatched part exactly like the
+    // previous sequential version did. Only the actual byte fetch -- the
+    // part that fans out to EC shards across peers -- is run concurrently
+    // below: each `fetch_plain_object_bytes` call already parallelizes its
+    // own shard fan-out, but a 50-part upload still paid 50 sequential
+    // round-trip-groups before this, one per part, instead of one.
+    let mut validated: Vec<(String, String)> = Vec::with_capacity(requested.len());
     for (part_number, client_etag) in requested {
         let part_key = multipart_part_key(upload_id, *part_number);
         let stored = state
@@ -819,11 +804,23 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
         if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored_etag) {
             return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
         }
-        let part_bytes = fetch_plain_object_bytes(user_id, bucket, &part_key, state).await?;
-        if let Ok(raw) = hex::decode(crate::s3::handlers::common::normalize_etag(&stored_etag)) {
+        validated.push((part_key, stored_etag));
+    }
+
+    // `join_all` preserves input order in its output, so `part_bytes[i]`
+    // still lines up with `validated[i]` -- required here, since the
+    // reassembled body must be the parts concatenated in request order,
+    // not whichever fetch happens to finish first.
+    let fetches = validated.iter().map(|(part_key, _)| fetch_plain_object_bytes(user_id, bucket, part_key, state));
+    let part_bytes: Vec<Vec<u8>> = join_all(fetches).await.into_iter().collect::<Result<_, _>>()?;
+
+    let mut combined_md5_bytes: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    for ((_, stored_etag), bytes) in validated.iter().zip(part_bytes) {
+        if let Ok(raw) = hex::decode(crate::s3::handlers::common::normalize_etag(stored_etag)) {
             combined_md5_bytes.extend_from_slice(&raw);
         }
-        body.extend_from_slice(&part_bytes);
+        body.extend_from_slice(&bytes);
     }
 
     // Same composite-ETag formula single-node's CompleteMultipartUpload
@@ -854,9 +851,30 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     // (see RFC3), so leftover shard bytes on peers already accumulate
     // the same way for ordinary deletes. Tracked as the same class of
     // future work, not a new gap introduced here.
-    let _ = state.location_store.delete(user_id, bucket, &multipart_meta_key(upload_id));
-    for (part_number, _) in requested {
-        let _ = state.location_store.delete(user_id, bucket, &multipart_part_key(upload_id, *part_number));
+    //
+    // web::block: `delete` now does a real group-commit fsync per call
+    // (see `storage::group_commit`'s module doc), so this whole loop (one
+    // blocking task, not one per part) must run off the actix worker's
+    // event loop the same way the single-object delete paths were fixed.
+    {
+        let store = Arc::clone(&state.location_store);
+        let user_id_owned = user_id.to_string();
+        let bucket_owned = bucket.to_string();
+        let upload_id_owned = upload_id.to_string();
+        let part_numbers: Vec<i32> = requested.iter().map(|(n, _)| *n).collect();
+        let result = web::block(move || {
+            store.delete(&user_id_owned, &bucket_owned, &multipart_meta_key(&upload_id_owned))?;
+            for part_number in part_numbers {
+                store.delete(&user_id_owned, &bucket_owned, &multipart_part_key(&upload_id_owned, part_number))?;
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("multipart cleanup failed for {bucket}/{upload_id}: {e}"),
+            Err(e) => log::warn!("multipart cleanup blocking task failed for {bucket}/{upload_id}: {e}"),
+        }
     }
 
     Ok((final_etag, total_size))
@@ -869,10 +887,29 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
         return Err(ErrorNotFound("no such upload"));
     }
     let prefix = multipart_part_prefix(upload_id);
-    for (part_key, _) in state.location_store.list(user_id, bucket, &prefix) {
-        let _ = state.location_store.delete(user_id, bucket, &part_key);
+    let part_keys: Vec<String> = state.location_store.list(user_id, bucket, &prefix).into_iter().map(|(k, _)| k).collect();
+
+    // Best-effort local cleanup, same "storage-reclamation gap, not a
+    // correctness one" reasoning as the matching cleanup in
+    // `cluster_complete_multipart_upload_inner` -- a failure here doesn't
+    // fail the abort itself. web::block (one blocking task, not one per
+    // part): `delete` now does a real group-commit fsync per call.
+    let store = Arc::clone(&state.location_store);
+    let user_id_owned = user_id.to_string();
+    let bucket_owned = bucket.to_string();
+    let upload_id_owned = upload_id.to_string();
+    let result = web::block(move || {
+        for part_key in part_keys {
+            store.delete(&user_id_owned, &bucket_owned, &part_key)?;
+        }
+        store.delete(&user_id_owned, &bucket_owned, &multipart_meta_key(&upload_id_owned))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("multipart abort cleanup failed for {bucket}/{upload_id}: {e}"),
+        Err(e) => log::warn!("multipart abort cleanup blocking task failed for {bucket}/{upload_id}: {e}"),
     }
-    let _ = state.location_store.delete(user_id, bucket, &multipart_meta_key(upload_id));
     Ok(())
 }
 

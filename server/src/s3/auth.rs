@@ -720,8 +720,34 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
     let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
     let base_url = base_url.ok_or_else(|| s3_access_denied("No authentication method configured"))?;
     let service_secret = service_secret.ok_or_else(|| s3_access_denied("WARPDRIVE_SERVICE_SECRET not set"))?;
-    let (owner_id, secret_key, _, _) =
+    let (mut owner_id, mut secret_key, mut allowed_buckets, cache_hit) =
         load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
+
+    if cache_hit && allowed_buckets.is_empty() && !bucket.is_empty() {
+        warn!(
+            "Presigned V4 auth: empty cached bucket set for path_bucket={:?} — invalidating and re-fetching",
+            bucket
+        );
+        invalidate_s3_credential_cache(&access_key);
+        let (o, s, ab, _) =
+            load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
+        owner_id = o;
+        secret_key = s;
+        allowed_buckets = ab;
+    }
+
+    if !bucket.is_empty() && !allowed_buckets.contains(&bucket) {
+        warn!(
+            "Presigned V4 auth: FORBIDDEN path_bucket={:?} not in cached Console bucket set {:?}",
+            bucket, allowed_buckets
+        );
+        return Err(ErrorForbidden(
+            "Bucket is not registered for this account in Vitality Console",
+        ));
+    }
+
+    let mut allowed_buckets_vec: Vec<String> = allowed_buckets.iter().cloned().collect();
+    allowed_buckets_vec.sort();
 
     verify_sigv4_presigned(req, &secret_key, &parsed)?;
     debug!("Presigned V4 auth: Console OK bucket={:?} user={}", bucket, owner_id);
@@ -730,7 +756,7 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
         owner_display_name: owner_id.clone(),
         user_id: owner_id,
         bucket,
-        allowed_buckets: vec![],
+        allowed_buckets: allowed_buckets_vec,
         allow_all_buckets: false,
         is_anonymous: false,
     })
@@ -920,6 +946,16 @@ mod tests {
     use super::*;
     use actix_web::test;
 
+    lazy_static! {
+        /// `VITALITY_CONSOLE_URL`/`WARPDRIVE_SERVICE_SECRET` are process-global,
+        /// but Rust runs tests in this module on multiple threads by default --
+        /// without this, two tests that both set/remove these mid-run race and
+        /// intermittently fail with "No authentication method configured" or
+        /// similar, depending on which one's remove_var lands first. Every test
+        /// that touches either env var holds this for its full duration.
+        static ref ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    }
+
     #[actix_web::test]
     async fn test_parse_authorization_header() {
         let auth_header = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
@@ -930,6 +966,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_authenticate_s3_request_requires_console_config() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("VITALITY_CONSOLE_URL");
         std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
         let req = test::TestRequest::default()
@@ -942,6 +979,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_authenticate_s3_request_errors_when_console_config_missing() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("VITALITY_CONSOLE_URL");
         let req = test::TestRequest::default()
             .uri("/s3/test-bucket/test-key")
@@ -1004,5 +1042,129 @@ mod tests {
             .to_http_request();
         let err = verify_sigv4(&req, "secret", &parsed);
         assert!(err.is_err());
+    }
+
+    /// Builds a presigned-V4 GET request for `canonical_uri`, signed with
+    /// `secret_key`, using the identical canonical-request/signing steps
+    /// `verify_sigv4_presigned` checks against -- so a test can exercise
+    /// `authenticate_presigned_v4` with a signature that actually verifies,
+    /// instead of only ever hitting the signature-mismatch error path.
+    fn build_presigned_get_request(access_key: &str, secret_key: &str, canonical_uri: &str, host: &str) -> HttpRequest {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        type HmacSha256 = Hmac<Sha256>;
+
+        let now = chrono::Utc::now();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.format("%Y%m%d").to_string();
+        let region = "us-east-1";
+        let service = "s3";
+        let credential = format!("{access_key}/{date}/{region}/{service}/aws4_request");
+        let signed_headers = "host";
+
+        let mut pairs = vec![
+            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            ("X-Amz-Credential".to_string(), credential),
+            ("X-Amz-Date".to_string(), amz_date.clone()),
+            ("X-Amz-Expires".to_string(), "900".to_string()),
+            ("X-Amz-SignedHeaders".to_string(), signed_headers.to_string()),
+        ];
+        pairs.sort_by(|a, b| percent_encode_uri(&a.0).cmp(&percent_encode_uri(&b.0)));
+        let canonical_query_string = pairs.iter()
+            .map(|(k, v)| format!("{}={}", percent_encode_uri(k), percent_encode_uri(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let canonical_headers = format!("host:{host}");
+        let canonical_request =
+            format!("GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers}\nUNSIGNED-PAYLOAD");
+
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_request.as_bytes());
+        let canonical_request_hash = hex::encode(hasher.finalize());
+        let credential_scope = format!("{date}/{region}/{service}/aws4_request");
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
+
+        let k_secret = format!("AWS4{secret_key}");
+        let mut mac = HmacSha256::new_from_slice(k_secret.as_bytes()).unwrap();
+        mac.update(date.as_bytes());
+        let k_date = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_date).unwrap();
+        mac.update(region.as_bytes());
+        let k_region = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_region).unwrap();
+        mac.update(service.as_bytes());
+        let k_service = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_service).unwrap();
+        mac.update(b"aws4_request");
+        let k_signing = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_signing).unwrap();
+        mac.update(string_to_sign.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let full_query = format!("{canonical_query_string}&X-Amz-Signature={signature}");
+        test::TestRequest::get()
+            .uri(&format!("{canonical_uri}?{full_query}"))
+            .insert_header(("host", host))
+            .to_http_request()
+    }
+
+    #[actix_web::test]
+    async fn presigned_v4_rejects_bucket_not_in_allowed_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:1");
+        std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-service-secret");
+        let access_key = "AKIAPRESIGNREJECT";
+        let secret_key = "presign-reject-secret";
+        {
+            let mut cache = CREDENTIAL_CACHE.write();
+            cache.insert(access_key.to_string(), CachedCredential {
+                secret_key: secret_key.to_string(),
+                owner_id: "owner-presign-reject".to_string(),
+                allowed_buckets: ["bucket-a".to_string()].into_iter().collect(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(300),
+            });
+        }
+
+        // bucket-b is signed correctly but is NOT in this access key's
+        // allowed_buckets -- this is the cross-tenant-bucket bypass the fix
+        // closes. Before the fix, this request was accepted because the
+        // presigned path never checked allowed_buckets at all.
+        let req = build_presigned_get_request(access_key, secret_key, "/s3/bucket-b/some-key", "localhost:9710");
+        let query_map = parse_query_map(&req);
+        let result = authenticate_presigned_v4(&req, &query_map).await;
+        assert!(result.is_err(), "presigned URL for a bucket outside the access key's allowed set must be rejected");
+
+        invalidate_s3_credential_cache(access_key);
+        std::env::remove_var("VITALITY_CONSOLE_URL");
+        std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
+    }
+
+    #[actix_web::test]
+    async fn presigned_v4_allows_bucket_in_allowed_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:1");
+        std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-service-secret");
+        let access_key = "AKIAPRESIGNALLOW";
+        let secret_key = "presign-allow-secret";
+        {
+            let mut cache = CREDENTIAL_CACHE.write();
+            cache.insert(access_key.to_string(), CachedCredential {
+                secret_key: secret_key.to_string(),
+                owner_id: "owner-presign-allow".to_string(),
+                allowed_buckets: ["bucket-a".to_string()].into_iter().collect(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(300),
+            });
+        }
+
+        let req = build_presigned_get_request(access_key, secret_key, "/s3/bucket-a/some-key", "localhost:9710");
+        let query_map = parse_query_map(&req);
+        let result = authenticate_presigned_v4(&req, &query_map).await;
+        assert!(result.is_ok(), "presigned URL for a bucket the access key IS registered for must still succeed: {:?}", result.err());
+        assert_eq!(result.unwrap().bucket, "bucket-a");
+
+        invalidate_s3_credential_cache(access_key);
+        std::env::remove_var("VITALITY_CONSOLE_URL");
+        std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
     }
 }

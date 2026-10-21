@@ -406,9 +406,21 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
     let db = MetadataService::new(&user_id)?;
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
+    // web::block: `Storage::write` now does a real (group-committed) fsync
+    // -- see `storage::group_commit`'s module doc -- so this has to go
+    // through `web::block` the same way `object.rs`'s PUT handler does;
+    // calling it directly here would block this actix worker's whole
+    // event loop for the fsync's duration.
     let store = StorageConfig::from_env().create_store();
-    let (offset, size) = store.write(&user_id, &bucket, &form.file_bytes)
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let user_id_owned = user_id.clone();
+    let bucket_owned = bucket.clone();
+    let file_bytes = form.file_bytes.clone();
+    let (offset, size) = web::block(move || {
+        store.write(&user_id_owned, &bucket_owned, &file_bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
 
     let etag = md5_etag(&form.file_bytes);
     let content_type = f.get("content-type").cloned();

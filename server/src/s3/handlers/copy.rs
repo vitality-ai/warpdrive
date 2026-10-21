@@ -101,7 +101,17 @@ pub async fn s3_copy_object_handler(
 
     let storage_service = StorageService::new();
     let src_data = storage_service.read_object(&src_context, &src_meta.to_offset_size_list(), StorageMode::S3)?;
-    let new_offset_size_list = storage_service.write_object(&dst_context, &src_data, StorageMode::S3)?;
+    // web::block: `write_object` now does a real group-committed fsync --
+    // see `storage::group_commit`'s module doc -- so this has to go
+    // through `web::block` the same way `object.rs`'s PUT handler does.
+    let dst_context_c = dst_context.clone();
+    let src_data_c = src_data.clone();
+    let new_offset_size_list = web::block(move || {
+        StorageService::new().write_object(&dst_context_c, &src_data_c, StorageMode::S3).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
 
     let directive = req.headers().get("x-amz-metadata-directive")
         .and_then(|v| v.to_str().ok())

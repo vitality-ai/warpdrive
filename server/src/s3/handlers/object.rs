@@ -404,7 +404,8 @@ pub async fn s3_get_object_handler(
         // bucket's — a private bucket can still have an individually public-read object.
         // Checked *before* bucket/key existence so a nonexistent bucket/object doesn't
         // leak via a 404 — anonymous requests get a flat 403, same as real S3.
-        let readable = match db.get_object_acl(&bucket, &key, "") {
+        let acl_version_id = super::acl::resolve_effective_acl_version_id(&db, &bucket, &key, &req);
+        let readable = match db.get_object_acl(&bucket, &key, &acl_version_id) {
             Ok(Some((_, grants_json))) => is_publicly_readable(&grants_from_json(&grants_json)),
             _ => false,
         };
@@ -640,7 +641,8 @@ pub async fn s3_head_object_handler(
     let db = MetadataService::new(&owner_id)?;
 
     if auth_result.is_anonymous {
-        let readable = match db.get_object_acl(&bucket, &key, "") {
+        let acl_version_id = super::acl::resolve_effective_acl_version_id(&db, &bucket, &key, &req);
+        let readable = match db.get_object_acl(&bucket, &key, &acl_version_id) {
             Ok(Some((_, grants_json))) => is_publicly_readable(&grants_from_json(&grants_json)),
             _ => false,
         };

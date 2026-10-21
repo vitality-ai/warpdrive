@@ -334,7 +334,14 @@ fn check_block_public_acls(db: &crate::service::metadata_service::MetadataServic
 // Bucket ACL  GET/PUT /s3/{bucket}?acl
 // ---------------------------------------------------------------------------
 
-pub(super) async fn s3_get_bucket_acl_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+/// Shared GET implementation for both bucket- and object-level ACLs --
+/// `key: None` is the bucket-level call, `key: Some(..)` the object-level
+/// one, the only real difference between what used to be two near-twin
+/// functions (existence check + version resolution only apply when a key
+/// is present; which `MetadataService` getter to call differs; everything
+/// else -- auth, bucket validation, the private-ACL fallback, XML
+/// rendering -- was identical).
+async fn get_acl_response(bucket: &str, key: Option<&str>, req: &HttpRequest) -> Result<HttpResponse, Error> {
     use crate::s3::auth::authenticate_s3_request;
     use crate::service::metadata_service::MetadataService;
 
@@ -342,22 +349,45 @@ pub(super) async fn s3_get_bucket_acl_inner(bucket: &str, req: &HttpRequest) -> 
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
 
-    let (owner_id, grants) = match db.get_bucket_acl(bucket) {
-        Ok(Some((owner_id, grants_json))) => (owner_id, grants_from_json(&grants_json)),
-        _ => (auth_result.user_id.clone(), expand_canned("private", &auth_result.user_id, &auth_result.owner_display_name).unwrap_or_default()),
+    let (owner_id, grants) = if let Some(key) = key {
+        if !db.check_key(bucket, key)? {
+            return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                               "The specified key does not exist.", &format!("/{}/{}", bucket, key)));
+        }
+        let version_id = resolve_effective_acl_version_id(&db, bucket, key, req);
+        match db.get_object_acl(bucket, key, &version_id) {
+            Ok(Some((owner_id, grants_json))) => (owner_id, grants_from_json(&grants_json)),
+            _ => (auth_result.user_id.clone(), expand_canned("private", &auth_result.user_id, &auth_result.owner_display_name).unwrap_or_default()),
+        }
+    } else {
+        match db.get_bucket_acl(bucket) {
+            Ok(Some((owner_id, grants_json))) => (owner_id, grants_from_json(&grants_json)),
+            _ => (auth_result.user_id.clone(), expand_canned("private", &auth_result.user_id, &auth_result.owner_display_name).unwrap_or_default()),
+        }
     };
     let owner_display = if owner_id == auth_result.user_id { auth_result.owner_display_name.clone() } else { owner_id.clone() };
     let xml = grants_to_xml(&owner_id, &owner_display, &grants);
     Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
 }
 
-pub(super) async fn s3_put_bucket_acl_inner(bucket: &str, body: &[u8], req: &HttpRequest) -> Result<HttpResponse, Error> {
+/// Shared PUT implementation, same bucket-vs-object split as `get_acl_response`.
+async fn put_acl_response(bucket: &str, key: Option<&str>, body: &[u8], req: &HttpRequest) -> Result<HttpResponse, Error> {
     use crate::s3::auth::authenticate_s3_request;
     use crate::service::metadata_service::MetadataService;
 
     let auth_result = authenticate_s3_request(req).await?;
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
+
+    let version_id = if let Some(key) = key {
+        if !db.check_key(bucket, key)? {
+            return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                               "The specified key does not exist.", &format!("/{}/{}", bucket, key)));
+        }
+        Some(resolve_effective_acl_version_id(&db, bucket, key, req))
+    } else {
+        None
+    };
 
     let body_str = String::from_utf8_lossy(body);
     let grants = match resolve_effective_grants(req, Some(&body_str), &auth_result.user_id, &auth_result.owner_display_name) {
@@ -366,8 +396,19 @@ pub(super) async fn s3_put_bucket_acl_inner(bucket: &str, body: &[u8], req: &Htt
     };
     if let Err(resp) = check_block_public_acls(&db, bucket, &grants) { return Ok(resp); }
 
-    db.set_bucket_acl(bucket, &auth_result.user_id, &grants_to_json(&grants))?;
+    match (key, version_id) {
+        (Some(key), Some(version_id)) => db.set_object_acl(bucket, key, &version_id, &auth_result.user_id, &grants_to_json(&grants))?,
+        _ => db.set_bucket_acl(bucket, &auth_result.user_id, &grants_to_json(&grants))?,
+    }
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+}
+
+pub(super) async fn s3_get_bucket_acl_inner(bucket: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    get_acl_response(bucket, None, req).await
+}
+
+pub(super) async fn s3_put_bucket_acl_inner(bucket: &str, body: &[u8], req: &HttpRequest) -> Result<HttpResponse, Error> {
+    put_acl_response(bucket, None, body, req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +424,7 @@ pub(super) async fn s3_put_bucket_acl_inner(bucket: &str, body: &[u8], req: &Htt
 /// (`test_versioned_object_acl_no_version_specified`: PUT with no
 /// VersionId, then GET with the current version's id explicitly, must see
 /// the same ACL).
-fn resolve_effective_acl_version_id(db: &crate::service::metadata_service::MetadataService, bucket: &str, key: &str, req: &HttpRequest) -> String {
+pub(super) fn resolve_effective_acl_version_id(db: &crate::service::metadata_service::MetadataService, bucket: &str, key: &str, req: &HttpRequest) -> String {
     let explicit = req.query_string()
         .split('&')
         .find_map(|p| p.strip_prefix("versionId="))
@@ -399,49 +440,11 @@ fn resolve_effective_acl_version_id(db: &crate::service::metadata_service::Metad
 }
 
 pub(super) async fn s3_get_object_acl_inner(bucket: &str, key: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
-    use crate::s3::auth::authenticate_s3_request;
-    use crate::service::metadata_service::MetadataService;
-
-    let auth_result = authenticate_s3_request(req).await?;
-    let db = MetadataService::new(&auth_result.user_id)?;
-    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
-    if !db.check_key(bucket, key)? {
-        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
-                           "The specified key does not exist.", &format!("/{}/{}", bucket, key)));
-    }
-    let version_id = resolve_effective_acl_version_id(&db, bucket, key, req);
-
-    let (owner_id, grants) = match db.get_object_acl(bucket, key, &version_id) {
-        Ok(Some((owner_id, grants_json))) => (owner_id, grants_from_json(&grants_json)),
-        _ => (auth_result.user_id.clone(), expand_canned("private", &auth_result.user_id, &auth_result.owner_display_name).unwrap_or_default()),
-    };
-    let owner_display = if owner_id == auth_result.user_id { auth_result.owner_display_name.clone() } else { owner_id.clone() };
-    let xml = grants_to_xml(&owner_id, &owner_display, &grants);
-    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+    get_acl_response(bucket, Some(key), req).await
 }
 
 pub(super) async fn s3_put_object_acl_inner(bucket: &str, key: &str, body: &[u8], req: &HttpRequest) -> Result<HttpResponse, Error> {
-    use crate::s3::auth::authenticate_s3_request;
-    use crate::service::metadata_service::MetadataService;
-
-    let auth_result = authenticate_s3_request(req).await?;
-    let db = MetadataService::new(&auth_result.user_id)?;
-    if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
-    if !db.check_key(bucket, key)? {
-        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
-                           "The specified key does not exist.", &format!("/{}/{}", bucket, key)));
-    }
-    let version_id = resolve_effective_acl_version_id(&db, bucket, key, req);
-
-    let body_str = String::from_utf8_lossy(body);
-    let grants = match resolve_effective_grants(req, Some(&body_str), &auth_result.user_id, &auth_result.owner_display_name) {
-        Ok(g) => g,
-        Err(resp) => return Ok(resp),
-    };
-    if let Err(resp) = check_block_public_acls(&db, bucket, &grants) { return Ok(resp); }
-
-    db.set_object_acl(bucket, key, &version_id, &auth_result.user_id, &grants_to_json(&grants))?;
-    Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+    put_acl_response(bucket, Some(key), body, req).await
 }
 
 // ---------------------------------------------------------------------------
