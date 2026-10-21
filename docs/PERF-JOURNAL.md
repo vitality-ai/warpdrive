@@ -505,3 +505,94 @@ measured ceiling by roughly **2.1x-2.6x** with that durability turned on
 honest win on the comparison that was the actual point. Shipped as the
 final fsync design -- the previously-stashed naive per-write version is
 superseded, not used.
+
+## 2026-10-21 (later) — Re-run on upgraded hardware: local SSD removes MinIO's disk ceiling
+
+Re-ran the same head-to-head on better hardware, to check whether the e2-small/
+pd-standard ceiling (320-395 obj/s for MinIO) was really MinIO's limit or just
+that disk's limit. Account has a hard **12 vCPU global cap across all regions
+combined** (separate from the much higher per-region quota, which doesn't
+bind) -- ruled out the originally-planned `n2-standard-4 x 6` (24 vCPU).
+`n2-standard-2` (2 vCPU/8GB, dedicated not burstable) x 6 fits exactly, kept
+local SSD (375GB NVMe, replacing `pd-standard`) on all 5 storage nodes. Also
+hit regional stockouts for n2 + local SSD in every `us-central1` zone; fleet
+now lives in `us-east1-c` instead. Binaries (`warp_drive`, `minio_bin`)
+carried over from the old fleet node-to-node via SSH pipe (`cat | ssh ... cat
+>`), never touching local disk, since they were already verified-identical
+from the prior group-commit session -- no rebuild needed.
+
+**MinIO (distributed, 5 nodes, same CRC-fsync'd durability as before):**
+```
+concurrency=64:   1025.5 obj/s   (was ~394.6 on e2-small/pd-standard)
+concurrency=128:  1311.7 obj/s   (was ~323.7)
+concurrency=640:  1601.7 obj/s   (was ~380.2)
+```
+Confirms the earlier `vmstat` finding directly: MinIO was never CPU-bound on
+this hardware, it was disk-bound. Local SSD alone is a 2.6-4.2x jump with the
+exact same server binary and exact same durability guarantees.
+
+**WarpDrive (group-commit binary, same one verified in the previous session,
+unchanged):**
+```
+single coordinator, concurrency=64:   1183.7 req/s   (was 241.4)
+single coordinator, concurrency=256:  1326.7 req/s   (was 251.7)
+5-way spread (128 each, 640 total):   4742.8 req/s   (was 837.4)
+  per-node: 551.3 / 900.0 / 1070.0 / 1108.0 / 1113.5
+```
+Zero errors across every run, both tools.
+
+**Bottom line:** WarpDrive's lead over MinIO is *larger* on better hardware,
+not smaller: 4742.8 vs MinIO's best observed (1601.7 at concurrency=640) is
+**~3.0x**; against MinIO's concurrency-matched 128 result (1311.7) it's
+**~3.6x** -- both ahead of the ~2.1-2.6x measured on e2-small/pd-standard.
+Node-0's spread number (551.3) lags the other four (~1070-1114) -- the
+bench client is itself only `n2-standard-2` (2 vCPU) running all 5 generator
+processes at once, so this is very likely client-side CPU contention between
+the 5 concurrent `load_gen_auth` processes, not a server-side asymmetry; not
+dug into further since it doesn't change which side of the comparison it
+favors.
+
+## 2026-10-21 (later still) — Same-client-harness redo: patched `warp` for both sides
+
+User pushed back hard, correctly, on the previous comparison: MinIO was
+driven by `warp` (Go, MinIO's own tool) and WarpDrive by `load_gen_auth` (a
+custom Rust/SigV4 tool) -- two different HTTP clients, connection pools, and
+measurement methods, not just two different servers. Fixing this properly
+turned out to require more than picking one tool, because `warp` cannot
+address WarpDrive's real distributed path at all: `main.rs` mounts root
+`/{bucket}/{key}` to the **single-node** handlers (no erasure coding, no
+fan-out, no quorum) regardless of cluster mode -- the actual distributed path
+only exists at `/cluster/s3/{bucket}/{key}`. `warp`/minio-go has no concept
+of a path-prefixed endpoint (`isValidEndpointURL` in minio-go explicitly
+rejects any path on the endpoint: "Endpoint url cannot have fully qualified
+paths."), so pointing `warp` at WarpDrive's root would have silently
+benchmarked the wrong code path -- a worse bug than the mismatched-client
+problem it would have "fixed".
+
+Patched minio-go (vendored into a writable local copy, `replace` directive
+in warp's go.mod, no changes to WarpDrive itself): `isValidEndpointURL` no
+longer rejects a path component, and `makeTargetURL` splices
+`c.endpointURL.Path` in front of the bucket/key path when building the
+request URL. ~10 lines total. SigV4 signing needed no separate fix -- the
+signer signs whatever path ends up in the actual outgoing request, and
+WarpDrive's `authenticate_s3_request` verifies against the same real
+request path, so the two agree automatically. Verified against both a
+first boto3-based prototype harness (ruled out `load_gen_auth` the same
+way, for the same reason) and the final patched-`warp` runs below --
+zero errors on either server, either tool.
+
+**Same binary, same flags, only `--host` differs (MinIO: `ip:9000`,
+WarpDrive: `ip:9710/cluster/s3`):**
+```
+                                MinIO          WarpDrive       ratio
+single node, concurrency=64:   672.7 obj/s    1160.2 req/s    1.72x
+single node, concurrency=256:  752.0 obj/s    1110.3 req/s    1.48x
+5-way spread (128 each, agg):  1513.7 obj/s   4544.0 req/s    3.00x
+```
+
+The ratio is smaller at a single node (1.5-1.7x -- both systems still do
+real cross-node erasure-coding fan-out regardless of which node the client's
+request lands on) and grows to ~3x once the full 5-node cluster is actually
+in play on both sides. This is now the number to use going forward: it
+isolates the actual server comparison from any client-harness difference,
+which the earlier `load_gen_auth`-vs-`warp` numbers did not.
