@@ -557,7 +557,7 @@
         <a href="#motivation">Why Warpdrive</a>
         <a href="#install">Install</a>
         <a href="#compat">Integrations</a>
-        <a href="characterization/neon_tpcc_results.html">Neon Characterization</a>
+        <a href="#workloads">Workloads</a>
         <a href="#distributed">Distributed Engine</a>
         <a href="#research">Research</a>
         <button id="theme-toggle" aria-label="Toggle theme">
@@ -799,6 +799,51 @@ EOF</pre>
       <p style="margin-top:20px;font-size:12px;color:var(--muted)">
         In pipeline: LangGraph · LlamaIndex · Ray · PyTorch Lightning
       </p>
+    </section>
+
+    <!-- workloads -->
+    <section id="workloads">
+      <h2>Workloads</h2>
+      <p class="section-sub">Measured against real engines running their own real workloads, OLTP and OLAP alike, not synthetic microbenchmarks.</p>
+
+      <h3 style="font-size:15px;font-weight:600;margin-bottom:14px">OLTP &middot; Neon, serverless Postgres</h3>
+      <div class="bench-grid">
+        <div class="bench-card">
+          <div class="bench-label">TPS at 16 tenants, cold start</div>
+          <div class="bench-value">10x<span class="bench-unit">with co-located slabs</span></div>
+          <div class="bench-sub">4.1 → 41.8 TPS</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">Cold-start GETs at 16 tenants</div>
+          <div class="bench-value">11x<span class="bench-unit">fewer</span></div>
+          <div class="bench-sub">2,981 → 231 GETs</div>
+        </div>
+      </div>
+      <a class="btn-outline" href="characterization/neon_tpcc_results.html" style="margin-top:16px;margin-bottom:36px">
+        Full OLTP results with charts →
+      </a>
+
+      <h3 style="font-size:15px;font-weight:600;margin-bottom:14px">OLAP &middot; DuckDB TPC-H &amp; Lance vector search</h3>
+      <div class="bench-grid">
+        <div class="bench-card">
+          <div class="bench-label">TPC-H Q6 (selective)</div>
+          <div class="bench-value">149x<span class="bench-unit">faster</span></div>
+          <div class="bench-sub">7756.6ms → 51.9ms</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">Lance <code>take</code> latency</div>
+          <div class="bench-value">up to 41x<span class="bench-unit">faster</span></div>
+          <div class="bench-sub">row-batch packing</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">SIFT1M-small recall@10</div>
+          <div class="bench-value">identical<span class="bench-unit">plain vs packed</span></div>
+          <div class="bench-sub">every nprobe level</div>
+        </div>
+      </div>
+      <a class="btn-outline" href="characterization/v1.0.0-results.html" style="margin-top:16px">
+        Full OLAP results with charts →
+      </a>
     </section>
 
     <!-- distributed engine -->
