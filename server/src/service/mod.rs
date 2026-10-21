@@ -80,9 +80,24 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     info!("Total received data size: {} bytes", bytes.len());
 
-    // Write incoming FlatBuffers payload to storage and collect (offset, size)
-    let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &bytes, StorageMode::Native)?;
+    // Write incoming FlatBuffers payload to storage and collect (offset, size).
+    // `Storage::write` now does a real (group-committed) fsync -- see
+    // `storage::group_commit`'s module doc -- so this has to go through
+    // `web::block` the same way `s3/handlers/object.rs`'s PUT already
+    // does: calling it directly here would block this actix worker's
+    // whole event loop for the fsync's duration, which also starves
+    // group commit of the concurrent callers it needs to batch well.
+    // This route doubles as the cluster's HTTP shard-transport endpoint
+    // (see `peer_client.rs::HttpPeerClient::put_shard`), so it's on the
+    // same hot path the cluster PUT benchmark measured.
+    let ctx = context.clone();
+    let buf = bytes.to_vec();
+    let offset_size_list = web::block(move || {
+        StorageService::new().write_object(&ctx, &buf, StorageMode::Native).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(ErrorInternalServerError)?;
 
 
     if offset_size_list.is_empty()  {

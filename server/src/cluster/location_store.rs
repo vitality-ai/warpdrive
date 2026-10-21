@@ -18,10 +18,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
+use crate::storage::durable_log::DurableAppendLog;
 
 /// Sentinel `user_id` for every request that arrives with no authenticated
 /// identity -- which today is *every* request on the bare, pre-Phase-3
@@ -165,7 +166,10 @@ fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
 /// scan instead of a full-table scan.
 pub struct BitcaskLocationStore {
     log_path: PathBuf,
-    log_file: RwLock<File>,
+    /// Owns the file, the dup'd sync-only handle, and the group-commit
+    /// batching needed to make an append durable without paying one
+    /// fsync per write -- see `storage::durable_log`'s module doc.
+    log: DurableAppendLog,
     index: RwLock<BTreeMap<String, LocationRecord>>,
     /// #155: `log_file` and `index` are two *separate* locks, so without
     /// this, two concurrent writers (e.g. a replicated PUT and a
@@ -220,10 +224,10 @@ impl BitcaskLocationStore {
             }
         }
 
-        let log_file = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let log = DurableAppendLog::open(&log_path)?;
         Ok(Self {
             log_path,
-            log_file: RwLock::new(log_file),
+            log,
             index: RwLock::new(index),
             write_lock: parking_lot::Mutex::new(()),
         })
@@ -231,12 +235,6 @@ impl BitcaskLocationStore {
 
     pub fn path(&self) -> &Path {
         &self.log_path
-    }
-
-    fn append_line(&self, line: &str) -> io::Result<()> {
-        let mut f = self.log_file.write();
-        writeln!(f, "{line}")?;
-        f.flush()
     }
 }
 
@@ -247,11 +245,16 @@ impl LocationStore for BitcaskLocationStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // #155: held across both the append and the index update, so a
         // concurrent put/delete for the same key can never apply to the
-        // log and the index in different orders.
-        let _write_guard = self.write_lock.lock();
-        self.append_line(&line)?;
-        self.index.write().insert(rk, record);
-        Ok(())
+        // log and the index in different orders. Released before the
+        // durability wait below, so it never serializes group commit's
+        // whole point (batching many callers' fsyncs) behind one lock.
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().insert(rk, record);
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord> {
@@ -262,10 +265,13 @@ impl LocationStore for BitcaskLocationStore {
         let rk = record_key(user_id, bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<LocationRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let _write_guard = self.write_lock.lock();
-        self.append_line(&line)?;
-        self.index.write().remove(&rk);
-        Ok(())
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().remove(&rk);
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
@@ -294,7 +300,6 @@ impl LocationStore for BitcaskLocationStore {
         // compacted file.
         let _write_guard = self.write_lock.lock();
         let index = self.index.read();
-        let mut log_file = self.log_file.write();
 
         let tmp_path = self.log_path.with_extension("compact.tmp");
         {
@@ -306,12 +311,7 @@ impl LocationStore for BitcaskLocationStore {
             }
             tmp.flush()?;
         }
-        // Atomic on the same filesystem (same directory as log_path, not
-        // /tmp): a crash here leaves either the old log or the new one
-        // fully intact, never a half-written file.
-        std::fs::rename(&tmp_path, &self.log_path)?;
-        *log_file = OpenOptions::new().create(true).append(true).open(&self.log_path)?;
-        Ok(())
+        self.log.replace_with_compacted(&tmp_path, &self.log_path)
     }
 }
 
@@ -322,6 +322,7 @@ impl LocationStore for BitcaskLocationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     fn sample(bucket: &str, key: &str) -> LocationRecord {
         sample_for("u1", bucket, key)

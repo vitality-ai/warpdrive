@@ -5,6 +5,8 @@
 pub mod local_store;
 pub mod mock_store;
 pub mod config;
+pub mod group_commit;
+pub mod durable_log;
 
 use actix_web::Error;
 

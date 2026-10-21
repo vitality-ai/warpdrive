@@ -1619,10 +1619,20 @@ pub async fn cluster_internal_put_content_location(
     body: web::Json<super::content_location_store::ContentDependentRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    state
-        .content_location_store
-        .put(body.into_inner())
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    // `put` now does a real (group-committed) fsync -- see
+    // `storage::group_commit`'s module doc. Calling it directly here
+    // would block this actix worker's whole event loop for the fsync's
+    // duration, which also starves group commit of the concurrent
+    // callers it needs to batch well (measured locally: throughput fell
+    // ~99% without this). `web::block` matches what single-node's own
+    // PUT path (`s3/handlers/object.rs`) already does for the same
+    // underlying reason.
+    let store = Arc::clone(&state.content_location_store);
+    let record = body.into_inner();
+    web::block(move || store.put(record).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -1634,10 +1644,13 @@ pub async fn cluster_internal_put_location(
     body: web::Json<LocationRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    state
-        .location_store
-        .put(body.into_inner())
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    // See `cluster_internal_put_content_location`'s matching comment.
+    let store = Arc::clone(&state.location_store);
+    let record = body.into_inner();
+    web::block(move || store.put(record).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -1671,11 +1684,14 @@ pub async fn cluster_internal_delete_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
+    // See `cluster_internal_put_content_location`'s matching comment:
+    // `delete` fsyncs a tombstone append too.
+    let store = Arc::clone(&state.location_store);
     let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
-    state
-        .location_store
-        .delete(&user_id, &bucket, &key)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    web::block(move || store.delete(&user_id, &bucket, &key).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -1685,11 +1701,12 @@ pub async fn cluster_internal_delete_content_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
+    let store = Arc::clone(&state.content_location_store);
     let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
-    state
-        .content_location_store
-        .delete(&user_id, &bucket, &key)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    web::block(move || store.delete(&user_id, &bucket, &key).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 

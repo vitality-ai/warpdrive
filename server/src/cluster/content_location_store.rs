@@ -11,10 +11,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
+use crate::storage::durable_log::DurableAppendLog;
 
 /// One stripe's placement pin: which peers hold its `k+m` shards, the
 /// shared bin size (`capacity`, what every shard in this stripe is padded
@@ -211,7 +212,10 @@ fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
 /// makes `list`'s prefix lookup a bounded range scan.
 pub struct BitcaskContentLocationStore {
     log_path: PathBuf,
-    log_file: RwLock<File>,
+    /// Owns the file, the dup'd sync-only handle, and the group-commit
+    /// batching needed to make an append durable without paying one
+    /// fsync per write -- see `storage::durable_log`'s module doc.
+    log: DurableAppendLog,
     index: RwLock<BTreeMap<String, ContentDependentRecord>>,
     /// #155 — see `location_store.rs`'s matching field doc for why this
     /// is needed: without one lock held across both the log append and
@@ -261,10 +265,10 @@ impl BitcaskContentLocationStore {
             }
         }
 
-        let log_file = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let log = DurableAppendLog::open(&log_path)?;
         Ok(Self {
             log_path,
-            log_file: RwLock::new(log_file),
+            log,
             index: RwLock::new(index),
             write_lock: parking_lot::Mutex::new(()),
         })
@@ -278,15 +282,16 @@ impl ContentLocationStore for BitcaskContentLocationStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // #155: held across both the append and the index update, so a
         // concurrent put/delete for the same key can never apply to the
-        // log and the index in different orders.
-        let _write_guard = self.write_lock.lock();
-        {
-            let mut f = self.log_file.write();
-            writeln!(f, "{line}")?;
-            f.flush()?;
-        }
-        self.index.write().insert(rk, record);
-        Ok(())
+        // log and the index in different orders. Released before the
+        // durability wait below -- see `location_store.rs::put`'s
+        // matching comment for why that matters for group commit.
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().insert(rk, record);
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord> {
@@ -297,14 +302,13 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         let rk = record_key(user_id, bucket, key);
         let line = serde_json::to_string(&(rk.clone(), Option::<ContentDependentRecord>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let _write_guard = self.write_lock.lock();
-        {
-            let mut f = self.log_file.write();
-            writeln!(f, "{line}")?;
-            f.flush()?;
-        }
-        self.index.write().remove(&rk);
-        Ok(())
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().remove(&rk);
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
@@ -323,7 +327,6 @@ impl ContentLocationStore for BitcaskContentLocationStore {
         // interleave with either.
         let _write_guard = self.write_lock.lock();
         let index = self.index.read();
-        let mut log_file = self.log_file.write();
         let tmp_path = self.log_path.with_extension("compact.tmp");
         {
             let mut tmp = File::create(&tmp_path)?;
@@ -334,15 +337,14 @@ impl ContentLocationStore for BitcaskContentLocationStore {
             }
             tmp.flush()?;
         }
-        std::fs::rename(&tmp_path, &self.log_path)?;
-        *log_file = OpenOptions::new().create(true).append(true).open(&self.log_path)?;
-        Ok(())
+        self.log.replace_with_compacted(&tmp_path, &self.log_path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     fn sample(bucket: &str, key: &str) -> ContentDependentRecord {
         sample_for("u1", bucket, key)

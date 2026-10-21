@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use lazy_static::lazy_static;
+use crate::storage::group_commit::GroupCommit;
 
 // Per-(user, bucket) next-write-offset, so concurrent writes to DIFFERENT
 // buckets never block each other, and concurrent writes to the SAME bucket
@@ -83,6 +84,22 @@ fn cached_file(user_id: &str, bucket: &str, file_path: &PathBuf) -> io::Result<A
     Ok(Arc::clone(
         map.entry(key).or_insert_with(|| Arc::new(file)),
     ))
+}
+
+// One `GroupCommit` per (user, bucket) -- a fsync on one bucket's file
+// says nothing about another bucket's durability, so each needs its own
+// batching domain, same granularity as `NEXT_OFFSET`/`OPEN_FILES` above.
+// See `storage::group_commit`'s module doc for why this batches many
+// concurrent writers' fsyncs into far fewer real syscalls without ever
+// acknowledging a write before it's actually durable.
+lazy_static! {
+    static ref GROUP_COMMITS: Mutex<HashMap<String, Arc<GroupCommit>>> = Mutex::new(HashMap::new());
+}
+
+fn group_commit_for(user_id: &str, bucket: &str) -> Arc<GroupCommit> {
+    let key = format!("{user_id}/{bucket}");
+    let mut map = GROUP_COMMITS.lock();
+    Arc::clone(map.entry(key).or_insert_with(|| Arc::new(GroupCommit::new())))
 }
 
 fn get_storage_directory() -> PathBuf {
@@ -155,6 +172,25 @@ impl Storage for LocalXFSBinaryStore {
         // `write_all_at` loops until every byte lands or a real error
         // occurs, matching what the caller already assumes happened.
         file.write_all_at(data, offset)
+            .map_err(ErrorInternalServerError)?;
+
+        // Durability (see docs/PERF-JOURNAL.md, 2026-10-21): without this,
+        // a write was only as durable as the OS page cache -- acknowledged
+        // to the client with no guarantee it would survive a crash before
+        // an unrelated future writeback happened to flush it. A naive
+        // `file.sync_data()` here was measured to cost 82-89% of
+        // throughput under load, enough to fall below the very baseline
+        // (MinIO) this project is being compared against -- the wrong
+        // tradeoff. `group_commit_for` batches many concurrent writers
+        // (even to different offsets in the *same* bucket file, which
+        // this trait's whole design supports lock-free) behind far fewer
+        // real fsync calls; see `storage::group_commit`'s module doc for
+        // why this never acknowledges a write before it is actually
+        // durable, unlike a fixed-interval timer-based flush would.
+        let group_commit = group_commit_for(user_id, bucket);
+        let ticket = group_commit.ticket();
+        group_commit
+            .wait_for_durable(ticket, &*file)
             .map_err(ErrorInternalServerError)?;
 
         debug!("Wrote data for user {} bucket {} at offset {} with size {}",

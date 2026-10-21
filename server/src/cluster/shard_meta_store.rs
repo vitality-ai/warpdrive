@@ -17,10 +17,11 @@
 //! cluster-only store, same as `location_store.rs`.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
+use crate::storage::durable_log::DurableAppendLog;
 
 pub trait ShardMetaStore: Send + Sync {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()>;
@@ -59,7 +60,10 @@ pub trait ShardMetaStore: Send + Sync {
 /// content in `shard_key` as a matter of course.
 pub struct BitcaskShardMetaStore {
     log_path: PathBuf,
-    log_file: RwLock<File>,
+    /// Owns the file, the dup'd sync-only handle, and the group-commit
+    /// batching needed to make an append durable without paying one
+    /// fsync per write -- see `storage::durable_log`'s module doc.
+    log: DurableAppendLog,
     index: RwLock<HashMap<String, (u64, u64)>>,
     /// #155 — see `location_store.rs`'s matching field doc: without one
     /// lock held across both the log append and the index update, a
@@ -111,10 +115,10 @@ impl BitcaskShardMetaStore {
             }
         }
 
-        let log_file = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let log = DurableAppendLog::open(&log_path)?;
         Ok(Self {
             log_path,
-            log_file: RwLock::new(log_file),
+            log,
             index: RwLock::new(index),
             write_lock: parking_lot::Mutex::new(()),
         })
@@ -131,15 +135,16 @@ impl ShardMetaStore for BitcaskShardMetaStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // #155: held across both the append and the index update, so a
         // concurrent put/delete for the same shard key can never apply to
-        // the log and the index in different orders.
-        let _write_guard = self.write_lock.lock();
-        {
-            let mut f = self.log_file.write();
-            writeln!(f, "{line}")?;
-            f.flush()?;
-        }
-        self.index.write().insert(shard_key.to_string(), (offset, size));
-        Ok(())
+        // the log and the index in different orders. Released before the
+        // durability wait below -- see `location_store.rs::put`'s
+        // matching comment for why that matters for group commit.
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().insert(shard_key.to_string(), (offset, size));
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn get(&self, shard_key: &str) -> Option<(u64, u64)> {
@@ -149,14 +154,13 @@ impl ShardMetaStore for BitcaskShardMetaStore {
     fn delete(&self, shard_key: &str) -> io::Result<()> {
         let line = serde_json::to_string(&(shard_key, Option::<(u64, u64)>::None))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let _write_guard = self.write_lock.lock();
-        {
-            let mut f = self.log_file.write();
-            writeln!(f, "{line}")?;
-            f.flush()?;
-        }
-        self.index.write().remove(shard_key);
-        Ok(())
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().remove(shard_key);
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn compact(&self) -> io::Result<()> {
@@ -164,7 +168,6 @@ impl ShardMetaStore for BitcaskShardMetaStore {
         // interleave with either.
         let _write_guard = self.write_lock.lock();
         let index = self.index.read();
-        let mut log_file = self.log_file.write();
         let tmp_path = self.log_path.with_extension("compact.tmp");
         {
             let mut tmp = File::create(&tmp_path)?;
@@ -175,15 +178,14 @@ impl ShardMetaStore for BitcaskShardMetaStore {
             }
             tmp.flush()?;
         }
-        std::fs::rename(&tmp_path, &self.log_path)?;
-        *log_file = OpenOptions::new().create(true).append(true).open(&self.log_path)?;
-        Ok(())
+        self.log.replace_with_compacted(&tmp_path, &self.log_path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     #[test]
     fn put_then_get_round_trips() {

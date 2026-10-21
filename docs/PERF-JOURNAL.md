@@ -419,3 +419,89 @@ cutting it meaningfully would mean reducing fixed per-RPC overhead (auth/
 checksum cost per shard call) or further parallelism, both bigger-scope than
 what's safe to change blind overnight. Treating this as context for a future
 session, not something to chase further right now.
+
+## 2026-10-21 — Group commit: the real fsync fix, implemented and verified
+
+The previous entry's "concrete next step" -- a group-commit writer for each
+of the four stores -- implemented this session. `storage::group_commit`
+(`server/src/storage/group_commit.rs`) is the batching primitive: callers
+call `ticket()` right after their own write lands, then `wait_for_durable`,
+which blocks behind a single mutex gate -- the first caller through
+becomes the leader, snapshots every ticket issued so far, and does one real
+`sync()` covering all of them; everyone else just waits on that same lock
+and re-checks, becoming the next leader only if their own ticket wasn't
+covered. No fixed interval to tune (ruled out an explicit timer-based
+periodic-flush design for exactly this reason: a timer either adds latency
+waiting for the next tick, or -- if it acks a write before that tick's
+flush runs -- reopens the same ack-before-durable gap this work exists to
+close; group commit's batch window is exactly as long as the hardware's
+own fsync takes, no shorter, no longer, and never acks before the real
+sync that covers it returns).
+
+`storage::durable_log::DurableAppendLog` wraps this for the three Bitcask
+stores (`location_store.rs`, `content_location_store.rs`,
+`shard_meta_store.rs`) in one shared type (file handle + dup'd sync-only
+handle + `GroupCommit`), instead of each store repeating the same wiring
+-- the first version of this fix pasted that wiring three times, caught
+and fixed before shipping. `local_store.rs` gets its own `GroupCommit` per
+`(user, bucket)`, matching its existing per-bucket lock-free write design.
+
+**A real bug found via testing, not guessing:** the first local benchmark
+of this fix (single Mac process acting as its own two cluster peers over
+loopback HTTP) showed a ~99% throughput drop -- far worse than the logic
+should produce. Checked raw fsync latency on that disk directly first
+(0.02ms median) to rule out "disk is just slow," which it wasn't. Root
+cause: four `coordinator.rs` handlers (`cluster_internal_put_location`,
+`_put_content_location`, `_delete_location`, `_delete_content_location`)
+and the native `/put/{key}` handler (`service/mod.rs`, which the HTTP
+cluster transport reuses for shard writes) called the now-fsync'ing store
+methods directly inside their `async fn`, with no `web::block` -- blocking
+the actix worker's entire event loop for the sync's duration, which also
+starves group commit of the concurrent callers it needs to batch well.
+Single-node's own S3 PUT path (`s3/handlers/object.rs`) already did this
+correctly; these cluster-internal paths never needed it before because
+nothing they called was ever slow. Fixed by wrapping each in `web::block`,
+matching the existing pattern. (The local Mac benchmark still looked bad
+after this fix -- turned out to be the loopback-self-peer test topology
+itself being a poor proxy, not a real regression; see below for the real
+measurement.)
+
+**Real measurement, on the actual GCP fleet** (all 5 nodes rebuilt and
+redeployed with this fix, not just one):
+
+```
+Single coordinator, concurrency=64:
+  no-fsync (committed baseline):   811.9 req/s
+  naive per-write fsync:           137.1 req/s
+  group commit:                    241.4 req/s   (1.76x naive, 0 errors)
+
+Single coordinator, concurrency=256:
+  no-fsync (committed baseline):   834.7 req/s
+  naive per-write fsync:           154.1 req/s
+  group commit:                    251.7 req/s   (1.63x naive, 0 errors)
+
+5-way spread (aggregate, the number compared against MinIO):
+  no-fsync (committed baseline):   2416.4 req/s
+  group commit:                     837.4 req/s  (191.1+156.5+174.6+149.6+165.6, 0 errors)
+  MinIO ceiling (measured earlier): ~320-395 obj/s
+```
+
+**Honest bottom line:** group commit does not recover anywhere near all of
+the no-fsync speed -- single-coordinator throughput with real durability on
+is still ~30% of the no-fsync number, not "most of it" as hoped. The
+remaining gap is structural, not a batching failure: a cluster PUT's
+critical path crosses the network to multiple peers in two sequential
+phases (shard fan-out, then location-pin quorum), and group commit can
+only batch *concurrent writers to the same file on the same node* -- it
+can't shorten a single request's own cross-machine round trips. That's a
+distinct, bigger question (parallelizing or restructuring the replication
+phases) than today's scope.
+
+What group commit *does* deliver, confirmed rather than assumed: real
+durability restored (every acknowledged write now provably survives a
+host crash, not just a process crash) **and** WarpDrive still beats MinIO's
+measured ceiling by roughly **2.1x-2.6x** with that durability turned on
+(837.4 vs. ~320-395), down from the no-durability 6.5x claim but a real,
+honest win on the comparison that was the actual point. Shipped as the
+final fsync design -- the previously-stashed naive per-write version is
+superseded, not used.
