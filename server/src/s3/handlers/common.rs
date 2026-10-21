@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use crate::service::metadata_service::MetadataService;
 
-pub(super) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 pub(super) const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Empty body that reports a custom Content-Length for HEAD responses.
@@ -59,7 +59,7 @@ pub(super) fn xml_unescape(s: &str) -> String {
 }
 
 /// Encode a stored metadata value as a HeaderValue for HTTP responses.
-pub(super) fn metadata_value_header(v: &str) -> actix_web::http::header::HeaderValue {
+pub(crate) fn metadata_value_header(v: &str) -> actix_web::http::header::HeaderValue {
     let bytes: Vec<u8> = v.chars()
         .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
         .collect();
@@ -81,7 +81,7 @@ pub(super) fn s3_url_encode(s: &str) -> String {
 }
 
 /// Build an S3-spec XML error response.
-pub(super) fn s3_error(status: StatusCode, code: &str, message: &str, resource: &str) -> HttpResponse {
+pub(crate) fn s3_error(status: StatusCode, code: &str, message: &str, resource: &str) -> HttpResponse {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <Error>\n\
@@ -109,6 +109,18 @@ pub(super) fn require_bucket(db: &MetadataService, bucket: &str) -> Result<(), H
         Err(_)    => Err(s3_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalError",
                                   "Internal server error", bucket)),
     }
+}
+
+/// If `x-amz-expected-bucket-owner` is present, reject with 403 unless it matches the
+/// bucket's actual owner. AWS enforces this independently of ACL/permission grants —
+/// notably it still applies to a publicly-readable/writable bucket.
+pub(super) fn check_expected_bucket_owner(req: &HttpRequest, actual_owner: &str, resource: &str) -> Result<(), HttpResponse> {
+    if let Some(expected) = req.headers().get("x-amz-expected-bucket-owner").and_then(|v| v.to_str().ok()) {
+        if expected != actual_owner {
+            return Err(s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", resource));
+        }
+    }
+    Ok(())
 }
 
 /// Split extent list into ≤ S3_GET_STREAM_CHUNK slices for streaming.
@@ -206,7 +218,7 @@ pub(super) fn range_slices(chunks: &[(u64, u64)], range_start: u64, range_end: u
 
 /// Returns the current timestamp as the canonical last_modified string stored in metadata
 /// and emitted in S3 XML bodies. Format: ISO 8601 (`2026-07-01T12:00:00.000Z`).
-pub(super) fn last_modified_now() -> String {
+pub(crate) fn last_modified_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string()
 }
 
@@ -218,26 +230,26 @@ pub(super) fn last_modified_for_header(s: &str) -> String {
 }
 
 /// Compute MD5 ETag (double-quoted) from accumulated bytes.
-pub(super) fn md5_etag(data: &[u8]) -> String {
+pub(crate) fn md5_etag(data: &[u8]) -> String {
     format!("\"{}\"", hex::encode(md5::compute(data).0))
 }
 
 /// Strip surrounding double quotes from an ETag for comparison.
 #[inline]
-pub(super) fn normalize_etag(etag: &str) -> &str {
+pub(crate) fn normalize_etag(etag: &str) -> &str {
     etag.trim().trim_matches('"')
 }
 
 /// Return a 412 PreconditionFailed S3 error response.
 #[inline]
-pub(super) fn s3_precondition_failed(resource: &str) -> HttpResponse {
+pub(crate) fn s3_precondition_failed(resource: &str) -> HttpResponse {
     s3_error(StatusCode::PRECONDITION_FAILED, "PreconditionFailed",
              "At least one of the pre-conditions you specified did not hold",
              resource)
 }
 
 /// Extract the text content of the first occurrence of `<tag>…</tag>` in `src`.
-pub(super) fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
+pub(crate) fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
     let start = src.find(&open)? + open.len();
@@ -246,7 +258,7 @@ pub(super) fn extract_xml_tag(src: &str, tag: &str) -> Option<String> {
 }
 
 /// Extract text content of ALL occurrences of `<tag>…</tag>` in `src`.
-pub(super) fn extract_all_xml_tags(src: &str, tag: &str) -> Vec<String> {
+pub(crate) fn extract_all_xml_tags(src: &str, tag: &str) -> Vec<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
     let mut results = Vec::new();
@@ -277,7 +289,7 @@ pub(super) fn parse_http_date(s: &str) -> Option<i64> {
     None
 }
 
-pub(super) fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -297,7 +309,7 @@ pub(super) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub(super) fn req_query_map(req: &HttpRequest) -> std::collections::HashMap<String, String> {
+pub(crate) fn req_query_map(req: &HttpRequest) -> std::collections::HashMap<String, String> {
     actix_web::web::Query::<std::collections::HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner())
         .unwrap_or_default()

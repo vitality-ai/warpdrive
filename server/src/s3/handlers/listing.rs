@@ -5,14 +5,14 @@ use log::{info, warn};
 
 use std::collections::HashMap;
 
-use crate::s3::auth::authenticate_s3_request;
+use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, ADMIN_USER_ID};
 use crate::service::metadata_service::MetadataService;
 
 use super::common::*;
 use super::tagging::s3_get_bucket_tagging_inner;
 use super::versioning::{s3_get_bucket_versioning_inner, s3_list_object_versions_handler_inner};
 use super::cors::{s3_get_bucket_cors_inner, s3_get_bucket_location_inner};
-use super::acl::s3_get_bucket_acl_stub;
+use super::acl::{s3_get_bucket_acl_inner, s3_get_public_access_block_inner, s3_get_bucket_policy_status_inner, grants_from_json, is_publicly_readable};
 use super::multipart::s3_list_multipart_uploads_handler;
 use super::object_lock::s3_get_bucket_object_lock_inner;
 
@@ -53,11 +53,35 @@ pub async fn s3_list_objects_handler(
         return s3_get_bucket_object_lock_inner(&bucket, &req).await;
     }
     if query.contains_key("acl") {
-        return s3_get_bucket_acl_stub(&bucket, &req).await;
+        return s3_get_bucket_acl_inner(&bucket, &req).await;
+    }
+    if query.contains_key("publicAccessBlock") {
+        return s3_get_public_access_block_inner(&bucket, &req).await;
+    }
+    if query.contains_key("policyStatus") {
+        return s3_get_bucket_policy_status_inner(&bucket, &req).await;
     }
 
-    let auth_result = authenticate_s3_request(&req).await?;
-    let db = MetadataService::new(&auth_result.user_id)?;
+    let auth_result = authenticate_s3_request_allow_anonymous(&req).await?;
+    // Anonymous requests aren't tied to any owned bucket set — resolve against the
+    // single static admin owner (today's only possible bucket owner) so bucket
+    // existence/ACL checks work the same as an authenticated lookup would.
+    let owner_id = if auth_result.is_anonymous { ADMIN_USER_ID.to_string() } else { auth_result.user_id.clone() };
+    let owner_display = if owner_id == ADMIN_USER_ID { crate::s3::auth::admin_display_name() } else { auth_result.owner_display_name.clone() };
+    let db = MetadataService::new(&owner_id)?;
+
+    if let Err(resp) = check_expected_bucket_owner(&req, &owner_id, &bucket) { return Ok(resp); }
+
+    if auth_result.is_anonymous {
+        // Checked before bucket existence so a nonexistent bucket doesn't leak via a 404.
+        let is_public = match db.get_bucket_acl(&bucket) {
+            Ok(Some((_, grants_json))) => is_publicly_readable(&grants_from_json(&grants_json)),
+            _ => false,
+        };
+        if !is_public {
+            return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", &bucket));
+        }
+    }
 
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
@@ -103,7 +127,6 @@ pub async fn s3_list_objects_handler(
 
     let all_keys = db.list_objects(&bucket)?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
-    let owner_id = auth_result.user_id.clone();
 
     let mut contents_xml   = String::new();
     let mut prefixes_xml   = String::new();
@@ -171,8 +194,8 @@ pub async fn s3_list_objects_handler(
             let disp_key = if url_encode { s3_url_encode(key) } else { xml_escape(key) };
 
             let owner_xml = if !is_v2 || fetch_owner {
-                format!("      <Owner><ID>{id}</ID><DisplayName>{id}</DisplayName></Owner>\n",
-                        id = xml_escape(&owner_id))
+                format!("      <Owner><ID>{id}</ID><DisplayName>{dn}</DisplayName></Owner>\n",
+                        id = xml_escape(&owner_id), dn = xml_escape(&owner_display))
             } else {
                 String::new()
             };

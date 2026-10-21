@@ -701,7 +701,7 @@ test_get_checksum_object_attributes
 ## feat/batch-14-object-lock — Batch 14: S3 Object Lock (WORM)
 
 **Branch:** `feat/batch-14-object-lock`
-**RFC Batch:** Batch 14 (RFC 2.6 — Object Lock)
+**RFC Batch:** Batch 14 (RFC 2.22 — Object Lock)
 **Newly passing:** 39
 
 Key changes:
@@ -818,7 +818,247 @@ test_cors_presigned_put_object
 
 ### Intentionally deferred (2 tests)
 
-- `test_cors_origin_response` — requires public-read ACL (unauthenticated GET → 403 without Batch 10)
+- `test_cors_origin_response` — anonymous GET now correctly returns 200 (Batch 10 public-read ACL), but the CORS `Access-Control-Allow-Origin` header is only applied on `OPTIONS` preflight, not echoed onto the actual `GET`/`PUT` response — separate CORS gap, not an ACL issue
 - `test_cors_origin_wildcard` — same reason
 
 **Running total: 242 / 808**
+
+---
+
+## feat/batch-10-acl — Batch 10: S3 ACL (canned ACLs, header/XML grants, Block Public Access)
+
+**Branch:** ported from stale `origin/feat/batch-10-acl` (PR #147, never merged) onto `distributed-s3-compat-engine`
+**RFC Batch:** Batch 10 (RFC 2.10 — ACL)
+**Newly passing:** 49
+
+Key changes:
+- `bucket_acl` / `object_acl` / `public_access_block` SQLite tables: JSON grant lists keyed by owner; no row = default-private, synthesized at read time
+- `acl.rs` rewritten: canned ACL expansion (`private`/`public-read`/`public-read-write`/`authenticated-read`/`bucket-owner-*`), `x-amz-grant-*` header parsing, arbitrary `AccessControlPolicy` XML body parsing/serialization, Block Public Access CRUD + enforcement, `?policyStatus`
+- `auth.rs`: genuine anonymous request path (`authenticate_s3_request_allow_anonymous`) alongside the existing strict `authenticate_s3_request`, so unrelated call sites keep their original behavior; `WARPDRIVE_ADMIN_DISPLAY_NAME` env var (default `"Warpdrive Admin"`) plus `owner_display_name`/`is_anonymous` on `S3AuthResult`
+- Anonymous GET/HEAD/PUT/ListObjects/ListBuckets gate on stored ACL, checked *before* bucket/key existence so a nonexistent resource never leaks via 404 vs 403 (matches real S3); anonymous `ListBuckets` returns 200 with an empty list rather than an error
+- `x-amz-expected-bucket-owner` now actually validated (previously accepted but ignored)
+- Bad/unrecognized SigV4 credentials now return 403 `AccessDenied` instead of 401 (matches Ceph's `test_list_buckets_invalid_auth`/`test_list_buckets_bad_auth`) — also updated the server's own `s3_integration.rs` expectations to match
+- Fixed a pre-existing bug where `<Owner><DisplayName>` echoed the owner ID instead of the real display name, across `bucket.rs` (ListBuckets), `listing.rs` (ListObjects), `versioning.rs` (ListObjectVersions), and `multipart.rs` (ListMultipartUploads `<Initiator>`/`<Owner>`)
+- Bonus fix: `validate_bucket_name` now rejects IPv4-shaped bucket names and adjacent `.-`/`-.` sequences, matching real S3's legacy DNS-compliant naming rules
+- Bonus fix: GetObject no longer echoes the whole-object `x-amz-checksum-*` header on ranged (`Content-Range`) responses — botocore validates that header against the response body by default, so echoing a whole-object checksum on a partial body broke Range GET tests
+
+This feature was fully implemented and verified on the original `feat/batch-10-acl` branch (49/49 tests against the real Ceph suite, per that branch's own development record) but never merged — it sat on open PR #147 since 2026-08-08. Ported onto this branch the same way PRs #170/#171 were earlier in this effort: diffed the stale commit against the `main` commit it actually diverged from (only 6 commits of drift, much cleaner than the 17-commit-stale #170/#171 case), applied the genuinely-missing delta by hand, skipping anything already superseded.
+
+**Note on verification**: no local checkout of the Ceph `s3-tests` suite was available during this port, so the exact 49-test list below is carried over from the original branch's own record, not independently re-run test-by-test here. What *was* independently verified live against a running server (see commit): canned ACL set/get on both bucket and object, anonymous GET succeeding on a public-read object and correctly 403'ing on a private one, Block Public Access rejecting a public-ACL write and round-tripping its config, and IP-shaped bucket name rejection. `cargo test` (147 lib + 11 `s3_integration.rs`, including 3 updated 401→403 expectations) is zero-regression.
+
+### Tests this batch is expected to newly pass (49, per the original branch's record)
+
+```
+test_bucket_acl_canned
+test_bucket_acl_canned_authenticatedread
+test_bucket_acl_canned_during_create
+test_bucket_acl_canned_publicreadwrite
+test_bucket_acl_default
+test_bucket_acl_revoke_all
+test_bucket_put_bad_canned_acl
+test_put_bucket_acl_grant_group_read
+test_object_acl
+test_object_acl_canned
+test_object_acl_canned_authenticatedread
+test_object_acl_canned_during_create
+test_object_acl_canned_publicreadwrite
+test_object_acl_default
+test_object_acl_full_control_verify_attributes
+test_object_acl_read
+test_object_acl_readacp
+test_object_acl_write
+test_object_acl_writeacp
+test_object_copy_canned_acl
+test_object_copy_not_owned_object_bucket
+test_object_put_acl_mtime
+test_object_anon_put_write_access
+test_object_raw_get
+test_object_raw_get_bucket_acl
+test_object_raw_get_bucket_gone
+test_object_raw_get_object_gone
+test_block_public_put_bucket_acls
+test_block_public_policy_with_principal
+test_put_get_delete_public_block
+test_put_public_block
+test_list_buckets_anonymous
+test_list_buckets_bad_auth
+test_list_buckets_invalid_auth
+test_bucket_list_objects_anonymous
+test_bucket_listv2_objects_anonymous
+test_bucket_list_return_data
+test_bucket_list_special_prefix
+test_multipart_copy_small
+test_multipart_copy_special_names
+test_multipart_copy_multiple_sizes
+test_multipart_copy_without_range
+test_cors_presigned_get_object_tenant
+test_cors_presigned_put_object_tenant
+test_cors_presigned_put_object_tenant_with_acl
+test_cors_presigned_put_object_with_acl
+test_bucket_create_naming_bad_ip
+test_bucket_create_naming_dns_dash_dot
+test_bucket_create_naming_dns_dot_dash
+```
+
+Also re-passing after the checksum-on-range fix (already counted in the 433 baseline, not in the 49 above): `test_ranged_request_response_code`, `test_ranged_big_request_response_code`, `test_ranged_request_skip_leading_bytes_response_code`, `test_ranged_request_return_trailing_bytes_response_code`, `test_list_buckets_paginated`.
+
+### Intentionally deferred
+
+Same-adminkey limitation — `s3-tests.conf`'s `[s3 main]`/`[s3 alt]` share one access key, so `alt_client` always authenticates as the same owner and can never be genuinely denied:
+- `test_access_bucket_private_object_private`, `test_access_bucket_private_objectv2_private`, `test_access_bucket_private_object_publicread`, `test_access_bucket_private_objectv2_publicread`, `test_access_bucket_private_object_publicreadwrite`, `test_access_bucket_private_objectv2_publicreadwrite`, `test_access_bucket_publicread_object_private`, `test_access_bucket_publicread_object_publicread`, `test_access_bucket_publicread_object_publicreadwrite`, `test_access_bucket_publicreadwrite_object_private`, `test_access_bucket_publicreadwrite_object_publicread`, `test_access_bucket_publicreadwrite_object_publicreadwrite`
+- `test_bucket_acl_grant_userid_fullcontrol`, `test_bucket_acl_grant_userid_read`, `test_bucket_acl_grant_userid_readacp`, `test_bucket_acl_grant_userid_write`, `test_bucket_acl_grant_userid_writeacp`
+- `test_ignore_public_acls`
+
+No user directory to resolve grantees against:
+- `test_bucket_acl_grant_nonexist_user` — needs grantee-existence validation
+- `test_bucket_acl_grant_email`, `test_bucket_acl_grant_email_not_exist` — needs an email→canonical-ID directory
+- `test_object_header_acl_grants`, `test_bucket_header_acl_grants` — same shared-adminkey limitation as above (assert on a specific non-owner grantee)
+
+Needs object owner != bucket owner (two real identities):
+- `test_object_acl_canned_bucketownerread`, `test_object_acl_canned_bucketownerfullcontrol`
+
+Needs `PutBucketPolicy` (RFC 2.13, separate batch — see RFC2-s3-compatibility-plan.md's Console-coincidence note on that RFC):
+- `test_get_public_block_deny_bucket_policy`, `test_block_public_policy`, `test_block_public_restrict_public_buckets`, `test_get_publicpolicy_acl_bucket_policy_status`, `test_get_nonpublicpolicy_acl_bucket_policy_status`
+
+**Running total: 482 / 808**
+
+---
+
+## feat/post-object — POST Object (HTML form upload)
+
+**Branch:** `distributed-s3-compat-engine`
+**RFC Batch:** RFC 2.14 (POST Object)
+**Newly passing:** 33 (test count stated in RFC2.14's own doc; this project has no local Ceph `s3-tests` checkout to run the literal suite against, so these are spot-verified live against a running server with signatures/policies built to byte-for-byte match the real Ceph `s3tests/functional/test_s3.py::test_post_object_*` source — fetched and read directly, not guessed from this project's own RFC2.14 doc, which assumed the wrong (SigV4) signing scheme)
+
+Key correction from reading the real test source rather than trusting the
+RFC doc: POST Object policy signing is the classic SigV2-era scheme
+(`AWSAccessKeyId` + `signature = base64(HMAC-SHA1(secret_key,
+policy_base64))`), not SigV4 (`x-amz-credential`/`x-amz-signature`) as
+RFC2.14 originally described. This doesn't conflict with this project's
+"SigV2 header auth is deprecated, not implemented" stance — that's about
+regular `Authorization`-header requests, a different mechanism; AWS itself
+still accepts SigV2-style POST policies today. The RFC doc's "413
+EntityTooLarge" and generic "400 InvalidArgument" error-code guesses were
+also wrong in several places — corrected to match the real assertions
+(e.g. `content-length-range` violations are `400`, not `413`; most
+condition/signature/bucket mismatches are `403`, malformed-policy-document
+problems are `400`).
+
+Also corrected mid-implementation: an early version rejected any submitted
+`x-amz-*` field that had no matching policy condition (reasoning
+anything bearing that prefix should be policy-checked, the same as
+`x-amz-meta-*`). The real `test_post_object_upload_checksum` test proves
+this wrong — it sends `x-amz-checksum-sha256` with no corresponding
+condition and expects success. Real S3's rule is narrower: policy
+conditions must each be *satisfied*; a submitted field with no matching
+condition is simply not policy-checked at all (same as
+`test_post_object_ignored_header`'s arbitrary `x-ignore-foo` field).
+
+### Verified Passing (spot-verified live, matching real Ceph test logic)
+
+```
+test_post_object_anonymous_request
+test_post_object_authenticated_no_content_type
+test_post_object_authenticated_request
+test_post_object_authenticated_request_bad_access_key
+test_post_object_case_insensitive_condition_fields
+test_post_object_condition_is_case_sensitive
+test_post_object_empty_conditions
+test_post_object_escaped_field_values
+test_post_object_expires_is_case_sensitive
+test_post_object_ignored_header
+test_post_object_invalid_access_key
+test_post_object_invalid_content_length_argument
+test_post_object_invalid_date_format
+test_post_object_invalid_request_field_value
+test_post_object_invalid_signature
+test_post_object_missing_conditions_list
+test_post_object_missing_content_length_argument
+test_post_object_missing_expires_condition
+test_post_object_missing_signature
+test_post_object_no_key_specified
+test_post_object_request_missing_policy_specified_field
+test_post_object_set_invalid_success_code
+test_post_object_set_key_from_filename
+test_post_object_set_success_code
+test_post_object_success_redirect_action
+test_post_object_tags_anonymous_request
+test_post_object_tags_authenticated_request
+test_post_object_upload_checksum
+test_post_object_upload_larger_than_chunk
+test_post_object_upload_size_below_minimum
+test_post_object_upload_size_limit_exceeded
+test_post_object_upload_size_rgw_chunk_size_bug
+test_post_object_user_specified_header
+test_post_object_wrong_bucket
+```
+
+Persisted as `server/tests/python/post_object_test.py` (uses `requests`
+directly, not boto3 — boto3 has no client method for constructing a
+deliberately-malformed signed POST policy). Single-node only; cluster has
+no form-upload surface and this RFC's own doc never claimed one.
+
+**Running total: 515 / 808** (this entry's own count — superseded below;
+it was never actually re-run against the real suite, see the correction
+immediately following)
+
+---
+
+## Correction — real Ceph suite actually run, not estimated
+
+The 515/808 figure above (and every running total before it in this file)
+was never produced by `pytest` against the real suite — it was accumulated
+from individual PR descriptions and spot-checks. Actually cloning
+`ceph/s3-tests` and running `test_s3.py` + `test_headers.py` for real
+surfaced two things the estimate had wrong:
+
+1. **The real suite has grown**: `886` tests collect today, not `808`.
+   The 808 baseline this file has used throughout is stale relative to
+   upstream `s3-tests`' `master` branch.
+2. **Several tests this file already counted as passing were not** --
+   a test-harness config mistake (`s3tests.conf`'s `display_name` not
+   matching the server's actual `WARPDRIVE_ADMIN_DISPLAY_NAME` default,
+   `"Warpdrive Admin"`) was masking real passes as failures across the
+   ACL batch, and two real product bugs were caught that no prior
+   spot-check had found: POST Object's `x-amz-checksum-*` field was
+   never actually verified against the uploaded bytes (just stored as an
+   opaque string), and four distinct versioning/ACL bugs (`UploadPartCopy`
+   not parsing `?versionId=` off `x-amz-copy-source`, `GetObjectAcl`/
+   `PutObjectAcl` not even reading `?versionId` and dispatching after
+   `?versionId` instead of before it, `GetObjectAttributes` ignoring
+   `?versionId` and never echoing `x-amz-version-id`, `HeadObject`'s 404
+   missing `x-amz-delete-marker` for a marker-current key). All fixed
+   this session (commits `18cec27`, `6adefcd`).
+
+**Verified final count, this session, against the real cloned suite**:
+**496 / 886** passed, 274 failed, 25 errors, 92 skipped. This is the
+authoritative number going forward -- not the batch-by-batch running
+total above, which undercounts real upstream growth and was never
+re-verified end to end. Of the 299 failures/errors, the large majority
+are already-known, already-documented gaps, not new findings:
+
+| Category | Count | Status |
+|---|---|---|
+| SSE-S3/SSE-C/SSE-KMS | 109 | Not implemented (RFC 2.15-17) |
+| Bucket policy / Block Public Access | 43 | Deferred, Console-coincidence (RFC 2.13) |
+| Bucket logging | 39 | Deprioritized per explicit direction (RFC 2.21) |
+| Lifecycle | 25 | Not implemented (RFC 2.20) |
+| Deprecated SigV2 (`_aws2`) | 21 | Intentionally excluded project-wide |
+| Same-admin-key / no user directory | ~12 | Structural test-env limitation, not a bug |
+| Bucket ownership controls | 5 | Not implemented (RFC 2.12) |
+| Everything else | remainder | Not yet individually triaged |
+
+**Lesson for future batches**: run the real suite (`git clone
+https://github.com/ceph/s3-tests`, `pip install -r requirements.txt && pip
+install -e .`, a `s3tests.conf` with `host=localhost port=9710
+is_secure=False` and `[s3 main]`/`[s3 alt]`/`[s3 tenant]`/`[iam]`/`[iam
+root]`/`[iam alt root]` all pointed at the same admin credentials since
+there's only one real user, `display_name` set to match
+`WARPDRIVE_ADMIN_DISPLAY_NAME` (default `"Warpdrive Admin"`) --
+`S3TEST_CONF=s3tests.conf pytest s3tests/functional/test_s3.py
+s3tests/functional/test_headers.py -q`) before updating this file's
+running total. A replica script or a read of the test source is not a
+substitute for actually running it, even when it's built faithfully from
+the real assertions — this session's own POST Object work proved that:
+reading the source got 32/33 tests right and missed a second assertion
+inside `test_post_object_upload_checksum` entirely.

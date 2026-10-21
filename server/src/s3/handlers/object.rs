@@ -8,17 +8,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::metadata::Metadata;
-use crate::s3::auth::{authenticate_s3_request, create_authenticated_request};
+use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, create_authenticated_request, ADMIN_USER_ID};
 use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
 use crate::storage::config::StorageConfig;
 
-use super::checksum::{parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
+use super::checksum::{compute_checksum, parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use super::common::*;
 use super::tagging::{s3_put_object_tagging_inner, s3_get_object_tagging_inner, s3_delete_object_tagging_inner, parse_url_tags, validate_tags};
 use super::versioning::{s3_get_object_version_handler, s3_delete_specific_version_handler};
-use super::acl::{s3_put_acl_stub, s3_get_object_acl_stub, validate_object_key};
+use super::acl::{s3_put_object_acl_inner, s3_get_object_acl_inner, resolve_effective_grants, grants_to_json, grants_from_json, is_publicly_writable, is_publicly_readable, validate_object_key};
 use super::copy::s3_copy_object_handler;
 use super::multipart::{s3_upload_part_handler, s3_upload_part_copy_handler, s3_abort_multipart_upload_handler, s3_get_object_attributes_handler, s3_get_part_handler, s3_head_part_handler};
 use super::object_lock::{s3_put_object_retention_inner, s3_get_object_retention_inner, s3_put_object_legal_hold_inner, s3_get_object_legal_hold_inner, compute_retain_until};
@@ -51,7 +51,12 @@ pub async fn s3_put_object_handler(
             return s3_put_object_tagging_inner(&bucket, &key, &body, &req).await;
         }
         if query.contains_key("acl") {
-            return s3_put_acl_stub(&req).await;
+            let (bucket, key) = path.into_inner();
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = payload.next().await {
+                body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+            }
+            return s3_put_object_acl_inner(&bucket, &key, &body, &req).await;
         }
         if query.contains_key("retention") || query.contains_key("legal-hold") {
             let (bucket, key) = path.into_inner();
@@ -70,15 +75,34 @@ pub async fn s3_put_object_handler(
     }
 
     let (bucket, key) = path.into_inner();
-    let auth_result = authenticate_s3_request(&req).await?;
+    let auth_result = authenticate_s3_request_allow_anonymous(&req).await?;
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
 
-    let db = MetadataService::new(&auth_result.user_id)?;
+    // Anonymous requests aren't tied to an owned bucket — resolve against the single
+    // static admin owner (today's only possible bucket owner), same as listing.rs.
+    let owner_id = if auth_result.is_anonymous { ADMIN_USER_ID.to_string() } else { auth_result.user_id.clone() };
+    let db = MetadataService::new(&owner_id)?;
+
+    if let Err(resp) = check_expected_bucket_owner(&req, &owner_id, &format!("/{}/{}", bucket, key)) { return Ok(resp); }
+
+    if auth_result.is_anonymous {
+        // Object doesn't exist yet (or is being overwritten) — permission to create/
+        // overwrite it is a bucket-level WRITE grant, not an object-level one. Checked
+        // before bucket existence so a nonexistent bucket doesn't leak via a 404.
+        let bucket_writable = match db.get_bucket_acl(&bucket) {
+            Ok(Some((_, grants_json))) => is_publicly_writable(&grants_from_json(&grants_json)),
+            _ => false,
+        };
+        if !bucket_writable {
+            return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", &format!("/{}/{}", bucket, key)));
+        }
+    }
+
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    info!("S3 PutObject: bucket={} key={} user={}", bucket, key, auth_result.user_id);
+    info!("S3 PutObject: bucket={} key={} user={}", bucket, key, owner_id);
 
-    let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+    let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
 
     let if_match_put = req.headers().get("if-match")
         .and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
@@ -218,6 +242,21 @@ pub async fn s3_put_object_handler(
         }
     }
 
+    // Checksum on by default, not opt-in: a client that never asked for
+    // AWS's checksum feature still gets a real checksum computed and
+    // stored, catching post-write corruption (bit-rot, a storage bug) on
+    // a later GET rather than only validating what the client sent over
+    // the wire. CRC32C, not SHA256 -- this only needs to catch accidental
+    // corruption, not resist a malicious adversary, and CRC32C is
+    // hardware-accelerated (SSE4.2/ARM CRC instructions) where SHA256
+    // isn't, the same tradeoff AWS's own SDKs make by defaulting to it.
+    // A client-supplied checksum (already verified above) is trusted as
+    // given instead of being overridden by a second, redundant one.
+    let checksum_result = match checksum_result {
+        Some(r) => Some(r),
+        None => Some((ChecksumAlgorithm::Crc32c, compute_checksum(&ChecksumAlgorithm::Crc32c, &body_buf))),
+    };
+
     let mut metadata = Metadata::from_offset_size_list(offset_size_list);
     metadata.etag = Some(etag.clone());
     metadata.size = size;
@@ -276,6 +315,19 @@ pub async fn s3_put_object_handler(
         );
     }
 
+    // Only store an ACL row when the request actually specifies one — otherwise the
+    // ACL handlers synthesize the private-owner-only default at read time.
+    let has_acl_header = req.headers().contains_key("x-amz-acl")
+        || ["x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp", "x-amz-grant-write-acp", "x-amz-grant-full-control"]
+            .iter().any(|h| req.headers().contains_key(*h));
+    if has_acl_header {
+        let owner_display = if owner_id == ADMIN_USER_ID { crate::s3::auth::admin_display_name() } else { auth_result.owner_display_name.clone() };
+        match resolve_effective_grants(&req, None, &owner_id, &owner_display) {
+            Ok(grants) => db.set_object_acl(&bucket, &key, effective_vid, &owner_id, &grants_to_json(&grants))?,
+            Err(resp) => return Ok(resp),
+        }
+    }
+
     debug!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("ETag", etag));
@@ -311,18 +363,23 @@ pub async fn s3_get_object_handler(
     if qmap.contains_key("tagging") {
         return s3_get_object_tagging_inner(&bucket, &key, &req).await;
     }
-    // retention/legal-hold come before versionId — boto3 sends both params together
+    // retention/legal-hold/acl come before versionId — boto3 sends both
+    // params together for a versioned object's ACL
+    // (`test_versioned_object_acl`: `get_object_acl(..., VersionId=vid)`
+    // sends `?acl&versionId=X`); acl was missing from this group, so a
+    // versioned-ACL GET fell into the plain versioned-GetObject branch
+    // instead, ignoring `?acl` entirely.
     if qmap.contains_key("retention") {
         return s3_get_object_retention_inner(&bucket, &key, &req).await;
     }
     if qmap.contains_key("legal-hold") {
         return s3_get_object_legal_hold_inner(&bucket, &key, &req).await;
     }
+    if qmap.contains_key("acl") {
+        return s3_get_object_acl_inner(&bucket, &key, &req).await;
+    }
     if let Some(vid) = qmap.get("versionId") {
         return s3_get_object_version_handler(&bucket, &key, vid, &req).await;
-    }
-    if qmap.contains_key("acl") {
-        return s3_get_object_acl_stub(&bucket, &key, &req).await;
     }
     if let Some(pn_str) = qmap.get("partNumber") {
         let pn: i32 = match pn_str.parse::<i32>() {
@@ -336,10 +393,27 @@ pub async fn s3_get_object_handler(
 
     if let Err(resp) = validate_object_key(&key, &bucket) { return Ok(resp); }
 
-    let auth_result = authenticate_s3_request(&req).await?;
+    let auth_result = authenticate_s3_request_allow_anonymous(&req).await?;
     let _authenticated_req = create_authenticated_request(&req, &auth_result);
 
-    let db = MetadataService::new(&auth_result.user_id)?;
+    let owner_id = if auth_result.is_anonymous { ADMIN_USER_ID.to_string() } else { auth_result.user_id.clone() };
+    let db = MetadataService::new(&owner_id)?;
+
+    if auth_result.is_anonymous {
+        // Object read permission comes from the object's own ACL, independent of the
+        // bucket's — a private bucket can still have an individually public-read object.
+        // Checked *before* bucket/key existence so a nonexistent bucket/object doesn't
+        // leak via a 404 — anonymous requests get a flat 403, same as real S3.
+        let acl_version_id = super::acl::resolve_effective_acl_version_id(&db, &bucket, &key, &req);
+        let readable = match db.get_object_acl(&bucket, &key, &acl_version_id) {
+            Ok(Some((_, grants_json))) => is_publicly_readable(&grants_from_json(&grants_json)),
+            _ => false,
+        };
+        if !readable {
+            return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", &format!("/{}/{}", bucket, key)));
+        }
+    }
+
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
     if !db.check_key(&bucket, &key)? {
@@ -421,7 +495,7 @@ pub async fn s3_get_object_handler(
 
     let slices = Arc::new(slices);
     let store = StorageConfig::from_env().create_store();
-    let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
+    let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
     let bucket_log = bucket.clone();
     let key_log = key.clone();
 
@@ -462,7 +536,8 @@ pub async fn s3_get_object_handler(
     let resp_content_encoding = qmap.get("response-content-encoding").cloned()
         .or_else(|| meta.content_encoding.clone());
 
-    let status = if range_header.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    let is_ranged = range_header.is_some();
+    let status = if is_ranged { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
     let mut resp = HttpResponse::build(status);
     resp.content_type(resp_content_type.as_str());
     resp.insert_header(("Content-Length", response_len.to_string()));
@@ -495,10 +570,13 @@ pub async fn s3_get_object_handler(
     if let Some(ref vid) = meta.version_id {
         resp.insert_header(("x-amz-version-id", vid.clone()));
     }
-    // Return checksum headers when x-amz-checksum-mode: ENABLED
+    // Return checksum headers when x-amz-checksum-mode: ENABLED. A stored checksum
+    // covers the whole object, so it can't validate a partial (ranged) body — real S3
+    // omits it in that case, and clients like botocore auto-validate it against the
+    // response body when present, so echoing it here breaks Range GETs.
     let checksum_mode = req.headers().get("x-amz-checksum-mode")
         .and_then(|v| v.to_str().ok()).map(|s| s.to_uppercase());
-    if checksum_mode.as_deref() == Some("ENABLED") {
+    if !is_ranged && checksum_mode.as_deref() == Some("ENABLED") {
         if let (Some(ref algo_str), Some(ref cksum_val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
             if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
                 let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
@@ -557,14 +635,45 @@ pub async fn s3_head_object_handler(
 
     if let Err(resp) = validate_object_key(&key, &bucket) { return Ok(resp); }
 
-    let auth_result = authenticate_s3_request(&req).await?;
+    let auth_result = authenticate_s3_request_allow_anonymous(&req).await?;
 
-    let db = MetadataService::new(&auth_result.user_id)?;
+    let owner_id = if auth_result.is_anonymous { ADMIN_USER_ID.to_string() } else { auth_result.user_id.clone() };
+    let db = MetadataService::new(&owner_id)?;
+
+    if auth_result.is_anonymous {
+        let acl_version_id = super::acl::resolve_effective_acl_version_id(&db, &bucket, &key, &req);
+        let readable = match db.get_object_acl(&bucket, &key, &acl_version_id) {
+            Ok(Some((_, grants_json))) => is_publicly_readable(&grants_from_json(&grants_json)),
+            _ => false,
+        };
+        if !readable {
+            return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", &format!("/{}/{}", bucket, key)));
+        }
+    }
+
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
     if !db.check_key(&bucket, &key)? {
-        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
-                           "The specified key does not exist", &format!("/{}/{}", bucket, key)));
+        // `check_key` excludes delete markers (a marker-current key doesn't
+        // "exist" for a plain GET/HEAD) -- but real S3 still echoes
+        // `x-amz-delete-marker: true` (and the marker's own version id) on
+        // that 404, so a client can tell "deleted via a marker, older
+        // versions may exist" from "never existed"
+        // (`test_delete_marker_versioned`).
+        let mut not_found = s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                                     "The specified key does not exist", &format!("/{}/{}", bucket, key));
+        if let Ok(Some((vid, true))) = db.get_latest_version_marker_info(&bucket, &key) {
+            not_found.headers_mut().insert(
+                actix_web::http::header::HeaderName::from_static("x-amz-delete-marker"),
+                actix_web::http::header::HeaderValue::from_static("true"),
+            );
+            if !vid.is_empty() {
+                if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&vid) {
+                    not_found.headers_mut().insert(actix_web::http::header::HeaderName::from_static("x-amz-version-id"), hv);
+                }
+            }
+        }
+        return Ok(not_found);
     }
 
     let meta = db.get_object_full(&bucket, &key)?;
@@ -670,7 +779,7 @@ pub async fn s3_delete_object_handler(
     let has_auth = req.headers().contains_key("authorization")
         || req.query_string().contains("X-Amz-Signature");
     if !has_auth {
-        if let Ok(db) = MetadataService::new("admin") {
+        if let Ok(db) = MetadataService::new(ADMIN_USER_ID) {
             if matches!(db.bucket_exists(&bucket), Ok(false)) {
                 return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchBucket",
                                    "The specified bucket does not exist", &bucket));

@@ -18,6 +18,11 @@ message PutShardRequest {
   string key = 2;
   uint32 shard_idx = 3;
   bytes data = 4;
+  // Tenant-isolation fix: empty string means the unauthenticated/legacy
+  // namespace (see location_store::UNAUTHENTICATED_USER), not a protocol
+  // version gap -- every caller sets this explicitly, proto3's own
+  // default-empty-string behavior is never relied on to mean anything.
+  string user_id = 5;
 }
 
 message PutShardResponse {}
@@ -26,6 +31,7 @@ message GetShardRequest {
   string bucket = 1;
   string key = 2;
   uint32 shard_idx = 3;
+  string user_id = 4;
 }
 
 message GetShardResponse {

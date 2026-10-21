@@ -38,14 +38,14 @@ async fn bench_transport(name: &str, client: &dyn PeerClient, peer: &str, bucket
 
         let t0 = Instant::now();
         client
-            .put_shard(peer, bucket, &key, 0, payload.to_vec())
+            .put_shard(peer, "", bucket, &key, 0, payload.to_vec())
             .await
             .unwrap_or_else(|e| panic!("{name} put_shard failed: {e}"));
         put_times.push(t0.elapsed().as_secs_f64() * 1000.0);
 
         let t0 = Instant::now();
         let got = client
-            .get_shard(peer, bucket, &key, 0)
+            .get_shard(peer, "", bucket, &key, 0)
             .await
             .unwrap_or_else(|e| panic!("{name} get_shard failed: {e}"));
         get_times.push(t0.elapsed().as_secs_f64() * 1000.0);

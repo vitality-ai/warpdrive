@@ -38,7 +38,7 @@ async fn main() {
         let t0 = Instant::now();
         let key = format!("concurrent-{i}");
         let futs = peers.iter().enumerate().map(|(idx, peer)| {
-            client.put_shard(peer, "fanoutbucket", &key, idx, payload.clone())
+            client.put_shard(peer, "", "fanoutbucket", &key, idx, payload.clone())
         });
         let results = join_all(futs).await;
         for r in results {
@@ -52,7 +52,7 @@ async fn main() {
         let t0 = Instant::now();
         for (idx, peer) in peers.iter().enumerate() {
             client
-                .put_shard(peer, "fanoutbucket", &format!("sequential-{i}"), idx, payload.clone())
+                .put_shard(peer, "", "fanoutbucket", &format!("sequential-{i}"), idx, payload.clone())
                 .await
                 .unwrap_or_else(|e| panic!("sequential put_shard failed: {e}"));
         }

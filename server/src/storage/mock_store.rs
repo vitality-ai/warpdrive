@@ -4,7 +4,8 @@ use crate::storage::Storage;
 use actix_web::Error;
 use actix_web::error::ErrorNotFound;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use log::info;
 
 /// Mock implementation of Storage for testing
@@ -22,31 +23,31 @@ impl MockBinaryStore {
     
     /// Get the number of users in the store
     pub fn user_count(&self) -> usize {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.len()
     }
     
     /// Get the number of buckets for a specific user
     pub fn bucket_count(&self, user_id: &str) -> usize {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.get(user_id).map(|buckets| buckets.len()).unwrap_or(0)
     }
     
     /// Clear all data from the store
     pub fn clear(&self) {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         data.clear();
     }
     
     /// Check if a user exists in the store
     pub fn user_exists(&self, user_id: &str) -> bool {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.contains_key(user_id)
     }
     
     /// List all buckets for a user
     pub fn list_buckets(&self, user_id: &str) -> Vec<String> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         data.get(user_id)
             .map(|buckets| buckets.keys().cloned().collect())
             .unwrap_or_default()
@@ -61,7 +62,7 @@ impl Default for MockBinaryStore {
 
 impl Storage for MockBinaryStore {
     fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
-        let mut store = self.data.lock().unwrap();
+        let mut store = self.data.lock();
         let user_entry = store.entry(user_id.to_string()).or_insert_with(HashMap::new);
         let bucket_entry = user_entry.entry(bucket.to_string()).or_insert_with(HashMap::new);
         let next_offset = bucket_entry.keys().copied().max().unwrap_or(0)
@@ -73,7 +74,7 @@ impl Storage for MockBinaryStore {
     }
 
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
-        let store = self.data.lock().unwrap();
+        let store = self.data.lock();
         if let Some(user_entry) = store.get(user_id) {
             if let Some(bucket_entry) = user_entry.get(bucket) {
                 if let Some(data) = bucket_entry.get(&offset) {
@@ -87,7 +88,7 @@ impl Storage for MockBinaryStore {
     }
 
     fn delete(&self, user_id: &str, bucket: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
-        let mut store = self.data.lock().unwrap();
+        let mut store = self.data.lock();
         if let Some(user_entry) = store.get_mut(user_id) {
             if let Some(bucket_entry) = user_entry.get_mut(bucket) {
                 for (offset, size) in offset_size_list {

@@ -28,10 +28,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use parking_lot::RwLock;
+use crate::storage::durable_log::DurableAppendLog;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BucketPlacementConfig {
@@ -64,7 +65,15 @@ pub trait BucketConfigStore: Send + Sync {
 }
 
 pub struct BitcaskBucketConfigStore {
-    log_file: RwLock<File>,
+    /// Owns the file, the dup'd sync-only handle, and the group-commit
+    /// batching needed to make an append durable without paying one
+    /// fsync per write -- see `storage::durable_log`'s module doc. This
+    /// store's own doc above explains why durability matters here more
+    /// than for shard/location writes: a bucket-config write is
+    /// synchronously replicated to every peer and all of them must ack,
+    /// so a crash that silently loses it on one node after a full-quorum
+    /// ack is exactly the gap group-commit exists to close.
+    log: DurableAppendLog,
     index: RwLock<HashMap<String, BucketPlacementConfig>>,
     /// #155 — see `location_store.rs`'s matching field doc: without one
     /// lock held across both the log append and the index update, two
@@ -72,7 +81,7 @@ pub struct BitcaskBucketConfigStore {
     /// its config at once) could apply to the log and the index in
     /// different orders, so a restart (log replay only) can disagree
     /// with what the live index had.
-    write_lock: std::sync::Mutex<()>,
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl BitcaskBucketConfigStore {
@@ -96,11 +105,11 @@ impl BitcaskBucketConfigStore {
             }
         }
 
-        let log_file = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let log = DurableAppendLog::open(&log_path)?;
         Ok(Self {
-            log_file: RwLock::new(log_file),
+            log,
             index: RwLock::new(index),
-            write_lock: std::sync::Mutex::new(()),
+            write_lock: parking_lot::Mutex::new(()),
         })
     }
 }
@@ -110,19 +119,20 @@ impl BucketConfigStore for BitcaskBucketConfigStore {
         let line = serde_json::to_string(&config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // #155: held across both the append and the index update, so two
         // concurrent puts for the same bucket can never apply to the log
-        // and the index in different orders.
-        let _write_guard = self.write_lock.lock().unwrap();
-        {
-            let mut f = self.log_file.write().unwrap();
-            writeln!(f, "{line}")?;
-            f.flush()?;
-        }
-        self.index.write().unwrap().insert(config.bucket.clone(), config);
-        Ok(())
+        // and the index in different orders. Released before the
+        // durability wait below, same reasoning as location_store.rs's
+        // `put`.
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            let ticket = self.log.append_line(&line)?;
+            self.index.write().insert(config.bucket.clone(), config);
+            ticket
+        };
+        self.log.sync_ticket(ticket)
     }
 
     fn get(&self, bucket: &str) -> Option<BucketPlacementConfig> {
-        self.index.read().unwrap().get(bucket).cloned()
+        self.index.read().get(bucket).cloned()
     }
 }
 

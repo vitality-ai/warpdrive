@@ -19,16 +19,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
-use super::content_location_store::{ContentLocationStore, UnitMeta};
+use super::content_location_store::{ContentDependentRecord, ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
-use super::location_store::{LocationRecord, LocationStore};
+use super::location_store::{LocationRecord, LocationStore, ObjectS3Metadata, UNAUTHENTICATED_USER};
 use super::membership::Membership;
 use super::packing::StripePacker;
 use super::peer_client::PeerClient;
 use super::placement::PlacementPolicy;
 use super::pushdown::ColumnCodec;
 use super::shard_storage::{new_version_id, versioned_key};
-use crate::s3::handlers::common::{parse_range_header, RangeResult};
+use crate::s3::handlers::checksum::ChecksumAlgorithm;
+use crate::s3::handlers::common::{metadata_value_header, parse_range_header, RangeResult};
 use base64::Engine;
 
 pub struct ClusterState {
@@ -58,6 +59,14 @@ pub struct ClusterState {
     /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
     /// the codec name a unit was tagged with at PUT time.
     pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
+    // Phase 4 multipart upload bookkeeping deliberately has no field here:
+    // both the part bytes and the upload "header" (status, content-type,
+    // user-metadata) are ordinary objects through the existing
+    // `location_store`/`put_object_plain` path, replicated to every peer
+    // the same way as any other write -- see `multipart_meta_key`'s own
+    // doc in coordinator.rs for why that, not a separate per-node store,
+    // is what keeps "any node can coordinate any request" true for
+    // multipart too.
 }
 
 /// Write succeeds once this many of the `k+m` peers acknowledge: `k`, or
@@ -127,54 +136,59 @@ fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderVal
         .collect()
 }
 
-/// Replicate a `LocationRecord` to every peer in `peers` (symmetric,
-/// including this node, via the same internal HTTP call — no special
-/// self-case). Returns how many acknowledged.
-async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
-    let puts = peers.iter().cloned().map(|peer| {
+/// Shared fan-out for every `replicate_*` function below: build one request
+/// per peer (symmetric, including this node, via the same internal HTTP
+/// call -- no special self-case), send them all concurrently, and count
+/// how many succeeded. `build` constructs the actual `RequestBuilder`
+/// (method + body) for a given peer's URL -- the one thing that genuinely
+/// differs between a location/content-location put/delete -- everything
+/// else (fan-out, success/failure counting, the warn! on a bad response or
+/// a transport error) was previously duplicated four times, once per
+/// record-shape/verb combination.
+async fn replicate_to_peers<F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, build: F) -> usize
+where
+    F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+{
+    let requests = peers.iter().map(|peer| {
         let client = state.location_http.clone();
-        let record = record.clone();
+        let url = format!("{}/cluster/_internal/{path_suffix}", peer.trim_end_matches('/'));
+        let req = build(&client, &url);
         async move {
-            let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
-            match client.post(&url).json(&record).send().await {
+            match req.send().await {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
-                    warn!("location pin replication to {peer} returned {}", r.status());
+                    warn!("{label} replication to {peer} returned {}", r.status());
                     false
                 }
                 Err(e) => {
-                    warn!("location pin replication to {peer} failed: {e}");
+                    warn!("{label} replication to {peer} failed: {e}");
                     false
                 }
             }
         }
     });
-    join_all(puts).await.into_iter().filter(|ok| *ok).count()
+    join_all(requests).await.into_iter().filter(|ok| *ok).count()
 }
 
-/// Replicate a tombstone (delete) for `(bucket, key)` to every peer in
-/// `peers`. Same symmetric-including-self treatment as the put path.
-pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
-    let deletes = peers.iter().cloned().map(|peer| {
-        let client = state.location_http.clone();
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        async move {
-            let url = format!("{}/cluster/_internal/location", peer.trim_end_matches('/'));
-            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
-                Ok(r) if r.status().is_success() => true,
-                Ok(r) => {
-                    warn!("location tombstone replication to {peer} returned {}", r.status());
-                    false
-                }
-                Err(e) => {
-                    warn!("location tombstone replication to {peer} failed: {e}");
-                    false
-                }
-            }
-        }
-    });
-    join_all(deletes).await.into_iter().filter(|ok| *ok).count()
+/// Replicate a `LocationRecord` to every peer in `peers`. Returns how many
+/// acknowledged.
+async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
+    replicate_to_peers(state, peers, "location", "location pin", |client, url| client.post(url).json(record)).await
+}
+
+/// Content-dependent counterpart of `replicate_location_put` -- same
+/// reasoning, same mechanism, just the other record shape. Used by
+/// Phase 4's tagging support, which (unlike retention) applies to packed
+/// objects too.
+async fn replicate_content_location_put(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
+    replicate_to_peers(state, peers, "content_location", "content-location pin", |client, url| client.post(url).json(record)).await
+}
+
+/// Replicate a tombstone (delete) for `(user_id, bucket, key)` to every
+/// peer in `peers`.
+pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
+    let body = DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string() };
+    replicate_to_peers(state, peers, "location", "location tombstone", |client, url| client.delete(url).json(&body)).await
 }
 
 /// Content-location counterpart of `replicate_location_delete` — needed so
@@ -184,27 +198,9 @@ pub(crate) async fn replicate_location_delete(state: &ClusterState, bucket: &str
 /// which was possible before: a packed object lived *only* in
 /// `ContentLocationStore`, which DELETE never touched, and a plain overwrite
 /// never cleared the packed pin GET still preferred.
-pub(crate) async fn replicate_content_location_delete(state: &ClusterState, bucket: &str, key: &str, peers: &[String]) -> usize {
-    let deletes = peers.iter().cloned().map(|peer| {
-        let client = state.location_http.clone();
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        async move {
-            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
-            match client.delete(&url).json(&DeleteKeyRequest { bucket, key }).send().await {
-                Ok(r) if r.status().is_success() => true,
-                Ok(r) => {
-                    warn!("content-location tombstone replication to {peer} returned {}", r.status());
-                    false
-                }
-                Err(e) => {
-                    warn!("content-location tombstone replication to {peer} failed: {e}");
-                    false
-                }
-            }
-        }
-    });
-    join_all(deletes).await.into_iter().filter(|ok| *ok).count()
+pub(crate) async fn replicate_content_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
+    let body = DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string() };
+    replicate_to_peers(state, peers, "content_location", "content-location tombstone", |client, url| client.delete(url).json(&body)).await
 }
 
 /// Attaches `x-warpd-placement` (`plain`|`packed`) and, when a packing
@@ -229,6 +225,47 @@ fn attach_placement_headers(mut resp: HttpResponse, placement: &'static str, ove
     resp
 }
 
+/// Decodes an AWS SigV4 "streaming payload" body: repeated
+/// `<hex-chunk-size>;chunk-signature=<sig>\r\n<chunk-bytes>\r\n`, ending in
+/// a zero-size chunk. Chunk signatures are not re-verified here (same
+/// no-auth-check posture as the rest of the cluster API) -- this only
+/// strips the framing so the stored object is the real payload bytes,
+/// not the wire encoding.
+fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut pos = 0usize;
+    loop {
+        let header_end = raw[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("malformed chunk: no CRLF after chunk header")?;
+        let header = std::str::from_utf8(&raw[pos..pos + header_end])
+            .map_err(|_| "malformed chunk header: not UTF-8".to_string())?;
+        let size_str = header.split(';').next().unwrap_or("");
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| format!("malformed chunk size: {size_str:?}"))?;
+        pos += header_end + 2;
+
+        if size == 0 {
+            break;
+        }
+        if pos + size > raw.len() {
+            return Err("malformed chunk: declared size exceeds remaining body".into());
+        }
+        out.extend_from_slice(&raw[pos..pos + size]);
+        pos += size;
+        if raw.get(pos..pos + 2) != Some(b"\r\n") {
+            return Err("malformed chunk: missing trailing CRLF after chunk data".into());
+        }
+        pos += 2;
+    }
+    Ok(out)
+}
+
+/// Bare, pre-auth route: no identity to supply, so every write here lands
+/// in the `UNAUTHENTICATED_USER` namespace and carries no S3 metadata.
+/// Kept exactly as before this split -- see `cluster_put_object_inner`
+/// for the real logic, now also reachable from an authenticated caller.
 pub async fn cluster_put_object(
     path: web::Path<(String, String)>,
     body: web::Bytes,
@@ -236,6 +273,50 @@ pub async fn cluster_put_object(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+    cluster_put_object_inner(
+        UNAUTHENTICATED_USER, bucket, key, body, &req, &state, &ObjectS3Metadata::default(),
+    )
+    .await
+}
+
+/// `user_id`/`s3_meta` are the Phase 3 seam: a bare pre-auth caller passes
+/// `UNAUTHENTICATED_USER`/`Default::default()` (see `cluster_put_object`
+/// above), an authenticated `/cluster/s3/...` caller passes the real
+/// identity and the S3 metadata it parsed from request headers.
+pub(crate) async fn cluster_put_object_inner(
+    user_id: &str,
+    bucket: String,
+    key: String,
+    body: web::Bytes,
+    req: &actix_web::HttpRequest,
+    state: &web::Data<ClusterState>,
+    s3_meta: &ObjectS3Metadata,
+) -> Result<HttpResponse, Error> {
+    // Real S3 SDKs (minio-go, used by minio/warp and many other tools)
+    // sign PUT bodies with AWS's "streaming payload" scheme when
+    // content-length is known up front: `x-amz-content-sha256:
+    // STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, body wire-encoded as repeated
+    // `<hex-chunk-size>;chunk-signature=<sig>\r\n<chunk-bytes>\r\n`,
+    // terminated by a zero-size chunk. `body: web::Bytes` is the raw wire
+    // bytes -- actix/hyper only unwraps HTTP-level Transfer-Encoding, not
+    // this application-level AWS framing, so without decoding it here the
+    // stored object silently includes chunk-size/signature bytes as part
+    // of its content (confirmed via `x-amz-decoded-content-length`
+    // mismatching the raw body length). The legacy single-node S3 path
+    // (s3/handlers/object.rs) has the same gap -- it only strips
+    // "aws-chunked" from the stored Content-Encoding metadata, never
+    // decodes the body -- so this was latent there too, just never
+    // exercised by a real streaming-signing SDK client until now.
+    let body: web::Bytes = if req
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("STREAMING-"))
+    {
+        web::Bytes::from(decode_aws_chunked_payload(&body).map_err(ErrorBadRequest)?)
+    } else {
+        body
+    };
 
     // #150: `packed.rs::stripe_key` reserves a leading NUL byte to keep a
     // content-dependent object's per-stripe shard keys structurally
@@ -255,7 +336,7 @@ pub async fn cluster_put_object(
     // same cost as before this feature existed (see the North star's
     // before/after performance check).
     let Some(config) = state.bucket_config_store.get(&bucket) else {
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     };
@@ -267,7 +348,7 @@ pub async fn cluster_put_object(
     // before any packer runs, the same way the plain path's own encoder
     // already floors shard length at 1 byte for this exact case.
     if body.is_empty() {
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     }
@@ -285,7 +366,7 @@ pub async fn cluster_put_object(
         .unwrap_or(false);
     if forced_plain {
         info!("bucket={bucket} key={key} x-warpd-computable-units: false — explicit opt-out of this bucket's custom placement");
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
     }
@@ -329,7 +410,7 @@ pub async fn cluster_put_object(
         let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
 
         if overhead <= config.overhead_threshold_pct {
-            return super::packed::put_object_content_dependent(&bucket, &key, &body, &units_header, stripes, &state)
+            return super::packed::put_object_content_dependent(user_id, &bucket, &key, &body, &units_header, stripes, state, s3_meta)
                 .await
                 .map(|r| attach_placement_headers(r, "packed", Some(overhead)));
         }
@@ -338,7 +419,7 @@ pub async fn cluster_put_object(
              {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
             config.overhead_threshold_pct, config.packer_name
         );
-        return put_object_plain(&bucket, &key, &body, &state)
+        return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", Some(overhead)));
     } else {
@@ -349,12 +430,14 @@ pub async fn cluster_put_object(
         );
     }
 
-    put_object_plain(&bucket, &key, &body, &state)
+    put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
         .await
         .map(|r| attach_placement_headers(r, "plain", None))
 }
 
-async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterState) -> Result<HttpResponse, Error> {
+async fn put_object_plain(
+    user_id: &str, bucket: &str, key: &str, body: &[u8], state: &ClusterState, s3_meta: &ObjectS3Metadata,
+) -> Result<HttpResponse, Error> {
     let bucket = bucket.to_string();
     let key = key.to_string();
     let request_start = std::time::Instant::now();
@@ -425,7 +508,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             async move {
-                let res = client.put_shard(&peer, &bucket, &wire_key, idx, shard).await;
+                let res = client.put_shard(&peer, user_id, &bucket, &wire_key, idx, shard).await;
                 if let Err(ref e) = res {
                     warn!("put_shard idx={idx} peer={peer} failed: {e}");
                 }
@@ -452,6 +535,7 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // with the pin, making "any node can serve GET" actually true rather
     // than only true for the k+m peers that happened to hold shards.
     let record = LocationRecord {
+        user_id: user_id.to_string(),
         bucket: bucket.clone(),
         key: key.clone(),
         shard_peers: chosen.clone(),
@@ -462,17 +546,22 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
+        etag: s3_meta.etag.clone(),
+        content_type: s3_meta.content_type.clone(),
+        last_modified: s3_meta.last_modified.clone(),
+        user_metadata: s3_meta.user_metadata.clone(),
+        cache_control: s3_meta.cache_control.clone(),
+        expires: s3_meta.expires.clone(),
+        content_encoding: s3_meta.content_encoding.clone(),
+        checksum_algorithm: s3_meta.checksum_algorithm.clone(),
+        checksum_value: s3_meta.checksum_value.clone(),
+        checksum_type: s3_meta.checksum_type.clone(),
+        // A PUT (full overwrite) starts a conceptually new object version
+        // with no tags, same as real S3 -- tags are (re-)applied via a
+        // separate PutObjectTagging call, never inherited from whatever
+        // the previous version had.
+        tags: Vec::new(),
     };
-
-    let t0 = std::time::Instant::now();
-    let loc_acked = replicate_location_put(&state, &record, &peers).await;
-    state.timing.location_replicate.record(t0.elapsed());
-    if loc_acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
-            "location pin quorum not met: {loc_acked}/{required_acks} peers stored the placement record \
-             (shard data was written, but the object may not be findable from every node)"
-        )));
-    }
 
     // This key may have previously been written content-dependent (packed)
     // on a bucket whose config later changed, or simply have had its
@@ -491,8 +580,49 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
     // every other write here: a PUT that can't confirm the stale pin was
     // actually cleared cluster-wide is treated as not fully succeeded.
-    let _ = state.content_location_store.delete(&bucket, &key);
-    let cleanup_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    //
+    // Run concurrently with the location-pin replication below rather than
+    // after it: the two broadcasts touch different stores/keys (the new
+    // object's placement pin vs. a possibly-nonexistent old packed pin) and
+    // neither's result depends on the other's, so there is no ordering
+    // requirement between them -- only that both finish, and both quorums
+    // are still checked independently afterward. This halves the number of
+    // sequential cross-peer round trips a PUT pays for (was: shard fan-out,
+    // then location-pin quorum, then cleanup-broadcast quorum, each waiting
+    // on the last; now the latter two overlap).
+    {
+        // web::block: this store's `delete` now does a real group-commit
+        // fsync (see `storage::group_commit`'s module doc) -- calling it
+        // directly here would block this actix worker's whole event loop
+        // for the fsync's duration, same hazard `cluster_internal_delete_*`
+        // were fixed for. Best-effort local cleanup (the actual durability
+        // guarantee is the quorum-checked broadcast below), so a failure
+        // here doesn't fail the PUT, but it's logged rather than silently
+        // discarded -- a real disk error (e.g. out of space) on this node
+        // shouldn't vanish just because the write still succeeded cluster-wide.
+        let store = Arc::clone(&state.content_location_store);
+        let user_id_owned = user_id.to_string();
+        let bucket_owned = bucket.clone();
+        let key_owned = key.clone();
+        let result = web::block(move || store.delete(&user_id_owned, &bucket_owned, &key_owned).map_err(|e| e.to_string())).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("stale content-location pin cleanup failed for {bucket}/{key}: {e}"),
+            Err(e) => log::warn!("stale content-location pin cleanup blocking task failed for {bucket}/{key}: {e}"),
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let (loc_acked, cleanup_acked) = tokio::join!(
+        replicate_location_put(&state, &record, &peers),
+        replicate_content_location_delete(&state, user_id, &bucket, &key, &peers),
+    );
+    state.timing.location_replicate.record(t0.elapsed());
+    if loc_acked < required_acks {
+        return Err(ErrorInternalServerError(format!(
+            "location pin quorum not met: {loc_acked}/{required_acks} peers stored the placement record \
+             (shard data was written, but the object may not be findable from every node)"
+        )));
+    }
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
@@ -504,6 +634,283 @@ async fn put_object_plain(bucket: &str, key: &str, body: &[u8], state: &ClusterS
     state.timing.total.record(request_start.elapsed());
     info!("cluster PUT bucket={bucket} key={key} acked={acked}/{required_acks} loc_acked={loc_acked}/{required_acks}");
     Ok(HttpResponse::Ok().finish())
+}
+
+/// Fetches and EC-decodes a plain object's full bytes -- the same fetch
+/// loop `cluster_get_object_inner`'s no-range path uses, extracted so
+/// multipart completion (below) can read a part's bytes back without
+/// going through response-building. Only used for parts stored via
+/// `put_object_plain` (see `cluster_upload_part_inner`), so there's no
+/// content-dependent (packed) case to handle here.
+async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>) -> Result<Vec<u8>, Error> {
+    let record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+
+    let wire_key = if record.version.is_empty() {
+        key.to_string()
+    } else {
+        versioned_key(key, &record.version)
+    };
+
+    let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
+        let client = Arc::clone(&state.peer_client);
+        let bucket = bucket.to_string();
+        let wire_key = wire_key.clone();
+        async move { client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await.ok().map(|d| (idx, d)) }
+    });
+    let results = join_all(gets).await;
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; record.shard_peers.len()];
+    for (idx, data) in results.into_iter().flatten() {
+        shards[idx] = Some(data);
+    }
+    let present = shards.iter().filter(|s| s.is_some()).count();
+    if present < record.k {
+        return Err(ErrorInternalServerError(format!("read quorum not met: {present}/{} shards available", record.k)));
+    }
+    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m).map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    decoder.decode(&shards, record.original_len).map_err(|e| ErrorInternalServerError(e.to_string()))
+}
+
+/// Synthetic key for one multipart part's bytes, stored via the ordinary
+/// plain EC path. Same NUL-byte key-space-disjointness scheme as
+/// `packed.rs::stripe_key` (a real object key is rejected if it starts
+/// with `\0`, enforced in `cluster_put_object_inner`), with its own
+/// distinct literal prefix (`mpu:` vs. `cdstripe`, and vs. `mpu-meta:`
+/// below) so none of these synthetic namespaces can ever collide.
+fn multipart_part_key(upload_id: &str, part_number: i32) -> String {
+    format!("\0mpu:{}:{upload_id}:{part_number}", upload_id.len())
+}
+
+/// Prefix matching every part key for one upload -- `upload_id` is
+/// guaranteed `:`-free (`new_version_id`'s own doc), so splitting a
+/// listed key on its *last* `:` to recover `part_number` is unambiguous,
+/// the same guarantee `shard_key`/`versioned_key` already rely on.
+fn multipart_part_prefix(upload_id: &str) -> String {
+    format!("\0mpu:{}:{upload_id}:", upload_id.len())
+}
+
+/// Synthetic key for an upload's own bookkeeping "header" -- deliberately
+/// an ordinary plain object through the exact same replicated write path
+/// as everything else in this file, not a separate per-node store. Its
+/// *existence* in `location_store` (replicated to every peer, like any
+/// other PUT) means "upload in progress"; its absence means "completed,
+/// aborted, or never existed" -- no separate status field needed. Its
+/// `content_type`/`user_metadata` fields (via `ObjectS3Metadata`, same as
+/// any other object) carry what `CompleteMultipartUpload` needs to set on
+/// the final object. This is what makes multipart bookkeeping visible
+/// from *any* coordinating node, not just the one that happened to
+/// receive `CreateMultipartUpload` -- the same "any node can coordinate
+/// any request" symmetry every other cluster write already has.
+fn multipart_meta_key(upload_id: &str) -> String {
+    format!("\0mpu-meta:{upload_id}")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: multipart upload, authenticated-surface support functions.
+// Scope deliberately narrower than single-node's multipart: only plain
+// (non-content-dependent) final objects are supported. A content-
+// dependent final object would need re-running the packer over the
+// reassembled bytes, which is real, separate scope -- not attempted
+// here, and not silently dropped either: `cluster_complete_multipart_
+// upload_inner` always writes a plain final object, regardless of the
+// destination bucket's packing config, and says so in its own doc.
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn cluster_create_multipart_upload_inner(
+    user_id: &str, bucket: &str, _key: &str, content_type: Option<String>, user_metadata: HashMap<String, String>,
+    state: &web::Data<ClusterState>,
+) -> Result<String, Error> {
+    let upload_id = super::shard_storage::new_version_id();
+    let s3_meta = ObjectS3Metadata { content_type, user_metadata, ..Default::default() };
+    // Empty body: the header carries no bytes of its own, only metadata
+    // on the (fully replicated) LocationRecord it creates.
+    put_object_plain(user_id, bucket, &multipart_meta_key(&upload_id), &[], state, &s3_meta).await?;
+    Ok(upload_id)
+}
+
+/// Stores one part's bytes via the ordinary plain EC path under its
+/// synthetic key. The part's own `LocationRecord` (etag, size) *is* the
+/// bookkeeping -- replicated the same way as the part's bytes, no
+/// separate index. Returns the part's ETag.
+pub(crate) async fn cluster_upload_part_inner(
+    user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
+) -> Result<String, Error> {
+    if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
+        return Err(ErrorNotFound("no such upload"));
+    }
+
+    let etag = crate::s3::handlers::common::md5_etag(&body);
+    let s3_meta = ObjectS3Metadata { etag: Some(etag.clone()), ..Default::default() };
+    put_object_plain(user_id, bucket, &multipart_part_key(upload_id, part_number), &body, state, &s3_meta).await?;
+    Ok(etag)
+}
+
+/// Lists an upload's parts via `LocationStore::list`'s prefix scan --
+/// already replicated, already available on any node -- then one `get`
+/// per listed key to recover its real etag (`list` itself only returns
+/// key+size). Sorted by part number.
+pub(crate) fn cluster_list_parts_inner(user_id: &str, bucket: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<Vec<(i32, String, u64)>, Error> {
+    if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
+        return Err(ErrorNotFound("no such upload"));
+    }
+    let prefix = multipart_part_prefix(upload_id);
+    let mut parts: Vec<(i32, String, u64)> = state
+        .location_store
+        .list(user_id, bucket, &prefix)
+        .into_iter()
+        .filter_map(|(part_key, size)| {
+            let part_number: i32 = part_key.rsplit(':').next()?.parse().ok()?;
+            let record = state.location_store.get(user_id, bucket, &part_key)?;
+            Some((part_number, record.etag.unwrap_or_default(), size))
+        })
+        .collect();
+    parts.sort_by_key(|(n, _, _)| *n);
+    Ok(parts)
+}
+
+/// Reassembles the requested parts in order, writes the result as one
+/// ordinary plain object under `final_key` (see this section's own doc
+/// on why this is always plain, never re-packed), cleans up the header
+/// and part records, and returns `(final_etag, total_size)`. `requested`
+/// is `(part_number, client-sent etag)` pairs in the order the client
+/// wants them assembled -- each is validated against the stored part's
+/// own etag before use, same check single-node's `CompleteMultipartUpload`
+/// does.
+pub(crate) async fn cluster_complete_multipart_upload_inner(
+    user_id: &str, bucket: &str, final_key: &str, upload_id: &str, requested: &[(i32, String)], state: &web::Data<ClusterState>,
+) -> Result<(String, u64), Error> {
+    let meta_record = state
+        .location_store
+        .get(user_id, bucket, &multipart_meta_key(upload_id))
+        .ok_or_else(|| ErrorNotFound("no such upload"))?;
+
+    // Validate every part up front (cheap local index lookups, no network),
+    // bailing out on the first missing/mismatched part exactly like the
+    // previous sequential version did. Only the actual byte fetch -- the
+    // part that fans out to EC shards across peers -- is run concurrently
+    // below: each `fetch_plain_object_bytes` call already parallelizes its
+    // own shard fan-out, but a 50-part upload still paid 50 sequential
+    // round-trip-groups before this, one per part, instead of one.
+    let mut validated: Vec<(String, String)> = Vec::with_capacity(requested.len());
+    for (part_number, client_etag) in requested {
+        let part_key = multipart_part_key(upload_id, *part_number);
+        let stored = state
+            .location_store
+            .get(user_id, bucket, &part_key)
+            .ok_or_else(|| ErrorBadRequest("one or more of the specified parts could not be found"))?;
+        let stored_etag = stored.etag.unwrap_or_default();
+        if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored_etag) {
+            return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
+        }
+        validated.push((part_key, stored_etag));
+    }
+
+    // `join_all` preserves input order in its output, so `part_bytes[i]`
+    // still lines up with `validated[i]` -- required here, since the
+    // reassembled body must be the parts concatenated in request order,
+    // not whichever fetch happens to finish first.
+    let fetches = validated.iter().map(|(part_key, _)| fetch_plain_object_bytes(user_id, bucket, part_key, state));
+    let part_bytes: Vec<Vec<u8>> = join_all(fetches).await.into_iter().collect::<Result<_, _>>()?;
+
+    let mut combined_md5_bytes: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    for ((_, stored_etag), bytes) in validated.iter().zip(part_bytes) {
+        if let Ok(raw) = hex::decode(crate::s3::handlers::common::normalize_etag(stored_etag)) {
+            combined_md5_bytes.extend_from_slice(&raw);
+        }
+        body.extend_from_slice(&bytes);
+    }
+
+    // Same composite-ETag formula single-node's CompleteMultipartUpload
+    // uses: md5 of the concatenated per-part md5 bytes, dash, part count.
+    let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
+    let total_size = body.len() as u64;
+
+    // Checksum on by default here too, same reasoning (and same CRC32C
+    // choice) as the single-part PUT path (see
+    // `cluster_s3_put_object_authenticated`'s matching comment): a real
+    // checksum over the *reassembled* bytes, so a later GET can verify
+    // the complete object, not just rely on each part having been
+    // individually correct at upload time.
+    let s3_meta = ObjectS3Metadata {
+        etag: Some(final_etag.clone()),
+        content_type: meta_record.content_type.clone(),
+        last_modified: Some(super::s3_surface::now_http_date()),
+        user_metadata: meta_record.user_metadata.clone(),
+        checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
+        checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
+        ..Default::default()
+    };
+    put_object_plain(user_id, bucket, final_key, &body, state, &s3_meta).await?;
+
+    // Local-only cleanup of the now-dead header/part records (no tombstone
+    // replication to peers) -- a storage-reclamation gap, not a
+    // correctness one: this project has no compaction/GC anywhere yet
+    // (see RFC3), so leftover shard bytes on peers already accumulate
+    // the same way for ordinary deletes. Tracked as the same class of
+    // future work, not a new gap introduced here.
+    //
+    // web::block: `delete` now does a real group-commit fsync per call
+    // (see `storage::group_commit`'s module doc), so this whole loop (one
+    // blocking task, not one per part) must run off the actix worker's
+    // event loop the same way the single-object delete paths were fixed.
+    {
+        let store = Arc::clone(&state.location_store);
+        let user_id_owned = user_id.to_string();
+        let bucket_owned = bucket.to_string();
+        let upload_id_owned = upload_id.to_string();
+        let part_numbers: Vec<i32> = requested.iter().map(|(n, _)| *n).collect();
+        let result = web::block(move || {
+            store.delete(&user_id_owned, &bucket_owned, &multipart_meta_key(&upload_id_owned))?;
+            for part_number in part_numbers {
+                store.delete(&user_id_owned, &bucket_owned, &multipart_part_key(&upload_id_owned, part_number))?;
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("multipart cleanup failed for {bucket}/{upload_id}: {e}"),
+            Err(e) => log::warn!("multipart cleanup blocking task failed for {bucket}/{upload_id}: {e}"),
+        }
+    }
+
+    Ok((final_etag, total_size))
+}
+
+/// Aborts an in-progress upload: cleans up the header and part records
+/// without writing a final object.
+pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<(), Error> {
+    if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
+        return Err(ErrorNotFound("no such upload"));
+    }
+    let prefix = multipart_part_prefix(upload_id);
+    let part_keys: Vec<String> = state.location_store.list(user_id, bucket, &prefix).into_iter().map(|(k, _)| k).collect();
+
+    // Best-effort local cleanup, same "storage-reclamation gap, not a
+    // correctness one" reasoning as the matching cleanup in
+    // `cluster_complete_multipart_upload_inner` -- a failure here doesn't
+    // fail the abort itself. web::block (one blocking task, not one per
+    // part): `delete` now does a real group-commit fsync per call.
+    let store = Arc::clone(&state.location_store);
+    let user_id_owned = user_id.to_string();
+    let bucket_owned = bucket.to_string();
+    let upload_id_owned = upload_id.to_string();
+    let result = web::block(move || {
+        for part_key in part_keys {
+            store.delete(&user_id_owned, &bucket_owned, &part_key)?;
+        }
+        store.delete(&user_id_owned, &bucket_owned, &multipart_meta_key(&upload_id_owned))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("multipart abort cleanup failed for {bucket}/{upload_id}: {e}"),
+        Err(e) => log::warn!("multipart abort cleanup blocking task failed for {bucket}/{upload_id}: {e}"),
+    }
+    Ok(())
 }
 
 /// Diagnostic endpoint: phase-level latency breakdown for `cluster_put_object`,
@@ -531,19 +938,86 @@ pub async fn cluster_grpc_client_timing() -> HttpResponse {
         .body(super::grpc_peer_client::CLIENT_TIMING.summary())
 }
 
+/// Bare, pre-auth route -- see `cluster_put_object`'s matching doc.
 pub async fn cluster_get_object(
     path: web::Path<(String, String)>,
     req: actix_web::HttpRequest,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+    cluster_get_object_inner(UNAUTHENTICATED_USER, bucket, key, &req, &state).await
+}
 
+/// Shared by both GET read paths (plain and FAC): a reconstructed object
+/// must never reach the client if it doesn't match its stored checksum --
+/// that's what actually catches post-write corruption (bit-rot, an
+/// EC-reconstruction bug, a shard silently corrupted on one peer but
+/// still accepted by read-quorum), as opposed to only checking a
+/// client-sent checksum once at write time. A record with no stored
+/// checksum passes through untouched instead of failing closed: the one
+/// real path that produces this today is the bare, unauthenticated
+/// `/cluster/{bucket}/{key}` route (`cluster_put_object` passes
+/// `ObjectS3Metadata::default()`, which never computes one), not old
+/// data from before this feature existed -- this project has no
+/// production deployment yet, so there's no such data to be compatible
+/// with. Same passthrough for an unrecognized algorithm string.
+fn verify_object_checksum(
+    bucket: &str, key: &str, data: &[u8], stored_checksum: &Option<(String, String)>,
+) -> Result<(), Error> {
+    let Some((algo_str, expected)) = stored_checksum else { return Ok(()) };
+    let Some(algo) = ChecksumAlgorithm::from_str(algo_str) else { return Ok(()) };
+    if crate::s3::handlers::checksum::verify_checksum(&algo, data, expected) {
+        Ok(())
+    } else {
+        Err(ErrorInternalServerError(format!(
+            "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
+             match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
+        )))
+    }
+}
+
+/// `(header-name, value)` to echo on a GET/HEAD response when the client
+/// sent `x-amz-checksum-mode: ENABLED` and the record actually has a
+/// stored checksum -- same opt-in convention single-node's
+/// `s3_get_object_handler`/`s3_head_object_handler` use.
+fn checksum_response_header(
+    req: &actix_web::HttpRequest, checksum_algorithm: &Option<String>, checksum_value: &Option<String>,
+) -> Option<(String, String)> {
+    let enabled = req
+        .headers()
+        .get("x-amz-checksum-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("ENABLED"));
+    if !enabled {
+        return None;
+    }
+    let algo = ChecksumAlgorithm::from_str(checksum_algorithm.as_deref()?)?;
+    Some((format!("x-amz-checksum-{}", algo.header_suffix()), checksum_value.clone()?))
+}
+
+pub(crate) async fn cluster_get_object_inner(
+    user_id: &str,
+    bucket: String,
+    key: String,
+    req: &actix_web::HttpRequest,
+    state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
     // A content-dependent PUT pins into a separate store (different record
     // shape — many stripes, not one shard set). Check there first: cheap,
     // and a key is either content-dependent or not, decided once at PUT
     // time by header presence.
-    if let Some(record) = state.content_location_store.get(&bucket, &key) {
+    if let Some(record) = state.content_location_store.get(user_id, &bucket, &key) {
         let total_len = record.original_len as u64;
+        // Captured before `record` moves into the fetch calls below --
+        // same metadata fields `ClusterMetadataStore::get_metadata` reads,
+        // now also surfaced on the actual GET response.
+        let etag = record.etag.clone();
+        let content_type = record.content_type.clone();
+        let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+        let user_metadata = record.user_metadata.clone();
+        let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
+        let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
+        let has_sparse_gaps = record.has_sparse_gaps;
         // Range-aware fetch only reaches the stripes whose units actually
         // overlap the requested bytes (see packed.rs) — this is the whole
         // reason a DuckDB-style selective Parquet read benefits from
@@ -551,11 +1025,19 @@ pub async fn cluster_get_object(
         let range_result = parse_range_header(&req, total_len);
         return match range_result {
             RangeResult::Valid(start, end) => {
-                let has_sparse_gaps = record.has_sparse_gaps;
                 let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
-                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")));
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                    .insert_header(("Last-Modified", last_modified));
+                if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+                if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+                for (k, v) in &user_metadata {
+                    resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+                }
+                if let Some((name, value)) = &checksum_header {
+                    resp.insert_header((name.as_str(), value.as_str()));
+                }
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -565,13 +1047,24 @@ pub async fn cluster_get_object(
                 actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
             ),
             RangeResult::None => {
-                let resp = super::packed::get_object_content_dependent(record, &state).await?;
-                let mut resp = resp;
-                resp.headers_mut().insert(
-                    actix_web::http::header::HeaderName::from_static("accept-ranges"),
-                    actix_web::http::header::HeaderValue::from_static("bytes"),
-                );
-                Ok(resp)
+                let data = super::packed::get_object_content_dependent(record, &state).await?;
+                verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
+
+                let mut resp = HttpResponse::Ok();
+                resp.insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Last-Modified", last_modified));
+                if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+                if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+                for (k, v) in &user_metadata {
+                    resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+                }
+                if let Some((name, value)) = &checksum_header {
+                    resp.insert_header((name.as_str(), value.as_str()));
+                }
+                if has_sparse_gaps {
+                    resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
+                }
+                Ok(resp.body(data))
             }
         };
     }
@@ -579,9 +1072,14 @@ pub async fn cluster_get_object(
     // Never recompute placement here — look up the pin from write time.
     let record = state
         .location_store
-        .get(&bucket, &key)
+        .get(user_id, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
     let total_len = record.original_len as u64;
+    let etag = record.etag.clone();
+    let content_type = record.content_type.clone();
+    let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+    let user_metadata = record.user_metadata.clone();
+    let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
 
     // #151: an empty `version` means this pin predates the field
     // (`#[serde(default)]`) -- its shards are at the old, unversioned
@@ -593,16 +1091,66 @@ pub async fn cluster_get_object(
         versioned_key(&key, &record.version)
     };
 
-    // No sub-object structure to be selective about here: a Range request
-    // still requires a full fan-out and full EC decode, then an in-memory
-    // slice. This is the expected, unoptimized baseline a Range-GET demo
-    // compares against — the cost difference is the point.
+    // A Range request against the plain path used to force a full k+m
+    // fan-out and a full EC decode of the whole object before slicing out
+    // the requested bytes, no matter how small the range -- every one of
+    // DuckDB's many small per-column-chunk range-GETs paid the full
+    // object's fetch and decode cost. Reed-Solomon here is systematic
+    // (ec.rs: `encode` only computes parity from the k data shards, never
+    // rewrites them), so when the data shards covering the requested
+    // range are all healthy, no decode is needed at all -- just fetch
+    // those specific data shards and slice. Falls back to the original
+    // full fetch+decode path (below) if any needed shard isn't
+    // available, so correctness under failures is unchanged.
+    if let RangeResult::Valid(start, end) = parse_range_header(&req, total_len) {
+        let shard_len = ((record.original_len + record.k - 1) / record.k).max(1);
+        let first_idx = ((start as usize) / shard_len).min(record.k - 1);
+        let last_idx = ((end as usize) / shard_len).min(record.k - 1);
+
+        let partial_gets = (first_idx..=last_idx).map(|idx| {
+            let client = Arc::clone(&state.peer_client);
+            let bucket = bucket.clone();
+            let wire_key = wire_key.clone();
+            let peer = record.shard_peers[idx].clone();
+            async move { client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await.ok() }
+        });
+        let partial_results = join_all(partial_gets).await;
+
+        if partial_results.iter().all(|r| r.is_some()) {
+            let mut buf = Vec::with_capacity((last_idx - first_idx + 1) * shard_len);
+            for shard in partial_results.into_iter().flatten() {
+                buf.extend_from_slice(&shard);
+            }
+            let local_start = start as usize - first_idx * shard_len;
+            let local_end = (end as usize - first_idx * shard_len).min(buf.len() - 1);
+            if let Some(slice) = buf.get(local_start..=local_end) {
+                let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
+                resp.insert_header(("Accept-Ranges", "bytes"))
+                    .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
+                    .insert_header(("Last-Modified", last_modified.clone()));
+                if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+                if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+                for (k, v) in &user_metadata {
+                    resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+                }
+                if let Some((name, value)) = &checksum_header {
+                    resp.insert_header((name.as_str(), value.as_str()));
+                }
+                return Ok(resp.body(slice.to_vec()));
+            }
+        }
+        // Fall through to the full fetch+decode path below -- a needed
+        // data shard's peer was unavailable, or the slice math above
+        // came up empty; both are rare-path, not the common case this
+        // fix targets.
+    }
+
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);
         let bucket = bucket.clone();
         let wire_key = wire_key.clone();
         async move {
-            match client.get_shard(&peer, &bucket, &wire_key, idx).await {
+            match client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await {
                 Ok(data) => Some((idx, data)),
                 Err(e) => {
                     warn!("get_shard idx={idx} peer={peer} failed: {e}");
@@ -640,22 +1188,56 @@ pub async fn cluster_get_object(
         .decode(&shards, record.original_len)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
 
+    // Verify the reconstructed object against its stored checksum before
+    // ever returning it -- every object has one by default now (see
+    // `cluster_s3_put_object_authenticated`'s matching comment), not just
+    // objects whose client explicitly requested AWS's checksum feature.
+    // This is what actually catches post-write corruption (bit-rot, a
+    // reconstruction bug, a shard silently corrupted on one peer but
+    // still accepted by read-quorum) -- storing a checksum at write time
+    // is not a safety guarantee by itself if nothing ever checks it
+    // again on read. A mismatch means the data this node just
+    // reconstructed is not what was written, so it must never reach the
+    // client -- fail the request instead of serving it.
+    let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
+    verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
+
     match parse_range_header(&req, total_len) {
         RangeResult::Valid(start, end) => {
             let slice = data
                 .get(start as usize..=end as usize)
                 .ok_or_else(|| actix_web::error::ErrorRangeNotSatisfiable("range out of bounds"))?
                 .to_vec();
-            Ok(HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT)
-                .insert_header(("Accept-Ranges", "bytes"))
+            let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
+            resp.insert_header(("Accept-Ranges", "bytes"))
                 .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
-                .body(slice))
+                .insert_header(("Last-Modified", last_modified));
+            if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+            if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+            for (k, v) in &user_metadata {
+                resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+            }
+            if let Some((name, value)) = &checksum_header {
+                resp.insert_header((name.as_str(), value.as_str()));
+            }
+            Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
             actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
         ),
         RangeResult::None => {
-            Ok(HttpResponse::Ok().insert_header(("Accept-Ranges", "bytes")).body(data))
+            let mut resp = HttpResponse::Ok();
+            resp.insert_header(("Accept-Ranges", "bytes"))
+                .insert_header(("Last-Modified", last_modified));
+            if let Some(etag) = &etag { resp.insert_header(("ETag", etag.as_str())); }
+            if let Some(ct) = &content_type { resp.insert_header(("Content-Type", ct.as_str())); }
+            for (k, v) in &user_metadata {
+                resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
+            }
+            if let Some((name, value)) = &checksum_header {
+                resp.insert_header((name.as_str(), value.as_str()));
+            }
+            Ok(resp.body(data))
         }
     }
 }
@@ -674,25 +1256,34 @@ pub async fn cluster_content_record(
     let (bucket, key) = path.into_inner();
     let record = state
         .content_location_store
-        .get(&bucket, &key)
+        .get(UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("no content-dependent record for this key"))?;
     Ok(HttpResponse::Ok().json(record))
 }
 
+/// Bare, pre-auth route -- see `cluster_put_object`'s matching doc.
 pub async fn cluster_delete_object(
     path: web::Path<(String, String)>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
+    cluster_delete_object_inner(UNAUTHENTICATED_USER, bucket, key, &state).await
+}
 
+pub(crate) async fn cluster_delete_object_inner(
+    user_id: &str,
+    bucket: String,
+    key: String,
+    state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
     // A key is either plain (`LocationStore`) or content-dependent/packed
     // (`ContentLocationStore`) — decided once, at PUT time, by which path
     // handled it. A key can even have a *stale* entry in the other store
     // left over from an earlier overwrite that changed which path it took
     // (see `put_object_plain`'s and `put_object_content_dependent`'s
     // overwrite handling).
-    let plain_record = state.location_store.get(&bucket, &key);
-    let packed_record = state.content_location_store.get(&bucket, &key);
+    let plain_record = state.location_store.get(user_id, &bucket, &key);
+    let packed_record = state.content_location_store.get(user_id, &bucket, &key);
 
     // Deliberately *not* a 404 short-circuit when both are locally absent:
     // this coordinator only needed quorum to receive either pin, not all
@@ -745,8 +1336,8 @@ pub async fn cluster_delete_object(
         .unwrap_or_else(|| (state.ec.k(), state.ec.m()));
     let required_acks = required_write_acks(k, m);
 
-    let plain_acked = replicate_location_delete(&state, &bucket, &key, &peers).await;
-    let packed_acked = replicate_content_location_delete(&state, &bucket, &key, &peers).await;
+    let plain_acked = replicate_location_delete(state, user_id, &bucket, &key, &peers).await;
+    let packed_acked = replicate_content_location_delete(state, user_id, &bucket, &key, &peers).await;
     if plain_acked < required_acks || packed_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "tombstone quorum not met: plain {plain_acked}/{required_acks}, \
@@ -754,7 +1345,11 @@ pub async fn cluster_delete_object(
         )));
     }
 
-    Ok(HttpResponse::Ok().finish())
+    // Real S3 semantics (and real S3 SDKs, e.g. minio-go used by
+    // minio/warp): a successful DeleteObject returns 204 No Content, not
+    // 200 -- the SDK client treats any other status as an error even
+    // though the delete itself succeeded.
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[derive(Debug, Deserialize)]
@@ -779,9 +1374,17 @@ pub async fn cluster_put_retention(
         return Err(ErrorBadRequest("mode must be GOVERNANCE or COMPLIANCE"));
     }
 
+    // Explicit, not just a fallthrough to "object not found": a packed
+    // object might genuinely exist (in content_location_store) while
+    // simply having no retention support -- that's a different, clearer
+    // error than claiming the key doesn't exist at all.
+    if state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+
     let mut record = state
         .location_store
-        .get(&bucket, &key)
+        .get(UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("object not found"))?;
 
     record.retention_mode = Some(body.mode.clone());
@@ -810,6 +1413,177 @@ pub async fn cluster_put_retention(
     }
 
     Ok(HttpResponse::Ok().finish())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: object tagging, authenticated-surface support functions.
+// ---------------------------------------------------------------------------
+
+/// Sets an object's tags, replicated to every peer (same all-peers-ack
+/// reasoning as `cluster_put_retention` -- any peer can coordinate a
+/// later GET/DELETE, so every peer must agree on the new tag set, not
+/// just a write-quorum subset). Unlike retention, tagging applies to
+/// both plain and content-dependent (packed) records -- tags are a pure
+/// metadata field on either record shape, with no EC/placement
+/// implications, so there's no reason to restrict it to plain objects.
+pub(crate) async fn cluster_put_object_tagging_inner(
+    user_id: &str, bucket: &str, key: &str, tags: Vec<(String, String)>, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let peers = state.membership.peers();
+
+    if let Some(mut record) = state.content_location_store.get(user_id, bucket, key) {
+        record.tags = tags;
+        let acked = replicate_content_location_put(state, &record, &peers).await;
+        if acked < peers.len() {
+            return Err(ErrorInternalServerError(format!(
+                "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+            )));
+        }
+        return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
+    }
+
+    if let Some(mut record) = state.location_store.get(user_id, bucket, key) {
+        record.tags = tags;
+        let acked = replicate_location_put(state, &record, &peers).await;
+        if acked < peers.len() {
+            return Err(ErrorInternalServerError(format!(
+                "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+            )));
+        }
+        return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
+    }
+
+    Err(ErrorNotFound("object not found"))
+}
+
+/// Reads an object's tags -- a pure local lookup, same precedence
+/// (content-dependent checked first) as every other cluster GET-side
+/// read. Not async: no network call needed.
+pub(crate) fn cluster_get_object_tagging(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<Vec<(String, String)>, Error> {
+    if let Some(record) = state.content_location_store.get(user_id, bucket, key) {
+        return Ok(record.tags);
+    }
+    if let Some(record) = state.location_store.get(user_id, bucket, key) {
+        return Ok(record.tags);
+    }
+    Err(ErrorNotFound("object not found"))
+}
+
+/// Clears an object's tags -- same shape as the put side above, just an
+/// empty tag set.
+pub(crate) async fn cluster_delete_object_tagging_inner(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    cluster_put_object_tagging_inner(user_id, bucket, key, Vec::new(), state).await
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: object-lock (retention/legal-hold), authenticated-surface
+// support functions. Plain records only -- `ContentDependentRecord` has
+// no retention/legal_hold fields at all (see `cluster_put_retention`'s
+// own doc on why object-lock was never extended to packed objects); a
+// caller targeting a packed key gets a clear, explicit error instead of
+// a silent no-op that would let a packed object bypass locking entirely.
+// ---------------------------------------------------------------------------
+
+fn packed_object_lock_not_implemented() -> Error {
+    ErrorInternalServerError(
+        "object-lock (retention/legal-hold) is not implemented for content-dependent \
+         (packed) objects -- a documented, carried-forward gap, not a silent no-op",
+    )
+}
+
+/// Sets *only* `retention_mode`/`retain_until`, leaving `legal_hold`
+/// untouched -- the real S3 API treats PutObjectRetention and
+/// PutObjectLegalHold as independent calls; `cluster_put_retention`
+/// (above) is the bare, pre-auth, sentinel-only endpoint that sets both
+/// together and predates this split. Authenticated callers use this
+/// instead.
+pub(crate) async fn cluster_put_object_retention_inner(
+    user_id: &str, bucket: &str, key: &str, mode: &str, retain_until: &str, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if mode != "GOVERNANCE" && mode != "COMPLIANCE" {
+        return Err(ErrorBadRequest("mode must be GOVERNANCE or COMPLIANCE"));
+    }
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let mut record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    record.retention_mode = Some(mode.to_string());
+    record.retain_until = Some(retain_until.to_string());
+
+    let peers = state.membership.peers();
+    let acked = replicate_location_put(state, &record, &peers).await;
+    if acked < peers.len() {
+        return Err(ErrorInternalServerError(format!(
+            "retention update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+        )));
+    }
+    Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+}
+
+/// Sets *only* `legal_hold`, leaving `retention_mode`/`retain_until`
+/// untouched -- the real S3 API treats PutObjectLegalHold and
+/// PutObjectRetention as independent calls; `cluster_put_retention`
+/// (above) sets both together and predates this split.
+pub(crate) async fn cluster_put_object_legal_hold_inner(
+    user_id: &str, bucket: &str, key: &str, legal_hold: bool, state: &web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let mut record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    record.legal_hold = legal_hold;
+
+    let peers = state.membership.peers();
+    let acked = replicate_location_put(state, &record, &peers).await;
+    if acked < peers.len() {
+        return Err(ErrorInternalServerError(format!(
+            "legal-hold update requires every peer to ack: {acked}/{} acknowledged", peers.len()
+        )));
+    }
+    Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
+}
+
+/// Returns `(mode, retain_until)` if the plain object has an active
+/// retention record, `Ok(None)` if it exists but has none set, `Err` if
+/// the key doesn't exist or resolves to a packed object.
+pub(crate) fn cluster_get_object_retention(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<Option<(String, String)>, Error> {
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    Ok(match (record.retention_mode, record.retain_until) {
+        (Some(mode), Some(until)) => Some((mode, until)),
+        _ => None,
+    })
+}
+
+/// Returns whether legal hold is currently set on the plain object.
+pub(crate) fn cluster_get_object_legal_hold(
+    user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
+) -> Result<bool, Error> {
+    if state.content_location_store.get(user_id, bucket, key).is_some() {
+        return Err(packed_object_lock_not_implemented());
+    }
+    let record = state
+        .location_store
+        .get(user_id, bucket, key)
+        .ok_or_else(|| ErrorNotFound("object not found"))?;
+    Ok(record.legal_hold)
 }
 
 #[derive(Debug, Deserialize)]
@@ -882,10 +1656,20 @@ pub async fn cluster_internal_put_content_location(
     body: web::Json<super::content_location_store::ContentDependentRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    state
-        .content_location_store
-        .put(body.into_inner())
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    // `put` now does a real (group-committed) fsync -- see
+    // `storage::group_commit`'s module doc. Calling it directly here
+    // would block this actix worker's whole event loop for the fsync's
+    // duration, which also starves group commit of the concurrent
+    // callers it needs to batch well (measured locally: throughput fell
+    // ~99% without this). `web::block` matches what single-node's own
+    // PUT path (`s3/handlers/object.rs`) already does for the same
+    // underlying reason.
+    let store = Arc::clone(&state.content_location_store);
+    let record = body.into_inner();
+    web::block(move || store.put(record).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -897,10 +1681,13 @@ pub async fn cluster_internal_put_location(
     body: web::Json<LocationRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    state
-        .location_store
-        .put(body.into_inner())
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    // See `cluster_internal_put_content_location`'s matching comment.
+    let store = Arc::clone(&state.location_store);
+    let record = body.into_inner();
+    web::block(move || store.put(record).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -919,6 +1706,12 @@ pub async fn cluster_internal_put_location(
 /// param), just applied consistently to DELETE too.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteKeyRequest {
+    /// `#[serde(default)]`: a tombstone sent by an older peer process that
+    /// predates this field replays as `UNAUTHENTICATED_USER`, matching
+    /// what `LocationRecord`/`ContentDependentRecord`'s own `user_id`
+    /// default to for the same reason.
+    #[serde(default)]
+    pub user_id: String,
     pub bucket: String,
     pub key: String,
 }
@@ -928,11 +1721,14 @@ pub async fn cluster_internal_delete_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let DeleteKeyRequest { bucket, key } = body.into_inner();
-    state
-        .location_store
-        .delete(&bucket, &key)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    // See `cluster_internal_put_content_location`'s matching comment:
+    // `delete` fsyncs a tombstone append too.
+    let store = Arc::clone(&state.location_store);
+    let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
+    web::block(move || store.delete(&user_id, &bucket, &key).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -942,11 +1738,12 @@ pub async fn cluster_internal_delete_content_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let DeleteKeyRequest { bucket, key } = body.into_inner();
-    state
-        .content_location_store
-        .delete(&bucket, &key)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    let store = Arc::clone(&state.content_location_store);
+    let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
+    web::block(move || store.delete(&user_id, &bucket, &key).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -984,6 +1781,91 @@ mod tests {
         assert_eq!(required_write_acks(4, 2), 4);
     }
 
+    #[test]
+    fn decode_aws_chunked_payload_strips_framing_to_the_real_bytes() {
+        // Exact shape captured from a real minio-go (warp) PUT: two data
+        // chunks of different sizes, then a zero-size terminal chunk.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"5;chunk-signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        raw.extend_from_slice(b"hello");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"6;chunk-signature=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n");
+        raw.extend_from_slice(b" world");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"0;chunk-signature=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let decoded = decode_aws_chunked_payload(&raw).unwrap();
+        assert_eq!(decoded, b"hello world");
+    }
+
+    #[test]
+    fn decode_aws_chunked_payload_handles_single_chunk_matching_real_capture() {
+        // Same chunk size (0x10000 = 65536) seen in the real capture.
+        let mut raw = Vec::new();
+        let data = vec![0xABu8; 0x10000];
+        raw.extend_from_slice(b"10000;chunk-signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n");
+        raw.extend_from_slice(&data);
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"0;chunk-signature=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let decoded = decode_aws_chunked_payload(&raw).unwrap();
+        assert_eq!(decoded.len(), 0x10000);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn decode_aws_chunked_payload_rejects_truncated_chunk() {
+        let raw = b"a;chunk-signature=abc\r\nshort\r\n".to_vec();
+        assert!(decode_aws_chunked_payload(&raw).is_err());
+    }
+
+    /// The real safety property added this release: a reconstructed
+    /// object that doesn't match its stored checksum must never reach
+    /// the client. Tested directly against `verify_object_checksum`
+    /// (shared by the plain and FAC GET paths) rather than through a live
+    /// multi-node cluster -- round-tripping actual EC-encoded bytes
+    /// through real peer servers belongs to the Python S3-compat suite
+    /// (`server/tests/python/s3_boto_test.py`, run against both `/s3` and
+    /// `/cluster/s3`); this is the fast, deterministic unit coverage for
+    /// the verification logic itself, independent of transport/placement.
+    #[test]
+    fn verify_object_checksum_accepts_matching_data() {
+        let data = b"the real bytes that were written".to_vec();
+        let checksum = crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &data);
+        let stored = Some((ChecksumAlgorithm::Crc32c.as_str().to_string(), checksum));
+        assert!(verify_object_checksum("b", "k", &data, &stored).is_ok());
+    }
+
+    #[test]
+    fn verify_object_checksum_rejects_corrupted_data() {
+        let original = b"the real bytes that were written".to_vec();
+        let checksum = crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &original);
+        let stored = Some((ChecksumAlgorithm::Crc32c.as_str().to_string(), checksum));
+
+        // Simulates a shard silently corrupted on disk (bit-rot) or a
+        // reconstruction bug: the bytes handed to the client-facing
+        // response are not the bytes the checksum was computed over.
+        let mut corrupted = original.clone();
+        corrupted[10] ^= 0xFF;
+        assert_ne!(corrupted, original);
+
+        let err = verify_object_checksum("b", "k", &corrupted, &stored)
+            .expect_err("corrupted data must be rejected, not served");
+        let msg = err.to_string();
+        assert!(msg.contains("data integrity check failed"), "unexpected error message: {msg}");
+    }
+
+    #[test]
+    fn verify_object_checksum_passes_through_for_the_bare_unauthenticated_route() {
+        // `/cluster/{bucket}/{key}` never computes a checksum
+        // (`ObjectS3Metadata::default()`) -- must not fail closed on data
+        // nothing ever checksummed.
+        let data = b"object written through the bare pre-auth route".to_vec();
+        assert!(verify_object_checksum("b", "k", &data, &None).is_ok());
+    }
+
     /// #149: `replicate_location_delete`/`replicate_content_location_delete`
     /// now send `(bucket, key)` as this JSON body instead of interpolating
     /// them into a URL path, specifically so a key containing `?`, `#`,
@@ -993,7 +1875,7 @@ mod tests {
     #[test]
     fn delete_key_request_round_trips_keys_with_url_special_characters() {
         for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
-            let req = DeleteKeyRequest { bucket: "b".to_string(), key: key.to_string() };
+            let req = DeleteKeyRequest { user_id: "u1".to_string(), bucket: "b".to_string(), key: key.to_string() };
             let json = serde_json::to_string(&req).unwrap();
             let decoded: DeleteKeyRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded.key, key, "round-trip mismatch for key {key:?}");

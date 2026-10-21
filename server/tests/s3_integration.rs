@@ -148,9 +148,9 @@ async fn test_s3_authentication_invalid() {
 
     let resp = test::call_service(&app, req).await;
     println!("Invalid Auth Response status: {:?}", resp.status());
-    
-    // Should return 401 Unauthorized
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // S3 returns 403 AccessDenied (not 401) for an unrecognized access key
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// Test S3 authentication with missing authorization header
@@ -191,9 +191,9 @@ async fn test_s3_bucket_mismatch() {
 
     let resp = test::call_service(&app, req).await;
     println!("Bucket Mismatch Response status: {:?}", resp.status());
-    
-    // Should return 401 Unauthorized due to bucket mismatch
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Unrecognized access key with no Console configured — S3 returns 403 AccessDenied
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// Test S3 with curl-like requests
@@ -246,9 +246,10 @@ async fn test_s3_curl_simulation() {
 
 // --- Console / SigV4 auth integration tests ---
 
-/// When VITALITY_CONSOLE_URL is set but WARPDRIVE_SERVICE_SECRET is not set, auth fails with 401 (invalid configuration).
+/// When VITALITY_CONSOLE_URL is set but WARPDRIVE_SERVICE_SECRET is not set, auth fails with
+/// 403 AccessDenied (invalid configuration) — matching S3's auth-failure status code.
 #[actix_web::test]
-async fn test_s3_console_url_without_service_secret_returns_401() {
+async fn test_s3_console_url_without_service_secret_returns_403() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("VITALITY_CONSOLE_URL", "http://localhost:9999");
     std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
@@ -264,7 +265,7 @@ async fn test_s3_console_url_without_service_secret_returns_401() {
         .to_request();
 
     let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     std::env::remove_var("VITALITY_CONSOLE_URL");
 }

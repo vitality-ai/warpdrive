@@ -26,7 +26,7 @@ use actix_web::Error;
 use async_trait::async_trait;
 use flatbuffers::FlatBufferBuilder;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex as StdMutex;
+use parking_lot::Mutex as StdMutex;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -129,7 +129,7 @@ impl TcpPeerClient {
     }
 
     fn pool_for(&self, endpoint: &str) -> Arc<PeerPool> {
-        let mut pools = self.pools.lock().unwrap();
+        let mut pools = self.pools.lock();
         let pool_size = self.pool_size;
         Arc::clone(pools.entry(endpoint.to_string()).or_insert_with(|| {
             Arc::new(PeerPool {
@@ -208,11 +208,12 @@ impl Default for TcpPeerClient {
 
 #[async_trait]
 impl PeerClient for TcpPeerClient {
-    async fn put_shard(&self, peer: &str, bucket: &str, key: &str, shard_idx: usize, data: Vec<u8>) -> Result<(), Error> {
+    async fn put_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: Vec<u8>) -> Result<(), Error> {
         let mut fbb = FlatBufferBuilder::new();
         let bucket_off = fbb.create_string(bucket);
         let key_off = fbb.create_string(key);
         let data_off = fbb.create_vector(&data);
+        let user_id_off = fbb.create_string(user_id);
         let req = PutShardRequest::create(
             &mut fbb,
             &PutShardRequestArgs {
@@ -220,6 +221,7 @@ impl PeerClient for TcpPeerClient {
                 key: Some(key_off),
                 shard_idx: shard_idx as u32,
                 data: Some(data_off),
+                user_id: Some(user_id_off),
             },
         );
         let envelope = Envelope::create(
@@ -246,16 +248,18 @@ impl PeerClient for TcpPeerClient {
         Ok(())
     }
 
-    async fn get_shard(&self, peer: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
+    async fn get_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
         let mut fbb = FlatBufferBuilder::new();
         let bucket_off = fbb.create_string(bucket);
         let key_off = fbb.create_string(key);
+        let user_id_off = fbb.create_string(user_id);
         let req = GetShardRequest::create(
             &mut fbb,
             &GetShardRequestArgs {
                 bucket: Some(bucket_off),
                 key: Some(key_off),
                 shard_idx: shard_idx as u32,
+                user_id: Some(user_id_off),
             },
         );
         let envelope = Envelope::create(
@@ -315,6 +319,7 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             let key = req.key().unwrap_or_default().to_string();
             let shard_idx = req.shard_idx() as usize;
             let data = req.data().map(|d| d.bytes().to_vec()).unwrap_or_default();
+            let user_id = req.user_id().unwrap_or_default().to_string();
 
             // #161: same reasoning as the gRPC server side -- store_shard
             // is synchronous file I/O plus a Bitcask log append, and this
@@ -327,7 +332,7 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             // plain String inside the closure before crossing the thread
             // boundary (spawn_blocking's result must be Send + 'static).
             let result: Result<(), String> =
-                tokio::task::spawn_blocking(move || store_shard(&bucket, &key, shard_idx, &data).map_err(|e| e.to_string()))
+                tokio::task::spawn_blocking(move || store_shard(&user_id, &bucket, &key, shard_idx, &data).map_err(|e| e.to_string()))
                     .await
                     .unwrap_or_else(|e| Err(format!("shard store task panicked: {e}")));
             let (ok, error) = match &result {
@@ -343,9 +348,10 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
             let bucket = req.bucket().unwrap_or_default().to_string();
             let key = req.key().unwrap_or_default().to_string();
             let shard_idx = req.shard_idx() as usize;
+            let user_id = req.user_id().unwrap_or_default().to_string();
 
             let result: Result<Vec<u8>, String> =
-                tokio::task::spawn_blocking(move || load_shard(&bucket, &key, shard_idx).map_err(|e| e.to_string()))
+                tokio::task::spawn_blocking(move || load_shard(&user_id, &bucket, &key, shard_idx).map_err(|e| e.to_string()))
                     .await
                     .unwrap_or_else(|e| Err(format!("shard load task panicked: {e}")));
             match result {

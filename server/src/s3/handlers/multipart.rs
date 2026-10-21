@@ -165,8 +165,12 @@ pub async fn s3_upload_part_handler(
     let upload_id = query.get("uploadId")
         .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing uploadId"))?.clone();
 
-    let part_number: i32 = part_number_str.parse()
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;
+    let part_number: i32 = match part_number_str.parse() {
+        Ok(n) if (1..=10000).contains(&n) => n,
+        _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                "Part number must be an integer between 1 and 10000, inclusive",
+                                &format!("/{}/{}", bucket, key))),
+    };
 
     let auth_result = authenticate_s3_request(&req).await?;
     let db = MetadataService::new(&auth_result.user_id)?;
@@ -187,8 +191,19 @@ pub async fn s3_upload_part_handler(
     }
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let storage_service = StorageService::new();
-    let offset_size_list = storage_service.write_object(&context, &body, StorageMode::S3)?;
+    // web::block: `Storage::write` now does a real (group-committed) fsync
+    // -- see `storage::group_commit`'s module doc -- so this has to go
+    // through `web::block` the same way `object.rs`'s PUT handler does;
+    // calling it directly here would block this actix worker's whole
+    // event loop for the fsync's duration.
+    let context_c = context.clone();
+    let body_c = body.clone();
+    let offset_size_list = web::block(move || {
+        StorageService::new().write_object(&context_c, &body_c, StorageMode::S3).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
@@ -257,7 +272,18 @@ pub async fn s3_upload_part_copy_handler(
         None => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
                                    "Missing x-amz-copy-source", &bucket)),
     };
-    let source = copy_source.trim_start_matches('/');
+    // Same `?versionId=` split `copy.rs`'s CopyObject already does --
+    // UploadPartCopy allows copying from a specific source version too
+    // (`test_multipart_copy_versioned`), and without stripping it here the
+    // literal "key?versionId=..." string gets looked up as a key that can
+    // never exist.
+    let source_raw = copy_source.trim_start_matches('/');
+    let (source, copy_source_version_id) = if let Some(pos) = source_raw.find("?versionId=") {
+        let vid = percent_decode(&source_raw[pos + 11..]);
+        (&source_raw[..pos], if vid == "null" { None } else { Some(vid) })
+    } else {
+        (source_raw, None)
+    };
     let (src_bucket, src_key_enc) = match source.splitn(2, '/').collect::<Vec<_>>().as_slice() {
         [b, k] => (b.to_string(), k.to_string()),
         _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
@@ -265,11 +291,19 @@ pub async fn s3_upload_part_copy_handler(
     };
     let src_key = percent_decode(&src_key_enc);
 
-    if !db.check_key(&src_bucket, &src_key)? {
-        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
-                           "The source key does not exist", &format!("/{}/{}", src_bucket, src_key)));
-    }
-    let src_meta = db.get_object_full(&src_bucket, &src_key)?;
+    let src_meta = if let Some(ref vid) = copy_source_version_id {
+        match db.get_object_version(&src_bucket, &src_key, vid) {
+            Ok(m) if !m.is_delete_marker => m,
+            _ => return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                                    "The source key does not exist", &format!("/{}/{}", src_bucket, src_key))),
+        }
+    } else {
+        if !db.check_key(&src_bucket, &src_key)? {
+            return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                               "The source key does not exist", &format!("/{}/{}", src_bucket, src_key)));
+        }
+        db.get_object_full(&src_bucket, &src_key)?
+    };
     let src_size = src_meta.size;
     let src_extents = src_meta.to_offset_size_list();
 
@@ -311,10 +345,23 @@ pub async fn s3_upload_part_copy_handler(
     let part_bytes = storage_service.read_object(&src_context, &read_extents, StorageMode::S3)?;
 
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    let offset_size_list = storage_service.write_object(&dst_context, &part_bytes, StorageMode::S3)?;
+    // web::block: same reasoning as UploadPart's matching fix -- `write_object`
+    // now does a real group-committed fsync.
+    let dst_context_c = dst_context.clone();
+    let part_bytes_c = part_bytes.clone();
+    let offset_size_list = web::block(move || {
+        StorageService::new().write_object(&dst_context_c, &part_bytes_c, StorageMode::S3).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    let part_number_i32: i32 = part_number.parse()
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid partNumber"))?;
+    let part_number_i32: i32 = match part_number.parse() {
+        Ok(n) if (1..=10000).contains(&n) => n,
+        _ => return Ok(s3_error(StatusCode::BAD_REQUEST, "InvalidArgument",
+                                "Part number must be an integer between 1 and 10000, inclusive",
+                                &format!("/{}/{}", bucket, key))),
+    };
 
     match db.get_multipart_upload(&upload_id)? {
         Some(row) if row.status == "in_progress" => {}
@@ -704,18 +751,20 @@ pub(super) async fn s3_list_multipart_uploads_handler(bucket: &str, req: &HttpRe
     let mut uploads_xml = String::new();
     for upload in &uploads {
         let uid = xml_escape(&upload.user_id);
+        let udn = if upload.user_id == auth_result.user_id { &auth_result.owner_display_name } else { &upload.user_id };
         uploads_xml.push_str(&format!(
             "<Upload>\
               <Key>{key}</Key>\
               <UploadId>{upid}</UploadId>\
-              <Initiator><ID>{uid}</ID><DisplayName>{uid}</DisplayName></Initiator>\
-              <Owner><ID>{uid}</ID><DisplayName>{uid}</DisplayName></Owner>\
+              <Initiator><ID>{uid}</ID><DisplayName>{udn}</DisplayName></Initiator>\
+              <Owner><ID>{uid}</ID><DisplayName>{udn}</DisplayName></Owner>\
               <StorageClass>STANDARD</StorageClass>\
               <Initiated>{init}</Initiated>\
             </Upload>",
             key   = xml_escape(&upload.key),
             upid  = xml_escape(&upload.upload_id),
             uid   = uid,
+            udn   = xml_escape(udn),
             init  = xml_escape(&upload.initiated_at),
         ));
     }
@@ -746,11 +795,23 @@ pub(super) async fn s3_get_object_attributes_handler(bucket: &str, key: &str, re
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
 
-    if !db.check_key(bucket, key)? {
-        return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
-                           "The specified key does not exist", &format!("/{}/{}", bucket, key)));
-    }
-    let meta = db.get_object_full(bucket, key)?;
+    // `?versionId=` requests attributes of a specific (possibly non-current)
+    // version -- `test_get_versioned_object_attributes` asks for an older
+    // version's attributes after writing a newer current one.
+    let version_id = req.query_string()
+        .split('&')
+        .find_map(|p| p.strip_prefix("versionId="))
+        .map(|v| percent_decode(v));
+
+    let meta = if let Some(ref vid) = version_id {
+        db.get_object_version(bucket, key, vid)?
+    } else {
+        if !db.check_key(bucket, key)? {
+            return Ok(s3_error(StatusCode::NOT_FOUND, "NoSuchKey",
+                               "The specified key does not exist", &format!("/{}/{}", bucket, key)));
+        }
+        db.get_object_full(bucket, key)?
+    };
     let etag_raw = meta.etag.as_deref().map(normalize_etag).unwrap_or("").to_string();
 
     let max_parts: usize = req.headers().get("x-amz-max-parts")
@@ -847,6 +908,11 @@ pub(super) async fn s3_get_object_attributes_handler(bucket: &str, key: &str, re
     let mut resp = HttpResponse::Ok();
     resp.content_type("application/xml");
     if let Some(lm) = &meta.last_modified { resp.insert_header(("Last-Modified", last_modified_for_header(lm))); }
+    if let Some(vid) = &meta.version_id {
+        if !vid.is_empty() && vid != "null" {
+            resp.insert_header(("x-amz-version-id", vid.clone()));
+        }
+    }
     Ok(resp.body(xml))
 }
 

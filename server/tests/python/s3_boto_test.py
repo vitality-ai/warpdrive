@@ -4,6 +4,7 @@ S3-compatible API test client using boto3 (AWS SDK)
 This script tests the CIAOS S3 API using the official AWS SDK to ensure full compatibility
 """
 
+import os
 import boto3
 import botocore
 import json
@@ -12,9 +13,14 @@ import time
 from botocore.exceptions import ClientError, NoCredentialsError
 from botocore.config import Config
 
-# Server configuration
-SERVER_URL = "http://localhost:9710"
-S3_ENDPOINT_URL = f"{SERVER_URL}/s3"
+# Server configuration. The same suite runs against both single-node and
+# the distributed/cluster engine by pointing S3_PATH at "/cluster/s3"
+# instead of "/s3" -- no separate test file, no separate cluster-only
+# setup, just a different base path on the same running server:
+#   WARPDRIVE_S3_PATH=/cluster/s3 python3 s3_boto_test.py
+SERVER_URL = os.environ.get("WARPDRIVE_SERVER_URL", "http://localhost:9710")
+S3_PATH = os.environ.get("WARPDRIVE_S3_PATH", "/s3")
+S3_ENDPOINT_URL = f"{SERVER_URL}{S3_PATH}"
 
 # S3 Authentication credentials (hardcoded for testing)
 ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
@@ -39,7 +45,13 @@ def create_s3_client():
                 signature_version='s3v4',
                 s3={
                     'addressing_style': 'path'
-                }
+                },
+                # Stops newer botocore versions from attaching their own
+                # client-side checksum to every PUT by default -- without
+                # this, the server's own default-on checksum behavior
+                # (test_s3_checksum_default_and_echo below) is never
+                # actually exercised, since the client always sent one.
+                request_checksum_calculation='when_required',
             )
         )
         return s3_client
@@ -285,6 +297,92 @@ def test_s3_authentication_failure():
         print(f"Authentication Error: {e}")
         return True  # This is also expected
 
+def test_s3_checksum_default_and_echo(s3_client):
+    """A PUT with no client-sent checksum still gets one by default
+    (CRC32C), and it's echoed back on GET/HEAD when the client asks for
+    it via x-amz-checksum-mode: ENABLED. Same assertion against both
+    single-node and the cluster engine -- both compute a default checksum
+    now, not just when AWS's checksum feature is explicitly used.
+    """
+    print("\nTesting S3 checksum-by-default + echo with boto3...")
+
+    key = f"{TEST_KEY}-checksum"
+    body = b"checksum default test data " * 100
+
+    try:
+        s3_client.put_object(Bucket=TEST_BUCKET, Key=key, Body=body, ContentType='text/plain')
+
+        got = s3_client.get_object(Bucket=TEST_BUCKET, Key=key, ChecksumMode='ENABLED')
+        if got['Body'].read() != body:
+            print("GET body does not match what was PUT")
+            return False
+        checksum_headers = [h for h in got['ResponseMetadata']['HTTPHeaders'] if h.startswith('x-amz-checksum-')]
+        print(f"GET response checksum headers: {checksum_headers}")
+        if not checksum_headers:
+            print("Expected a default checksum echoed on GET even though the client sent none on PUT")
+            return False
+        if not any('crc32c' in h for h in checksum_headers):
+            print(f"Expected the lightweight CRC32C default, got {checksum_headers}")
+            return False
+
+        head = s3_client.head_object(Bucket=TEST_BUCKET, Key=key, ChecksumMode='ENABLED')
+        if not any(h.startswith('x-amz-checksum-') for h in head['ResponseMetadata']['HTTPHeaders']):
+            print("Expected checksum echoed on HEAD")
+            return False
+
+        s3_client.delete_object(Bucket=TEST_BUCKET, Key=key)
+        return True
+
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        print(f"Checksum test Error: {error_code} - {e}")
+        return False
+    except Exception as e:
+        print(f"Checksum test Unexpected Error: {e}")
+        return False
+
+def test_s3_anonymous_public_read_versioned_object(s3_client):
+    """Anonymous GET of a public-read object on a versioning-enabled bucket,
+    with no VersionId in the request. Regression test for a real bug: the
+    anonymous-read ACL check looked up the object's ACL with a hardcoded
+    empty version_id instead of resolving the current version, so this
+    exact case (public-read + versioning + no explicit VersionId) 403'd
+    even though the object really was public."""
+    print("\nTesting anonymous GET of a public-read object on a versioned bucket...")
+    bucket = f"test-bucket-anon-versioned-{int(time.time())}"
+    key = "public-object"
+    data = b"anyone can read this"
+
+    try:
+        s3_client.create_bucket(Bucket=bucket)
+        s3_client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        put_resp = s3_client.put_object(Bucket=bucket, Key=key, Body=data, ACL="public-read")
+        version_id = put_resp.get("VersionId")
+        print(f"PUT created version_id={version_id}")
+
+        anon_client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT_URL,
+            config=Config(
+                signature_version=botocore.UNSIGNED,
+                s3={"addressing_style": "path"},
+            ),
+        )
+        # No VersionId specified -- this is the exact case that regressed:
+        # the handler must resolve "current version" itself, not assume "".
+        anon_resp = anon_client.get_object(Bucket=bucket, Key=key)
+        body = anon_resp["Body"].read()
+        print(f"Anonymous GET body matches: {body == data}")
+        return body == data
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        print(f"Anonymous public-read GET Error: {error_code} - {e}")
+        return False
+    except Exception as e:
+        print(f"Anonymous public-read GET Unexpected Error: {e}")
+        return False
+
 def test_s3_bucket_operations(s3_client):
     """Test S3 bucket operations"""
     print("\nTesting S3 Bucket Operations...")
@@ -334,7 +432,9 @@ def main():
         ("S3 HEAD Object", lambda: test_s3_head_object(s3_client)),
         ("S3 List Objects", lambda: test_s3_list_objects(s3_client)),
         ("S3 Multipart Upload", lambda: test_s3_multipart_upload(s3_client)),
+        ("S3 Checksum Default + Echo", lambda: test_s3_checksum_default_and_echo(s3_client)),
         ("S3 Copy Object", lambda: test_s3_copy_object(s3_client)),
+        ("S3 Anonymous Public-Read Versioned Object", lambda: test_s3_anonymous_public_read_versioned_object(s3_client)),
         ("S3 Bucket Operations", lambda: test_s3_bucket_operations(s3_client)),
         ("S3 Authentication Failure", test_s3_authentication_failure),
         ("S3 DELETE Object", lambda: test_s3_delete_object(s3_client)),

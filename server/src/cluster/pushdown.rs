@@ -194,7 +194,7 @@ pub async fn cluster_internal_pushdown_filter(
     } else {
         super::shard_storage::versioned_key(&sk, &req.version)
     };
-    let raw_bin = super::shard_storage::load_shard(&req.bucket, &wire_key, req.bin_index)?;
+    let raw_bin = super::shard_storage::load_shard(super::location_store::UNAUTHENTICATED_USER, &req.bucket, &wire_key, req.bin_index)?;
     let response = evaluate(&raw_bin, &req, &state)?;
     Ok(HttpResponse::Ok().json(response))
 }
@@ -215,7 +215,7 @@ pub async fn cluster_pushdown_query(
 
     let record = state
         .content_location_store
-        .get(&bucket, &key)
+        .get(super::location_store::UNAUTHENTICATED_USER, &bucket, &key)
         .ok_or_else(|| ErrorNotFound("no content-dependent record for this key"))?;
 
     let (stripe_idx, bin_idx) = record
@@ -312,5 +312,42 @@ mod tests {
     fn compressibility_is_uncompressed_over_compressed() {
         assert_eq!(compressibility(930, 100), 9.3);
         assert_eq!(compressibility(100, 0), 1.0); // guards div-by-zero, not a real case
+    }
+
+    /// Phase 5 regression gate: replicates `evaluate()`'s own sequence
+    /// (decode -> filter -> compute selectivity/compressibility -> push-
+    /// down decision) end to end through the public pieces, without
+    /// needing a live `ClusterState` -- confirms Phases 2-4's changes
+    /// elsewhere in the cluster module didn't disturb this composition.
+    /// `evaluate()` itself is unchanged (not touched by this session),
+    /// this just proves its building blocks still fit together.
+    #[test]
+    fn pushdown_end_to_end_through_the_public_pieces_still_composes() {
+        let values: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let mut raw = Vec::new();
+        for v in &values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let uncompressed_len = raw.len() as u64;
+        let compressed_len = compressed.len() as u64;
+
+        let codec: &dyn ColumnCodec = &ZlibF64Codec;
+        let decoded = codec.decode(&compressed).unwrap();
+        assert_eq!(decoded.len(), 1000);
+
+        let op = CompareOp::Lt;
+        let threshold = 10.0;
+        let matched: Vec<f64> = decoded.iter().copied().filter(|&v| matches(op, v, threshold)).collect();
+        assert_eq!(matched.len(), 10, "values 0..10 are < 10.0");
+
+        let selectivity = matched.len() as f64 / decoded.len() as f64;
+        let compress = compressibility(uncompressed_len, compressed_len);
+        // Low selectivity (1%) on real zlib-compressible sequential data:
+        // pushing down the filtered, uncompressed values should win over
+        // shipping the whole compressed chunk for the caller to decode.
+        assert!(should_push_down_projection(selectivity, compress));
     }
 }

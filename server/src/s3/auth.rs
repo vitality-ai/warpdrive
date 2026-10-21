@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use log::{debug, warn};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 lazy_static! {
@@ -39,16 +39,37 @@ struct S3CredentialsResponse {
     registered_buckets: Vec<String>,
 }
 
+/// The single static admin identity's canonical user ID. Every bucket/object in
+/// admin-only mode is owned by this ID — resource-owner lookups use this constant
+/// rather than a literal so the one place that assumes "single owner" is easy to
+/// find and replace once Vitality Console (UAM) can resolve real per-bucket owners.
+pub const ADMIN_USER_ID: &str = "admin";
+
 /// S3 Authentication result
 #[derive(Debug)]
 pub struct S3AuthResult {
     pub access_key: String,
     pub user_id: String,
+    /// Owner display name for ACL/Owner XML elements (e.g. "Warpdrive Admin").
+    /// Empty for anonymous requests.
+    pub owner_display_name: String,
     pub bucket: String,
     /// Snapshot of Console-registered buckets for this key (from credential cache at refresh time).
     pub allowed_buckets: Vec<String>,
     /// True for the hardcoded admin user — skips bucket membership checks so any bucket is reachable.
     pub allow_all_buckets: bool,
+    /// True when the request had no Authorization header and no presigned query params.
+    /// Anonymous requests are gated by stored bucket/object ACL, not auto-denied.
+    pub is_anonymous: bool,
+}
+
+/// Static admin display name, e.g. for `<Owner><DisplayName>` in ACL XML.
+/// Defaults to match `s3-tests.conf`'s `[s3 main] display_name`.
+pub fn admin_display_name() -> String {
+    std::env::var("WARPDRIVE_ADMIN_DISPLAY_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Warpdrive Admin".to_string())
 }
 
 /// Returns (base_url, service_secret, cache_ttl_secs).
@@ -140,13 +161,12 @@ async fn fetch_credential_bundle_from_console(
 }
 
 fn invalidate_s3_credential_cache(access_key: &str) {
-    if let Ok(mut cache) = CREDENTIAL_CACHE.write() {
-        if cache.remove(access_key).is_some() {
-            debug!(
-                "S3 credential cache INVALIDATED access_key={}",
-                access_key_log_prefix(access_key)
-            );
-        }
+    let mut cache = CREDENTIAL_CACHE.write();
+    if cache.remove(access_key).is_some() {
+        debug!(
+            "S3 credential cache INVALIDATED access_key={}",
+            access_key_log_prefix(access_key)
+        );
     }
 }
 
@@ -162,7 +182,7 @@ async fn load_or_refresh_credential_bundle(
 ) -> Result<(String, String, HashSet<String>, bool), Error> {
     let cache_key = access_key.to_string();
     {
-        let cached = CREDENTIAL_CACHE.read().map_err(|_| ErrorUnauthorized("Cache lock"))?;
+        let cached = CREDENTIAL_CACHE.read();
         if let Some(c) = cached.get(&cache_key) {
             if c.expires_at > Instant::now() {
                 debug!(
@@ -190,7 +210,7 @@ async fn load_or_refresh_credential_bundle(
     let allowed_buckets: HashSet<String> = names.into_iter().collect();
 
     let expires_at = Instant::now() + Duration::from_secs(cache_ttl_secs);
-    let mut cache = CREDENTIAL_CACHE.write().map_err(|_| ErrorUnauthorized("Cache lock"))?;
+    let mut cache = CREDENTIAL_CACHE.write();
     cache.insert(
         cache_key,
         CachedCredential {
@@ -420,7 +440,7 @@ fn verify_sigv4(
             canonical_uri,
             canonical_query_string.len()
         );
-        return Err(ErrorUnauthorized("Signature does not match"));
+        return Err(s3_access_denied("Signature does not match"));
     }
     Ok(())
 }
@@ -469,14 +489,25 @@ fn is_list_buckets_request(req: &HttpRequest) -> bool {
 }
 
 /// Extract bucket from request path.
-/// Handles both the warpdrive-prefixed form (/s3/{bucket}/...) and the standard
-/// root form (/{bucket}/...) that Ceph s3-tests and boto3 clients use by default.
+/// Handles the warpdrive-prefixed form (/s3/{bucket}/...), the cluster
+/// surface's form (/cluster/s3/{bucket}/...), and the standard root form
+/// (/{bucket}/...) that Ceph s3-tests and boto3 clients use by default.
 fn extract_bucket_from_path(req: &HttpRequest) -> Result<String, Error> {
     let path = req.path();
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    // Skip the "s3" prefix if present (warpdrive path-style: /s3/{bucket}/...)
-    let bucket_idx = if parts.first().copied() == Some("s3") { 1 } else { 0 };
+    // Skip a leading "cluster" segment (the cluster S3 surface's path
+    // prefix, /cluster/s3/{bucket}/...), then skip "s3" if present
+    // (warpdrive path-style: /s3/{bucket}/... or /cluster/s3/{bucket}/...).
+    // SigV4 verification itself (`verify_sigv4`) uses `req.path()` directly
+    // as the canonical URI, so it's unaffected by this -- this only fixes
+    // which path segment `S3AuthResult.bucket` (used for bucket-level
+    // access checks) reports as the bucket name.
+    let mut idx = if parts.first().copied() == Some("cluster") { 1 } else { 0 };
+    if parts.get(idx).copied() == Some("s3") {
+        idx += 1;
+    }
+    let bucket_idx = idx;
 
     if parts.len() <= bucket_idx || parts[bucket_idx].is_empty() {
         return Ok(String::new()); // list-buckets call
@@ -654,7 +685,7 @@ fn verify_sigv4_presigned(req: &HttpRequest, secret_key: &str, parsed: &ParsedPr
     })?;
     if mac.verify_slice(&provided_sig).is_err() {
         warn!("Presigned V4 signature mismatch (uri={}, query_len={})", canonical_uri, canonical_query_string.len());
-        return Err(ErrorUnauthorized("Signature does not match"));
+        return Err(s3_access_denied("Signature does not match"));
     }
     Ok(())
 }
@@ -675,29 +706,59 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
             debug!("Presigned V4 auth: admin bypass OK bucket={:?}", bucket);
             return Ok(S3AuthResult {
                 access_key,
-                user_id: "admin".to_string(),
+                user_id: ADMIN_USER_ID.to_string(),
+                owner_display_name: admin_display_name(),
                 bucket,
                 allowed_buckets: vec![],
                 allow_all_buckets: true,
+                is_anonymous: false,
             });
         }
     }
 
     // Console path
     let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
-    let base_url = base_url.ok_or_else(|| ErrorUnauthorized("No authentication method configured"))?;
-    let service_secret = service_secret.ok_or_else(|| ErrorUnauthorized("WARPDRIVE_SERVICE_SECRET not set"))?;
-    let (owner_id, secret_key, _, _) =
+    let base_url = base_url.ok_or_else(|| s3_access_denied("No authentication method configured"))?;
+    let service_secret = service_secret.ok_or_else(|| s3_access_denied("WARPDRIVE_SERVICE_SECRET not set"))?;
+    let (mut owner_id, mut secret_key, mut allowed_buckets, cache_hit) =
         load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
+
+    if cache_hit && allowed_buckets.is_empty() && !bucket.is_empty() {
+        warn!(
+            "Presigned V4 auth: empty cached bucket set for path_bucket={:?} — invalidating and re-fetching",
+            bucket
+        );
+        invalidate_s3_credential_cache(&access_key);
+        let (o, s, ab, _) =
+            load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
+        owner_id = o;
+        secret_key = s;
+        allowed_buckets = ab;
+    }
+
+    if !bucket.is_empty() && !allowed_buckets.contains(&bucket) {
+        warn!(
+            "Presigned V4 auth: FORBIDDEN path_bucket={:?} not in cached Console bucket set {:?}",
+            bucket, allowed_buckets
+        );
+        return Err(ErrorForbidden(
+            "Bucket is not registered for this account in Vitality Console",
+        ));
+    }
+
+    let mut allowed_buckets_vec: Vec<String> = allowed_buckets.iter().cloned().collect();
+    allowed_buckets_vec.sort();
 
     verify_sigv4_presigned(req, &secret_key, &parsed)?;
     debug!("Presigned V4 auth: Console OK bucket={:?} user={}", bucket, owner_id);
     Ok(S3AuthResult {
         access_key,
+        owner_display_name: owner_id.clone(),
         user_id: owner_id,
         bucket,
-        allowed_buckets: vec![],
+        allowed_buckets: allowed_buckets_vec,
         allow_all_buckets: false,
+        is_anonymous: false,
     })
 }
 
@@ -729,28 +790,31 @@ fn s3_access_denied(message: &str) -> Error {
     ).into()
 }
 
+/// Authenticate an S3 request, requiring valid credentials — a missing Authorization
+/// header is always a 403, exactly like before ACL support existed. This is what the
+/// vast majority of handlers should keep using unchanged.
 pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, Error> {
+    authenticate_s3_request_inner(req, false).await
+}
+
+/// Same as `authenticate_s3_request`, but a missing Authorization header returns an
+/// `Ok(S3AuthResult { is_anonymous: true, .. })` instead of erroring, so the caller can
+/// gate the request against the resource's stored ACL (public-read/public-read-write/
+/// authenticated-read) instead of rejecting it outright. Only handlers that actually
+/// implement an ACL check for anonymous access should call this — everything else
+/// should keep using `authenticate_s3_request`.
+pub async fn authenticate_s3_request_allow_anonymous(req: &HttpRequest) -> Result<S3AuthResult, Error> {
+    authenticate_s3_request_inner(req, true).await
+}
+
+async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool) -> Result<S3AuthResult, Error> {
     // Detect presigned requests before looking for Authorization header
     let query_map = parse_query_map(req);
     if query_map.contains_key("X-Amz-Algorithm") {
         return authenticate_presigned_v4(req, &query_map).await;
     }
 
-    let auth_header = req
-        .headers()
-        .get("Authorization")
-        .ok_or_else(|| {
-            warn!("Missing Authorization header");
-            s3_access_denied("Access Denied")
-        })?
-        .to_str()
-        .map_err(|_| {
-            warn!("Invalid Authorization header format");
-            s3_access_denied("Access Denied")
-        })?;
-
-    let parsed = parse_authorization_header_full(auth_header)?;
-    let access_key = parsed.access_key.clone();
+    let auth_header_opt = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
     let bucket = extract_bucket_from_path(req)?;
 
     if !is_list_buckets_request(req) && bucket.is_empty() {
@@ -763,6 +827,32 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
             "S3 path must be /s3/{bucket}/... for this operation (use path-style addressing in your S3 client)",
         ));
     }
+
+    let auth_header = match auth_header_opt {
+        Some(h) => h,
+        None => {
+            if allow_anonymous {
+                // S3 never rejects this outright (e.g. anonymous ListBuckets returns 200
+                // with an empty list) — the caller gates on `is_anonymous` against the
+                // resource's stored ACL.
+                debug!("S3 auth: anonymous request path_bucket={:?}", bucket);
+                return Ok(S3AuthResult {
+                    access_key: String::new(),
+                    user_id: String::new(),
+                    owner_display_name: String::new(),
+                    bucket,
+                    allowed_buckets: vec![],
+                    allow_all_buckets: false,
+                    is_anonymous: true,
+                });
+            }
+            warn!("Missing Authorization header");
+            return Err(s3_access_denied("Access Denied"));
+        }
+    };
+
+    let parsed = parse_authorization_header_full(auth_header)?;
+    let access_key = parsed.access_key.clone();
 
     debug!(
         "S3 auth: request_path={} extracted_bucket={:?} list_buckets={}",
@@ -779,10 +869,12 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
             debug!("S3 auth: admin bypass OK path_bucket={:?}", bucket);
             return Ok(S3AuthResult {
                 access_key,
-                user_id: "admin".to_string(),
+                user_id: ADMIN_USER_ID.to_string(),
+                owner_display_name: admin_display_name(),
                 bucket,
                 allowed_buckets: vec![],
                 allow_all_buckets: true,
+                is_anonymous: false,
             });
         }
     }
@@ -792,11 +884,11 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
 
     let base_url = base_url.ok_or_else(|| {
         warn!("VITALITY_CONSOLE_URL not set and no admin credentials configured");
-        ErrorUnauthorized("No authentication method configured (set WARPDRIVE_ADMIN_ACCESS_KEY or VITALITY_CONSOLE_URL)")
+        s3_access_denied("No authentication method configured (set WARPDRIVE_ADMIN_ACCESS_KEY or VITALITY_CONSOLE_URL)")
     })?;
     let service_secret = service_secret.ok_or_else(|| {
         warn!("WARPDRIVE_SERVICE_SECRET not set");
-        ErrorUnauthorized("WARPDRIVE_SERVICE_SECRET must be set when using Vitality Console")
+        s3_access_denied("WARPDRIVE_SERVICE_SECRET must be set when using Vitality Console")
     })?;
 
     let (mut owner_id, mut secret_key, mut allowed_buckets, cache_hit) =
@@ -835,10 +927,12 @@ pub async fn authenticate_s3_request(req: &HttpRequest) -> Result<S3AuthResult, 
     );
     Ok(S3AuthResult {
         access_key,
+        owner_display_name: owner_id.clone(),
         user_id: owner_id,
         bucket,
         allowed_buckets: allowed_buckets_vec,
         allow_all_buckets: false,
+        is_anonymous: false,
     })
 }
 
@@ -852,6 +946,16 @@ mod tests {
     use super::*;
     use actix_web::test;
 
+    lazy_static! {
+        /// `VITALITY_CONSOLE_URL`/`WARPDRIVE_SERVICE_SECRET` are process-global,
+        /// but Rust runs tests in this module on multiple threads by default --
+        /// without this, two tests that both set/remove these mid-run race and
+        /// intermittently fail with "No authentication method configured" or
+        /// similar, depending on which one's remove_var lands first. Every test
+        /// that touches either env var holds this for its full duration.
+        static ref ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    }
+
     #[actix_web::test]
     async fn test_parse_authorization_header() {
         let auth_header = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20231201/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
@@ -862,6 +966,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_authenticate_s3_request_requires_console_config() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("VITALITY_CONSOLE_URL");
         std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
         let req = test::TestRequest::default()
@@ -874,6 +979,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_authenticate_s3_request_errors_when_console_config_missing() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("VITALITY_CONSOLE_URL");
         let req = test::TestRequest::default()
             .uri("/s3/test-bucket/test-key")
@@ -936,5 +1042,129 @@ mod tests {
             .to_http_request();
         let err = verify_sigv4(&req, "secret", &parsed);
         assert!(err.is_err());
+    }
+
+    /// Builds a presigned-V4 GET request for `canonical_uri`, signed with
+    /// `secret_key`, using the identical canonical-request/signing steps
+    /// `verify_sigv4_presigned` checks against -- so a test can exercise
+    /// `authenticate_presigned_v4` with a signature that actually verifies,
+    /// instead of only ever hitting the signature-mismatch error path.
+    fn build_presigned_get_request(access_key: &str, secret_key: &str, canonical_uri: &str, host: &str) -> HttpRequest {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        type HmacSha256 = Hmac<Sha256>;
+
+        let now = chrono::Utc::now();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.format("%Y%m%d").to_string();
+        let region = "us-east-1";
+        let service = "s3";
+        let credential = format!("{access_key}/{date}/{region}/{service}/aws4_request");
+        let signed_headers = "host";
+
+        let mut pairs = vec![
+            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            ("X-Amz-Credential".to_string(), credential),
+            ("X-Amz-Date".to_string(), amz_date.clone()),
+            ("X-Amz-Expires".to_string(), "900".to_string()),
+            ("X-Amz-SignedHeaders".to_string(), signed_headers.to_string()),
+        ];
+        pairs.sort_by(|a, b| percent_encode_uri(&a.0).cmp(&percent_encode_uri(&b.0)));
+        let canonical_query_string = pairs.iter()
+            .map(|(k, v)| format!("{}={}", percent_encode_uri(k), percent_encode_uri(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let canonical_headers = format!("host:{host}");
+        let canonical_request =
+            format!("GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers}\nUNSIGNED-PAYLOAD");
+
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_request.as_bytes());
+        let canonical_request_hash = hex::encode(hasher.finalize());
+        let credential_scope = format!("{date}/{region}/{service}/aws4_request");
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
+
+        let k_secret = format!("AWS4{secret_key}");
+        let mut mac = HmacSha256::new_from_slice(k_secret.as_bytes()).unwrap();
+        mac.update(date.as_bytes());
+        let k_date = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_date).unwrap();
+        mac.update(region.as_bytes());
+        let k_region = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_region).unwrap();
+        mac.update(service.as_bytes());
+        let k_service = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_service).unwrap();
+        mac.update(b"aws4_request");
+        let k_signing = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&k_signing).unwrap();
+        mac.update(string_to_sign.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let full_query = format!("{canonical_query_string}&X-Amz-Signature={signature}");
+        test::TestRequest::get()
+            .uri(&format!("{canonical_uri}?{full_query}"))
+            .insert_header(("host", host))
+            .to_http_request()
+    }
+
+    #[actix_web::test]
+    async fn presigned_v4_rejects_bucket_not_in_allowed_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:1");
+        std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-service-secret");
+        let access_key = "AKIAPRESIGNREJECT";
+        let secret_key = "presign-reject-secret";
+        {
+            let mut cache = CREDENTIAL_CACHE.write();
+            cache.insert(access_key.to_string(), CachedCredential {
+                secret_key: secret_key.to_string(),
+                owner_id: "owner-presign-reject".to_string(),
+                allowed_buckets: ["bucket-a".to_string()].into_iter().collect(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(300),
+            });
+        }
+
+        // bucket-b is signed correctly but is NOT in this access key's
+        // allowed_buckets -- this is the cross-tenant-bucket bypass the fix
+        // closes. Before the fix, this request was accepted because the
+        // presigned path never checked allowed_buckets at all.
+        let req = build_presigned_get_request(access_key, secret_key, "/s3/bucket-b/some-key", "localhost:9710");
+        let query_map = parse_query_map(&req);
+        let result = authenticate_presigned_v4(&req, &query_map).await;
+        assert!(result.is_err(), "presigned URL for a bucket outside the access key's allowed set must be rejected");
+
+        invalidate_s3_credential_cache(access_key);
+        std::env::remove_var("VITALITY_CONSOLE_URL");
+        std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
+    }
+
+    #[actix_web::test]
+    async fn presigned_v4_allows_bucket_in_allowed_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:1");
+        std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-service-secret");
+        let access_key = "AKIAPRESIGNALLOW";
+        let secret_key = "presign-allow-secret";
+        {
+            let mut cache = CREDENTIAL_CACHE.write();
+            cache.insert(access_key.to_string(), CachedCredential {
+                secret_key: secret_key.to_string(),
+                owner_id: "owner-presign-allow".to_string(),
+                allowed_buckets: ["bucket-a".to_string()].into_iter().collect(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(300),
+            });
+        }
+
+        let req = build_presigned_get_request(access_key, secret_key, "/s3/bucket-a/some-key", "localhost:9710");
+        let query_map = parse_query_map(&req);
+        let result = authenticate_presigned_v4(&req, &query_map).await;
+        assert!(result.is_ok(), "presigned URL for a bucket the access key IS registered for must still succeed: {:?}", result.err());
+        assert_eq!(result.unwrap().bucket, "bucket-a");
+
+        invalidate_s3_credential_cache(access_key);
+        std::env::remove_var("VITALITY_CONSOLE_URL");
+        std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
     }
 }
