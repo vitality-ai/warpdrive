@@ -32,7 +32,19 @@ jobs:
 
       - name: Build .deb package
         working-directory: server
-        run: cargo deb --no-build
+        # A static revision (cargo-deb's default "1") means every push to
+        # main that doesn't also bump Cargo.toml's version builds a .deb
+        # under the exact same Debian version string. Two real problems
+        # with that, not just one: reprepro correctly refuses to silently
+        # swap one version's published bytes for another's (what actually
+        # happened: 2026-10-?? CI run, "Already existing files can only be
+        # included again, if they are the same" -- a real safety check,
+        # not a flake), and even without that failure, a frozen version
+        # string means `apt-get upgrade` would never see a rebuilt package
+        # as newer and silently never update anyone already on it. The
+        # commit count always increases, so every real commit gets its own
+        # version and apt's upgrade detection works correctly going forward.
+        run: cargo deb --no-build --deb-revision "$(git rev-list --count HEAD)"
 
       - name: Upload .deb as a build artifact
         uses: actions/upload-artifact@v4
@@ -71,6 +83,13 @@ jobs:
           cp server/target/debian/*.deb /tmp/gh-pages-publish/
           cd /tmp/gh-pages-publish
           DEB_FILE=$(ls *.deb)
+          # Rust builds aren't bit-for-bit reproducible by default (embedded
+          # paths/timestamps), so a workflow re-run on the same commit --
+          # same version string by design, see the build step's comment --
+          # can still produce different bytes. `remove` first (a no-op if
+          # this version was never published) makes this step idempotent
+          # under a re-run instead of hitting the same collision error.
+          reprepro -b . remove stable warpdrive || true
           reprepro -b . includedeb stable "$DEB_FILE"
           rm -f "$DEB_FILE"
           git add pool dists db
