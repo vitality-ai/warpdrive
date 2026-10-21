@@ -837,11 +837,20 @@ EOF</pre>
         Full distributed engine report with charts →
       </a>
 
-      <p class="section-sub" style="margin-top:28px">
-        A write-durability gap (missing fsync on the cluster write path) was found and fixed with a
-        group-commit design, then measured against MinIO on identical hardware with the same client
-        tool against both servers. Methodology, full data, and plots are in the report below.
-      </p>
+      <div class="bench-grid" style="margin-top:28px">
+        <div class="bench-card">
+          <div class="bench-label">vs MinIO, 5-node cluster</div>
+          <div class="bench-value">3.0x<span class="bench-unit">throughput</span></div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">vs MinIO, single node</div>
+          <div class="bench-value">1.5-1.7x<span class="bench-unit">throughput</span></div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">Write durability</div>
+          <div class="bench-value">fsync<span class="bench-unit">group-commit</span></div>
+        </div>
+      </div>
       <a class="btn-outline" href="https://github.com/vitality-ai/warpdrive/blob/distributed-s3-compat-engine/docs/durability-and-minio-comparison.md">
         Durability &amp; MinIO comparison report →
       </a>
