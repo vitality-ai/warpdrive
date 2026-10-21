@@ -341,6 +341,48 @@ def test_s3_checksum_default_and_echo(s3_client):
         print(f"Checksum test Unexpected Error: {e}")
         return False
 
+def test_s3_anonymous_public_read_versioned_object(s3_client):
+    """Anonymous GET of a public-read object on a versioning-enabled bucket,
+    with no VersionId in the request. Regression test for a real bug: the
+    anonymous-read ACL check looked up the object's ACL with a hardcoded
+    empty version_id instead of resolving the current version, so this
+    exact case (public-read + versioning + no explicit VersionId) 403'd
+    even though the object really was public."""
+    print("\nTesting anonymous GET of a public-read object on a versioned bucket...")
+    bucket = f"test-bucket-anon-versioned-{int(time.time())}"
+    key = "public-object"
+    data = b"anyone can read this"
+
+    try:
+        s3_client.create_bucket(Bucket=bucket)
+        s3_client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        put_resp = s3_client.put_object(Bucket=bucket, Key=key, Body=data, ACL="public-read")
+        version_id = put_resp.get("VersionId")
+        print(f"PUT created version_id={version_id}")
+
+        anon_client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT_URL,
+            config=Config(
+                signature_version=botocore.UNSIGNED,
+                s3={"addressing_style": "path"},
+            ),
+        )
+        # No VersionId specified -- this is the exact case that regressed:
+        # the handler must resolve "current version" itself, not assume "".
+        anon_resp = anon_client.get_object(Bucket=bucket, Key=key)
+        body = anon_resp["Body"].read()
+        print(f"Anonymous GET body matches: {body == data}")
+        return body == data
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        print(f"Anonymous public-read GET Error: {error_code} - {e}")
+        return False
+    except Exception as e:
+        print(f"Anonymous public-read GET Unexpected Error: {e}")
+        return False
+
 def test_s3_bucket_operations(s3_client):
     """Test S3 bucket operations"""
     print("\nTesting S3 Bucket Operations...")
@@ -392,6 +434,7 @@ def main():
         ("S3 Multipart Upload", lambda: test_s3_multipart_upload(s3_client)),
         ("S3 Checksum Default + Echo", lambda: test_s3_checksum_default_and_echo(s3_client)),
         ("S3 Copy Object", lambda: test_s3_copy_object(s3_client)),
+        ("S3 Anonymous Public-Read Versioned Object", lambda: test_s3_anonymous_public_read_versioned_object(s3_client)),
         ("S3 Bucket Operations", lambda: test_s3_bucket_operations(s3_client)),
         ("S3 Authentication Failure", test_s3_authentication_failure),
         ("S3 DELETE Object", lambda: test_s3_delete_object(s3_client)),
