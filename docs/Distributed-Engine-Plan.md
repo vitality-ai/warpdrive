@@ -1,4 +1,4 @@
-# WarpDrive: Real Distributed, Erasure-Coded Object Engine with Pluggable Placement
+# WarpDrive: Distributed, Erasure-Coded Object Engine with Pluggable Placement
 
 ## Context
 
