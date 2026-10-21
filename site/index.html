@@ -559,6 +559,7 @@
         <a href="#compat">Integrations</a>
         <a href="#characterization">Characterization</a>
         <a href="#distributed">Distributed Engine</a>
+        <a href="#research">Research</a>
         <button id="theme-toggle" aria-label="Toggle theme">
           <svg class="icon-sun icon-sun-default" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
           <svg class="icon-moon icon-moon-default" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
@@ -872,6 +873,59 @@ EOF</pre>
       <a class="btn-outline" href="characterization/v1.0.0-results.html">
         Full distributed engine report with charts →
       </a>
+
+      <div class="bench-note" style="margin-top:32px">
+        <strong>Finding:</strong> a real fsync durability gap was found and fixed (group-commit, not a naive per-write fsync that would have cost 82-89% of throughput), then verified against MinIO deployed on identical hardware. After correcting two methodology gaps caught along the way — the original hardware was disk-bound on both sides, and the two servers were being driven by two different client tools — WarpDrive still beats MinIO 1.5-1.7x on a single node and ~3.0x across the full cluster, both with real fsync'd durability and zero errors.
+      </div>
+
+      <div class="bench-grid">
+        <div class="bench-card">
+          <div class="bench-label">Single node, same client</div>
+          <div class="bench-value">1.5-1.7x<span class="bench-unit">vs MinIO</span></div>
+          <div class="bench-sub">1160/1110 req/s vs 673/752 obj/s</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">5-node spread, same client</div>
+          <div class="bench-value">3.0x<span class="bench-unit">vs MinIO</span></div>
+          <div class="bench-sub">4544 req/s vs 1514 obj/s, aggregate</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">Local SSD vs. pd-standard</div>
+          <div class="bench-value">4.2x<span class="bench-unit">MinIO itself</span></div>
+          <div class="bench-sub">disk, not CPU, was the old ceiling</div>
+        </div>
+        <div class="bench-card">
+          <div class="bench-label">Group-commit durability</div>
+          <div class="bench-value">real<span class="bench-unit">fsync</span></div>
+          <div class="bench-sub">batched, not a timer or per-write cost</div>
+        </div>
+      </div>
+
+      <a class="btn-outline" href="characterization/durability-and-minio.html">
+        Full durability &amp; MinIO comparison with charts →
+      </a>
+    </section>
+
+    <!-- research -->
+    <section id="research">
+      <h2>Research</h2>
+      <p class="section-sub">WarpDrive's design work feeds back into peer-reviewed research, not just internal benchmarking.</p>
+      <div class="features">
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          </div>
+          <h3>VLDB 2026 · CMDS Workshop</h3>
+          <p><em>WarpDrive: A Composable Storage Substrate for Disaggregated Data Systems</em> — accepted as a lightning talk at CMDS (Composable Data Management Systems), the VLDB 2026 workshop. <a href="https://vldb.org/2026/Workshops/VLDB-Workshops-2026/CDMS/CDMS26_8.pdf" target="_blank" rel="noopener">Read the position paper →</a></p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          </div>
+          <h3>HiPC · submitted, under review</h3>
+          <p><em>WarpDial</em> — a case for reconfigurable placement policies and explainability in storage SLAs. Currently under review; we'll link the paper once a decision is in.</p>
+        </div>
+      </div>
     </section>
   </div>
 
