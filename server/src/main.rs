@@ -170,6 +170,7 @@ async fn main() -> std::io::Result<()> {
         let addr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
         info!("Starting gRPC shard server on {addr}");
         if let Err(e) = tonic::transport::Server::builder()
+            .tcp_nodelay(true)
             .add_service(make_grpc_shard_server())
             .serve(addr)
             .await
