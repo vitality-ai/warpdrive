@@ -236,6 +236,7 @@ fn attach_fetch_stat_headers(resp: &mut actix_web::HttpResponseBuilder, stat: &s
     resp.insert_header(("x-warpd-stripes-fetched", stat.stripes_fetched.to_string()));
     resp.insert_header(("x-warpd-stripes-total", stat.stripes_total.to_string()));
     resp.insert_header(("x-warpd-shard-bytes-read", stat.shard_bytes.to_string()));
+    SHARD_BYTES_READ.fetch_add(stat.shard_bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Decodes an AWS SigV4 "streaming payload" body: repeated
@@ -956,8 +957,22 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
 /// so a load test can show where time actually goes (added specifically to
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
+/// Process-wide cumulative count of shard-backing-store bytes a GET required to
+/// serve its response, summed across every content-dependent and plain read
+/// this coordinator handled. A workload driver snapshots it before/after a query
+/// (see `/cluster/_internal/read_stats`) to measure, end to end through a real
+/// engine's own scan, how much less an intra-object-pushdown read pulls off disk.
+pub static SHARD_BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(state.timing.summary())
+}
+
+/// Cumulative shard bytes read (see `SHARD_BYTES_READ`), as JSON. Monotonic
+/// since process start; snapshot the delta around a query to attribute reads.
+pub async fn cluster_read_stats() -> HttpResponse {
+    let n = SHARD_BYTES_READ.load(std::sync::atomic::Ordering::Relaxed);
+    HttpResponse::Ok().content_type("application/json").body(format!("{{\"shard_bytes_read\":{n}}}"))
 }
 
 /// Server-side breakdown of `store_shard` (the gRPC `ShardService::put_shard`
@@ -1191,6 +1206,7 @@ pub(crate) async fn cluster_get_object_inner(
                 let plain_bytes = ((last_idx - first_idx + 1) * shard_len) as u64;
                 resp.insert_header(("x-warpd-placement", "plain"));
                 resp.insert_header(("x-warpd-shard-bytes-read", plain_bytes.to_string()));
+                SHARD_BYTES_READ.fetch_add(plain_bytes, std::sync::atomic::Ordering::Relaxed);
                 return Ok(resp.body(slice.to_vec()));
             }
         }
@@ -1280,6 +1296,7 @@ pub(crate) async fn cluster_get_object_inner(
             // plain path read every data shard regardless of range size.
             resp.insert_header(("x-warpd-placement", "plain"));
             resp.insert_header(("x-warpd-shard-bytes-read", total_len.to_string()));
+            SHARD_BYTES_READ.fetch_add(total_len, std::sync::atomic::Ordering::Relaxed);
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
@@ -1299,6 +1316,7 @@ pub(crate) async fn cluster_get_object_inner(
             }
             resp.insert_header(("x-warpd-placement", "plain"));
             resp.insert_header(("x-warpd-shard-bytes-read", total_len.to_string()));
+            SHARD_BYTES_READ.fetch_add(total_len, std::sync::atomic::Ordering::Relaxed);
             Ok(resp.body(data))
         }
     }

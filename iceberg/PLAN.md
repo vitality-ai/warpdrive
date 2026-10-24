@@ -166,6 +166,27 @@ Degrade-to-plain safety confirmed working: one-unit-per-column (unbalanced,
 K-1 padded bins) reported ~3x overhead and auto-fell-back to plain under a 60%
 budget; the K-split balanced layout reports 0.0027% and engages.
 
-Next: a custom pyiceberg FileIO that derives these units from each data file's
-footer so Iceberg tables get this transparently; then measure a real Iceberg
-projection scan and run Spark/Trino against the REST catalog.
+#### 2026-10-24 — end-to-end THROUGH Iceberg (place-after-write bridge)
+Bridge: write the table normally through the REST catalog (pyarrow writes plain
+Parquet), then rewrite each data file BYTE-IDENTICALLY to the same S3 key with
+per-column units (each column chunk split K ways, grouped by column index across
+row groups). Identical bytes => Iceberg metadata (path/size/count) untouched, so
+the table is unchanged to any reader; only WarpDrive's physical placement
+changes. No custom FileIO, no engine changes.
+
+Measured through pyiceberg's OWN scan (server keeps a cumulative shard-bytes-read
+counter at /cluster/_internal/read_stats; snapshot the delta around a scan), 8-col
+60k-row table, RS(3,2), eval_pushdown_iceberg.py:
+  * 1-column projection, plain table:   953,320 bytes read off disk
+  * 1-column projection, placed table:  363,303 bytes  -> 2.6x less
+  * full scan, placed table:          1,601,322 bytes  (projection = 4.4x less than full)
+Lower than the 5.2x direct-S3 figure because pyarrow adds footer/page-index/
+metadata reads, but it is a fully honest number through the UNMODIFIED engine.
+
+So: a standard Iceberg projection query reads 2.6x less off disk purely because
+the data files are content-dependently placed by column -- the Layer-3
+differentiator, working end to end with no client changes.
+
+Next: run Spark/Trino against the REST catalog (stress more of the protocol);
+optionally a transparent server-side Parquet-footer parser so placement needs no
+place-after-write step.

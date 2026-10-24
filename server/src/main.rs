@@ -24,7 +24,7 @@ use warp_drive::cluster::coordinator::{
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
     cluster_internal_put_content_location, cluster_internal_delete_content_location, cluster_content_record,
     cluster_put_bucket_config, cluster_internal_put_bucket_config,
-    cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
+    cluster_timing_stats, cluster_read_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
 use warp_drive::cluster::s3_surface::{
@@ -251,6 +251,7 @@ async fn main() -> std::io::Result<()> {
             // {bucket}/{key:.*} catch-alls so they aren't shadowed.
             .route("/cluster/join", web::post().to(cluster_join))
             .route("/cluster/_internal/timing", web::get().to(cluster_timing_stats))
+            .route("/cluster/_internal/read_stats", web::get().to(cluster_read_stats))
             .route("/cluster/_internal/shard_timing", web::get().to(cluster_shard_server_timing))
             .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
