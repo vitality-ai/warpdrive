@@ -43,6 +43,7 @@ cd server/tests/chaos/jepsen-warpdrive
 lein run selftest                 # negative control: Elle must catch a planted G1a
 lein run validate                 # SigV4 S3 client smoke test against a running node:9710
 lein run durability --m 200       # power-loss: write 200 acked keys, SIGKILL all, recover, assert survival
+                                   # (writes/reads run at --concurrency in-flight requests, default 32)
 lein run test --seed 42 --duration-sec 60 --concurrency 8   # seeded Jepsen+Elle consistency run
 ```
 
