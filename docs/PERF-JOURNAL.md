@@ -596,3 +596,129 @@ request lands on) and grows to ~3x once the full 5-node cluster is actually
 in play on both sides. This is now the number to use going forward: it
 isolates the actual server comparison from any client-harness difference,
 which the earlier `load_gen_auth`-vs-`warp` numbers did not.
+
+## 2026-10-24 — WASM placement-policy serving micro-benchmarks (M1/M2/M3/M5)
+
+Micro-benchmarks for serving user-submitted WASM placement policies
+(`server/src/bin/wasm_bench.rs`, release, identity policy, RS k=3). Each
+number decides one choice in `docs/placement-policy-serving.md`. Warm pack =
+fresh `Store`+`Instance` per call.
+
+```
+M3 cold compile (Module::new)         p50 = 866 µs
+M2 instantiate-only (warm, no limits) p50 = 9.5 µs
+compiled module (serialized)          13,808 bytes
+
+warm pack latency (µs), by units/object:
+   n    thread/pack   shared-ticker   no-limits   M1 saving
+  16       73.98          15.79         15.59        79%
+  64       80.53          16.24         15.66        80%
+ 256       69.84          18.46         17.36        74%
+1024       90.96          28.89         23.51        68%
+```
+
+**M1 — the shared epoch ticker is the single biggest win.** The prototype
+spawned one watchdog thread per `pack` to enforce the wall-clock deadline;
+that spawn is 68–80% of total pack latency (70–91 µs vs 16–29 µs). Replaced
+with one process-wide ticker thread on a shared engine (`wasm_packer.rs`).
+This also fixes a correctness fragility: with a per-pack thread and
+`set_epoch_deadline(1)`, a stray increment from a lingering watchdog could
+trap an unrelated pack — the bench hit exactly this before engines were
+separated per strategy.
+
+**M5 — the sandbox is nearly free.** Full fuel + epoch + `StoreLimits` costs
+~1–5 µs over no limits (15.8 vs 15.6 at n=16; 28.9 vs 23.5 at n=1024). Safety
+was never the cost; the thread spawn was. Keep all limits on.
+
+**M3 — cold compile (866 µs) is ~54× a warm pack.** A module cache plus
+pre-compile at submission is mandatory, not optional; a cache miss on the PUT
+hot path would dominate. Compiled modules are ~14 KB, so caching thousands is
+cheap (10⁴ buckets ≈ 140 MB).
+
+**M2 — instantiate is ~60% of the warm pack (9.5 of ~16 µs).** Instance
+pooling is the next lever if sub-10 µs packs are wanted; not yet needed, since
+even the warm path is already a negligible slice of a cross-network PUT.
+
+Macro benchmarks (A1 PUT hot-path tax, A2 read/pushdown benefit) are next,
+against the live RS(3,2) cluster.
+
+## 2026-10-24 — A1 macro: PUT hot-path tax, plain vs FacPacker vs WASM policy
+
+Live 5-node RS(3,2) cluster, release `--features wasm`, a user WASM policy
+(`packall`, co-locates all units into one stripe) registered via
+`WARPDRIVE_WASM_PACKER`. Sequential PUT latency (64KB body), driven over the
+unauthenticated `/cluster/{bucket}/{key}` path with the `x-warpd-computable-units`
+header. Three buckets: plain (no header), facb (built-in FacPacker), wasmb (the
+WASM policy).
+
+```
+p50 PUT latency (ms), by units/object:
+   n     plain    fac    wasm(packall)
+  16      3.61   10.68     4.65
+  64      3.39   29.37     5.15
+ 256      4.37  102.67     6.52
+
+content record stripe counts at n=256:  fac = 86 stripes,  wasm = 1 stripe
+```
+
+**The packer's own compute tax is negligible — confirmed.** The WASM policy is
+only ~1-2 ms over plain, and that gap is the extra shard writes, not the pack
+(micro-bench M1 put warm pack at 16-29 µs). So the per-PUT CPU of running a
+user policy does not register end to end.
+
+**The dominant cost is the number of stripes the policy emits × EC fan-out, and
+the packed write path writes stripes SEQUENTIALLY.** `packed.rs`'s write loop
+(~L259) fans out a stripe's k+m shards in parallel (`join_all`, ~L285) but
+`.await`s each stripe before the next, so a packing of S stripes pays
+S × per-stripe round-trip. FacPacker on fine-grained equal-sized units emits
+~n/k stripes (86 at n=256) → ~103 ms; `packall` emits 1 → ~6.5 ms. The 86×
+sequential fan-out, not the greedy's CPU, is the 103 ms.
+
+Two consequences:
+1. **Stripe count is a first-class, user-controlled cost dimension** the
+   submission report must show, alongside storage overhead and blast radius.
+   The tradeoff is three-way: few stripes (packall) = cheap writes + low
+   overhead + *large* blast radius; many stripes (identity/fac) = isolation +
+   *expensive* writes. A user choosing isolation pays in write latency, not
+   just storage — and today nothing tells them.
+2. **Operator optimization:** pipeline the per-stripe fan-out (`join_all` across
+   stripes, not only within one), with each stripe's quorum still checked
+   independently. That removes the sequential S factor and is the single
+   biggest write-path win for many-stripe policies. (Proposed, not yet done;
+   needs care that the location pin still lands only after all stripes ack.)
+
+A2 (read/pushdown benefit of a workload-aware policy vs FacPacker) is next and
+needs a `good_locality` policy wired in.
+
+## 2026-10-24 — A2 macro: read amplification on a real Parquet object (lakehouse)
+
+The Fusion-style benefit, measured end to end: a user-submittable WASM grouping
+policy that co-locates a Parquet column's chunks, vs the built-in size-based
+FacPacker, on a real 5 MB Parquet file (6 columns x 8 row groups = 48
+column-chunk computable units, extracted by parsing the Parquet footer with
+pyarrow). Both PUT to the live RS(3,2) cluster with the `x-warpd-computable-units`
+header; read amplification for a single-column scan computed from the content
+records (bytes in the stripes a column touches / bytes the column needs).
+
+```
+FacPacker (size-based):     13 stripes,  avg read-amp 1.81x
+  region   11.08x   status 12.38x   payload 8.80x   (small columns scattered)
+good_bykey (column-grouped): 6 stripes,  avg read-amp 1.00x
+  every column: exactly 1 stripe, 1.00x
+```
+
+A projected scan of a small column (the common analytics filter: status/region)
+fetches 8-12x the bytes it needs under FacPacker, because its chunks land in
+stripes dominated by big columns. Grouping by column makes every scan fetch
+exactly its own bytes. This is intra-object pushdown locality — the benefit that
+complements (does not replace) cross-file z-order compaction — delivered by a
+sandboxed, user-submittable policy, with no compaction pass.
+
+Bonus: the column-grouped packing also uses fewer stripes (6 vs 13), so it is
+cheaper on the write path too (A1's stripe-count axis). When the policy matches
+the access pattern, read amplification and write cost improve together.
+
+Caveat: this measures stripe-level fetch locality (which stripes a column scan
+must read), not real Parquet page decoding/filtering — that needs a Parquet
+`ColumnCodec` (deferred). The locality result stands on its own: it is where the
+bytes-read win comes from.

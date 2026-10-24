@@ -407,6 +407,24 @@ pub(crate) async fn cluster_put_object_inner(
             .map(|u| super::packing::Unit { unit_id: u.unit_id.clone(), size: u.len as usize, metadata: u.metadata.clone() })
             .collect();
         let stripes = packer.pack(k, &units);
+
+        // Safety gate for ANY packer (built-in or a user-submitted WASM
+        // policy): a structurally-invalid packing must never be written. A
+        // dropped unit is silent data loss; an over-capacity bin would even
+        // *lower* overhead and slip past the threshold check into corruption.
+        // Validate O(units) first and degrade to plain on any violation, so a
+        // bad custom packer costs a fallback, never data integrity.
+        if let Err(why) = super::packing::validate_stripes(k, &units, &stripes) {
+            warn!(
+                "bucket={bucket} key={key} packer={:?} produced an invalid packing ({why}) \
+                 — falling back to plain erasure coding for this object",
+                config.packer_name
+            );
+            return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
+                .await
+                .map(|r| attach_placement_headers(r, "plain", None));
+        }
+
         let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
 
         if overhead <= config.overhead_threshold_pct {

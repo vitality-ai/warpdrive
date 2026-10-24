@@ -57,6 +57,56 @@ pub fn overhead_pct(k: usize, m: usize, units: &[Unit], stripes: &[Stripe]) -> f
     100.0 * (actual_physical as f64 / optimal_physical - 1.0)
 }
 
+/// Structural validity of a packing, independent of its storage cost. The
+/// built-in `FacPacker` is correct by construction, but once a bucket can
+/// select a *user-defined* packer (a submitted WASM policy), its output is
+/// untrusted: a packer that drops a unit would silently lose that unit's
+/// bytes on an otherwise-200 PUT, and one that emits an over-capacity bin
+/// would actually *lower* `overhead_pct`, sailing past the threshold check
+/// into a corrupt write. So the coordinator runs this on EVERY pack result
+/// before it is written, and degrades to the plain path on any violation —
+/// a cheap O(units) gate that is the real safety boundary for custom packers
+/// (and defense-in-depth for the built-in one). The checks mirror exactly
+/// what `FacPacker`'s own unit tests assert: every unit placed exactly once,
+/// never split or duplicated, no unknown unit, k bins per stripe, and no bin
+/// exceeding its stripe's capacity.
+pub fn validate_stripes(k: usize, units: &[Unit], stripes: &[Stripe]) -> Result<(), String> {
+    use std::collections::HashMap;
+    let sizes: HashMap<&str, usize> = units.iter().map(|u| (u.unit_id.as_str(), u.size)).collect();
+    let mut placed: HashMap<&str, bool> = units.iter().map(|u| (u.unit_id.as_str(), false)).collect();
+    for (si, s) in stripes.iter().enumerate() {
+        if s.bins.len() != k {
+            return Err(format!("stripe {si}: {} bins, must equal k={k}", s.bins.len()));
+        }
+        for (bi, bin) in s.bins.iter().enumerate() {
+            let mut bin_bytes: usize = 0;
+            for id in bin {
+                match sizes.get(id.as_str()) {
+                    None => return Err(format!("stripe {si} bin {bi}: unknown unit id {id:?}")),
+                    Some(&sz) => {
+                        let seen = placed.get_mut(id.as_str()).expect("id present");
+                        if *seen {
+                            return Err(format!("unit {id:?} appears more than once (split/duplicated)"));
+                        }
+                        *seen = true;
+                        bin_bytes += sz;
+                    }
+                }
+            }
+            if bin_bytes > s.capacity {
+                return Err(format!(
+                    "stripe {si} bin {bi}: {bin_bytes} bytes exceeds stripe capacity {}",
+                    s.capacity
+                ));
+            }
+        }
+    }
+    if let Some((id, _)) = placed.iter().find(|(_, &p)| !p) {
+        return Err(format!("unit {id:?} was dropped (every unit must be placed exactly once)"));
+    }
+    Ok(())
+}
+
 /// Fusion's Algorithm 1, generalized, as a standalone helper — not just
 /// `FacPacker`'s private body. Greedy: seed each stripe with the largest
 /// remaining unit, pack the rest into whichever other bin is least full

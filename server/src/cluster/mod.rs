@@ -19,6 +19,8 @@ pub mod coordinator;
 pub mod packed;
 pub mod pushdown;
 pub mod s3_surface;
+#[cfg(feature = "wasm")]
+pub mod wasm_packer;
 
 pub mod shard_proto {
     tonic::include_proto!("warpdrive.cluster");
