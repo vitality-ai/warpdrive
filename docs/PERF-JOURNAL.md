@@ -596,3 +596,48 @@ request lands on) and grows to ~3x once the full 5-node cluster is actually
 in play on both sides. This is now the number to use going forward: it
 isolates the actual server comparison from any client-harness difference,
 which the earlier `load_gen_auth`-vs-`warp` numbers did not.
+
+## 2026-10-24 — WASM placement-policy serving micro-benchmarks (M1/M2/M3/M5)
+
+Micro-benchmarks for serving user-submitted WASM placement policies
+(`server/src/bin/wasm_bench.rs`, release, identity policy, RS k=3). Each
+number decides one choice in `docs/placement-policy-serving.md`. Warm pack =
+fresh `Store`+`Instance` per call.
+
+```
+M3 cold compile (Module::new)         p50 = 866 µs
+M2 instantiate-only (warm, no limits) p50 = 9.5 µs
+compiled module (serialized)          13,808 bytes
+
+warm pack latency (µs), by units/object:
+   n    thread/pack   shared-ticker   no-limits   M1 saving
+  16       73.98          15.79         15.59        79%
+  64       80.53          16.24         15.66        80%
+ 256       69.84          18.46         17.36        74%
+1024       90.96          28.89         23.51        68%
+```
+
+**M1 — the shared epoch ticker is the single biggest win.** The prototype
+spawned one watchdog thread per `pack` to enforce the wall-clock deadline;
+that spawn is 68–80% of total pack latency (70–91 µs vs 16–29 µs). Replaced
+with one process-wide ticker thread on a shared engine (`wasm_packer.rs`).
+This also fixes a correctness fragility: with a per-pack thread and
+`set_epoch_deadline(1)`, a stray increment from a lingering watchdog could
+trap an unrelated pack — the bench hit exactly this before engines were
+separated per strategy.
+
+**M5 — the sandbox is nearly free.** Full fuel + epoch + `StoreLimits` costs
+~1–5 µs over no limits (15.8 vs 15.6 at n=16; 28.9 vs 23.5 at n=1024). Safety
+was never the cost; the thread spawn was. Keep all limits on.
+
+**M3 — cold compile (866 µs) is ~54× a warm pack.** A module cache plus
+pre-compile at submission is mandatory, not optional; a cache miss on the PUT
+hot path would dominate. Compiled modules are ~14 KB, so caching thousands is
+cheap (10⁴ buckets ≈ 140 MB).
+
+**M2 — instantiate is ~60% of the warm pack (9.5 of ~16 µs).** Instance
+pooling is the next lever if sub-10 µs packs are wanted; not yet needed, since
+even the warm path is already a negligible slice of a cross-network PUT.
+
+Macro benchmarks (A1 PUT hot-path tax, A2 read/pushdown benefit) are next,
+against the live RS(3,2) cluster.

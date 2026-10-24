@@ -29,25 +29,49 @@
 //! or rename a unit.
 
 use super::packing::{Stripe, StripePacker, Unit};
+use std::sync::OnceLock;
 use wasmtime::*;
 
 const MEM_LIMIT_BYTES: usize = 16 << 20;
 const FUEL: u64 = 100_000_000;
-const EPOCH_DEADLINE_MS: u64 = 250;
+// Wall-clock budget = EPOCH_TICK_MS * EPOCH_DEADLINE_TICKS (~250ms). Enforced
+// by ONE shared epoch ticker thread for the whole process, not a thread per
+// pack: micro-benchmark M1 (docs/placement-policy-serving.md) measured the
+// thread-per-pack spawn at 68-80% of total pack latency (70-91µs vs 16-29µs),
+// and a shared engine also lets modules share a compiled-module cache.
+const EPOCH_TICK_MS: u64 = 50;
+const EPOCH_DEADLINE_TICKS: u64 = 5;
+
+/// One shared wasm engine for the whole process, with a single background
+/// epoch ticker. All `WasmPacker`s compile against it and run on it, so there
+/// is exactly one ticker thread regardless of how many buckets have policies.
+fn shared_engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut c = Config::new();
+        c.consume_fuel(true);
+        c.epoch_interruption(true);
+        let engine = Engine::new(&c).expect("build wasm engine");
+        let ticker = engine.clone();
+        std::thread::Builder::new()
+            .name("wasm-epoch-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(EPOCH_TICK_MS));
+                ticker.increment_epoch();
+            })
+            .expect("spawn epoch ticker");
+        engine
+    })
+}
 
 pub struct WasmPacker {
-    engine: Engine,
     module: Module,
 }
 
 impl WasmPacker {
     pub fn from_bytes(wasm: &[u8]) -> Result<Self, String> {
-        let mut c = Config::new();
-        c.consume_fuel(true);
-        c.epoch_interruption(true);
-        let engine = Engine::new(&c).map_err(|e| format!("engine: {e}"))?;
-        let module = Module::new(&engine, wasm).map_err(|e| format!("compile: {e}"))?;
-        Ok(Self { engine, module })
+        let module = Module::new(shared_engine(), wasm).map_err(|e| format!("compile: {e}"))?;
+        Ok(Self { module })
     }
 
     pub fn from_file(path: &str) -> Result<Self, String> {
@@ -61,16 +85,12 @@ impl WasmPacker {
             .memories(1)
             .instances(1)
             .build();
-        let mut store = Store::new(&self.engine, limits);
+        let mut store = Store::new(shared_engine(), limits);
         store.limiter(|l| l);
         store.set_fuel(FUEL).map_err(|e| format!("fuel: {e}"))?;
-        store.set_epoch_deadline(1);
-
-        let eng = self.engine.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(EPOCH_DEADLINE_MS));
-            eng.increment_epoch();
-        });
+        // Trap after EPOCH_DEADLINE_TICKS of the shared ticker (~250ms). No
+        // per-pack thread: the one shared ticker advances the epoch for all.
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
 
         let instance = Instance::new(&mut store, &self.module, &[])
             .map_err(|e| format!("instantiate (imports forbidden): {e}"))?;
