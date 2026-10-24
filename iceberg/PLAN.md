@@ -246,5 +246,19 @@ Same object, same overhead, opposite decisions driven purely by the expected
 read pattern -- pushdown is disabled exactly when it would be a net loss.
 157/157 lib tests pass (adds pushdown_cost_gate_* ).
 
+#### 2026-10-24 — real TPC-H benchmark (lineitem SF=1, 6M rows) in Spark
+Generated TPC-H lineitem with tpchgen-cli (crates.io; dataset downloads are
+egress-blocked), loaded into tpch.lineitem_plain vs tpch.lineitem_placed (3 data
+files, all column-placed), ran real TPC-H Q6 and Q1 in Spark (tpch_build.py +
+tpch_spark.py), median of 5 runs, with the server bytes-read delta:
+  * Q6 (revenue, 4/16 cols): plain 3027 ms / 1509 MB  -> placed 2167 ms / 651 MB
+      = 2.3x less read, 1.40x faster wall-clock
+  * Q1 (pricing summary, 7/16 cols): plain 3918 ms / 760 MB -> placed 3029 ms / 240 MB
+      = 3.2x less read, 1.29x faster wall-clock
+Clear, consistent wins on standard queries at a size where Spark fixed overhead
+no longer dominates. (Absolute MB exceed the ~163 MB table because the plain path
+re-reads whole shards per column byte-range; the relative reduction is the
+signal, and still loopback/warm-cache so wall-clock < bytes.)
+
 Next (optional): a transparent server-side Parquet-footer parser so placement
 needs no place-after-write step; port the REST catalog loop into the Rust server.
