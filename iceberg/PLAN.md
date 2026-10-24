@@ -216,5 +216,24 @@ connector.name=iceberg, iceberg.catalog.type=rest,
 iceberg.rest-catalog.uri=http://<host>:8181, fs.native-s3.enabled=true,
 s3.endpoint=http://<host>:9760, s3.path-style-access=true. Left as a follow-up.
 
+#### 2026-10-24 — Spark WALL-CLOCK A/B: placed is faster, not just fewer bytes
+bench_build.py builds bench.plain vs bench.placed (32 cols x 400k rows, identical
+data); bench_spark_time.py times a 1-column aggregate (sum(c0)) in Spark, median
+of 9 runs, with the server shard-bytes-read delta per query:
+  * plain : 221.6 ms, 31,332,189 bytes read
+  * placed: 120.6 ms,  1,001,430 bytes read
+  => 31.3x less data read AND 1.84x faster wall-clock -- on a single loopback
+     cluster with a warm cache, where I/O is NOT the bottleneck (decode + Spark
+     overhead set a floor, so wall-clock speedup < byte speedup). On I/O-bound
+     (remote/networked) storage the wall-clock win tracks closer to the 31x.
+So yes: content-dependent column placement makes a real Spark projection query
+measurably faster, not merely lighter on bytes.
+
+#### cost-gated pushdown (next)
+Pushdown wins for selective scans but a broad/full scan under a many-stripe
+layout pays S fan-out round trips vs plain's one. A write-time cost gate (beyond
+the existing storage-overhead gate) should degrade to plain when the modeled
+read cost at the expected selectivity does not beat plain.
+
 Next (optional): a transparent server-side Parquet-footer parser so placement
 needs no place-after-write step; port the REST catalog loop into the Rust server.
