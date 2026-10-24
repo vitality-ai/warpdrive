@@ -174,6 +174,19 @@ impl Storage for LocalXFSBinaryStore {
         file.write_all_at(data, offset)
             .map_err(ErrorInternalServerError)?;
 
+        // DST failpoints (no-op unless built with --features failpoints).
+        // `before_fsync`: crash the process (action `exit(1)`) after the
+        // write syscall lands in the page cache but BEFORE the durability
+        // wait -- i.e. exactly the power-loss window the group-commit design
+        // reasons about. Because `Ok` is returned only after
+        // `wait_for_durable` below, a crash here must never lose an *acked*
+        // write; this failpoint lets the harness prove that from inside.
+        // `skip_fsync`: return success WITHOUT waiting for durability -- an
+        // ack-before-durable regression, used as a control to confirm the
+        // durability test actually catches one.
+        fail::fail_point!("local_store::before_fsync");
+        fail::fail_point!("local_store::skip_fsync", |_| Ok((offset, size)));
+
         // Durability (see docs/PERF-JOURNAL.md, 2026-10-21): without this,
         // a write was only as durable as the OS page cache -- acknowledged
         // to the client with no guarantee it would survive a crash before

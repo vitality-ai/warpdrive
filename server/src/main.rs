@@ -137,6 +137,10 @@ fn build_cluster_state() -> web::Data<ClusterState> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
+    // DST: read the FAILPOINTS env var and arm any configured failpoints for
+    // this process's lifetime. Compiled in only with --features failpoints.
+    #[cfg(feature = "failpoints")]
+    let _fail_scenario = fail::FailScenario::setup();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
     info!("Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/...)");

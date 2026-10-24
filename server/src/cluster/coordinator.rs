@@ -525,6 +525,14 @@ async fn put_object_plain(
         )));
     }
 
+    // DST failpoint (no-op unless built with --features failpoints): crash
+    // the coordinator AFTER quorum shards have persisted but BEFORE the
+    // location pin is replicated. The 200 ack is returned only after the pin
+    // quorum below, so a crash here must not leave a client believing a
+    // write succeeded that no node can locate after recovery. Lets the
+    // harness verify that ack-vs-pin ordering from inside.
+    fail::fail_point!("coordinator::before_pin");
+
     // Pin the resolved placement — this, not the hash function, is what
     // makes reads stable across later membership changes. Replicated to
     // *every* known peer, not just the k+m shard-holders: a GET can land

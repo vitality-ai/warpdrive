@@ -58,6 +58,15 @@ flate2 = "1.0"
 percent-encoding = "2"
 actix-multipart = "0.6"
 parking_lot = "0.12"
+# Failpoints for deterministic fault injection (DST). The macros compile to
+# no-ops unless the `failpoints` feature is enabled, so production builds pay
+# nothing; the Jepsen/Elle harness builds with `--features failpoints`.
+fail = "0.5"
+
+[features]
+# Enables in-codebase failpoints (fsync boundary, shard persistence). Off by
+# default. Build the DST binary with: cargo build --release --features failpoints
+failpoints = ["fail/failpoints"]
 
 [build-dependencies]
 tonic-build = "0.11"
