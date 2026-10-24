@@ -229,11 +229,22 @@ of 9 runs, with the server shard-bytes-read delta per query:
 So yes: content-dependent column placement makes a real Spark projection query
 measurably faster, not merely lighter on bytes.
 
-#### cost-gated pushdown (next)
-Pushdown wins for selective scans but a broad/full scan under a many-stripe
-layout pays S fan-out round trips vs plain's one. A write-time cost gate (beyond
-the existing storage-overhead gate) should degrade to plain when the modeled
-read cost at the expected selectivity does not beat plain.
+#### 2026-10-24 — cost-gated pushdown (implemented)
+Added a second, READ-cost gate to the placement decision (packing::
+pushdown_read_cost), independent of the existing storage-overhead gate. Model
+(byte-equivalents): packed = selectivity*B + ceil(selectivity*stripes)*rtt_bytes;
+plain = B + rtt_bytes. Pack only if packed < plain. Knobs (env, OnceLock):
+WARPDRIVE_PUSHDOWN_SELECTIVITY (default 0.25), WARPDRIVE_PUSHDOWN_RTT_BYTES
+(default 65536). Natural next step: move both onto BucketPlacementConfig.
+
+Demonstrated end to end on the same column-placed Parquet (30 units, 0.0023%
+storage overhead so the STORAGE gate allows it either way):
+  * selectivity 0.90 (broad workload) -> placement=plain  (fan-out would cost
+    more than plain's single fetch group)
+  * selectivity 0.25 (default)        -> placement=packed  (selective read wins)
+Same object, same overhead, opposite decisions driven purely by the expected
+read pattern -- pushdown is disabled exactly when it would be a net loss.
+157/157 lib tests pass (adds pushdown_cost_gate_* ).
 
 Next (optional): a transparent server-side Parquet-footer parser so placement
 needs no place-after-write step; port the REST catalog loop into the Rust server.

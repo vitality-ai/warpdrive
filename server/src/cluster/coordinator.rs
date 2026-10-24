@@ -423,16 +423,37 @@ pub(crate) async fn cluster_put_object_inner(
         let stripes = packer.pack(k, &units);
         let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
 
-        if overhead <= config.overhead_threshold_pct {
+        // Two independent gates, both must pass to pack:
+        //  1. storage: extra bytes vs plain EC must stay under the bucket budget
+        //     (the Fusion overhead-threshold mechanism).
+        //  2. read cost: the modeled per-query read cost of this stripe layout
+        //     must beat plain at the expected selectivity -- a many-stripe layout
+        //     (or a broad workload) pays a per-stripe fan-out that plain's single
+        //     fetch group avoids, so pushing down can be a net loss. Disable
+        //     pushdown smartly rather than ship a layout that reads slower.
+        let (sel, rtt) = pushdown_cost_params();
+        let (read_worth_it, packed_cost, plain_cost) =
+            super::packing::pushdown_read_cost(body.len(), stripes.len(), sel, rtt);
+
+        if overhead <= config.overhead_threshold_pct && read_worth_it {
             return super::packed::put_object_content_dependent(user_id, &bucket, &key, &body, &units_header, stripes, state, s3_meta)
                 .await
                 .map(|r| attach_placement_headers(r, "packed", Some(overhead)));
         }
-        info!(
-            "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
-             {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
-            config.overhead_threshold_pct, config.packer_name
-        );
+        if overhead > config.overhead_threshold_pct {
+            info!(
+                "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
+                 {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
+                config.overhead_threshold_pct, config.packer_name
+            );
+        } else {
+            info!(
+                "bucket={bucket} key={key} content-dependent read cost {packed_cost:.0} >= plain {plain_cost:.0} \
+                 byte-equivalents at selectivity {sel:.2} over {} stripe(s) (packer={:?}) — fan-out would outweigh \
+                 the pushdown benefit, falling back to plain",
+                stripes.len(), config.packer_name
+            );
+        }
         return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", Some(overhead)));
@@ -963,6 +984,26 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
 /// (see `/cluster/_internal/read_stats`) to measure, end to end through a real
 /// engine's own scan, how much less an intra-object-pushdown read pulls off disk.
 pub static SHARD_BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Parameters for the read-cost pushdown gate (see `packing::pushdown_read_cost`),
+/// parsed once from the environment:
+///   WARPDRIVE_PUSHDOWN_SELECTIVITY  expected fraction of an object a query reads
+///                                   (default 0.25 = a quarter of the columns)
+///   WARPDRIVE_PUSHDOWN_RTT_BYTES    byte-equivalent cost of one extra stripe
+///                                   fetch / round trip (default 65536)
+/// Env rather than per-bucket config to avoid a config-store schema change; the
+/// natural next step is to move both onto `BucketPlacementConfig` so each bucket
+/// can reflect its own workload and storage medium.
+fn pushdown_cost_params() -> (f64, f64) {
+    static PARAMS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        let sel = std::env::var("WARPDRIVE_PUSHDOWN_SELECTIVITY").ok()
+            .and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0 && *v <= 1.0).unwrap_or(0.25);
+        let rtt = std::env::var("WARPDRIVE_PUSHDOWN_RTT_BYTES").ok()
+            .and_then(|v| v.parse::<f64>().ok()).filter(|v| *v >= 0.0).unwrap_or(65_536.0);
+        (sel, rtt)
+    })
+}
 
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(state.timing.summary())
