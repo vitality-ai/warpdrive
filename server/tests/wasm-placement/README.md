@@ -1,11 +1,28 @@
-# Sandboxed user-defined placement policies (WASM) — prototype + safety suite
+# Placement policies as submitted compute units (WASM) — prototype + safety suite
 
-Pillar 3 of WarpDrive is "safely customizable": a customer defines how their
-bytes are striped (a `StripePacker`), and the system explains the cost before
-it goes live. This prototype shows how to run an **untrusted** packer safely in
-a managed, multi-tenant service, and backs it with an **aggressive adversarial
-test suite**. It is standalone (like `tests/chaos/jepsen-warpdrive`); it does
-not change the server build.
+Pillar 3 of WarpDrive is "safely customizable." The model this prototype
+demonstrates: **at bucket creation, a customer submits a tiny compute unit** — a
+WASM module implementing `StripePacker` — that decides how that bucket's objects
+are striped. Before the bucket is accepted, WarpDrive runs the module in a
+sandbox against a sample workload and returns a full **policy report** that
+explains, in detail, what the customer is signing up for. A submission that
+fails any safety or structural check is rejected and the bucket is refused.
+
+This prototype runs that untrusted compute unit safely in a managed,
+multi-tenant setting and backs it with an **aggressive adversarial test suite**.
+It is standalone (like `tests/chaos/jepsen-warpdrive`); it does not change the
+server build.
+
+## Bucket-creation flow
+
+```
+CreateBucket { name, placement_policy: <wasm compute unit>, overhead_threshold }
+   -> sandboxed run on a sample workload
+   -> POLICY REPORT (below) returned to the customer
+   -> bucket created with the policy bound, OR refused with the report
+```
+`WasmPacker::explain(bucket, k, m, sizes) -> PolicyReport` is the entry point a
+`CreateBucket` handler would call.
 
 ## The safety model
 
@@ -28,13 +45,27 @@ previews cost; validation (run every pack) is what prevents corruption. Any
 failure ⇒ `Rejected` ⇒ caller degrades to the plain built-in path. A rejected
 policy never shapes user data.
 
-## Explaining the cost
+## The policy report — "explain a lot more"
 
-On load, the policy is run against a sample workload and its real storage
-overhead vs MDS-optimal is reported — the same `overhead_pct` definition the
-live overhead-threshold guard uses. Example: the `good_identity` policy (one
-unit per stripe) is accepted but reported at **200% overhead**, so the customer
-sees the cost before activating it.
+The report is not a single number. For an accepted submission it covers:
+
+- **Storage cost** — overhead vs MDS-optimal, stripe count, physical bytes, and
+  padding waste; plus **how it compares to the built-in default policy**, so the
+  customer sees the price of customizing vs not.
+- **Durability / blast radius** — how many objects share a stripe (max and avg),
+  i.e. how many are lost *together* if a stripe is lost. This is the real
+  tradeoff: more objects per stripe is cheaper but widens correlated-loss blast
+  radius.
+- **Policy compute cost** — the submitted unit runs on **every PUT**, so its own
+  cost is metered and shown: fuel (≈instructions), wall time, peak sandbox
+  memory, and a determinism verdict (required, or the quoted cost wouldn't hold).
+- **Sample placement** — a concrete rendering of how the sample workload got
+  packed, so the behavior is legible, not abstract.
+
+Example (`good_identity`, one object per stripe): ACCEPTED, **200% overhead
+(+195.6% vs the default's 4.4%)**, blast radius **1 object** — i.e. perfect
+isolation bought at a large storage premium. That tradeoff is exactly what the
+report makes explicit before the bucket is created.
 
 ## Running
 
