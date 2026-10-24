@@ -184,8 +184,24 @@ impl Storage for LocalXFSBinaryStore {
         // `skip_fsync`: return success WITHOUT waiting for durability -- an
         // ack-before-durable regression, used as a control to confirm the
         // durability test actually catches one.
-        fail::fail_point!("local_store::before_fsync");
-        fail::fail_point!("local_store::skip_fsync", |_| Ok((offset, size)));
+        // Armed with `local_store::before_fsync=return`: hard-exit the node
+        // after the write() syscall lands in the page cache but BEFORE the
+        // durability wait below -- the power-loss window the group-commit design
+        // reasons about. `exit`, not `panic`, so the whole process dies (a
+        // worker-thread panic would just be caught per-request). Because this
+        // function returns Ok only after `wait_for_durable`, a crash here must
+        // never lose an *acked* write; the harness verifies that after restart.
+        fail::fail_point!("local_store::before_fsync", |_| {
+            log::error!("DST failpoint local_store::before_fsync: exiting after write, before fsync");
+            std::process::exit(70);
+        });
+        // `local_store::skip_fsync=return`: return success WITHOUT waiting for
+        // durability -- an ack-before-durable regression, used as a control to
+        // confirm the durability check actually catches one.
+        fail::fail_point!("local_store::skip_fsync", |_| {
+            log::warn!("DST failpoint local_store::skip_fsync: returning Ok WITHOUT durability wait");
+            Ok((offset, size))
+        });
 
         // Durability (see docs/PERF-JOURNAL.md, 2026-10-21): without this,
         // a write was only as durable as the OS page cache -- acknowledged

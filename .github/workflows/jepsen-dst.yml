@@ -34,9 +34,9 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - name: Build release binary
+      - name: Build release binary (with DST failpoints)
         working-directory: server
-        run: cargo build --release --bin warp_drive
+        run: cargo build --release --bin warp_drive --features failpoints
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4

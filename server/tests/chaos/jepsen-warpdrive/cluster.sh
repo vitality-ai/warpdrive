@@ -68,7 +68,7 @@ wait_healthy() {
 }
 
 cmd_start() {
-  [ -x "$BIN" ] || { echo "missing $BIN (build: cd server && cargo build --release --bin warp_drive)" >&2; exit 1; }
+  [ -x "$BIN" ] || { echo "missing $BIN (build: cd server && cargo build --release --bin warp_drive --features failpoints)" >&2; exit 1; }
   # Pre-clean: kill any node still bound to our ports from a previous run,
   # so we never silently reuse a stale process (the bug that poisoned the
   # failpoint experiments). Verify the ports are actually free before we go.
