@@ -204,5 +204,17 @@ never exercised, now fixed in rest_catalog.py:
      (it's in the URL path); pyiceberg included it. Inject it from the path
      before validating.
 
-Next: Trino (and/or a lighter engine) for more breadth; optionally a transparent
-server-side Parquet-footer parser so placement needs no place-after-write step.
+#### 2026-10-24 — Trino / DuckDB blocked by sandbox egress (not a WarpDrive issue)
+Trino's server binary ships only as a GitHub release asset and DuckDB's iceberg
+extension loads from extensions.duckdb.org; both are denied (403) by this
+environment's network policy, which allowlists Maven Central and PyPI only. That
+is exactly why Spark succeeded (its runtime JARs are on Maven Central). To run
+Trino here, widen the environment's Network access (add github.com /
+objects.githubusercontent.com, or a broader level) and drop in trino-server-446
+(the last Java-21-compatible release); the iceberg.properties would be
+connector.name=iceberg, iceberg.catalog.type=rest,
+iceberg.rest-catalog.uri=http://<host>:8181, fs.native-s3.enabled=true,
+s3.endpoint=http://<host>:9760, s3.path-style-access=true. Left as a follow-up.
+
+Next (optional): a transparent server-side Parquet-footer parser so placement
+needs no place-after-write step; port the REST catalog loop into the Rust server.
