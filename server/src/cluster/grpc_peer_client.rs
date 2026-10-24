@@ -19,7 +19,7 @@ use super::peer_client::PeerClient;
 use super::shard_proto::shard_service_client::ShardServiceClient;
 use super::shard_proto::shard_service_server::{ShardService, ShardServiceServer};
 use super::shard_proto::{GetShardRequest, GetShardResponse, PutShardRequest, PutShardResponse};
-use super::shard_storage::{load_shard, store_shard};
+use super::shard_storage::{load_shard, load_shard_range, store_shard};
 use super::timing_stats::Phase;
 use lazy_static::lazy_static;
 
@@ -86,7 +86,12 @@ impl ShardService for ShardServiceImpl {
     async fn get_shard(&self, request: Request<GetShardRequest>) -> Result<Response<GetShardResponse>, Status> {
         let req = request.into_inner();
         let data = tokio::task::spawn_blocking(move || {
-            load_shard(&req.user_id, &req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
+            if req.length == 0 {
+                load_shard(&req.user_id, &req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
+            } else {
+                load_shard_range(&req.user_id, &req.bucket, &req.key, req.shard_idx as usize,
+                                 req.offset as usize, req.length as usize).map_err(|e| e.to_string())
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("shard load task panicked: {e}")))?
@@ -270,9 +275,30 @@ impl PeerClient for GrpcPeerClient {
                 key: key.to_string(),
                 shard_idx: shard_idx as u32,
                 user_id: user_id.to_string(),
+                offset: 0,
+                length: 0, // whole shard
             })
             .await
             .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} failed: {e}")))?;
+        Ok(resp.into_inner().data)
+    }
+
+    async fn get_shard_range(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize, rel_off: usize, rel_len: usize) -> Result<Vec<u8>, Error> {
+        if rel_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut client = self.client_for(peer).await?;
+        let resp = client
+            .get_shard(GetShardRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                shard_idx: shard_idx as u32,
+                user_id: user_id.to_string(),
+                offset: rel_off as u64,
+                length: rel_len as u64,
+            })
+            .await
+            .map_err(|e| ErrorBadGateway(format!("get_shard_range from {peer} failed: {e}")))?;
         Ok(resp.into_inner().data)
     }
 

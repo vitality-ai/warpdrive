@@ -32,6 +32,13 @@ message GetShardRequest {
   string key = 2;
   uint32 shard_idx = 3;
   string user_id = 4;
+  // Optional byte sub-range within the shard. length == 0 means "whole shard"
+  // (offset ignored), preserving the original whole-shard fetch. A non-zero
+  // length reads only [offset, offset+length) of the stored shard, so a plain
+  // range-GET fetches just the bytes its byte-range overlaps instead of every
+  // whole positional shard it spans.
+  uint64 offset = 5;
+  uint64 length = 6;
 }
 
 message GetShardResponse {

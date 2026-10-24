@@ -163,6 +163,22 @@ pub fn load_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> R
     store().read(user_id, bucket, offset, size)
 }
 
+/// Read only `[rel_off, rel_off+rel_len)` of a stored shard. The backing store
+/// is already offset-addressed, so this reads exactly the requested bytes off
+/// disk -- the basis for a plain range-GET fetching only the sub-range its byte
+/// range overlaps rather than whole positional shards. `rel_off`/`rel_len` are
+/// clamped to the shard's stored size, so a request that runs past the end
+/// (e.g. the padded tail of the last data shard) returns what actually exists.
+pub fn load_shard_range(user_id: &str, bucket: &str, key: &str, shard_idx: usize, rel_off: usize, rel_len: usize) -> Result<Vec<u8>, Error> {
+    let sk = shard_key(user_id, bucket, key, shard_idx);
+    let (offset, size) = SHARD_META_STORE
+        .get(&sk)
+        .ok_or_else(|| ErrorNotFound("shard key does not exist"))?;
+    let rel_off = (rel_off as u64).min(size);
+    let rel_len = (rel_len as u64).min(size - rel_off);
+    store().read(user_id, bucket, offset + rel_off, rel_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

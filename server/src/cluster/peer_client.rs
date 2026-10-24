@@ -67,6 +67,25 @@ pub trait PeerClient: Send + Sync {
         shard_idx: usize,
     ) -> Result<Vec<u8>, Error>;
 
+    /// Fetch only `[rel_off, rel_off+rel_len)` of a shard. The default fetches
+    /// the whole shard and slices (correct on every transport, no network
+    /// saving); a transport that can push the range to the peer (gRPC) overrides
+    /// this so only the requested bytes cross the wire and come off disk.
+    async fn get_shard_range(
+        &self,
+        peer: &str,
+        user_id: &str,
+        bucket: &str,
+        key: &str,
+        shard_idx: usize,
+        rel_off: usize,
+        rel_len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let full = self.get_shard(peer, user_id, bucket, key, shard_idx).await?;
+        let end = rel_off.saturating_add(rel_len).min(full.len());
+        Ok(full.get(rel_off..end).unwrap_or(&[]).to_vec())
+    }
+
     /// The largest single shard this transport can actually carry, if it has
     /// a fixed cap — `None` means "no known cap" (HTTP and raw-TCP have no
     /// built-in per-message limit here). Lets a caller reject an oversized

@@ -1208,23 +1208,39 @@ pub(crate) async fn cluster_get_object_inner(
         let first_idx = ((start as usize) / shard_len).min(record.k - 1);
         let last_idx = ((end as usize) / shard_len).min(record.k - 1);
 
-        let partial_gets = (first_idx..=last_idx).map(|idx| {
+        // Fetch only the sub-range of each spanning shard that actually overlaps
+        // [start, end], not the whole shard. A plain object's `k` positional
+        // shards are each ~object/k bytes, so fetching whole shards made a small
+        // column-chunk range drag a ~object/k shard off disk (big read
+        // amplification); the systematic data shards ARE the object bytes, so a
+        // shard's sub-range is exactly the object's sub-range. `get_shard_range`
+        // pushes the range to the peer over gRPC (whole-fetch+slice on other
+        // transports), so the concatenated pieces are exactly the [start,end]
+        // bytes with no further slicing.
+        let reqs: Vec<(usize, usize, usize)> = (first_idx..=last_idx).map(|idx| {
+            let shard_obj_start = idx * shard_len;
+            let ov_start = (start as usize).max(shard_obj_start);
+            let ov_end = (end as usize).min(shard_obj_start + shard_len - 1);
+            (idx, ov_start - shard_obj_start, ov_end - ov_start + 1)
+        }).collect();
+        let partial_gets = reqs.iter().map(|&(idx, rel_off, rel_len)| {
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             let peer = record.shard_peers[idx].clone();
-            async move { client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await.ok() }
+            async move { client.get_shard_range(&peer, user_id, &bucket, &wire_key, idx, rel_off, rel_len).await.ok() }
         });
         let partial_results = join_all(partial_gets).await;
 
         if partial_results.iter().all(|r| r.is_some()) {
-            let mut buf = Vec::with_capacity((last_idx - first_idx + 1) * shard_len);
-            for shard in partial_results.into_iter().flatten() {
-                buf.extend_from_slice(&shard);
+            let mut buf: Vec<u8> = Vec::with_capacity((end - start + 1) as usize);
+            for piece in partial_results.into_iter().flatten() {
+                buf.extend_from_slice(&piece);
             }
-            let local_start = start as usize - first_idx * shard_len;
-            let local_end = (end as usize - first_idx * shard_len).min(buf.len() - 1);
-            if let Some(slice) = buf.get(local_start..=local_end) {
+            // The pieces reconstruct exactly [start, end] (each shard contributed
+            // its overlapping object bytes, in order) -- unless a peer returned
+            // short near a padded EOF, in which case fall through to full decode.
+            if buf.len() == (end - start + 1) as usize {
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
                     .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
@@ -1239,22 +1255,20 @@ pub(crate) async fn cluster_get_object_inner(
                 // against the partial bytes (see the content-dependent
                 // partial arm above for the full rationale).
                 let _ = &checksum_header;
-                // Plain-path read telemetry, comparable to the content-dependent
-                // path's: a plain object is one opaque blob split into `k`
-                // positional shards, so a range still reads every data shard it
-                // spans (here first_idx..=last_idx), each `shard_len` bytes --
-                // with no per-column structure to be more selective about.
-                let plain_bytes = ((last_idx - first_idx + 1) * shard_len) as u64;
+                // Read telemetry: now the bytes actually fetched off disk equal
+                // the requested range, so a plain range-GET is comparable to the
+                // content-dependent path for the SAME byte range -- the A/B
+                // difference is then pure column pushdown, not plain over-read.
+                let plain_bytes = buf.len() as u64;
                 resp.insert_header(("x-warpd-placement", "plain"));
                 resp.insert_header(("x-warpd-shard-bytes-read", plain_bytes.to_string()));
                 SHARD_BYTES_READ.fetch_add(plain_bytes, std::sync::atomic::Ordering::Relaxed);
-                return Ok(resp.body(slice.to_vec()));
+                return Ok(resp.body(buf));
             }
         }
         // Fall through to the full fetch+decode path below -- a needed
-        // data shard's peer was unavailable, or the slice math above
-        // came up empty; both are rare-path, not the common case this
-        // fix targets.
+        // data shard's peer was unavailable, or a piece came up short; both
+        // are rare-path, not the common case this fix targets.
     }
 
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
