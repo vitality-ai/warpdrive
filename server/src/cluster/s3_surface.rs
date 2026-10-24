@@ -140,6 +140,24 @@ pub async fn cluster_s3_head_object_authenticated(
 /// by design (see its own module doc), used here only for the
 /// if-match/if-none-match existence/etag check, same as single-node's
 /// `s3_put_object_handler`.
+/// Decode an AWS streaming-chunked request body (signed or unsigned+trailer)
+/// into the real object bytes, keyed off `x-amz-content-sha256: STREAMING-*`.
+/// Used by write paths that receive a raw body (e.g. multipart part uploads),
+/// mirroring what `cluster_put_object_inner` already does for plain PUTs.
+fn decode_chunked_if_streaming(req: &HttpRequest, body: web::Bytes) -> Result<web::Bytes, Error> {
+    let streaming = req
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("STREAMING-"));
+    if streaming {
+        let decoded = super::coordinator::decode_aws_chunked_payload(&body).map_err(ErrorBadRequest)?;
+        Ok(web::Bytes::from(decoded))
+    } else {
+        Ok(body)
+    }
+}
+
 pub async fn cluster_s3_put_object_authenticated(
     path: web::Path<(String, String)>,
     body: web::Bytes,
@@ -158,6 +176,12 @@ pub async fn cluster_s3_put_object_authenticated(
         let upload_id = qmap.get("uploadId").cloned().unwrap_or_default();
         let part_number: i32 = qmap.get("partNumber").and_then(|s| s.parse().ok())
             .ok_or_else(|| ErrorBadRequest("partNumber must be an integer"))?;
+        // Decode AWS streaming-chunked part bodies the same way the plain PUT
+        // path does. pyarrow's S3 client uploads EVERY object as a multipart
+        // part with `x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
+        // so without this the chunk framing (and the trailer) would be stored
+        // as part of the object -- corrupting, e.g., Iceberg metadata.json.
+        let body = decode_chunked_if_streaming(&req, body)?;
         let etag = cluster_upload_part_inner(&user_id, &bucket, &upload_id, part_number, body, &state).await?;
         let mut resp = HttpResponse::Ok();
         if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&etag) {

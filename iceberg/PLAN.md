@@ -58,3 +58,21 @@ PUT and/or multipart part), so pyarrow's default FileIO stores corrupt bytes;
 s3fs/boto3 (non-chunked) work. decode_aws_chunked_payload itself handles
 unsigned headers, so the miss is a path that doesn't invoke it (suspect the
 multipart part handler). Until fixed, use the fsspec FileIO for pyiceberg.
+
+### 2026-10-24 — Fix: decode aws-chunked on multipart part uploads
+pyarrow's S3 client uploads every object as a multipart part with
+`x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER` (unsigned chunked +
+trailer). The cluster part-upload path passed the body raw, storing the chunk
+framing. Fix: decode in cluster_s3_put_object_authenticated's part branch
+(decode_chunked_if_streaming -> the now-pub(crate) decode_aws_chunked_payload,
+which already handles unsigned headers and ignores the trailer). Verified:
+pyarrow writes a 50KB object (multipart, unsigned-chunked) and boto3 reads it
+back byte-identical (sha match); a full pyiceberg lifecycle works via the
+default pyarrow FileIO.
+
+Next gap (separate, client-side): the AWS SDK's 2025 default data-integrity
+checksums (crc64nvme) make pyarrow's GET fail with "Response checksums mismatch"
+because WarpDrive doesn't return a matching checksum header. Workaround today:
+clients set AWS_RESPONSE_CHECKSUM_VALIDATION=when_required (and
+AWS_REQUEST_CHECKSUM_CALCULATION=when_required). Full out-of-box support means
+computing/storing/returning object checksums (crc32/crc64nvme) server-side.

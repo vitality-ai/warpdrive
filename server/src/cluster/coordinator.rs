@@ -231,7 +231,7 @@ fn attach_placement_headers(mut resp: HttpResponse, placement: &'static str, ove
 /// no-auth-check posture as the rest of the cluster API) -- this only
 /// strips the framing so the stored object is the real payload bytes,
 /// not the wire encoding.
-fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(raw.len());
     let mut pos = 0usize;
     loop {
