@@ -1,0 +1,42 @@
+# Iceberg compatibility interface for WarpDrive
+
+Goal: let standard Iceberg clients and query engines (pyiceberg, Spark, Trino,
+DuckDB) use WarpDrive as the warehouse, and eventually as the REST catalog, so
+WarpDrive's content-dependent placement powers Iceberg tables with no changes to
+those engines.
+
+Layers (build bottom-up; evaluate each before the next):
+1. **Warehouse / FileIO** — WarpDrive's S3 API holds the Iceberg objects
+   (metadata.json, manifests, data files). EVALUATE FIRST: can a real Iceberg
+   client (pyiceberg) create a table, append data, read it back, time-travel,
+   with WarpDrive S3 as the object store? Find the S3-compat gaps here before
+   anything else — a REST catalog can't paper over a broken FileIO.
+2. **REST catalog** — serve the Iceberg REST Catalog protocol (/v1/config,
+   namespaces, tables, commits) so external engines connect to WarpDrive
+   directly, metadata pointer stored in WarpDrive.
+3. **Placement bridge** — the differentiator: parse the table's Parquet/manifest
+   metadata (A2 work) and place data files' internals via the content-dependent
+   engine, so Iceberg scans get intra-object pushdown for free.
+
+This branch is for this work, separate from the placement-engine branches.
+
+## Evaluation log
+
+### 2026-10-24 — Layer 1 (warehouse/FileIO): PASS on distributed WarpDrive
+A real pyiceberg client ran end to end against the distributed RS(3,2) cluster
+via /cluster/s3: create table, append 1000+200 across two snapshots, full scan
+(1200), filtered scan region==r3 (150), time-travel to snapshot[0] (1000). 9
+objects written (2 parquet, 3 metadata.json, 4 avro manifests). See
+eval_pyiceberg.py.
+
+Compatibility findings (the "parser and other problems"):
+1. Must use fsspec/s3fs FileIO, not pyiceberg's default pyarrow FileIO: pyarrow
+   S3FileSystem takes only host:port and cannot target the /cluster/s3 path
+   prefix. => Real gap: the distributed engine is reachable only at /cluster/s3,
+   which pyarrow-based clients can't hit. The clean fix is Layer-2 work: expose
+   the distributed S3 surface at the standard root path so ANY client works.
+2. Single-node /s3 does not decode aws-chunked (streaming-signed PUT) bodies —
+   it stored chunk framing into objects, corrupting metadata.json on read-back.
+   The distributed coordinator decodes correctly. (Known latent single-node gap.)
+3. Local SqlCatalog avoids needing S3 conditional-write commit semantics; a
+   native REST catalog (Layer 2) will need to handle commit atomicity itself.
