@@ -83,6 +83,40 @@ rustup target add wasm32-unknown-unknown
 Current result: **8/8 PASS** — every hostile module contained for the right
 reason; the one valid policy accepted with its cost explained.
 
+## Experiments: explainability + agent scale (`cargo run --bin sweep`)
+
+A deterministic sweep of **3 policies × 4 workloads × 4 unit-counts = 48
+experiments** backs two claims with numbers.
+
+**Explainability — one report, one frontier.** For `uniform`, n=256, RS(3,2):
+
+| policy | overhead | blast radius (objects lost together) | reading |
+|---|---|---|---|
+| `good_identity` | 200.0% | 1 | max isolation |
+| `good_pairs` | 50.0% | 2 | balanced |
+| `good_packall` | 0.8% | 256 | min overhead |
+
+Every policy lands on the *same* quantitative cost↔durability frontier, so a
+human or an agent picks a point deliberately instead of guessing. (The report
+also shows each vs the built-in default, the per-PUT compute cost, and a sample
+placement — see above.)
+
+**Agent scale — the policy is a per-PUT compute unit, and its cost is bounded.**
+`pack` runs on every PUT over that object's units, so per-PUT cost must stay low
+and linear. Measured (workload=`skewed`):
+
+| policy | n=16 | n=64 | n=256 | n=1024 | fuel/unit |
+|---|---|---|---|---|---|
+| `good_identity` | 885 | 3381 | 13365 | 53301 | ~52 (flat) |
+| `good_pairs` | 798 | 3006 | 11838 | 47166 | ~46 (flat) |
+| `good_packall` | 1377 | 4737 | 18177 | 71937 | ~70 (flat) |
+
+Fuel is O(n) with a flat per-unit cost; wall time stays **sub-millisecond even
+at 1024 units/object**, so at agent PUT rates the policy is a negligible,
+bounded slice of each write. The whole 48-experiment space ran in **~144 ms**
+and is **reproducible** (same seed → identical overhead and fuel) — so an agent
+can explore the policy space and automate the choice.
+
 ## ABI
 
 Input (at a module-allocated ptr): `[u32 k][u32 n][n × u32 size]`.
