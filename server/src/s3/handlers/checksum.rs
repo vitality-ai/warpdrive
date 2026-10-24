@@ -96,11 +96,27 @@ pub fn parse_checksum_headers(req: &HttpRequest) -> Option<(ChecksumAlgorithm, S
 }
 
 /// Extract only the algorithm name from request headers (without requiring a value header).
+///
+/// Accepts the three ways a client can declare which algorithm it wants:
+///   * `x-amz-sdk-checksum-algorithm` (boto3/AWS SDKs, e.g. CreateMultipartUpload)
+///   * `x-amz-checksum-algorithm` (raw/REST clients)
+///   * `x-amz-trailer: x-amz-checksum-<suffix>` (streaming trailer uploads, e.g.
+///     pyarrow sends `x-amz-trailer: x-amz-checksum-crc64nvme` and carries the
+///     actual value in the chunked trailer rather than a header)
 pub fn parse_checksum_algorithm(req: &HttpRequest) -> Option<ChecksumAlgorithm> {
-    let algo_str = req.headers().get("x-amz-sdk-checksum-algorithm")
+    if let Some(algo_str) = req.headers().get("x-amz-sdk-checksum-algorithm")
         .or_else(|| req.headers().get("x-amz-checksum-algorithm"))
-        .and_then(|v| v.to_str().ok())?;
-    ChecksumAlgorithm::from_str(algo_str)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(algo) = ChecksumAlgorithm::from_str(algo_str) {
+            return Some(algo);
+        }
+    }
+    // Fall back to the trailer declaration: `x-amz-checksum-<suffix>`.
+    let trailer = req.headers().get("x-amz-trailer").and_then(|v| v.to_str().ok())?;
+    let suffix = trailer.split(',').map(str::trim)
+        .find_map(|t| t.strip_prefix("x-amz-checksum-"))?;
+    ChecksumAlgorithm::from_str(suffix)
 }
 
 /// Compute checksum of data, return base64-encoded string.

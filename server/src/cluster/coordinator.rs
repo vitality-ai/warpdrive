@@ -720,10 +720,17 @@ fn multipart_meta_key(upload_id: &str) -> String {
 
 pub(crate) async fn cluster_create_multipart_upload_inner(
     user_id: &str, bucket: &str, _key: &str, content_type: Option<String>, user_metadata: HashMap<String, String>,
+    checksum_algorithm: Option<String>,
     state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
     let upload_id = super::shard_storage::new_version_id();
-    let s3_meta = ObjectS3Metadata { content_type, user_metadata, ..Default::default() };
+    // Remember which checksum algorithm the client asked for at initiate
+    // (x-amz-sdk-checksum-algorithm / x-amz-checksum-algorithm / x-amz-trailer).
+    // The header record carries it on its LocationRecord so CompleteMultipartUpload
+    // can compute that same algorithm over the reassembled object and a later
+    // checksum-mode GET returns the algorithm the client actually requested,
+    // rather than a hardcoded default it would then reject as a mismatch.
+    let s3_meta = ObjectS3Metadata { content_type, user_metadata, checksum_algorithm, ..Default::default() };
     // Empty body: the header carries no bytes of its own, only metadata
     // on the (fully replicated) LocationRecord it creates.
     put_object_plain(user_id, bucket, &multipart_meta_key(&upload_id), &[], state, &s3_meta).await?;
@@ -735,14 +742,20 @@ pub(crate) async fn cluster_create_multipart_upload_inner(
 /// bookkeeping -- replicated the same way as the part's bytes, no
 /// separate index. Returns the part's ETag.
 pub(crate) async fn cluster_upload_part_inner(
-    user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
+    user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes,
+    checksum_algorithm: Option<String>,
+    state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
     if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
         return Err(ErrorNotFound("no such upload"));
     }
 
     let etag = crate::s3::handlers::common::md5_etag(&body);
-    let s3_meta = ObjectS3Metadata { etag: Some(etag.clone()), ..Default::default() };
+    // Record the checksum algorithm the client declared on this part (e.g.
+    // `x-amz-trailer: x-amz-checksum-crc64nvme`). Clients like pyarrow declare
+    // it per part rather than at CreateMultipartUpload, so CompleteMultipartUpload
+    // recovers it from the stored part records to checksum the whole object.
+    let s3_meta = ObjectS3Metadata { etag: Some(etag.clone()), checksum_algorithm, ..Default::default() };
     put_object_plain(user_id, bucket, &multipart_part_key(upload_id, part_number), &body, state, &s3_meta).await?;
     Ok(etag)
 }
@@ -794,12 +807,19 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     // own shard fan-out, but a 50-part upload still paid 50 sequential
     // round-trip-groups before this, one per part, instead of one.
     let mut validated: Vec<(String, String)> = Vec::with_capacity(requested.len());
+    // Recover the checksum algorithm the client declared per part (pyarrow and
+    // similar clients put it on the UploadPart trailer, not at initiate). The
+    // parts all share one algorithm, so the first one that carries it wins.
+    let mut part_checksum_algorithm: Option<String> = None;
     for (part_number, client_etag) in requested {
         let part_key = multipart_part_key(upload_id, *part_number);
         let stored = state
             .location_store
             .get(user_id, bucket, &part_key)
             .ok_or_else(|| ErrorBadRequest("one or more of the specified parts could not be found"))?;
+        if part_checksum_algorithm.is_none() {
+            part_checksum_algorithm = stored.checksum_algorithm.clone();
+        }
         let stored_etag = stored.etag.unwrap_or_default();
         if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored_etag) {
             return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
@@ -828,19 +848,25 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
     let total_size = body.len() as u64;
 
-    // Checksum on by default here too, same reasoning (and same CRC32C
-    // choice) as the single-part PUT path (see
-    // `cluster_s3_put_object_authenticated`'s matching comment): a real
-    // checksum over the *reassembled* bytes, so a later GET can verify
-    // the complete object, not just rely on each part having been
-    // individually correct at upload time.
+    // Checksum on by default here too: a real checksum over the
+    // *reassembled* bytes, so a later GET can verify the complete object,
+    // not just rely on each part having been individually correct at
+    // upload time. We honor the algorithm the client declared at initiate
+    // (stored on the header record) so a strict client that asked for
+    // CRC64NVME gets CRC64NVME back on a checksum-mode GET, not a default
+    // it would reject. Absent a declared algorithm we fall back to CRC32C.
+    let algo = part_checksum_algorithm.as_deref()
+        .or(meta_record.checksum_algorithm.as_deref())
+        .and_then(ChecksumAlgorithm::from_str)
+        .unwrap_or(ChecksumAlgorithm::Crc32c);
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
         content_type: meta_record.content_type.clone(),
         last_modified: Some(super::s3_surface::now_http_date()),
         user_metadata: meta_record.user_metadata.clone(),
-        checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
-        checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
+        checksum_algorithm: Some(algo.as_str().to_string()),
+        checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&algo, &body)),
+        checksum_type: Some(algo.default_type().to_string()),
         ..Default::default()
     };
     put_object_plain(user_id, bucket, final_key, &body, state, &s3_meta).await?;
@@ -1035,9 +1061,13 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // Deliberately NOT echoing the object checksum here: the stored
+                // value is the FULL-OBJECT checksum, but this is a partial (206)
+                // body. A strict client (pyarrow/awscrt) would recompute the
+                // checksum over the partial bytes and reject the whole-object
+                // value as a mismatch -- exactly what AWS avoids by not
+                // returning x-amz-checksum-* on a ranged GET.
+                let _ = &checksum_header;
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1133,9 +1163,11 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // No object checksum on a partial (206) body -- it's the
+                // whole-object value and a strict client would reject it
+                // against the partial bytes (see the content-dependent
+                // partial arm above for the full rationale).
+                let _ = &checksum_header;
                 return Ok(resp.body(slice.to_vec()));
             }
         }
@@ -1217,9 +1249,9 @@ pub(crate) async fn cluster_get_object_inner(
             for (k, v) in &user_metadata {
                 resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
             }
-            if let Some((name, value)) = &checksum_header {
-                resp.insert_header((name.as_str(), value.as_str()));
-            }
+            // No object checksum on a partial (206) body (see the fast-path
+            // partial arm above): it's the whole-object value.
+            let _ = &checksum_header;
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
