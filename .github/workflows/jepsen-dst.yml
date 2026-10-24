@@ -23,6 +23,14 @@ jobs:
           toolchain: stable
           override: true
 
+      # Caches ~/.cargo/registry, ~/.cargo/git and server/target, keyed on
+      # Cargo.lock. Without this every run recompiled the full dependency
+      # tree from scratch, which dominated the job's wall time.
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
@@ -43,6 +51,19 @@ jobs:
           chmod +x "$HOME/bin/lein"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/lein" version
+
+      # Leiningen resolves jepsen/elle/clojure jars into ~/.m2 on every run
+      # with no cache; this was the second-largest chunk of wall time after
+      # the Rust build. Keyed on project.clj since there's no lockfile.
+      - name: Cache Leiningen/Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-lein-${{ hashFiles('server/tests/chaos/jepsen-warpdrive/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-lein-
 
       # Negative control FIRST: if Elle can't catch a planted anomaly, a green
       # run below would be meaningless, so fail the whole job here.
