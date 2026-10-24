@@ -260,5 +260,37 @@ no longer dominates. (Absolute MB exceed the ~163 MB table because the plain pat
 re-reads whole shards per column byte-range; the relative reduction is the
 signal, and still loopback/warm-cache so wall-clock < bytes.)
 
+#### 2026-10-24 — broad TPC-H sweep (full schema, 7 queries incl. joins + WIDE)
+Loaded the full TPC-H SF=1 schema (8 tables) plain + column-placed (tpch_load_all.py)
+and ran Q1/Q3/Q5/Q6/Q9/Q18 and a wide 16-column scan in Spark (tpch_spark_broad.py),
+median of 3 runs, asserting placed and plain return IDENTICAL results each time:
+
+  query               plain_ms placed_ms  wall    read   ok
+  Q6  (1 tbl, 4 cols)     2962     1717   1.73x   2.3x   Y
+  Q3  (3-tbl join)        3887     2421   1.61x   4.3x   Y
+  Q9  (6-tbl join)        4004     2808   1.43x   9.4x   Y
+  Q18 (3-tbl + subq)      6619     4859   1.36x  28.9x   Y
+  Q5  (6-tbl join)        3818     2893   1.32x   9.9x   Y
+  Q1  (1 tbl, 7 cols)     3936     3121   1.26x   3.2x   Y
+  WIDE (1 tbl, 16 cols)   4467     3869   1.15x   3.3x   Y
+
+Honest reading:
+  * The spread is exactly as predicted: the most selective query (Q6) wins most
+    (1.73x), the all-columns WIDE scan wins least (1.15x). Placement helps in
+    proportion to how few columns a query needs.
+  * ok=Y everywhere: placement is transparent across multi-table joins and
+    subqueries -- same results, faster.
+  * Caveat: even WIDE "wins" 3.3x on bytes, which it shouldn't on pure column
+    pushdown (it reads all 16 columns). That extra comes from WarpDrive's PLAIN
+    range path re-reading whole shards per column byte-range (a plain-path read
+    inefficiency), so these numbers conflate "fewer columns" with "placed layout
+    reads more efficiently." The user-visible result (placed is faster for every
+    query) holds; isolating pure pushdown needs a tighter plain range path.
+  * No query got slower here -- the fan-out cost that the cost gate guards
+    against stays cheap on a loopback cluster; on real RTT a broad scan like WIDE
+    is where the gate would (correctly) decline placement.
+  * The cost gate already declined the tiny `nation` table (25 rows) at load.
+
 Next (optional): a transparent server-side Parquet-footer parser so placement
-needs no place-after-write step; port the REST catalog loop into the Rust server.
+needs no place-after-write step; tighten the plain range path; port the REST
+catalog loop into the Rust server.
