@@ -40,3 +40,21 @@ Compatibility findings (the "parser and other problems"):
    The distributed coordinator decodes correctly. (Known latent single-node gap.)
 3. Local SqlCatalog avoids needing S3 conditional-write commit semantics; a
    native REST catalog (Layer 2) will need to handle commit atomicity itself.
+
+### 2026-10-24 — Layer 1b: distributed engine now served at the ROOT S3 path
+main.rs: in cluster mode (WARPDRIVE_PEERS set), the root S3 surface
+(/{bucket}/...) routes object + list-objects ops to the DISTRIBUTED engine's
+authenticated handlers (register_root_s3). Standard clients connect at the
+normal endpoint with no /cluster/s3 prefix. Confirmed: boto3 create/put/head/
+get/list at root resolve to the same distributed object visible via /cluster/s3;
+a full pyiceberg lifecycle (create/append x2/scan/filter) works at the root
+endpoint. Bucket-registry ops stay shared; single-node keeps the in-process
+store.
+
+Open S3-compat gap (next fix): pyarrow's S3 client PUTs with
+`x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER` (unsigned chunked +
+CRC32 trailer). That framing is not decoded on at least one write path (small
+PUT and/or multipart part), so pyarrow's default FileIO stores corrupt bytes;
+s3fs/boto3 (non-chunked) work. decode_aws_chunked_payload itself handles
+unsigned headers, so the miss is a path that doesn't invoke it (suspect the
+multipart part handler). Until fixed, use the fsspec FileIO for pyiceberg.

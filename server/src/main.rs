@@ -134,6 +134,47 @@ fn build_cluster_state() -> web::Data<ClusterState> {
     web::Data::new(state)
 }
 
+/// Registers the root S3 routes (/{bucket}/...). Bucket-registry ops (create,
+/// delete, head bucket, list buckets) are shared. When `cluster` is true, the
+/// object and list-objects operations route to the DISTRIBUTED engine's
+/// authenticated handlers; otherwise to the single-node in-process store. This
+/// lets a standard S3/Iceberg client hit the distributed engine at the normal
+/// endpoint instead of the /cluster/s3 path prefix (which pyarrow and other
+/// clients cannot target).
+fn register_root_s3(cfg: &mut web::ServiceConfig, cluster: bool) {
+    use actix_web::http::Method;
+    // shared bucket-registry ops + OPTIONS
+    cfg.route("/", web::get().to(s3_list_buckets_handler))
+        .route("/{bucket}", web::put().to(s3_create_bucket_handler))
+        .route("/{bucket}", web::delete().to(s3_delete_bucket_handler))
+        .route("/{bucket}", web::head().to(s3_head_bucket_handler))
+        .route("/{bucket}", web::post().to(s3_post_bucket_handler))
+        .route("/{bucket}/", web::put().to(s3_create_bucket_handler))
+        .route("/{bucket}/", web::delete().to(s3_delete_bucket_handler))
+        .route("/{bucket}/", web::head().to(s3_head_bucket_handler))
+        .route("/{bucket}/", web::post().to(s3_post_bucket_handler))
+        .route("/{bucket}", web::method(Method::OPTIONS).to(s3_cors_not_configured_handler))
+        .route("/{bucket}/", web::method(Method::OPTIONS).to(s3_cors_not_configured_handler))
+        .route("/{bucket}/{key:.*}", web::method(Method::OPTIONS).to(s3_cors_not_configured_handler));
+    if cluster {
+        cfg.route("/{bucket}", web::get().to(cluster_s3_list_objects))
+            .route("/{bucket}/", web::get().to(cluster_s3_list_objects))
+            .route("/{bucket}/{key:.*}", web::put().to(cluster_s3_put_object_authenticated))
+            .route("/{bucket}/{key:.*}", web::get().to(cluster_s3_get_object_authenticated))
+            .route("/{bucket}/{key:.*}", web::delete().to(cluster_s3_delete_object_authenticated))
+            .route("/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object_authenticated))
+            .route("/{bucket}/{key:.*}", web::post().to(cluster_s3_multipart_post_authenticated));
+    } else {
+        cfg.route("/{bucket}", web::get().to(s3_list_objects_handler))
+            .route("/{bucket}/", web::get().to(s3_list_objects_handler))
+            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
+            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
+            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
+            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
+            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_router));
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
@@ -189,6 +230,16 @@ async fn main() -> std::io::Result<()> {
             log::error!("TCP shard server failed: {e}");
         }
     });
+
+    // Cluster mode (peers configured) serves the distributed engine at the
+    // root S3 path, so standard S3/Iceberg clients connect without the
+    // /cluster/s3 prefix. Single-node (no peers) keeps the in-process store.
+    let root_cluster = std::env::var("WARPDRIVE_PEERS")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if root_cluster {
+        info!("root S3 surface (/{{bucket}}/...) serves the DISTRIBUTED engine");
+    }
 
     HttpServer::new(move || {
         App::new()
@@ -255,27 +306,13 @@ async fn main() -> std::io::Result<()> {
             .service(delete)
             .service(update_key)
             .service(update)
-            // S3-compatible API — root form (/{bucket}/...) for standard boto3 / Ceph s3-tests
-            .route("/",                  web::get().to(s3_list_buckets_handler))
-            .route("/{bucket}",          web::put().to(s3_create_bucket_handler))
-            .route("/{bucket}",          web::delete().to(s3_delete_bucket_handler))
-            .route("/{bucket}",          web::head().to(s3_head_bucket_handler))
-            .route("/{bucket}",          web::get().to(s3_list_objects_handler))
-            .route("/{bucket}",          web::post().to(s3_post_bucket_handler))
-            // Trailing-slash bucket routes — aws-sdk-rust sends GET /bucket/?list-type=2
-            .route("/{bucket}/",         web::put().to(s3_create_bucket_handler))
-            .route("/{bucket}/",         web::delete().to(s3_delete_bucket_handler))
-            .route("/{bucket}/",         web::head().to(s3_head_bucket_handler))
-            .route("/{bucket}/",         web::get().to(s3_list_objects_handler))
-            .route("/{bucket}/",         web::post().to(s3_post_bucket_handler))
-            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
-            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
-            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
-            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
-            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
-            .route("/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
-            .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
-            .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
+            // S3-compatible API — root form (/{bucket}/...). In cluster mode the
+            // object + list-objects operations route to the DISTRIBUTED engine,
+            // so standard clients (boto3, pyiceberg, Spark) work at the normal
+            // endpoint with no /cluster/s3 prefix; single-node keeps the
+            // in-process store. Bucket-registry ops are shared. See
+            // `register_root_s3`.
+            .configure(move |cfg| register_root_s3(cfg, root_cluster))
     })
     .bind(("0.0.0.0", port))?
     .run()

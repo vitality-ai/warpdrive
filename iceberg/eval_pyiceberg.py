@@ -18,7 +18,7 @@ Prereq: a cluster started with admin creds, warehouse bucket created on
 import os, pyarrow as pa
 from pyiceberg.catalog.sql import SqlCatalog
 
-ENDPOINT = os.environ.get("WD_S3", "http://127.0.0.1:9710/cluster/s3")
+ENDPOINT = os.environ.get("WD_S3", "http://127.0.0.1:9710")
 DB = os.environ.get("CAT_DB", "/tmp/wd-iceberg-cat.db")
 try: os.remove(DB)
 except FileNotFoundError: pass
