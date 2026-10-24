@@ -140,7 +140,12 @@ def create_table(ns, body):
     return ("ok", TableResponse(metadata=md, metadata_location=meta_loc, config=S3_CLIENT_CONF))
 
 def commit_table(ns, t, body):
-    req = CommitTableRequest.model_validate_json(body)
+    # The table identifier is in the URL path; pyiceberg also repeats it in the
+    # body but Spark/Trino's REST client does not, and this pyiceberg's
+    # CommitTableRequest marks it required -- so inject it from the path.
+    raw = json.loads(body)
+    raw.setdefault("identifier", {"namespace": ns.split(chr(0x1f)), "name": t})
+    req = CommitTableRequest.model_validate(raw)
     with _lock:
         ptr, etag = _get(_tbl_key(ns, t))
         current_md = None
@@ -181,7 +186,25 @@ def commit_table(ns, t, body):
 
 # ---- HTTP routing -----------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
+    # Speak HTTP/1.1 so JVM clients (Spark/Trino via Apache HttpClient 5) can
+    # reuse keep-alive connections; with HTTP/1.0 the socket closes after each
+    # response and a reused connection sees "failed to respond". Every response
+    # carries an explicit Content-Length (see _send), required for keep-alive.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *a): pass
+
+    def handle_one_request(self):
+        # Never let a handler exception silently drop the connection (which a
+        # JVM client reports as "failed to respond"): map it to a 500 so the
+        # client gets a real error it can surface.
+        try:
+            super().handle_one_request()
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._err(500, "InternalError", f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
 
     def _send(self, code, obj=None):
         data = b"" if obj is None else (obj if isinstance(obj, (bytes, bytearray)) else json.dumps(obj).encode())

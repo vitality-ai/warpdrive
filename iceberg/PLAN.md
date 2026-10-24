@@ -187,6 +187,22 @@ So: a standard Iceberg projection query reads 2.6x less off disk purely because
 the data files are content-dependently placed by column -- the Layer-3
 differentiator, working end to end with no client changes.
 
-Next: run Spark/Trino against the REST catalog (stress more of the protocol);
-optionally a transparent server-side Parquet-footer parser so placement needs no
-place-after-write step.
+#### 2026-10-24 — Apache Spark 4.0 against the REST catalog: PASS
+Spark 4.0.0 (Scala 2.13, Java 21) + iceberg-spark-runtime-4.0_2.13:1.12.0 +
+iceberg-aws-bundle:1.12.0, catalog type=rest uri=:8181, io-impl=S3FileIO against
+WarpDrive S3 at :9760. Full SQL lifecycle: CREATE NAMESPACE / CREATE TABLE,
+two INSERTs (2 snapshots), count, WHERE filter, GROUP BY aggregate -- all correct
+(total=5200, region_r3=825, snapshots=2). eval_spark.py.
+
+Testing a real JVM engine surfaced two REST-protocol gaps the pyiceberg client
+never exercised, now fixed in rest_catalog.py:
+  1. HTTP/1.1 keep-alive: the stdlib handler defaulted to HTTP/1.0 and closed the
+     socket after each response; Spark/Trino's Apache HttpClient 5 reuses
+     connections and saw "failed to respond". Set protocol_version=HTTP/1.1
+     (every response already carries Content-Length) + a 500-on-exception guard.
+  2. commit identifier: Spark omits `identifier` from the CommitTableRequest body
+     (it's in the URL path); pyiceberg included it. Inject it from the path
+     before validating.
+
+Next: Trino (and/or a lighter engine) for more breadth; optionally a transparent
+server-side Parquet-footer parser so placement needs no place-after-write step.
