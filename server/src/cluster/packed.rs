@@ -448,7 +448,21 @@ async fn fetch_and_decode_stripe(
 /// here (that, including checksum verification against the record, is
 /// the caller's job in `coordinator.rs`, same division of labor
 /// `get_object_content_dependent_range` already uses).
-pub async fn get_object_content_dependent(record: ContentDependentRecord, state: &ClusterState) -> Result<Vec<u8>, Error> {
+/// Per-GET read telemetry: how many stripes were actually touched (vs how many
+/// the object has) and how many bytes were read off the shard backing store to
+/// serve this request. This is the direct, honest intra-object-pushdown metric
+/// -- a selective read of a content-dependent object touches only the stripes
+/// holding the requested units, so `shard_bytes` scales with the data a query
+/// needs, not the whole object. A healthy stripe reads its `k` data shards of
+/// `capacity` bytes each (systematic RS: no parity read when data shards are up).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FetchStat {
+    pub stripes_fetched: usize,
+    pub stripes_total: usize,
+    pub shard_bytes: u64,
+}
+
+pub async fn get_object_content_dependent(record: ContentDependentRecord, state: &ClusterState) -> Result<(Vec<u8>, FetchStat), Error> {
     let mut output = vec![0u8; record.original_len];
     let units_by_id: HashMap<&str, (u64, u64)> =
         record.units.iter().map(|u| (u.unit_id.as_str(), (u.offset, u.len))).collect();
@@ -495,7 +509,12 @@ pub async fn get_object_content_dependent(record: ContentDependentRecord, state:
         }
     }
 
-    Ok(output)
+    let stat = FetchStat {
+        stripes_fetched: record.stripes.len(),
+        stripes_total: record.stripes.len(),
+        shard_bytes: record.stripes.iter().map(|s| (record.k * s.capacity) as u64).sum(),
+    };
+    Ok((output, stat))
 }
 
 /// Range-GET for a content-dependent object: `start`/`end` are inclusive
@@ -510,7 +529,7 @@ pub async fn get_object_content_dependent_range(
     start: u64,
     end: u64,
     state: &ClusterState,
-) -> Result<Vec<u8>, Error> {
+) -> Result<(Vec<u8>, FetchStat), Error> {
     let want_len = (end - start + 1) as usize;
     let mut output = vec![0u8; want_len];
 
@@ -614,7 +633,12 @@ pub async fn get_object_content_dependent_range(
             );
     }
 
-    Ok(output)
+    let stat = FetchStat {
+        stripes_fetched: needed_stripes.len(),
+        stripes_total: record.stripes.len(),
+        shard_bytes: needed_stripes.iter().map(|&i| (record.k * record.stripes[i].capacity) as u64).sum(),
+    };
+    Ok((output, stat))
 }
 
 #[cfg(test)]

@@ -225,6 +225,19 @@ fn attach_placement_headers(mut resp: HttpResponse, placement: &'static str, ove
     resp
 }
 
+/// Attaches intra-object-pushdown read telemetry to a content-dependent GET
+/// response: `X-Warpd-Stripes-Fetched`/`-Total` (how many of the object's
+/// stripes this request actually touched) and `X-Warpd-Shard-Bytes-Read` (bytes
+/// read off the shard backing store to serve it). A selective read of a
+/// content-placed object touches only the stripes holding the requested units,
+/// so these numbers are far below the whole-object cost -- which is the entire
+/// point of content-dependent placement, now a client-visible, measurable fact.
+fn attach_fetch_stat_headers(resp: &mut actix_web::HttpResponseBuilder, stat: &super::packed::FetchStat) {
+    resp.insert_header(("x-warpd-stripes-fetched", stat.stripes_fetched.to_string()));
+    resp.insert_header(("x-warpd-stripes-total", stat.stripes_total.to_string()));
+    resp.insert_header(("x-warpd-shard-bytes-read", stat.shard_bytes.to_string()));
+}
+
 /// Decodes an AWS SigV4 "streaming payload" body: repeated
 /// `<hex-chunk-size>;chunk-signature=<sig>\r\n<chunk-bytes>\r\n`, ending in
 /// a zero-size chunk. Chunk signatures are not re-verified here (same
@@ -1051,7 +1064,7 @@ pub(crate) async fn cluster_get_object_inner(
         let range_result = parse_range_header(&req, total_len);
         return match range_result {
             RangeResult::Valid(start, end) => {
-                let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
+                let (data, stat) = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
                     .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
@@ -1068,6 +1081,7 @@ pub(crate) async fn cluster_get_object_inner(
                 // value as a mismatch -- exactly what AWS avoids by not
                 // returning x-amz-checksum-* on a ranged GET.
                 let _ = &checksum_header;
+                attach_fetch_stat_headers(&mut resp, &stat);
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1077,7 +1091,7 @@ pub(crate) async fn cluster_get_object_inner(
                 actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
             ),
             RangeResult::None => {
-                let data = super::packed::get_object_content_dependent(record, &state).await?;
+                let (data, stat) = super::packed::get_object_content_dependent(record, &state).await?;
                 verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
 
                 let mut resp = HttpResponse::Ok();
@@ -1091,6 +1105,7 @@ pub(crate) async fn cluster_get_object_inner(
                 if let Some((name, value)) = &checksum_header {
                     resp.insert_header((name.as_str(), value.as_str()));
                 }
+                attach_fetch_stat_headers(&mut resp, &stat);
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1168,6 +1183,14 @@ pub(crate) async fn cluster_get_object_inner(
                 // against the partial bytes (see the content-dependent
                 // partial arm above for the full rationale).
                 let _ = &checksum_header;
+                // Plain-path read telemetry, comparable to the content-dependent
+                // path's: a plain object is one opaque blob split into `k`
+                // positional shards, so a range still reads every data shard it
+                // spans (here first_idx..=last_idx), each `shard_len` bytes --
+                // with no per-column structure to be more selective about.
+                let plain_bytes = ((last_idx - first_idx + 1) * shard_len) as u64;
+                resp.insert_header(("x-warpd-placement", "plain"));
+                resp.insert_header(("x-warpd-shard-bytes-read", plain_bytes.to_string()));
                 return Ok(resp.body(slice.to_vec()));
             }
         }
@@ -1252,6 +1275,11 @@ pub(crate) async fn cluster_get_object_inner(
             // No object checksum on a partial (206) body (see the fast-path
             // partial arm above): it's the whole-object value.
             let _ = &checksum_header;
+            // This arm is only reached when the shard fast-path above fell
+            // through and we decoded the WHOLE object to slice from it, so the
+            // plain path read every data shard regardless of range size.
+            resp.insert_header(("x-warpd-placement", "plain"));
+            resp.insert_header(("x-warpd-shard-bytes-read", total_len.to_string()));
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
@@ -1269,6 +1297,8 @@ pub(crate) async fn cluster_get_object_inner(
             if let Some((name, value)) = &checksum_header {
                 resp.insert_header((name.as_str(), value.as_str()));
             }
+            resp.insert_header(("x-warpd-placement", "plain"));
+            resp.insert_header(("x-warpd-shard-bytes-read", total_len.to_string()));
             Ok(resp.body(data))
         }
     }

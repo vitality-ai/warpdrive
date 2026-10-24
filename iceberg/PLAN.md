@@ -136,7 +136,36 @@ commit accumulates (same GC class as the rest of the engine); rename_table and
 update_namespace_properties not yet implemented; staged-create (create-table
 transaction) returns a clear error rather than reconstructing base metadata.
 
-### Layer 3 — placement bridge (next)
-The differentiator: parse a data file's Parquet/manifest metadata (A2 work) and
-place its internals via the content-dependent engine, so Iceberg scans get
-intra-object pushdown for free.
+### Layer 3 — placement bridge (in progress)
+The differentiator: place a Parquet data file's column chunks via the
+content-dependent engine so a selective scan fetches only the columns it needs
+(intra-object pushdown) — something S3 Tables, which optimizes at the whole-file
+level (compaction/clustering), structurally cannot do.
+
+#### 2026-10-24 — direct S3-level proof + read telemetry
+Added per-GET read telemetry to the cluster GET path: response headers
+`x-warpd-stripes-fetched`/`-total` and `x-warpd-shard-bytes-read` (bytes read off
+the shard backing store to serve the request) on both the content-dependent and
+plain paths — the honest intra-object-pushdown metric, now client-visible.
+
+Unit model (eval_pushdown.py): tile a Parquet exactly; each column chunk is split
+into K=3 contiguous sub-units sharing one group id = the column index. The
+`ivf_centroid` group-by-key packer then places all K in ONE stripe (one per data
+bin, so the stripe is balanced ≈ parity-only overhead) AND isolates the column to
+a single stripe. The footer gets its own tiny stripe (every scan reads it).
+
+Measured, 8-column single-row-group Parquet (1.42 MB), RS(3,2), 1-column projection:
+  * plain (opt-out, positional k-split): 946,422 bytes read off disk (2 of 3
+    shards — the column's byte range + the footer each drag a full 473 KB shard)
+  * content-dependent (column-grouped):   181,638 bytes (the column's own stripe
+    179,937 + an isolated 1,701-byte footer stripe), touching 1 of 10 stripes
+  * => 5.2x less data read off disk for the projection, at 0.0027% storage
+    overhead; full GET byte-identical to the original (exact tiling, no corruption).
+
+Degrade-to-plain safety confirmed working: one-unit-per-column (unbalanced,
+K-1 padded bins) reported ~3x overhead and auto-fell-back to plain under a 60%
+budget; the K-split balanced layout reports 0.0027% and engages.
+
+Next: a custom pyiceberg FileIO that derives these units from each data file's
+footer so Iceberg tables get this transparently; then measure a real Iceberg
+projection scan and run Spark/Trino against the REST catalog.
