@@ -641,3 +641,51 @@ even the warm path is already a negligible slice of a cross-network PUT.
 
 Macro benchmarks (A1 PUT hot-path tax, A2 read/pushdown benefit) are next,
 against the live RS(3,2) cluster.
+
+## 2026-10-24 — A1 macro: PUT hot-path tax, plain vs FacPacker vs WASM policy
+
+Live 5-node RS(3,2) cluster, release `--features wasm`, a user WASM policy
+(`packall`, co-locates all units into one stripe) registered via
+`WARPDRIVE_WASM_PACKER`. Sequential PUT latency (64KB body), driven over the
+unauthenticated `/cluster/{bucket}/{key}` path with the `x-warpd-computable-units`
+header. Three buckets: plain (no header), facb (built-in FacPacker), wasmb (the
+WASM policy).
+
+```
+p50 PUT latency (ms), by units/object:
+   n     plain    fac    wasm(packall)
+  16      3.61   10.68     4.65
+  64      3.39   29.37     5.15
+ 256      4.37  102.67     6.52
+
+content record stripe counts at n=256:  fac = 86 stripes,  wasm = 1 stripe
+```
+
+**The packer's own compute tax is negligible — confirmed.** The WASM policy is
+only ~1-2 ms over plain, and that gap is the extra shard writes, not the pack
+(micro-bench M1 put warm pack at 16-29 µs). So the per-PUT CPU of running a
+user policy does not register end to end.
+
+**The dominant cost is the number of stripes the policy emits × EC fan-out, and
+the packed write path writes stripes SEQUENTIALLY.** `packed.rs`'s write loop
+(~L259) fans out a stripe's k+m shards in parallel (`join_all`, ~L285) but
+`.await`s each stripe before the next, so a packing of S stripes pays
+S × per-stripe round-trip. FacPacker on fine-grained equal-sized units emits
+~n/k stripes (86 at n=256) → ~103 ms; `packall` emits 1 → ~6.5 ms. The 86×
+sequential fan-out, not the greedy's CPU, is the 103 ms.
+
+Two consequences:
+1. **Stripe count is a first-class, user-controlled cost dimension** the
+   submission report must show, alongside storage overhead and blast radius.
+   The tradeoff is three-way: few stripes (packall) = cheap writes + low
+   overhead + *large* blast radius; many stripes (identity/fac) = isolation +
+   *expensive* writes. A user choosing isolation pays in write latency, not
+   just storage — and today nothing tells them.
+2. **Operator optimization:** pipeline the per-stripe fan-out (`join_all` across
+   stripes, not only within one), with each stripe's quorum still checked
+   independently. That removes the sequential S factor and is the single
+   biggest write-path win for many-stripe policies. (Proposed, not yet done;
+   needs care that the location pin still lands only after all stripes ack.)
+
+A2 (read/pushdown benefit of a workload-aware policy vs FacPacker) is next and
+needs a `good_locality` policy wired in.
