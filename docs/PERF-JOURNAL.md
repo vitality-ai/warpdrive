@@ -689,3 +689,36 @@ Two consequences:
 
 A2 (read/pushdown benefit of a workload-aware policy vs FacPacker) is next and
 needs a `good_locality` policy wired in.
+
+## 2026-10-24 — A2 macro: read amplification on a real Parquet object (lakehouse)
+
+The Fusion-style benefit, measured end to end: a user-submittable WASM grouping
+policy that co-locates a Parquet column's chunks, vs the built-in size-based
+FacPacker, on a real 5 MB Parquet file (6 columns x 8 row groups = 48
+column-chunk computable units, extracted by parsing the Parquet footer with
+pyarrow). Both PUT to the live RS(3,2) cluster with the `x-warpd-computable-units`
+header; read amplification for a single-column scan computed from the content
+records (bytes in the stripes a column touches / bytes the column needs).
+
+```
+FacPacker (size-based):     13 stripes,  avg read-amp 1.81x
+  region   11.08x   status 12.38x   payload 8.80x   (small columns scattered)
+good_bykey (column-grouped): 6 stripes,  avg read-amp 1.00x
+  every column: exactly 1 stripe, 1.00x
+```
+
+A projected scan of a small column (the common analytics filter: status/region)
+fetches 8-12x the bytes it needs under FacPacker, because its chunks land in
+stripes dominated by big columns. Grouping by column makes every scan fetch
+exactly its own bytes. This is intra-object pushdown locality — the benefit that
+complements (does not replace) cross-file z-order compaction — delivered by a
+sandboxed, user-submittable policy, with no compaction pass.
+
+Bonus: the column-grouped packing also uses fewer stripes (6 vs 13), so it is
+cheaper on the write path too (A1's stripe-count axis). When the policy matches
+the access pattern, read amplification and write cost improve together.
+
+Caveat: this measures stripe-level fetch locality (which stripes a column scan
+must read), not real Parquet page decoding/filtering — that needs a Parquet
+`ColumnCodec` (deferred). The locality result stands on its own: it is where the
+bytes-read win comes from.
