@@ -76,3 +76,67 @@ because WarpDrive doesn't return a matching checksum header. Workaround today:
 clients set AWS_RESPONSE_CHECKSUM_VALIDATION=when_required (and
 AWS_REQUEST_CHECKSUM_CALCULATION=when_required). Full out-of-box support means
 computing/storing/returning object checksums (crc32/crc64nvme) server-side.
+
+### 2026-10-24 — Fix: honor client checksum algorithm end-to-end (CLOSES the gap)
+The distributed path hardcoded CRC32C on write and echoed the whole-object
+checksum even on partial (206) responses. Fixes: (1) parse the client's declared
+algorithm from x-amz-sdk-checksum-algorithm / x-amz-checksum-algorithm /
+x-amz-trailer; (2) single PUT computes the declared algorithm server-side when
+the value only arrives in the chunked trailer; (3) multipart captures the
+algorithm per part (pyarrow declares it on the UploadPart trailer, not at
+initiate) and complete checksums the reassembled object with it; (4) GET no
+longer echoes the whole-object checksum on partial (206) bodies — mirrors AWS,
+which omits x-amz-checksum-* on ranged GETs, so a ranged Parquet read no longer
+sees a whole-object checksum it would reject. Verified: pyiceberg now works via
+BOTH the native pyarrow FileIO and fsspec, no checksum env var or workaround
+(eval_pyiceberg.py runs both). This retires finding #1's pyarrow limitation.
+Layer 1 is DONE.
+
+## Layer 2 — Iceberg REST catalog (in progress)
+Goal: serve the Iceberg REST Catalog protocol so external engines (pyiceberg
+RestCatalog, Spark, Trino) connect to WarpDrive directly instead of each client
+keeping its own SqlCatalog. Metadata pointer and catalog state live in WarpDrive.
+Endpoint set (minimum for pyiceberg RestCatalog): GET /v1/config; namespaces
+(list/create/load/exists/drop); tables (list/create/load/exists/drop/rename) and
+the atomic commit (POST /v1/namespaces/{ns}/tables/{tbl}). The hard part is
+commit atomicity — a compare-and-swap on each table's current metadata pointer —
+which the local SqlCatalog got from SQLite and a native catalog must provide
+itself.
+
+### 2026-10-24 — Layer 2 (REST catalog): PASS, commit atomicity from WarpDrive CAS
+rest_catalog.py serves the Iceberg REST protocol with its authoritative state
+living ENTIRELY in WarpDrive — no external catalog DB:
+  * namespace markers  -> __catalog__/namespaces/<ns>.json
+  * table pointers     -> __catalog__/tables/<ns>/<tbl>.json = {metadata_location, version}
+  * table metadata.json -> standard Iceberg layout under the table location
+Iceberg metadata semantics (build initial metadata, validate a commit's
+requirements, apply its updates, serialize metadata.json) are reused from
+pyiceberg itself, so the service is only protocol + storage + atomicity.
+
+Commit atomicity is a compare-and-swap on the pointer OBJECT via WarpDrive's S3
+conditional writes (verified end to end, ck_cas.py): create = PUT If-None-Match:*
+(409 if present), commit = PUT If-Match:<etag> (409 if another commit won). This
+mirrors SqlCatalog's `UPDATE ... WHERE metadata_location=<current>` CAS, but the
+"row" is a WarpDrive object and the lock is the 412 the object store returns — so
+the catalog needs no database and is effectively stateless. The If-Match (not the
+server's in-process lock) is what guarantees correctness: a loser always reloads
+from whatever the pointer currently points to before retrying.
+
+Evaluated (eval_rest_catalog.py):
+  A. a real pyiceberg RestCatalog given ONLY the REST uri (S3 wiring via
+     /v1/config overrides) — create namespace/table, append x2, full/filtered/
+     time-travel scans, reload-from-catalog. PASS.
+  B. atomicity — TWO independent catalog processes (ports 8181/8182, no shared
+     lock) racing concurrent commits on one table: 30 concurrent appends, ~15
+     real 409 conflicts detected and retried, 31 distinct snapshots, ZERO lost
+     updates. The only serialization is WarpDrive's conditional-PUT CAS. PASS.
+
+Known gaps (follow-ups, not correctness): orphaned metadata.json left by a losing
+commit accumulates (same GC class as the rest of the engine); rename_table and
+update_namespace_properties not yet implemented; staged-create (create-table
+transaction) returns a clear error rather than reconstructing base metadata.
+
+### Layer 3 — placement bridge (next)
+The differentiator: parse a data file's Parquet/manifest metadata (A2 work) and
+place its internals via the content-dependent engine, so Iceberg scans get
+intra-object pushdown for free.
