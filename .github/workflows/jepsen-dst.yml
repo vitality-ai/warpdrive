@@ -1,0 +1,61 @@
+name: jepsen-dst
+
+# Deterministic-simulation fault-injection tests (Jepsen/Elle) for the
+# distributed engine. Runs on every PR to main and on demand.
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dst:
+    name: Jepsen/Elle DST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Build release binary
+        working-directory: server
+        run: cargo build --release --bin warp_drive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/lein" version
+
+      # Negative control FIRST: if Elle can't catch a planted anomaly, a green
+      # run below would be meaningless, so fail the whole job here.
+      - name: Elle negative control (checker must have teeth)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run selftest
+
+      - name: Power-loss durability (acked writes must survive full-cluster SIGKILL)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run durability --m 200
+
+      # iptables partitions need root; the runner has passwordless sudo and
+      # cluster.sh already prefixes iptables with sudo when not root.
+      - name: Seeded Jepsen + Elle consistency run (kills, partitions, corruption)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run test --seed 42 --duration-sec 45 --concurrency 6
