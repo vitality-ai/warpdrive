@@ -291,6 +291,44 @@ Honest reading:
     is where the gate would (correctly) decline placement.
   * The cost gate already declined the tiny `nation` table (25 rows) at load.
 
-Next (optional): a transparent server-side Parquet-footer parser so placement
-needs no place-after-write step; tighten the plain range path; port the REST
-catalog loop into the Rust server.
+#### 2026-10-24 — HONEST re-measurement after tightening the plain range path
+Once the plain path fetches only the overlapping shard sub-ranges (ranged shard
+reads, commit c6e7c01), the same TPC-H sweep flips:
+
+  query               wall x  read x   (placed / plain; <1.0 wall = placed SLOWER)
+  Q1  (1 tbl)          0.99x   0.9x
+  Q6  (1 tbl)          0.90x   1.0x
+  Q3  (3-tbl join)     0.78x   1.0x
+  Q5  (6-tbl join)     0.87x   1.0x
+  Q9  (6-tbl join)     0.97x   1.0x
+  Q18 (3-tbl+subq)     1.03x   1.0x
+  WIDE (16 cols)       1.01x   0.9x
+
+Conclusion (the important, uncomfortable one): for columnar Parquet projection on
+Iceberg, content-dependent column placement provides ~NO byte benefit over a
+competent tight-range plain reader -- both read only the needed columns' bytes --
+and often HURTS wall-clock (Q3 ~28% slower), because splitting a file into many
+small stripes pays more fan-out than plain's few large sequential shard reads.
+The entire 1.15x-1.73x "win" measured earlier was an artifact of the plain path
+re-reading whole positional shards per column range, now fixed.
+
+Where content-dependent placement still earns its keep: access patterns a byte
+range CANNOT capture tightly -- genuinely scattered reads where the needed bytes
+are interleaved with unneeded ones at fine grain (e.g. IVF/vector-search centroid
+probes, which is exactly what IvfCentroidPacker was built for), not columnar
+analytics where Parquet already lays each column out contiguously.
+
+Implication for the cost gate: its model assumed plain reads the whole object
+(plain = B). With tight-range plain, plain reads ~the same bytes as placed, so
+the gate should now DECLINE placement for columnar workloads. The gate's
+plain-cost term needs updating to reflect the improved plain path -- otherwise it
+keeps placing where placement no longer helps. (Follow-up.)
+
+Net: the right deliverable from Layer 3 was the plain-path range fix (a real,
+general efficiency win -- DuckDB/Spark range reads now fetch only what they ask
+for) plus this honest finding, not a columnar-placement differentiator.
+
+Next (optional): update the cost-gate plain term for tight-range plain; a
+transparent server-side Parquet-footer parser; port the REST catalog into Rust;
+re-test placement on a genuinely scattered (vector-search) workload where it
+should actually win.
