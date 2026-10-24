@@ -57,6 +57,30 @@ pub fn overhead_pct(k: usize, m: usize, units: &[Unit], stripes: &[Stripe]) -> f
     100.0 * (actual_physical as f64 / optimal_physical - 1.0)
 }
 
+/// Modeled read cost of serving a representative query against a packed layout
+/// vs the plain single-stripe layout, in byte-equivalents (bytes you could have
+/// read in the time one extra stripe fetch costs is `rtt_bytes`). This is the
+/// READ-side counterpart to `overhead_pct`'s storage-side check: content-
+/// dependent placement reads fewer BYTES on a selective query, but a query that
+/// touches many stripes pays a per-stripe fan-out (round trip) that plain -- one
+/// fetch group for the whole object -- does not. When the layout is too
+/// fine-grained (many stripes) or the workload too broad (high selectivity),
+/// that fan-out can make pushdown a net loss, and placement should stay plain.
+///
+///   packed = selectivity*B + ceil(selectivity*stripes)*rtt_bytes   (bytes + fan-out)
+///   plain  = B + rtt_bytes                                         (whole object, 1 group)
+///
+/// `selectivity` in (0,1] is the fraction of the object a typical query reads
+/// (0.25 = a quarter of the columns). Returns (packing_is_worth_it, packed, plain).
+pub fn pushdown_read_cost(body_len: usize, num_stripes: usize, selectivity: f64, rtt_bytes: f64) -> (bool, f64, f64) {
+    let b = body_len as f64;
+    let s = selectivity.clamp(0.0, 1.0);
+    let touched = (s * num_stripes as f64).ceil().max(1.0);
+    let packed = s * b + touched * rtt_bytes;
+    let plain = b + rtt_bytes;
+    (packed < plain, packed, plain)
+}
+
 /// Fusion's Algorithm 1, generalized, as a standalone helper — not just
 /// `FacPacker`'s private body. Greedy: seed each stripe with the largest
 /// remaining unit, pack the rest into whichever other bin is least full
@@ -177,6 +201,22 @@ mod tests {
             .enumerate()
             .map(|(i, &size)| Unit { unit_id: format!("u{i}"), size, metadata: Vec::new() })
             .collect()
+    }
+
+    #[test]
+    fn pushdown_cost_gate_keeps_selective_and_rejects_broad_or_fine() {
+        let b = 10_000_000; // 10 MB object
+        let rtt = 65_536.0;
+        // Selective query (reads 1/32) on a modest 32-stripe layout: clear win.
+        let (worth, packed, plain) = pushdown_read_cost(b, 32, 1.0 / 32.0, rtt);
+        assert!(worth && packed < plain, "selective read should favor packing");
+        // Broad query (reads ~everything): plain's single fetch group wins.
+        let (worth_broad, _, _) = pushdown_read_cost(b, 32, 1.0, rtt);
+        assert!(!worth_broad, "a near-full scan should not favor a many-stripe layout");
+        // Pathologically fine layout (many tiny stripes) even at moderate
+        // selectivity: fan-out dominates, so pushdown is a net loss.
+        let (worth_fine, _, _) = pushdown_read_cost(b, 100_000, 0.25, rtt);
+        assert!(!worth_fine, "an over-fine layout should be rejected on fan-out cost");
     }
 
     #[test]

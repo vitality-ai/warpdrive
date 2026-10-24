@@ -225,13 +225,27 @@ fn attach_placement_headers(mut resp: HttpResponse, placement: &'static str, ove
     resp
 }
 
+/// Attaches intra-object-pushdown read telemetry to a content-dependent GET
+/// response: `X-Warpd-Stripes-Fetched`/`-Total` (how many of the object's
+/// stripes this request actually touched) and `X-Warpd-Shard-Bytes-Read` (bytes
+/// read off the shard backing store to serve it). A selective read of a
+/// content-placed object touches only the stripes holding the requested units,
+/// so these numbers are far below the whole-object cost -- which is the entire
+/// point of content-dependent placement, now a client-visible, measurable fact.
+fn attach_fetch_stat_headers(resp: &mut actix_web::HttpResponseBuilder, stat: &super::packed::FetchStat) {
+    resp.insert_header(("x-warpd-stripes-fetched", stat.stripes_fetched.to_string()));
+    resp.insert_header(("x-warpd-stripes-total", stat.stripes_total.to_string()));
+    resp.insert_header(("x-warpd-shard-bytes-read", stat.shard_bytes.to_string()));
+    SHARD_BYTES_READ.fetch_add(stat.shard_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Decodes an AWS SigV4 "streaming payload" body: repeated
 /// `<hex-chunk-size>;chunk-signature=<sig>\r\n<chunk-bytes>\r\n`, ending in
 /// a zero-size chunk. Chunk signatures are not re-verified here (same
 /// no-auth-check posture as the rest of the cluster API) -- this only
 /// strips the framing so the stored object is the real payload bytes,
 /// not the wire encoding.
-fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_aws_chunked_payload(raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(raw.len());
     let mut pos = 0usize;
     loop {
@@ -409,16 +423,37 @@ pub(crate) async fn cluster_put_object_inner(
         let stripes = packer.pack(k, &units);
         let overhead = super::packing::overhead_pct(k, state.ec.m(), &units, &stripes);
 
-        if overhead <= config.overhead_threshold_pct {
+        // Two independent gates, both must pass to pack:
+        //  1. storage: extra bytes vs plain EC must stay under the bucket budget
+        //     (the Fusion overhead-threshold mechanism).
+        //  2. read cost: the modeled per-query read cost of this stripe layout
+        //     must beat plain at the expected selectivity -- a many-stripe layout
+        //     (or a broad workload) pays a per-stripe fan-out that plain's single
+        //     fetch group avoids, so pushing down can be a net loss. Disable
+        //     pushdown smartly rather than ship a layout that reads slower.
+        let (sel, rtt) = pushdown_cost_params();
+        let (read_worth_it, packed_cost, plain_cost) =
+            super::packing::pushdown_read_cost(body.len(), stripes.len(), sel, rtt);
+
+        if overhead <= config.overhead_threshold_pct && read_worth_it {
             return super::packed::put_object_content_dependent(user_id, &bucket, &key, &body, &units_header, stripes, state, s3_meta)
                 .await
                 .map(|r| attach_placement_headers(r, "packed", Some(overhead)));
         }
-        info!(
-            "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
-             {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
-            config.overhead_threshold_pct, config.packer_name
-        );
+        if overhead > config.overhead_threshold_pct {
+            info!(
+                "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
+                 {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
+                config.overhead_threshold_pct, config.packer_name
+            );
+        } else {
+            info!(
+                "bucket={bucket} key={key} content-dependent read cost {packed_cost:.0} >= plain {plain_cost:.0} \
+                 byte-equivalents at selectivity {sel:.2} over {} stripe(s) (packer={:?}) — fan-out would outweigh \
+                 the pushdown benefit, falling back to plain",
+                stripes.len(), config.packer_name
+            );
+        }
         return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", Some(overhead)));
@@ -720,10 +755,17 @@ fn multipart_meta_key(upload_id: &str) -> String {
 
 pub(crate) async fn cluster_create_multipart_upload_inner(
     user_id: &str, bucket: &str, _key: &str, content_type: Option<String>, user_metadata: HashMap<String, String>,
+    checksum_algorithm: Option<String>,
     state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
     let upload_id = super::shard_storage::new_version_id();
-    let s3_meta = ObjectS3Metadata { content_type, user_metadata, ..Default::default() };
+    // Remember which checksum algorithm the client asked for at initiate
+    // (x-amz-sdk-checksum-algorithm / x-amz-checksum-algorithm / x-amz-trailer).
+    // The header record carries it on its LocationRecord so CompleteMultipartUpload
+    // can compute that same algorithm over the reassembled object and a later
+    // checksum-mode GET returns the algorithm the client actually requested,
+    // rather than a hardcoded default it would then reject as a mismatch.
+    let s3_meta = ObjectS3Metadata { content_type, user_metadata, checksum_algorithm, ..Default::default() };
     // Empty body: the header carries no bytes of its own, only metadata
     // on the (fully replicated) LocationRecord it creates.
     put_object_plain(user_id, bucket, &multipart_meta_key(&upload_id), &[], state, &s3_meta).await?;
@@ -735,14 +777,20 @@ pub(crate) async fn cluster_create_multipart_upload_inner(
 /// bookkeeping -- replicated the same way as the part's bytes, no
 /// separate index. Returns the part's ETag.
 pub(crate) async fn cluster_upload_part_inner(
-    user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
+    user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes,
+    checksum_algorithm: Option<String>,
+    state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
     if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
         return Err(ErrorNotFound("no such upload"));
     }
 
     let etag = crate::s3::handlers::common::md5_etag(&body);
-    let s3_meta = ObjectS3Metadata { etag: Some(etag.clone()), ..Default::default() };
+    // Record the checksum algorithm the client declared on this part (e.g.
+    // `x-amz-trailer: x-amz-checksum-crc64nvme`). Clients like pyarrow declare
+    // it per part rather than at CreateMultipartUpload, so CompleteMultipartUpload
+    // recovers it from the stored part records to checksum the whole object.
+    let s3_meta = ObjectS3Metadata { etag: Some(etag.clone()), checksum_algorithm, ..Default::default() };
     put_object_plain(user_id, bucket, &multipart_part_key(upload_id, part_number), &body, state, &s3_meta).await?;
     Ok(etag)
 }
@@ -794,12 +842,19 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     // own shard fan-out, but a 50-part upload still paid 50 sequential
     // round-trip-groups before this, one per part, instead of one.
     let mut validated: Vec<(String, String)> = Vec::with_capacity(requested.len());
+    // Recover the checksum algorithm the client declared per part (pyarrow and
+    // similar clients put it on the UploadPart trailer, not at initiate). The
+    // parts all share one algorithm, so the first one that carries it wins.
+    let mut part_checksum_algorithm: Option<String> = None;
     for (part_number, client_etag) in requested {
         let part_key = multipart_part_key(upload_id, *part_number);
         let stored = state
             .location_store
             .get(user_id, bucket, &part_key)
             .ok_or_else(|| ErrorBadRequest("one or more of the specified parts could not be found"))?;
+        if part_checksum_algorithm.is_none() {
+            part_checksum_algorithm = stored.checksum_algorithm.clone();
+        }
         let stored_etag = stored.etag.unwrap_or_default();
         if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored_etag) {
             return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
@@ -828,19 +883,25 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
     let total_size = body.len() as u64;
 
-    // Checksum on by default here too, same reasoning (and same CRC32C
-    // choice) as the single-part PUT path (see
-    // `cluster_s3_put_object_authenticated`'s matching comment): a real
-    // checksum over the *reassembled* bytes, so a later GET can verify
-    // the complete object, not just rely on each part having been
-    // individually correct at upload time.
+    // Checksum on by default here too: a real checksum over the
+    // *reassembled* bytes, so a later GET can verify the complete object,
+    // not just rely on each part having been individually correct at
+    // upload time. We honor the algorithm the client declared at initiate
+    // (stored on the header record) so a strict client that asked for
+    // CRC64NVME gets CRC64NVME back on a checksum-mode GET, not a default
+    // it would reject. Absent a declared algorithm we fall back to CRC32C.
+    let algo = part_checksum_algorithm.as_deref()
+        .or(meta_record.checksum_algorithm.as_deref())
+        .and_then(ChecksumAlgorithm::from_str)
+        .unwrap_or(ChecksumAlgorithm::Crc32c);
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
         content_type: meta_record.content_type.clone(),
         last_modified: Some(super::s3_surface::now_http_date()),
         user_metadata: meta_record.user_metadata.clone(),
-        checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
-        checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
+        checksum_algorithm: Some(algo.as_str().to_string()),
+        checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&algo, &body)),
+        checksum_type: Some(algo.default_type().to_string()),
         ..Default::default()
     };
     put_object_plain(user_id, bucket, final_key, &body, state, &s3_meta).await?;
@@ -917,8 +978,42 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
 /// so a load test can show where time actually goes (added specifically to
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
+/// Process-wide cumulative count of shard-backing-store bytes a GET required to
+/// serve its response, summed across every content-dependent and plain read
+/// this coordinator handled. A workload driver snapshots it before/after a query
+/// (see `/cluster/_internal/read_stats`) to measure, end to end through a real
+/// engine's own scan, how much less an intra-object-pushdown read pulls off disk.
+pub static SHARD_BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Parameters for the read-cost pushdown gate (see `packing::pushdown_read_cost`),
+/// parsed once from the environment:
+///   WARPDRIVE_PUSHDOWN_SELECTIVITY  expected fraction of an object a query reads
+///                                   (default 0.25 = a quarter of the columns)
+///   WARPDRIVE_PUSHDOWN_RTT_BYTES    byte-equivalent cost of one extra stripe
+///                                   fetch / round trip (default 65536)
+/// Env rather than per-bucket config to avoid a config-store schema change; the
+/// natural next step is to move both onto `BucketPlacementConfig` so each bucket
+/// can reflect its own workload and storage medium.
+fn pushdown_cost_params() -> (f64, f64) {
+    static PARAMS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        let sel = std::env::var("WARPDRIVE_PUSHDOWN_SELECTIVITY").ok()
+            .and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0 && *v <= 1.0).unwrap_or(0.25);
+        let rtt = std::env::var("WARPDRIVE_PUSHDOWN_RTT_BYTES").ok()
+            .and_then(|v| v.parse::<f64>().ok()).filter(|v| *v >= 0.0).unwrap_or(65_536.0);
+        (sel, rtt)
+    })
+}
+
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(state.timing.summary())
+}
+
+/// Cumulative shard bytes read (see `SHARD_BYTES_READ`), as JSON. Monotonic
+/// since process start; snapshot the delta around a query to attribute reads.
+pub async fn cluster_read_stats() -> HttpResponse {
+    let n = SHARD_BYTES_READ.load(std::sync::atomic::Ordering::Relaxed);
+    HttpResponse::Ok().content_type("application/json").body(format!("{{\"shard_bytes_read\":{n}}}"))
 }
 
 /// Server-side breakdown of `store_shard` (the gRPC `ShardService::put_shard`
@@ -1025,7 +1120,7 @@ pub(crate) async fn cluster_get_object_inner(
         let range_result = parse_range_header(&req, total_len);
         return match range_result {
             RangeResult::Valid(start, end) => {
-                let data = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
+                let (data, stat) = super::packed::get_object_content_dependent_range(record, start, end, &state).await?;
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
                     .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
@@ -1035,9 +1130,14 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // Deliberately NOT echoing the object checksum here: the stored
+                // value is the FULL-OBJECT checksum, but this is a partial (206)
+                // body. A strict client (pyarrow/awscrt) would recompute the
+                // checksum over the partial bytes and reject the whole-object
+                // value as a mismatch -- exactly what AWS avoids by not
+                // returning x-amz-checksum-* on a ranged GET.
+                let _ = &checksum_header;
+                attach_fetch_stat_headers(&mut resp, &stat);
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1047,7 +1147,7 @@ pub(crate) async fn cluster_get_object_inner(
                 actix_web::error::ErrorRangeNotSatisfiable("the requested range is not valid for this object"),
             ),
             RangeResult::None => {
-                let data = super::packed::get_object_content_dependent(record, &state).await?;
+                let (data, stat) = super::packed::get_object_content_dependent(record, &state).await?;
                 verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
 
                 let mut resp = HttpResponse::Ok();
@@ -1061,6 +1161,7 @@ pub(crate) async fn cluster_get_object_inner(
                 if let Some((name, value)) = &checksum_header {
                     resp.insert_header((name.as_str(), value.as_str()));
                 }
+                attach_fetch_stat_headers(&mut resp, &stat);
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1107,23 +1208,39 @@ pub(crate) async fn cluster_get_object_inner(
         let first_idx = ((start as usize) / shard_len).min(record.k - 1);
         let last_idx = ((end as usize) / shard_len).min(record.k - 1);
 
-        let partial_gets = (first_idx..=last_idx).map(|idx| {
+        // Fetch only the sub-range of each spanning shard that actually overlaps
+        // [start, end], not the whole shard. A plain object's `k` positional
+        // shards are each ~object/k bytes, so fetching whole shards made a small
+        // column-chunk range drag a ~object/k shard off disk (big read
+        // amplification); the systematic data shards ARE the object bytes, so a
+        // shard's sub-range is exactly the object's sub-range. `get_shard_range`
+        // pushes the range to the peer over gRPC (whole-fetch+slice on other
+        // transports), so the concatenated pieces are exactly the [start,end]
+        // bytes with no further slicing.
+        let reqs: Vec<(usize, usize, usize)> = (first_idx..=last_idx).map(|idx| {
+            let shard_obj_start = idx * shard_len;
+            let ov_start = (start as usize).max(shard_obj_start);
+            let ov_end = (end as usize).min(shard_obj_start + shard_len - 1);
+            (idx, ov_start - shard_obj_start, ov_end - ov_start + 1)
+        }).collect();
+        let partial_gets = reqs.iter().map(|&(idx, rel_off, rel_len)| {
             let client = Arc::clone(&state.peer_client);
             let bucket = bucket.clone();
             let wire_key = wire_key.clone();
             let peer = record.shard_peers[idx].clone();
-            async move { client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await.ok() }
+            async move { client.get_shard_range(&peer, user_id, &bucket, &wire_key, idx, rel_off, rel_len).await.ok() }
         });
         let partial_results = join_all(partial_gets).await;
 
         if partial_results.iter().all(|r| r.is_some()) {
-            let mut buf = Vec::with_capacity((last_idx - first_idx + 1) * shard_len);
-            for shard in partial_results.into_iter().flatten() {
-                buf.extend_from_slice(&shard);
+            let mut buf: Vec<u8> = Vec::with_capacity((end - start + 1) as usize);
+            for piece in partial_results.into_iter().flatten() {
+                buf.extend_from_slice(&piece);
             }
-            let local_start = start as usize - first_idx * shard_len;
-            let local_end = (end as usize - first_idx * shard_len).min(buf.len() - 1);
-            if let Some(slice) = buf.get(local_start..=local_end) {
+            // The pieces reconstruct exactly [start, end] (each shard contributed
+            // its overlapping object bytes, in order) -- unless a peer returned
+            // short near a padded EOF, in which case fall through to full decode.
+            if buf.len() == (end - start + 1) as usize {
                 let mut resp = HttpResponse::build(actix_web::http::StatusCode::PARTIAL_CONTENT);
                 resp.insert_header(("Accept-Ranges", "bytes"))
                     .insert_header(("Content-Range", format!("bytes {start}-{end}/{total_len}")))
@@ -1133,16 +1250,25 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
-                return Ok(resp.body(slice.to_vec()));
+                // No object checksum on a partial (206) body -- it's the
+                // whole-object value and a strict client would reject it
+                // against the partial bytes (see the content-dependent
+                // partial arm above for the full rationale).
+                let _ = &checksum_header;
+                // Read telemetry: now the bytes actually fetched off disk equal
+                // the requested range, so a plain range-GET is comparable to the
+                // content-dependent path for the SAME byte range -- the A/B
+                // difference is then pure column pushdown, not plain over-read.
+                let plain_bytes = buf.len() as u64;
+                resp.insert_header(("x-warpd-placement", "plain"));
+                resp.insert_header(("x-warpd-shard-bytes-read", plain_bytes.to_string()));
+                SHARD_BYTES_READ.fetch_add(plain_bytes, std::sync::atomic::Ordering::Relaxed);
+                return Ok(resp.body(buf));
             }
         }
         // Fall through to the full fetch+decode path below -- a needed
-        // data shard's peer was unavailable, or the slice math above
-        // came up empty; both are rare-path, not the common case this
-        // fix targets.
+        // data shard's peer was unavailable, or a piece came up short; both
+        // are rare-path, not the common case this fix targets.
     }
 
     let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
@@ -1217,9 +1343,15 @@ pub(crate) async fn cluster_get_object_inner(
             for (k, v) in &user_metadata {
                 resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
             }
-            if let Some((name, value)) = &checksum_header {
-                resp.insert_header((name.as_str(), value.as_str()));
-            }
+            // No object checksum on a partial (206) body (see the fast-path
+            // partial arm above): it's the whole-object value.
+            let _ = &checksum_header;
+            // This arm is only reached when the shard fast-path above fell
+            // through and we decoded the WHOLE object to slice from it, so the
+            // plain path read every data shard regardless of range size.
+            resp.insert_header(("x-warpd-placement", "plain"));
+            resp.insert_header(("x-warpd-shard-bytes-read", total_len.to_string()));
+            SHARD_BYTES_READ.fetch_add(total_len, std::sync::atomic::Ordering::Relaxed);
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
@@ -1237,6 +1369,9 @@ pub(crate) async fn cluster_get_object_inner(
             if let Some((name, value)) = &checksum_header {
                 resp.insert_header((name.as_str(), value.as_str()));
             }
+            resp.insert_header(("x-warpd-placement", "plain"));
+            resp.insert_header(("x-warpd-shard-bytes-read", total_len.to_string()));
+            SHARD_BYTES_READ.fetch_add(total_len, std::sync::atomic::Ordering::Relaxed);
             Ok(resp.body(data))
         }
     }
