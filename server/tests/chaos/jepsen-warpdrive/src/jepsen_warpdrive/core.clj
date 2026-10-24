@@ -161,16 +161,6 @@
       (println "\nElle details written to /tmp/wd-jepsen-elle")
       (:valid? res))))
 
-(defn- bounded-pmap
-  "Like `pmap`, but with a concurrency bound the caller chooses instead of
-   `pmap`'s own available-processors-based default. This workload is pure
-   I/O (HTTP round trips to the cluster), so a bound well above core count
-   is both safe and the point -- it's also a more faithful exercise of
-   group-commit's batching than issuing requests one at a time ever was."
-  [n f coll]
-  (mapcat (fn [chunk] (mapv deref (mapv #(future (f %)) chunk)))
-          (partition-all n coll)))
-
 (defn durability-test
   "Power-loss durability: write M keys through the ACKED S3 path (HTTP 200 =
    server claims durable), SIGKILL the whole cluster with no clean shutdown
@@ -178,28 +168,20 @@
    on the same data, and assert every acked value survives. This directly
    tests WarpDrive's group-commit guarantee -- the fast-path/slow-path design
    whose whole point is that a 200 means the bytes are on stable storage. An
-   ack-before-durable bug shows up here as a missing or stale read.
-
-   Writes and the read-back are both issued at `:concurrency` (default 32)
-   in-flight requests, not one at a time -- at m=200 the old sequential
-   version spent its wall time waiting on 400 serialized round trips, which
-   tested the same durability property as fewer, concurrent ones, just much
-   more slowly."
-  [{:keys [m concurrency] :or {m 200 concurrency 32}}]
-  (println (format "=== WarpDrive power-loss durability test: %d acked keys (concurrency %d) ===" m concurrency))
+   ack-before-durable bug shows up here as a missing or stale read."
+  [{:keys [m] :or {m 200}}]
+  (println (format "=== WarpDrive power-loss durability test: %d acked keys ===" m))
   (cluster-stop) (cluster-start)
   (let [conn (s3/conn "127.0.0.1:9710" access-key secret-key)
         _ (println "create-bucket ->" (:status (s3/create-bucket conn bucket)))
         expected (atom {})]
     (println "writing" m "keys, each acked (HTTP 200) before continuing ...")
-    (doseq [[k v st] (bounded-pmap concurrency
-                                   (fn [i]
-                                     (let [k (str "dur-" i) v (str "val-" i "-" (rand-int 1000000))]
-                                       [k v (:status (s3/put-object conn bucket k (.getBytes v)))]))
-                                   (range m))]
-      (if (= 200 st)
-        (swap! expected assoc k v)
-        (println "  WARN: write" k "not acked (status" st ") -- excluded from durability set")))
+    (doseq [i (range m)]
+      (let [k (str "dur-" i) v (str "val-" i "-" (rand-int 1000000))]
+        (let [st (:status (s3/put-object conn bucket k (.getBytes v)))]
+          (if (= 200 st)
+            (swap! expected assoc k v)
+            (println "  WARN: write" k "not acked (status" st ") -- excluded from durability set")))))
     (println "acked" (count @expected) "writes; now SIGKILLing whole cluster (power loss) ...")
     (ctl "crashall")
     (Thread/sleep 1000)
@@ -208,14 +190,12 @@
     (println "reading back all acked keys ...")
     (let [conn2 (s3/conn "127.0.0.1:9710" access-key secret-key)
           lost  (atom []) stale (atom [])]
-      (doseq [[k v st body] (bounded-pmap concurrency
-                                          (fn [[k v]]
-                                            (let [r (s3/get-object conn2 bucket k)]
-                                              [k v (:status r) (when (= 200 (:status r)) (String. (:body r)))]))
-                                          @expected)]
-        (cond
-          (not= 200 st) (swap! lost conj [k st])
-          (not= v body) (swap! stale conj [k v body])))
+      (doseq [[k v] @expected]
+        (let [r (s3/get-object conn2 bucket k)
+              st (:status r)]
+          (cond
+            (not= 200 st)            (swap! lost conj [k st])
+            (not= v (String. (:body r))) (swap! stale conj [k v (String. (:body r))]))))
       (println "\n=== DURABILITY RESULT ===")
       (println "acked writes      :" (count @expected))
       (println "lost after crash  :" (count @lost))
