@@ -211,10 +211,16 @@ impl GrpcPeerClient {
                     // first connect to a black-holed peer would block
                     // *every* concurrent caller waiting on that same
                     // cell, not just the one that triggered it.
+                    // tonic's Endpoint defaults tcp_nodelay to false, so Nagle's
+                    // algorithm can hold our small shard/metadata payloads for
+                    // tens of ms before sending -- enabling it is a one-line fix
+                    // for a 150-300x client-observed-vs-handler-time gap seen in
+                    // the server's own /cluster/_internal/grpc_client_timing.
                     let endpoint_obj = Endpoint::from_shared(endpoint_for_init.clone())
                         .map_err(|e| ErrorBadGateway(format!("invalid gRPC endpoint {endpoint_for_init}: {e}")))?
                         .connect_timeout(std::time::Duration::from_secs(3))
-                        .timeout(std::time::Duration::from_secs(10));
+                        .timeout(std::time::Duration::from_secs(10))
+                        .tcp_nodelay(true);
                     let connect_result = endpoint_obj.connect().await;
                     let channel = connect_result
                         .map_err(|e| ErrorBadGateway(format!("gRPC connect to {endpoint_for_init} failed: {e}")))?;
