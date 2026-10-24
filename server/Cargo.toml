@@ -58,6 +58,16 @@ flate2 = "1.0"
 percent-encoding = "2"
 actix-multipart = "0.6"
 parking_lot = "0.12"
+# WASM sandbox for user-submitted placement policies. Optional: pulls in a
+# large dependency only when the `wasm` feature is enabled, so the default
+# build is unchanged. See src/cluster/wasm_packer.rs.
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime"], optional = true }
+wat = { version = "1", optional = true }
+
+[features]
+# User-defined placement policies run as sandboxed WASM modules. Off by
+# default. Build with: cargo build --features wasm
+wasm = ["dep:wasmtime", "dep:wat"]
 
 [build-dependencies]
 tonic-build = "0.11"

@@ -109,6 +109,20 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             let mut m: std::collections::HashMap<String, Arc<dyn StripePacker>> = std::collections::HashMap::new();
             m.insert("fac".to_string(), Arc::new(warp_drive::cluster::packing::FacPacker));
             m.insert("ivf_centroid".to_string(), Arc::new(warp_drive::cluster::packing::IvfCentroidPacker));
+            // A user-submitted placement policy, loaded as a sandboxed WASM
+            // module and registered under "wasm" (a bucket selects it by that
+            // name, same as any built-in packer). Feature-gated; a load
+            // failure is logged and the server continues without it.
+            #[cfg(feature = "wasm")]
+            if let Ok(path) = std::env::var("WARPDRIVE_WASM_PACKER") {
+                match warp_drive::cluster::wasm_packer::WasmPacker::from_file(&path) {
+                    Ok(p) => {
+                        m.insert("wasm".to_string(), Arc::new(p));
+                        info!("registered WASM placement policy from {path} as packer \"wasm\"");
+                    }
+                    Err(e) => log::warn!("failed to load WASM packer from {path}: {e} (continuing without it)"),
+                }
+            }
             m
         },
         content_location_store: Arc::new(
