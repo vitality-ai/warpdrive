@@ -33,9 +33,22 @@ planted aborted-read (G1a) and asserts Elle reports `valid? false`. A green
 
 ## Running
 
-Prereqs: a release binary (`cd server && cargo build --release --bin warp_drive`),
-JDK 21, and [Leiningen](https://leiningen.org). `iptables` is used for
-partitions (run as root, or the script uses `sudo`).
+Prereqs: a release binary built WITH the DST failpoints
+(`cd server && cargo build --release --bin warp_drive --features failpoints` --
+without `--features failpoints` the `fail_point!` macros compile to no-ops and no
+failpoint can ever fire), JDK 21, and [Leiningen](https://leiningen.org).
+`iptables` is used for partitions (run as root, or the script uses `sudo`).
+
+Failpoints are armed per-run via the `FAILPOINTS` env var, inherited by the
+nodes (e.g. `FAILPOINTS="coordinator::before_pin=return" ./cluster.sh start`):
+  - `coordinator::before_pin=return` -- crash the coordinator after shard quorum
+    but before the location pin is replicated (the ack-vs-pin window).
+  - `local_store::before_fsync=return` -- crash a node after the write() syscall
+    but before the durability wait (the power-loss window).
+  - `local_store::skip_fsync=return` -- ack a write WITHOUT waiting for
+    durability; a regression control to confirm the durability check bites.
+All three are validated to fire (see commit message); `=20%return` fires
+probabilistically for the nemesis.
 
 ```bash
 cd server/tests/chaos/jepsen-warpdrive

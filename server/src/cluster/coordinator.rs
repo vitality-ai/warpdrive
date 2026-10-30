@@ -525,6 +525,22 @@ async fn put_object_plain(
         )));
     }
 
+    // DST failpoint (no-op unless built with --features failpoints): crash
+    // the coordinator AFTER quorum shards have persisted but BEFORE the
+    // location pin is replicated. The 200 ack is returned only after the pin
+    // quorum below, so a crash here must not leave a client believing a
+    // write succeeded that no node can locate after recovery. Lets the
+    // harness verify that ack-vs-pin ordering from inside.
+    // Armed with `coordinator::before_pin=return` (the closure fires on the
+    // `return` action). A bare `panic` would only unwind the one actix worker
+    // task and be caught per-request -- the process survives, which is NOT a
+    // crash. `std::process::exit` actually kills the node here, giving the DST
+    // harness a real crash exactly in the ack-vs-pin window.
+    fail::fail_point!("coordinator::before_pin", |_| {
+        log::error!("DST failpoint coordinator::before_pin: exiting after quorum, before pin");
+        std::process::exit(70);
+    });
+
     // Pin the resolved placement — this, not the hash function, is what
     // makes reads stable across later membership changes. Replicated to
     // *every* known peer, not just the k+m shard-holders: a GET can land
