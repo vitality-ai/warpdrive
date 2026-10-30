@@ -5,7 +5,7 @@
   <p>Fast by default. Explainable SLAs. Safely customizable.</p>
 
   <p>
-    <a href="https://vitality-ai.github.io/warpdrive/site/"><img alt="Website" src="https://img.shields.io/badge/Website-4a0e63?style=for-the-badge&logo=googlechrome&logoColor=ffb366&labelColor=4a0e63"></a>
+    <a href="https://vitality-ai.github.io/warpdrive/"><img alt="Website" src="https://img.shields.io/badge/Website-4a0e63?style=for-the-badge&logo=googlechrome&logoColor=ffb366&labelColor=4a0e63"></a>
     <a href="https://discord.gg/ZrxZnE87X"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/releases"><img alt="Version" src="https://img.shields.io/badge/version-1.0.0--beta-ff8a3d?style=for-the-badge&logo=semver&logoColor=1a1025&labelColor=1a1025"></a>
     <a href="https://github.com/vitality-ai/warpdrive/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/vitality-ai/warpdrive?style=for-the-badge&logo=star&color=ff8a3d&logoColor=1a1025&labelColor=1a1025"></a>
