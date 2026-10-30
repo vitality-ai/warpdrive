@@ -24,10 +24,20 @@
 (def script (str (System/getProperty "user.dir") "/cluster.sh"))
 
 ;; ---- cluster control (shell out to cluster.sh) ----
+;; Two failure modes used to be indistinguishable from the outside: a real
+;; script failure just logged a warning and let the caller barrel on into a
+;; dead cluster, and a genuine hang (observed for real in CI: a 200-key
+;; durability run sat silent for 6 hours until GitHub's own hard ceiling
+;; force-cancelled it) had no bound at all. `timeout` makes a hang fail
+;; instead of running forever; throwing on any non-zero exit makes a real
+;; script failure crash loudly in seconds, at the call site, instead of
+;; silently degrading into whatever the caller does next with a cluster
+;; that never actually came up.
 (defn- ctl [& args]
-  (let [r (apply sh/sh "bash" script args)]
+  (let [r (apply sh/sh "timeout" "-k" "5" "30" "bash" script args)]
     (when-not (zero? (:exit r))
-      (binding [*out* *err*] (println "ctl" (vec args) "failed:" (:err r))))
+      (throw (ex-info (format "ctl %s failed (exit %s): %s" (vec args) (:exit r) (:err r))
+                       {:args args :result r})))
     r))
 
 (defn cluster-start [] (ctl "start"))
