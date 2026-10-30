@@ -1,0 +1,82 @@
+name: jepsen-dst
+
+# Deterministic-simulation fault-injection tests (Jepsen/Elle) for the
+# distributed engine. Runs on every PR to main and on demand.
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dst:
+    name: Jepsen/Elle DST
+    runs-on: ubuntu-latest
+    # Generous for a cold-cache build plus the three lein steps; bounds a
+    # real hang well under GitHub's own 6-hour default ceiling.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo/registry, ~/.cargo/git and server/target, keyed on
+      # Cargo.lock. Without this every run recompiled the full dependency
+      # tree from scratch, which dominated the job's wall time.
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Build release binary
+        working-directory: server
+        run: cargo build --release --bin warp_drive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Leiningen
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/lein" version
+
+      # Leiningen resolves jepsen/elle/clojure jars into ~/.m2 on every run
+      # with no cache; this was the second-largest chunk of wall time after
+      # the Rust build. Keyed on project.clj since there's no lockfile.
+      - name: Cache Leiningen/Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-lein-${{ hashFiles('server/tests/chaos/jepsen-warpdrive/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-lein-
+
+      # Negative control FIRST: if Elle can't catch a planted anomaly, a green
+      # run below would be meaningless, so fail the whole job here.
+      - name: Elle negative control (checker must have teeth)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run selftest
+
+      - name: Power-loss durability (acked writes must survive full-cluster SIGKILL)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run durability --m 200
+
+      # iptables partitions need root; the runner has passwordless sudo and
+      # cluster.sh already prefixes iptables with sudo when not root.
+      - name: Seeded Jepsen + Elle consistency run (kills, partitions, corruption)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run test --seed 42 --duration-sec 45 --concurrency 6
