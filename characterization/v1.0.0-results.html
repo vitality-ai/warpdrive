@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Distributed Engine Results v1.0.0-beta — WarpDrive</title>
+<meta name="description" content="Measured results for WarpDrive's distributed, erasure-coded engine with content-dependent placement, against DuckDB (TPC-H) and Lance (vector search).">
+<style>
+:root {
+  --bg:       #07090F;
+  --surface:  #0D1018;
+  --surface2: #131924;
+  --border:   #1D2638;
+  --text:     #D6E0EE;
+  --muted:    #5A6A82;
+  --warm:     #00C8A8;
+  --cold:     #FF6E6E;
+  --green:    #1FBC7A;
+  --yellow:   #D29922;
+  --purple:   #A78BFA;
+  --amber:    #F59E0B;
+  --accent-bg: rgba(0,200,168,0.07);
+  --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:#F4F7FB; --surface:#FFFFFF; --surface2:#EEF2F8; --border:#D1DAE8;
+    --text:#0F1A2E; --muted:#607090; --warm:#007A66; --cold:#CF222E;
+    --green:#15874F; --yellow:#9A6700; --purple:#7C3AED; --amber:#B45309;
+    --accent-bg:rgba(0,122,102,0.07);
+  }
+}
+:root[data-theme="light"] {
+  --bg:#F4F7FB; --surface:#FFFFFF; --surface2:#EEF2F8; --border:#D1DAE8;
+  --text:#0F1A2E; --muted:#607090; --warm:#007A66; --cold:#CF222E;
+  --green:#15874F; --yellow:#9A6700; --purple:#7C3AED; --amber:#B45309;
+  --accent-bg:rgba(0,122,102,0.07);
+}
+:root[data-theme="dark"] {
+  --bg:#07090F; --surface:#0D1018; --surface2:#131924; --border:#1D2638;
+  --text:#D6E0EE; --muted:#5A6A82; --warm:#00C8A8; --cold:#FF6E6E;
+  --green:#1FBC7A; --yellow:#D29922; --purple:#A78BFA; --amber:#F59E0B;
+  --accent-bg:rgba(0,200,168,0.07);
+}
+
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+body {
+  background:var(--bg); color:var(--text);
+  font-family:var(--sans); font-size:14px; line-height:1.6;
+  padding:0 0 80px;
+  -webkit-font-smoothing:antialiased;
+}
+
+.site-nav {
+  position:sticky; top:0; z-index:100;
+  background:var(--bg); border-bottom:1px solid var(--border);
+  padding:0 40px; display:flex; align-items:center; height:44px; gap:16px;
+}
+.site-nav a { font-family:var(--mono); font-size:12px; color:var(--muted); text-decoration:none; display:flex; align-items:center; gap:5px; }
+.site-nav a:hover { color:var(--text); }
+.site-nav .sep { color:var(--border); }
+.site-nav .wm { color:var(--text); font-weight:600; }
+
+.page { max-width:1040px; margin:0 auto; padding:0 40px; }
+
+header { padding:32px 0 20px; border-bottom:1px solid var(--border); margin-bottom:28px; }
+.eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--warm); margin-bottom:8px; }
+h1 { font-family:var(--mono); font-size:19px; font-weight:600; color:var(--text); margin-bottom:10px; }
+.subtitle { font-size:13px; color:var(--muted); line-height:1.8; }
+.subtitle code { font-family:var(--mono); background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:11px; color:var(--text); }
+.badge-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+.badge { font-family:var(--mono); font-size:11px; border-radius:20px; padding:3px 10px; border:1px solid; }
+.badge-warm  { color:var(--warm);   border-color:var(--warm);   background:color-mix(in srgb,var(--warm)   10%,transparent); }
+.badge-cold  { color:var(--cold);   border-color:var(--cold);   background:color-mix(in srgb,var(--cold)   10%,transparent); }
+.badge-purp  { color:var(--purple); border-color:var(--purple); background:color-mix(in srgb,var(--purple) 10%,transparent); }
+.badge-amber { color:var(--amber);  border-color:var(--amber);  background:color-mix(in srgb,var(--amber)  10%,transparent); }
+
+.section-label {
+  font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--warm); margin-bottom:14px; padding-bottom:6px;
+  border-bottom:1px solid color-mix(in srgb,var(--warm) 25%,transparent);
+}
+
+/* ── motivation ──────────────────────────────────────────── */
+.motivation { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px 22px; margin-bottom:28px; }
+.motivation p { font-size:13px; color:var(--muted); line-height:1.8; }
+.motivation p + p { margin-top:12px; }
+.motivation strong { color:var(--text); }
+
+.stat-row { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:32px; }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+.stat-label { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:6px; }
+.stat-value { font-size:28px; font-weight:700; font-family:var(--mono); font-variant-numeric:tabular-nums; line-height:1; margin-bottom:4px; }
+.stat-sub { font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; line-height:1.5; }
+.val-cold  { color:var(--cold);   }
+.val-warm  { color:var(--warm);   }
+.val-purp  { color:var(--purple); }
+.val-amber { color:var(--amber);  }
+
+.section { margin-bottom:32px; }
+.section p.lead { font-size:13px; color:var(--muted); line-height:1.75; margin-bottom:16px; }
+
+.chart-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:12px 10px; }
+.card h2 { font-size:10px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:10px; padding:0 2px; }
+canvas { display:block; width:100%; }
+.chart-note { font-size:12px; color:var(--muted); line-height:1.65; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
+.chart-note strong { color:var(--text); }
+
+.table-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 18px; margin-bottom:28px; }
+.table-card h2 { font-size:10px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:var(--mono); margin-bottom:12px; }
+.table-scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }
+th { text-align:left; font-family:var(--mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:500; padding:7px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+td { padding:7px 10px; border-bottom:1px solid color-mix(in srgb,var(--border) 45%,transparent); font-family:var(--mono); font-size:12px; white-space:nowrap; }
+tr:last-child td { border-bottom:none; }
+.c-warm { color:var(--warm); }
+.c-cold { color:var(--cold); }
+.c-dim  { color:var(--muted); }
+
+.formula-box { background:var(--accent-bg); border:1px solid var(--border); border-left:3px solid var(--warm); border-radius:6px; padding:16px 18px; }
+.formula-note { font-family:var(--mono); font-size:12px; color:var(--muted); line-height:1.9; }
+.formula-note strong { color:var(--text); }
+.formula-note ul { margin:8px 0 8px 18px; }
+
+@media (max-width:720px) {
+  .chart-grid { grid-template-columns:1fr; }
+  .stat-row   { grid-template-columns:repeat(2,1fr); }
+}
+</style>
+</head>
+<body>
+
+<nav class="site-nav">
+  <a href="../index.html">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+    <span class="wm">warpdrive</span>
+  </a>
+  <span class="sep">/</span>
+  <a href="#">Distributed Engine Results v1.0.0-beta</a>
+</nav>
+
+<div class="page">
+
+<header>
+  <div class="eyebrow">v1.0.0-beta · Distributed, Erasure-Coded Engine</div>
+  <h1>Content-Dependent Placement · Measured Results</h1>
+  <p class="subtitle">
+    Measured against a live WarpDrive cluster (symmetric multi-node, gRPC fan-out, Reed-Solomon erasure coding).<br>
+    Established tools used unmodified against their own data: <code>Lance</code> vector search, <code>DuckDB</code>'s <code>tpch</code> extension (official <code>dbgen</code> + queries), and the texmex/SIFT1M-small corpus.
+  </p>
+  <div class="badge-row">
+    <span class="badge badge-warm">DuckDB · official TPC-H</span>
+    <span class="badge badge-cold">Lance · IVF_PQ vector search</span>
+    <span class="badge badge-purp">SIFT1M-small · published benchmark</span>
+    <span class="badge badge-amber">RS(3,2) erasure coding</span>
+  </div>
+</header>
+
+<!-- MOTIVATION -->
+<div class="motivation">
+  <div class="section-label" style="margin-bottom:10px">Why content-dependent placement</div>
+  <p>
+    Object stores have always treated a stored object as an opaque blob: whatever bytes a client sends get striped, erasure-coded, and handed back whole on read. That's fine for archival and file uploads, but it's a bad fit once an <strong>analytical query engine</strong> or a <strong>vector-index search</strong> is the actual client. A Parquet file has column chunks. A Lance index has per-partition structure. A query that only needs one column, or one nprobe's worth of partitions, still has to pay for reconstructing the entire object on a plain erasure-coded store, because the store has no concept of where the part it needs actually lives.
+  </p>
+  <p>
+    WarpDrive's content-dependent placement lets a bucket opt a workload's own internal byte layout into how it gets striped, so a query can touch only the stripes that actually cover the bytes it needs. The catch is that this can't be a blind optimization: a bad packing decision must never risk availability, so every packer reports its own storage overhead and the system falls back to plain whole-object storage automatically if that overhead crosses a configured threshold. <strong>The two results below are the same mechanism applied to two different workloads</strong>, an analytical SQL engine and a vector search engine, to check the benefit holds for more than one shape of structure, not just one convenient case.
+  </p>
+</div>
+
+<div class="stat-row">
+  <div class="stat-card">
+    <div class="stat-label">TPC-H Q6 (selective)</div>
+    <div class="stat-value val-warm">149x</div>
+    <div class="stat-sub">7756.6ms → 51.9ms, row-group pushdown</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Lance <code style="font-size:11px">take</code> latency</div>
+    <div class="stat-value val-cold">up to 41x</div>
+    <div class="stat-sub">20k vectors/768-dim, row-batch packing</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">SIFT1M-small recall@10</div>
+    <div class="stat-value val-purp">identical</div>
+    <div class="stat-sub">plain vs. packed, every nprobe level</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">TPC-H Q1 (control)</div>
+    <div class="stat-value val-amber">419.7ms</div>
+    <div class="stat-sub">low selectivity, less to prune</div>
+  </div>
+</div>
+
+<!-- TPC-H -->
+<div class="section">
+  <div class="section-label">Analytical SQL · Official TPC-H via DuckDB, pushdown</div>
+  <p class="lead">
+    DuckDB's <code style="font-family:var(--mono)">tpch</code> extension generates the official TPC-H dataset (<code style="font-family:var(--mono)">dbgen</code>, sf=1 → 6,001,215 <code style="font-family:var(--mono)">lineitem</code> rows) and exposes the official 22 queries verbatim. Q1 and Q6 are the only two that touch solely <code style="font-family:var(--mono)">lineitem</code>. The exported Parquet file was physically sorted by <code style="font-family:var(--mono)">l_shipdate</code> before upload, a standard clustering technique (the same idea as Databricks' Z-ORDER), which is what makes Q6's one-year date predicate actually prunable via row-group min/max statistics.
+  </p>
+  <div class="chart-grid" style="grid-template-columns:1fr">
+    <div class="card">
+      <h2>Q6 (selective) vs. Q1 (control), median latency</h2>
+      <canvas id="tpchChart" height="230"></canvas>
+      <p class="chart-note">Packed-bucket cost scales down with query selectivity (a stripe boundary to skip past). Plain-bucket cost stays flat regardless of selectivity (no sub-object boundary to exploit at all). Q1 has no plain bar: its near-full-table-scan plain-bucket cost was already evidenced per-request elsewhere and repeating it here is what made an earlier run impractically slow.</p>
+    </div>
+  </div>
+  <div class="table-card">
+    <h2>Full results</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Query</th><th>Selectivity</th><th>Bucket</th><th>Median latency</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Q6</td><td>Selective (1-yr window + discount/quantity range)</td><td class="c-dim">plain</td><td>7756.6 ms</td><td class="c-dim">no stripe concept, full reconstruction per range-GET</td></tr>
+          <tr><td>Q6</td><td>Selective</td><td class="c-warm">packed</td><td>51.9 ms</td><td class="c-warm">149x faster, 252 range-GETs, avg 1.0 of 268 stripes touched/request</td></tr>
+          <tr><td>Q1</td><td>Low selectivity (~96% of rows match)</td><td class="c-dim">packed only</td><td>419.7 ms</td><td class="c-dim">control: 1074 range-GETs, avg 2.2 of 268 stripes/request</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- LANCE -->
+<div class="section">
+  <div class="section-label">Vector Search · Lance IVF_PQ, content-dependent placement</div>
+  <p class="lead">
+    Lance's own <code style="font-family:var(--mono)">object_store::aws</code> client pointed at two WarpDrive buckets holding the same dataset, same index, same unmodified query engine. One bucket stored plain (whole-object erasure coding), the other configured to use <code style="font-family:var(--mono)">IvfCentroidPacker</code>, which groups IVF partitions by k-means cluster id and bin-packs within each cluster.
+  </p>
+  <div class="chart-grid">
+    <div class="card">
+      <h2>SIFT1M-small · latency (ms)</h2>
+      <canvas id="siftLatChart" height="210"></canvas>
+    </div>
+    <div class="card">
+      <h2>SIFT1M-small · recall@10</h2>
+      <canvas id="siftRecallChart" height="210"></canvas>
+    </div>
+  </div>
+  <p class="chart-note" style="margin:-2px 0 20px; padding:12px 14px; background:var(--surface); border:1px solid var(--border); border-radius:8px;">Recall@10 identical between plain and packed at every nprobe level, checked against independently-verifiable ground truth, not just agreement between our own two buckets.</p>
+  <div class="chart-grid" style="grid-template-columns:1fr">
+    <div class="card">
+      <h2>20k vectors/768-dim · row-batch packing latency (ms, log scale)</h2>
+      <canvas id="rowbatchChart" height="230"></canvas>
+      <p class="chart-note">The dominant cost here was reconstructing the ~60MB data fragment file to materialize 10 result rows. Row-batch packing (20 rows/batch, no cluster metadata needed since row access for a <code style="font-family:var(--mono)">take</code> is uniform-random) gives the largest win measured so far.</p>
+    </div>
+  </div>
+  <div class="table-card">
+    <h2>SIFT1M-small results</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>nprobe</th><th>plain (ms)</th><th>packed (ms)</th><th>speedup</th><th>recall@10 (plain)</th><th>recall@10 (packed)</th></tr></thead>
+        <tbody>
+          <tr><td>5</td><td>26.35</td><td class="c-warm">6.68</td><td class="c-warm">3.9x</td><td>0.743</td><td>0.743</td></tr>
+          <tr><td>10</td><td>6.08</td><td class="c-warm">1.10</td><td class="c-warm">5.5x</td><td>0.765</td><td>0.765</td></tr>
+          <tr><td>20</td><td>5.99</td><td class="c-warm">1.24</td><td class="c-warm">4.8x</td><td>0.768</td><td>0.768</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="table-card" style="margin-bottom:0">
+    <h2>Row-batch packing results (20k vectors/768-dim)</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>nprobe</th><th>plain (ms)</th><th>packed (ms)</th><th>speedup</th></tr></thead>
+        <tbody>
+          <tr><td>4</td><td>603.5</td><td class="c-warm">14.7</td><td class="c-warm">41x</td></tr>
+          <tr><td>16</td><td>604.9</td><td class="c-warm">29.8</td><td class="c-warm">20x</td></tr>
+          <tr><td>40</td><td>616.9</td><td class="c-warm">24.0</td><td class="c-warm">26x</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- CAVEATS -->
+<div class="formula-box">
+  <div class="formula-note">
+    <strong>Methodology notes and caveats, stated directly:</strong>
+    <ul>
+      <li>All results use the dev-loop default <strong>RS(3,2)</strong> (3 data + 2 parity shards), not Fusion's RS(9,6). Re-running at RS(9,6) is the natural next validation step.</li>
+      <li>All measurements are from a <strong>local multi-process cluster on one machine</strong> (gRPC calls between nodes, disk I/O per node), not yet a multi-VM/cross-datacenter run.</li>
+      <li><strong>No MinIO comparison yet</strong>, tracked as follow-up work.</li>
+      <li><strong>SIFT1M-small, not full SIFT1M</strong>, the 10k-vector subset, not the full 1M-vector corpus.</li>
+      <li>Every number above came from a script that also independently verifies correctness (byte-identical round-trip, recall@10 against ground truth, or exact result-value equality) in the same run that produced the timing.</li>
+    </ul>
+  </div>
+</div>
+
+</div>
+
+<script>
+function cv(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function drawBarLegend(ctx, datasets, pad, W, mono, sans, muted) {
+  const font = `10px ${sans}`;
+  ctx.font = font;
+  const maxW = W - pad.left - pad.right;
+  const rows = [];
+  let row = [], rowW = 0;
+  datasets.forEach(ds => {
+    const tw = ctx.measureText(ds.label).width;
+    const itemW = tw + 24;
+    if (row.length && rowW + itemW > maxW) { rows.push(row); row = []; rowW = 0; }
+    row.push({ ds, tw }); rowW += itemW;
+  });
+  if (row.length) rows.push(row);
+  const rowH = 16, startY = pad.top - rows.length * rowH - 4;
+  rows.forEach((items, ri) => {
+    let lx = pad.left;
+    items.forEach(({ ds, tw }) => {
+      ctx.fillStyle = ds.color; ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(lx, startY + ri * rowH - 8, 9, 9, 2);
+      else ctx.fillRect(lx, startY + ri * rowH - 8, 9, 9);
+      ctx.fill(); ctx.globalAlpha = 1;
+      ctx.fillStyle = muted; ctx.font = font; ctx.textAlign = 'left';
+      ctx.fillText(ds.label, lx + 12, startY + ri * rowH + 3);
+      lx += tw + 24;
+    });
+  });
+}
+
+function drawLegend(ctx, datasets, pad, W, mono, sans, muted) {
+  const font = `10px ${sans}`;
+  ctx.font = font;
+  const maxW = W - pad.left - pad.right;
+  const rows = [];
+  let row = [], rowW = 0;
+  datasets.forEach(ds => {
+    const tw = ctx.measureText(ds.label).width;
+    const itemW = tw + 36;
+    if (row.length && rowW + itemW > maxW) { rows.push(row); row = []; rowW = 0; }
+    row.push({ ds, tw }); rowW += itemW;
+  });
+  if (row.length) rows.push(row);
+  const rowH = 16, startY = pad.top - rows.length * rowH - 4;
+  rows.forEach((items, ri) => {
+    let lx = pad.left;
+    items.forEach(({ ds, tw }) => {
+      ctx.strokeStyle = ds.color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(lx, startY + ri * rowH); ctx.lineTo(lx + 18, startY + ri * rowH); ctx.stroke();
+      ctx.fillStyle = ds.color;
+      ctx.beginPath(); ctx.arc(lx + 9, startY + ri * rowH, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = muted; ctx.font = font; ctx.textAlign = 'left';
+      ctx.fillText(ds.label, lx + 22, startY + ri * rowH + 4);
+      lx += tw + 36;
+    });
+  });
+}
+
+function drawBars(id, labels, datasets, opts={}) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const H = parseInt(canvas.getAttribute('height'), 10) || 230;
+  const W = canvas.offsetWidth || 600;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+  const pad = { top:36, right:8, bottom:22, left:50 };
+  const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
+  const allVals = datasets.flatMap(d => d.data.filter(v => v != null && v > 0));
+  const maxV = Math.max(...allVals, 1) * 1.28;
+  const muted = cv('--muted'), border = cv('--border');
+  const mono = cv('--mono'), sans = cv('--sans');
+  const fmt = opts.fmt || (v => v >= 1000 ? (v/1000).toFixed(1)+'k' : (Number.isInteger(v) ? v : v.toFixed(1)));
+  let yTop, barH;
+  if (opts.logScale) {
+    const logMin = 0, logMax = Math.log10(maxV);
+    yTop = v => v > 0 ? pad.top + ch - (Math.log10(v) - logMin) / (logMax - logMin) * ch : pad.top + ch;
+    barH = v => v > 0 ? (Math.log10(v) - logMin) / (logMax - logMin) * ch : 0;
+    const maxPow = Math.ceil(logMax);
+    for (let p = 0; p <= maxPow; p++) {
+      const val = Math.pow(10, p);
+      const y = yTop(val);
+      if (y < pad.top || y > pad.top + ch + 1) continue;
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const label = val >= 1000 ? (val/1000).toFixed(0)+'k' : val;
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(label, pad.left - 6, y + 3);
+    }
+  } else {
+    yTop = v => pad.top + ch - (v / maxV) * ch;
+    barH = v => Math.max((v / maxV) * ch, v > 0 ? 1 : 0);
+    [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+      const y = pad.top + ch * (1 - f);
+      ctx.strokeStyle = border; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+      const val = maxV * f;
+      ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+      ctx.fillText(fmt(val), pad.left - 6, y + 3);
+    });
+  }
+
+  const n = labels.length, nb = datasets.length;
+  const slotW = cw / n;
+  const totalBarW = slotW * 0.6;
+  const bw = totalBarW / nb;
+
+  datasets.forEach((ds, di) => {
+    ds.data.forEach((val, gi) => {
+      if (val == null) return;
+      const x = pad.left + gi * slotW + slotW * 0.2 + di * bw;
+      const bh = Math.max(barH(val), val > 0 ? 1 : 0);
+      const y = yTop(val);
+      ctx.fillStyle = ds.color; ctx.globalAlpha = 0.82;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x, y, bw - 3, bh, [2,2,0,0]);
+      else ctx.rect(x, y, bw - 3, bh);
+      ctx.fill(); ctx.globalAlpha = 1;
+      ctx.fillStyle = ds.color; ctx.font = `bold 9px ${mono}`; ctx.textAlign = 'center';
+      ctx.fillText(fmt(val), x + (bw - 3) / 2, y - 4);
+    });
+  });
+
+  labels.forEach((lbl, i) => {
+    ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'center';
+    ctx.fillText(lbl, pad.left + i * slotW + slotW / 2, H - 8);
+  });
+
+  drawBarLegend(ctx, datasets, pad, W, mono, sans, muted);
+}
+
+function drawLine(id, labels, datasets, opts={}) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const H = parseInt(canvas.getAttribute('height'), 10) || 210;
+  const W = canvas.offsetWidth || 400;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
+  const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+  const pad = { top:36, right:14, bottom:22, left:46 };
+  const cw = W - pad.left - pad.right, ch = H - pad.top - pad.bottom;
+  const allVals = datasets.flatMap(d => d.data.filter(v => v !== null && v !== undefined));
+  const minV = Math.min(...allVals), maxV0 = Math.max(...allVals);
+  const span = (maxV0 - minV) || 1;
+  const lo = minV - span * 0.25, hi = maxV0 + span * 0.25;
+  const muted = cv('--muted'), border = cv('--border');
+  const mono = cv('--mono'), sans = cv('--sans');
+  const fmt = opts.fmt || (v => String(v));
+  const n = labels.length;
+  const xp = i => pad.left + (n === 1 ? 0.5 : i / (n - 1)) * cw;
+  const yp = v => pad.top + ch - (v - lo) / (hi - lo) * ch;
+  [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+    const y = pad.top + ch * (1 - f);
+    ctx.strokeStyle = border; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+    const val = lo + (hi - lo) * f;
+    ctx.fillStyle = muted; ctx.font = `10px ${mono}`; ctx.textAlign = 'right';
+    ctx.fillText(fmt(val), pad.left - 6, y + 3);
+  });
+  labels.forEach((lbl, i) => {
+    ctx.fillStyle = muted; ctx.font = `10px ${sans}`; ctx.textAlign = 'center';
+    ctx.fillText(lbl, xp(i), H - 8);
+  });
+  datasets.forEach(ds => {
+    const pts = ds.data.map((v, i) => ({ x: xp(i), y: yp(v), v }));
+    ctx.strokeStyle = ds.color; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    pts.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
+    ctx.stroke();
+    pts.forEach(pt => {
+      ctx.fillStyle = ds.color;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.font = `bold 9px ${mono}`; ctx.textAlign = 'center';
+      ctx.fillText(fmt(pt.v), pt.x, Math.max(pt.y - 9, pad.top + 10));
+    });
+  });
+  if (datasets.length > 1 || datasets[0].label) drawLegend(ctx, datasets, pad, W, mono, sans, muted);
+}
+
+function renderAll() {
+  const warm = cv('--warm'), cold = cv('--cold'), purple = cv('--purple');
+
+  drawBars('tpchChart', ['Q6 (selective)', 'Q1 (control)'], [
+    { label:'plain',  color:cold, data:[7756.6, null] },
+    { label:'packed', color:warm, data:[51.9, 419.7] },
+  ], { logScale:true });
+
+  drawBars('siftLatChart', ['nprobe=5', 'nprobe=10', 'nprobe=20'], [
+    { label:'plain',  color:cold, data:[26.35, 6.08, 5.99] },
+    { label:'packed', color:warm, data:[6.68, 1.10, 1.24] },
+  ], { fmt: v => v.toFixed(1) });
+
+  drawLine('siftRecallChart', ['5', '10', '20'], [
+    { label:'recall@10 (plain == packed)', color:purple, data:[0.743, 0.765, 0.768] },
+  ], { fmt: v => v.toFixed(3) });
+
+  drawBars('rowbatchChart', ['nprobe=4', 'nprobe=16', 'nprobe=40'], [
+    { label:'plain',  color:cold, data:[603.5, 604.9, 616.9] },
+    { label:'packed', color:warm, data:[14.7, 29.8, 24.0] },
+  ], { logScale:true });
+}
+
+renderAll();
+window.addEventListener('resize', renderAll);
+</script>
+
+</body>
+</html>
