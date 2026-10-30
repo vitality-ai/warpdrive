@@ -1,0 +1,44 @@
+name: deploy-site
+
+# Publishes site/ to the root of gh-pages, where GitHub Pages is actually
+# configured to serve from (branch-based Pages only supports / or /docs as
+# the source path, not an arbitrary subdirectory like site/). Without this,
+# https://vitality-ai.github.io/warpdrive/ 404s even though site/index.html
+# exists in the repo -- it just never reaches the branch root on its own.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "site/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy site/ onto the gh-pages root and push
+        run: |
+          set -e
+          # Capture site/'s own top-level entries before cd'ing elsewhere,
+          # so `git add` below only ever stages what site/ actually
+          # contains -- never dists/pool/db/conf (the live apt repo) or
+          # anything else already on this branch -- and stays correct as
+          # site/ gains new files, with no names hardcoded here.
+          SITE_ENTRIES=$(ls site)
+          git fetch origin gh-pages
+          git worktree add /tmp/gh-pages-publish origin/gh-pages
+          cp -r site/. /tmp/gh-pages-publish/
+          cd /tmp/gh-pages-publish
+          git add $SITE_ENTRIES
+          if git diff --cached --quiet; then
+            echo "No site changes; nothing to publish."
+            exit 0
+          fi
+          git -c user.name="warpdrive-ci" -c user.email="ci@vitality-ai.github" \
+            commit -m "Publish site/ to the Pages root (${{ github.sha }})"
+          git push origin HEAD:gh-pages
