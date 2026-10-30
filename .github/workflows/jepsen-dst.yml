@@ -14,12 +14,8 @@ jobs:
   dst:
     name: Jepsen/Elle DST
     runs-on: ubuntu-latest
-    # A real hang here (as opposed to a slow-but-finishing run) previously
-    # ran until GitHub's own 6-hour hard ceiling force-cancelled the job,
-    # burning CI minutes for 6 hours before anyone could tell something was
-    # actually stuck versus just slow. 20 minutes is generous for this job's
-    # real work (a cold-cache build plus the three lein steps, normally a
-    # few minutes) and turns a hang into a clear, fast failure instead.
+    # Generous for a cold-cache build plus the three lein steps; bounds a
+    # real hang well under GitHub's own 6-hour default ceiling.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
