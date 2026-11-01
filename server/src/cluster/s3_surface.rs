@@ -57,8 +57,39 @@ fn xml_escape(s: &str) -> String {
 /// text between tags with no entity decoding, so a key containing `&` (or
 /// `<`/`>`/`"`), correctly escaped by any real XML-writing client, would
 /// otherwise be used literally as e.g. `a&amp;b` instead of the real `a&b`.
+///
+/// Single-pass over the input, not chained `.replace()` calls: unescaping
+/// `&amp;` first can *create* text that looks like another entity (e.g. a
+/// key literally named `a&lt;b` is correctly escaped on the wire as
+/// `a&amp;lt;b` -- unescaping `&amp;`->`&` first turns that into the
+/// intermediate `a&lt;b`, and a later chained `.replace("&lt;", "<")`
+/// then wrongly matches *that*, corrupting the key into `a<b`). Each byte
+/// of input is consumed exactly once here, so a decoded `&` can never be
+/// re-interpreted as the start of another entity.
+const XML_ENTITIES: [(&str, char); 5] =
+    [("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>'), ("&quot;", '"'), ("&apos;", '\'')];
+
 fn xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp_pos) = rest.find('&') {
+        out.push_str(&rest[..amp_pos]);
+        let tail = &rest[amp_pos..];
+        match XML_ENTITIES.iter().find_map(|(pat, ch)| tail.strip_prefix(pat).map(|r| (*ch, r))) {
+            Some((ch, r)) => {
+                out.push(ch);
+                rest = r;
+            }
+            // Not a recognized entity -- copy the '&' literally and move
+            // past just that one byte, not the whole unmatched tail.
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Built fresh per call -- cheap (two `Arc::clone`s of state already held
@@ -596,4 +627,46 @@ pub async fn cluster_s3_multipart_post_authenticated(
     }
 
     Err(ErrorBadRequest("invalid multipart operation"))
+}
+
+#[cfg(test)]
+mod xml_unescape_tests {
+    use super::{xml_escape, xml_unescape};
+
+    #[test]
+    fn round_trips_a_key_containing_a_literal_ampersand() {
+        assert_eq!(xml_unescape("a&amp;b"), "a&b");
+    }
+
+    #[test]
+    fn does_not_double_decode_a_key_literally_named_with_entity_text() {
+        // "a&lt;b" (literal text, 6 chars: a & l t ; b) correctly escaped
+        // is "a&amp;lt;b". A chained-.replace() decoder unescapes &amp;
+        // first, creating an intermediate "a&lt;b" that a later &lt; pass
+        // then wrongly re-decodes into "a<b". This must not happen here.
+        let literal_key = "a&lt;b";
+        let wire_encoded = xml_escape(literal_key);
+        assert_eq!(wire_encoded, "a&amp;lt;b");
+        assert_eq!(xml_unescape(&wire_encoded), literal_key);
+    }
+
+    #[test]
+    fn round_trips_all_five_entities_together() {
+        let literal = "<tag> \"quoted\" & 'apos' </tag>";
+        let encoded = xml_escape(literal);
+        // xml_escape here doesn't handle &apos; (it only escapes &,<,>,"),
+        // so only decode what it actually produced.
+        assert_eq!(xml_unescape(&encoded), literal);
+    }
+
+    #[test]
+    fn leaves_an_unrecognized_ampersand_sequence_alone() {
+        assert_eq!(xml_unescape("a&weird;b"), "a&weird;b");
+    }
+
+    #[test]
+    fn handles_doubly_escaped_ampersand() {
+        // Literal text "&amp;" (5 chars), escaped once, is "&amp;amp;".
+        assert_eq!(xml_unescape("&amp;amp;"), "&amp;");
+    }
 }
