@@ -116,6 +116,27 @@ fn not_ready_error() -> Error {
     )
 }
 
+/// Buffers a streamed body into `web::Bytes`, the shape the cluster
+/// handlers need (erasure coding has to see the whole object anyway).
+/// Pre-sized from Content-Length when the client sends one -- actix's own
+/// `web::Bytes` extractor (what the unchanged `/cluster/s3/...` routes
+/// use) does the same, and growing a `Vec::new()` from zero one chunk at
+/// a time instead measurably cost a few percent of PUT throughput in a
+/// side-by-side benchmark against that route.
+async fn buffer_payload(req: &HttpRequest, mut payload: web::Payload) -> Result<web::Bytes, Error> {
+    let hint = req
+        .headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = Vec::with_capacity(hint);
+    while let Some(chunk) = payload.next().await {
+        body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+    }
+    Ok(web::Bytes::from(body))
+}
+
 /// PutObject dispatch: single-node streams the body (`web::Payload`) to
 /// avoid holding a large object fully in memory; the cluster path needs
 /// the whole object in memory anyway to erasure-code it, so in
@@ -123,17 +144,14 @@ fn not_ready_error() -> Error {
 /// duplicating single-node's own streaming write path for no benefit.
 async fn s3_put_object_dispatch(
     path: web::Path<(String, String)>,
-    mut payload: web::Payload,
+    payload: web::Payload,
     req: HttpRequest,
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::Distributed => {
-            let mut body = Vec::new();
-            while let Some(chunk) = payload.next().await {
-                body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
-            }
-            cluster_s3_put_object_authenticated(path, web::Bytes::from(body), req, cluster_state).await
+            let body = buffer_payload(&req, payload).await?;
+            cluster_s3_put_object_authenticated(path, body, req, cluster_state).await
         }
         Engine::NotReady => Err(not_ready_error()),
         Engine::SingleNode => s3_put_object_handler(path, payload, req).await,
@@ -200,17 +218,14 @@ async fn s3_list_objects_dispatch(
 async fn s3_multipart_dispatch(
     path: web::Path<(String, String)>,
     query: web::Query<HashMap<String, String>>,
-    mut payload: web::Payload,
+    payload: web::Payload,
     req: HttpRequest,
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::Distributed => {
-            let mut body = Vec::new();
-            while let Some(chunk) = payload.next().await {
-                body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
-            }
-            cluster_s3_multipart_post_authenticated(path, web::Bytes::from(body), req, cluster_state).await
+            let body = buffer_payload(&req, payload).await?;
+            cluster_s3_multipart_post_authenticated(path, body, req, cluster_state).await
         }
         Engine::NotReady => Err(not_ready_error()),
         Engine::SingleNode => s3_multipart_router(path, query, payload, req).await,
@@ -226,18 +241,15 @@ async fn s3_multipart_dispatch(
 async fn s3_post_bucket_dispatch(
     path: web::Path<String>,
     query: web::Query<HashMap<String, String>>,
-    mut payload: web::Payload,
+    payload: web::Payload,
     req: HttpRequest,
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     if query.contains_key("delete") {
         match pick_engine(&cluster_state) {
             Engine::Distributed => {
-                let mut body = Vec::new();
-                while let Some(chunk) = payload.next().await {
-                    body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
-                }
-                return cluster_s3_delete_objects_authenticated(path, web::Bytes::from(body), req, cluster_state).await;
+                let body = buffer_payload(&req, payload).await?;
+                return cluster_s3_delete_objects_authenticated(path, body, req, cluster_state).await;
             }
             Engine::NotReady => return Err(not_ready_error()),
             Engine::SingleNode => {}
