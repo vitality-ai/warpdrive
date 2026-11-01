@@ -1,9 +1,16 @@
 # Developer's Guide
 
-WarpDrive's default, recommended way to run is the **distributed cluster engine**
-— erasure-coded, multi-node, and still fully S3-compatible. Single-node mode
-still exists (see [below](#single-node-mode-not-the-default)) but isn't the
-onboarding path anymore.
+WarpDrive's default, recommended way to run is the **distributed cluster
+engine** — erasure-coded, multi-node, and fully S3-compatible. Single-node
+mode still exists (see [below](#single-node-mode-not-the-default)) but isn't
+the onboarding path anymore.
+
+**Both modes serve the exact same S3 URL** (`/s3/...`, or root — see
+[4. Verify with boto3](#4-verify-with-boto3)). Which engine actually answers
+it is decided once, at process startup, by whether the process was started
+with `WARPDRIVE_PEERS` set: no peers means single-node, a peer list means
+distributed. A client never needs to know or care which one it's talking
+to.
 
 ## Local Setup
 
@@ -60,14 +67,15 @@ needs a larger code where parity shards outnumber data shards less exactly,
 e.g. `RS(3,2)` below, where losing 2 of 5 nodes still leaves the required
 3 acks reachable.
 
-This is the smallest *redundant* config: WarpDrive's erasure coding requires
-at least 1 parity shard (`m >= 1`) to compute, so two mirrored nodes is the
-floor for anything that stores a real second copy. A real single cluster
-node is still possible, just without erasure coding — see just below.
+This is the smallest *redundant* config: WarpDrive's distributed engine
+always requires at least 1 parity shard (`m >= 1`) to compute, so two
+mirrored nodes is the floor. There's no "1-node cluster" mode — a single,
+unreplicated node is single-node mode (below), not a degenerate cluster.
 
 To run more nodes with a different code, pass data-shard count and
 parity-shard count explicitly, e.g. a 5-node cluster matching the project's
-own default (`RS(3,2)`, 3 data + 2 parity, tolerates 2 node failures):
+own default (`RS(3,2)`, 3 data + 2 parity, tolerates 2 node failures for
+both reads and writes):
 
 ```bash
 ./scripts/run_local_cluster.sh 3 2
@@ -77,13 +85,6 @@ Each node listens on its own port starting at `9710` (`9710`, `9711`, ...).
 Credentials default to `adminkey` / `adminsecretkey123456` for SigV4 auth —
 override with `WARPDRIVE_ADMIN_ACCESS_KEY`/`WARPDRIVE_ADMIN_SECRET_KEY` env
 vars before running the script if you want your own.
-
-A true single node (`./scripts/run_local_cluster.sh 1 0`) skips erasure
-coding entirely rather than being forced into a wasted, unsupported
-`RS(1,0)` — there's nobody else to shard across or compute parity
-against, so it just writes the plain object. This has no redundancy at
-all (unlike the `RS(1,1)` 2-node default above), so only use it for local
-testing, not for anything you'd mind losing.
 
 #### Running nodes on separate machines
 
@@ -107,7 +108,7 @@ import boto3
 
 s3 = boto3.client(
     's3',
-    endpoint_url='http://localhost:9710/cluster/s3',
+    endpoint_url='http://localhost:9710/s3',
     aws_access_key_id='adminkey',
     aws_secret_access_key='adminsecretkey123456',
     region_name='us-east-1',
@@ -119,17 +120,21 @@ print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
 ```
 
 Any node in the cluster can serve this — there's no dedicated coordinator,
-so pointing `endpoint_url` at any node's port works the same.
+so pointing `endpoint_url` at any node's port works the same. This is the
+same `/s3/...` endpoint single-node mode uses, below — the client code
+doesn't change between the two modes, only how the server was started
+does. (`/cluster/s3/...` still works too, unchanged, kept for existing
+tooling that already targets it explicitly.)
 
 ---
 
 ## Single-node mode (not the default)
 
-Not to be confused with the single-node *cluster* above (`run_local_cluster.sh 1 0`,
-still the cluster code path, just without erasure coding): this is the
-original, entirely separate non-distributed process, under `/s3/...` instead
-of `/cluster/s3/...`. It isn't the recommended path anymore — use the
-cluster above unless you specifically want this.
+The same binary, started without `WARPDRIVE_PEERS`, at the same `/s3/...`
+URL as above — no separate mode to learn, just a different startup
+decision. Not recommended for new setups (use the cluster above), but
+still fully supported for a local scratch instance or anything that
+genuinely doesn't need multi-node redundancy.
 
 ```bash
 cd server
@@ -140,25 +145,10 @@ WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
 ```
 
 Must be started from the `server/` directory (it looks for `server_log.yaml`
-and needs writable `logs/` and `storage/` subdirectories). Listens on port
-9710 (S3 API under `/s3/...`), same credential env vars as the cluster.
-
-```python
-import boto3
-
-s3 = boto3.client(
-    's3',
-    endpoint_url='http://localhost:9710',
-    aws_access_key_id='adminkey',
-    aws_secret_access_key='adminsecretkey123456',
-    region_name='us-east-1',
-    config=boto3.session.Config(s3={'addressing_style': 'path'}),
-)
-
-s3.create_bucket(Bucket='test-bucket')
-s3.put_object(Bucket='test-bucket', Key='hello.txt', Body=b'Hello, Warpdrive!')
-print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
-```
+and needs writable `logs/` and `storage/` subdirectories). Verify with the
+exact same boto3 snippet above (`endpoint_url='http://localhost:9710/s3'`) —
+`create_bucket` also works here, since single-node mode has a real bucket
+registry (the cluster engine doesn't, by design — see the User Guide).
 
 ---
 

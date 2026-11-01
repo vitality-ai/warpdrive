@@ -1,6 +1,8 @@
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
+use futures::StreamExt;
 use log::info;
 use log4rs;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use warp_drive::api::{put, get, append, delete, update_key, update};
@@ -33,6 +35,7 @@ use warp_drive::cluster::s3_surface::{
     cluster_s3_list_objects, cluster_s3_multipart_post_authenticated, cluster_s3_put_object_authenticated,
 };
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
+use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::location_store::BitcaskLocationStore;
 use warp_drive::cluster::membership::Membership;
 use warp_drive::cluster::peer_client::{HttpPeerClient, PeerClient};
@@ -53,15 +56,14 @@ use warp_drive::cluster::packing::StripePacker;
 /// run used k=9,m=6 (15 total nodes) by mistake. Per-bucket selection is
 /// deferred (see docs/Distributed-Engine-Plan.md).
 ///
-/// `WARPDRIVE_RS_M=0` turns erasure coding off entirely (`PlainCoder`,
-/// below): for a single, unreplicated node there's nobody to split shards
-/// across or compute parity against, so RS would be pure overhead — the
-/// underlying `reed-solomon-erasure` crate refuses `m=0` anyway. `k` is
-/// forced to 1 in that case regardless of `WARPDRIVE_RS_K`.
+/// `m` must be `>= 1` -- the cluster engine is always erasure-coded. A
+/// single, unreplicated node isn't a cluster config at all; use
+/// single-node mode (`/s3/...`, SQLite metadata, no EC) for that instead
+/// of asking the distributed engine to run with zero redundancy.
 fn ec_params_from_env() -> (usize, usize) {
     let k = std::env::var("WARPDRIVE_RS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let m = std::env::var("WARPDRIVE_RS_M").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-    if m == 0 { (1, 0) } else { (k, m) }
+    (k, m)
 }
 
 /// Transport decision point (docs/Distributed-Engine-Plan.md): the
@@ -79,6 +81,105 @@ fn peer_client_from_env() -> Arc<dyn PeerClient> {
     }
 }
 
+/// Whether this process serves `/s3/...` (and root `/{bucket}/...`) via the
+/// distributed engine instead of single-node. Decided once, from how the
+/// process was actually started -- `WARPDRIVE_PEERS` set and non-empty,
+/// the same thing that already has to be true for the cluster engine to
+/// work at all -- not a second, separate flag that could disagree with it.
+/// The URL a client uses is the same either way; this only decides which
+/// engine answers it.
+fn distributed_mode() -> bool {
+    std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+/// PutObject dispatch: single-node streams the body (`web::Payload`) to
+/// avoid holding a large object fully in memory; the cluster path needs
+/// the whole object in memory anyway to erasure-code it, so in
+/// distributed mode this buffers the stream once up front instead of
+/// duplicating single-node's own streaming write path for no benefit.
+async fn s3_put_object_dispatch(
+    path: web::Path<(String, String)>,
+    mut payload: web::Payload,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if distributed_mode() {
+        let mut body = Vec::new();
+        while let Some(chunk) = payload.next().await {
+            body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        return cluster_s3_put_object_authenticated(path, web::Bytes::from(body), req, cluster_state).await;
+    }
+    s3_put_object_handler(path, payload, req).await
+}
+
+async fn s3_get_object_dispatch(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if distributed_mode() {
+        return cluster_s3_get_object_authenticated(path, req, cluster_state).await;
+    }
+    s3_get_object_handler(path, req).await
+}
+
+async fn s3_delete_object_dispatch(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if distributed_mode() {
+        return cluster_s3_delete_object_authenticated(path, req, cluster_state).await;
+    }
+    s3_delete_object_handler(path, req).await
+}
+
+async fn s3_head_object_dispatch(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if distributed_mode() {
+        return cluster_s3_head_object_authenticated(path, req, cluster_state).await;
+    }
+    s3_head_object_handler(path, req).await
+}
+
+/// ListObjectsV2 dispatch (bucket-level GET). Bucket lifecycle itself
+/// (create/delete/head-bucket, bucket-level config POST) stays
+/// single-node-only in both modes -- the cluster engine has no bucket
+/// registry to hang that on (a deliberate, already-documented scope
+/// limit, not new here), so there's no cluster equivalent to dispatch to.
+async fn s3_list_objects_dispatch(
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if distributed_mode() {
+        return cluster_s3_list_objects(path, query, req, cluster_state).await;
+    }
+    s3_list_objects_handler(path, query, req).await
+}
+
+async fn s3_multipart_dispatch(
+    path: web::Path<(String, String)>,
+    query: web::Query<HashMap<String, String>>,
+    mut payload: web::Payload,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if distributed_mode() {
+        let mut body = Vec::new();
+        while let Some(chunk) = payload.next().await {
+            body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+        }
+        return cluster_s3_multipart_post_authenticated(path, web::Bytes::from(body), req, cluster_state).await;
+    }
+    s3_multipart_router(path, query, payload, req).await
+}
+
 fn build_cluster_state() -> web::Data<ClusterState> {
     let (k, m) = ec_params_from_env();
     let location_log = std::env::var("WARPDRIVE_LOCATION_LOG")
@@ -87,7 +188,7 @@ fn build_cluster_state() -> web::Data<ClusterState> {
     let state = ClusterState {
         membership: Arc::new(Membership::from_env()),
         placement: Arc::new(ComputedPlacement::new()),
-        ec: warp_drive::cluster::ec::coder_for(k, m).expect("invalid RS(k,m) configuration"),
+        ec: Arc::new(ReedSolomonCoder::new(k, m).expect("invalid RS(k,m) configuration")) as Arc<dyn ErasureCoder>,
         location_store: Arc::new(
             BitcaskLocationStore::open(&location_log).expect("failed to open location store log"),
         ),
@@ -144,7 +245,8 @@ async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
-    info!("Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/...)");
+    let mode = if distributed_mode() { "distributed" } else { "single-node" };
+    info!("Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/... and /, mode: {mode})");
 
     let _deletion_worker_handle = start_deletion_worker();
     info!("Deletion worker started in background");
@@ -244,13 +346,13 @@ async fn main() -> std::io::Result<()> {
             .route("/s3/{bucket}",      web::put().to(s3_create_bucket_handler))
             .route("/s3/{bucket}",      web::delete().to(s3_delete_bucket_handler))
             .route("/s3/{bucket}",      web::head().to(s3_head_bucket_handler))
-            .route("/s3/{bucket}",      web::get().to(s3_list_objects_handler))
+            .route("/s3/{bucket}",      web::get().to(s3_list_objects_dispatch))
             .route("/s3/{bucket}",      web::post().to(s3_post_bucket_handler))
-            .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
+            .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_dispatch))
             .route("/s3/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/s3/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             // Original native API (registered before root S3 routes to take priority on conflicts)
@@ -265,19 +367,19 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}",          web::put().to(s3_create_bucket_handler))
             .route("/{bucket}",          web::delete().to(s3_delete_bucket_handler))
             .route("/{bucket}",          web::head().to(s3_head_bucket_handler))
-            .route("/{bucket}",          web::get().to(s3_list_objects_handler))
+            .route("/{bucket}",          web::get().to(s3_list_objects_dispatch))
             .route("/{bucket}",          web::post().to(s3_post_bucket_handler))
             // Trailing-slash bucket routes — aws-sdk-rust sends GET /bucket/?list-type=2
             .route("/{bucket}/",         web::put().to(s3_create_bucket_handler))
             .route("/{bucket}/",         web::delete().to(s3_delete_bucket_handler))
             .route("/{bucket}/",         web::head().to(s3_head_bucket_handler))
-            .route("/{bucket}/",         web::get().to(s3_list_objects_handler))
+            .route("/{bucket}/",         web::get().to(s3_list_objects_dispatch))
             .route("/{bucket}/",         web::post().to(s3_post_bucket_handler))
-            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
-            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
-            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
-            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
-            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
+            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_dispatch))
             .route("/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))

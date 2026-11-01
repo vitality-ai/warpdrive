@@ -4,21 +4,25 @@
 #
 # Usage: ./scripts/run_local_cluster.sh [K] [M]
 #   K = data shards, M = parity shards (RS(K,M), see server/src/main.rs).
-#   Node count = K+M. Default is K=1 M=1: the smallest real *redundant*
-#   cluster — every object mirrored across both nodes. Reads tolerate one
-#   node down; writes don't (write quorum is k+1 when m==k, i.e. RS(1,1)
-#   needs both nodes up for a PUT/DELETE to succeed -- see
-#   required_write_acks in coordinator.rs). Pass `1 0` for a single node
-#   with no erasure coding at all (there's nobody to shard across or
-#   compute parity against with just one node, so it writes the plain
-#   object instead of a wasted RS(1,0) — not a supported config anyway,
-#   the underlying RS crate rejects 0 parity shards).
+#   Node count = K+M. Default is K=1 M=1: the smallest real cluster —
+#   every object mirrored across both nodes. Reads tolerate one node down;
+#   writes don't (write quorum is k+1 when m==k, i.e. RS(1,1) needs both
+#   nodes up for a PUT/DELETE to succeed -- see required_write_acks in
+#   coordinator.rs). The distributed engine is always erasure-coded (M
+#   must be >= 1) -- for a single node with no redundancy, use single-node
+#   mode (`cd server && cargo run`, the plain `/s3/...` API) instead of
+#   asking this script for a 1-node cluster.
 #
 # Ctrl-C stops every node.
 set -euo pipefail
 
 K="${1:-1}"
 M="${2:-1}"
+if [ "$M" -lt 1 ]; then
+  echo "M must be >= 1 -- the distributed engine is always erasure-coded." >&2
+  echo "For a single node with no redundancy, run single-node mode instead (cd server && cargo run)." >&2
+  exit 1
+fi
 NODES=$((K + M))
 BASE_PORT="${WARPDRIVE_BASE_PORT:-9710}"
 ACCESS_KEY="${WARPDRIVE_ADMIN_ACCESS_KEY:-adminkey}"

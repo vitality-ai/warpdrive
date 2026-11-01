@@ -7,7 +7,7 @@
 
 ## Getting Started
 
-Warpdrive is S3-compatible. Any client or library that speaks S3 follows the same semantics. The example below uses **boto3**.
+Warpdrive is S3-compatible. Any client or library that speaks S3 follows the same semantics. The example below uses **boto3**, and works identically whether the server is running single-node or as a [distributed cluster](#distributed-mode-default) — same URL, same client code either way; which engine answers it is a server-startup decision, not something the client specifies.
 
 ```bash
 pip install boto3
@@ -76,11 +76,10 @@ MinIO's own rule for this edge case), which for `RS(1,1)` means both nodes
 must be up for a PUT or DELETE to succeed. The project's own default erasure
 code, `RS(3,2)` (5 nodes), does tolerate 2 nodes down for both reads *and*
 writes, since its write quorum is `k=3`, reachable with only 3 of 5 nodes
-up. A single node is also supported
-(`WARPDRIVE_RS_K=1 WARPDRIVE_RS_M=0`) — erasure coding needs at least 1
-parity shard to compute anything, so with one node it's skipped entirely
-and objects are written plain, with no redundancy. Every node needs the
-*same* peer list, including itself:
+up. There's no "1-node cluster": erasure coding always needs at least 1
+parity shard to compute anything, so a single, unreplicated node is
+single-node mode (see "Getting Started" above), not a degenerate cluster.
+Every node needs the *same* peer list, including itself:
 
 ```bash
 WARPDRIVE_PEERS=http://node1:9710,http://node2:9710,http://node3:9710,http://node4:9710,http://node5:9710 \
@@ -158,26 +157,44 @@ Each entry is `[offset, length, length, codec]` in the original object's byte la
 
 ### Authenticated S3 access (recommended for S3 clients and third-party tools)
 
-`/cluster/s3/{bucket}/{key}` is the recommended way to talk to the cluster
-from a standard S3 client (boto3, aws-cli, Lance's `object_store::aws`,
-pyiceberg, Spark, etc.) — unlike the bare `/cluster/{bucket}/{key}` routes
-above, it requires real SigV4 authentication (the same verification
-single-node's `/s3/` API uses) and supports GET/PUT/HEAD/DELETE/LIST and
-full multipart upload on top of the same erasure-coded cluster engine, with
-real `ETag`/`Last-Modified`/user-metadata round-tripped from the stored
-object. The bare `/cluster/{bucket}/{key}` routes stay unauthenticated, for
-quick local testing (`curl`) without signing requests.
+A standard S3 client (boto3, aws-cli, Lance's `object_store::aws`,
+pyiceberg, Spark, etc.) should use the regular `/s3/{bucket}/{key}` (or
+root `/{bucket}/{key}`) endpoint — the exact same one single-node mode
+uses. Which engine actually answers it is decided once, at process
+startup, by whether `WARPDRIVE_PEERS` was set; the URL and client code
+never change. Unlike the bare `/cluster/{bucket}/{key}` routes above,
+this requires real SigV4 authentication (the same verification
+single-node's API uses) and supports GET/PUT/HEAD/DELETE/LIST and full
+multipart upload on top of the erasure-coded cluster engine, with real
+`ETag`/`Last-Modified`/user-metadata round-tripped from the stored
+object. The bare `/cluster/{bucket}/{key}` routes stay unauthenticated,
+for quick local testing (`curl`) without signing requests.
 
 ```python
 s3 = boto3.client(
     's3',
-    endpoint_url='http://localhost:9710/cluster/s3',
+    endpoint_url='http://localhost:9710/s3',
     aws_access_key_id='adminkey',
     aws_secret_access_key='adminsecretkey123456',
     region_name='us-east-1',
     config=boto3.session.Config(s3={'addressing_style': 'path'}),
 )
 ```
+
+`/cluster/s3/{bucket}/{key}` still works too, unchanged — it's the same
+cluster-authenticated handlers, kept as an explicit, always-cluster alias
+for existing tooling (the Jepsen/chaos test harnesses target it directly)
+and for forcing cluster access specifically if that's ever useful. New
+code should just use `/s3/...`.
+
+Bucket lifecycle (create/delete/head-bucket, bucket-level config like
+`?cors`/`?versioning`) stays single-node-only in both modes: the cluster
+engine has no bucket registry to hang that on (a deliberate,
+already-documented scope limit, not new here). `CreateBucket` "succeeds"
+against single-node's own local metadata regardless of which engine is
+actually serving object traffic — harmless, since cluster PUT/GET never
+checks bucket existence, but worth knowing if you're inspecting what a
+`CreateBucket` call actually touched.
 
 Not yet supported on this surface: bucket-level CORS/ACL and object
 versioning (no cluster bucket registry exists for the former; versioning

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMeta};
 use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
+use super::ec::ErasureCoder;
 use super::location_store::ObjectS3Metadata;
 use super::packing::Stripe;
 use super::shard_storage::{new_version_id, versioned_key};
@@ -433,10 +434,9 @@ async fn fetch_and_decode_stripe(
     }
 
     // Same fix as `coordinator.rs`'s plain GET: decode with *this record's*
-    // k/m, not the node's process-wide `state.ec` (and via `coder_for`, not
-    // `ReedSolomonCoder::new` directly, so `m == 0` doesn't 500).
+    // k/m, not the node's process-wide `state.ec`.
     let t_decode_start = std::time::Instant::now();
-    let decoded = super::ec::coder_for(record.k, record.m)
+    let decoded = super::ec::ReedSolomonCoder::new(record.k, record.m)
         .and_then(|decoder| decoder.decode_shards(&shards))
         .map_err(|e| ErrorInternalServerError(e.to_string()));
     let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1000.0;
