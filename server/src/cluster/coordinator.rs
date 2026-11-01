@@ -1035,9 +1035,12 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // No checksum header here: it covers the *whole* object, so
+                // a client that validates whatever checksum header it's
+                // given (boto3/botocore do, unconditionally, with no
+                // Range-awareness -- confirmed by reading httpchecksum.py)
+                // would reject this partial body against it. Real S3 never
+                // sends one on a Range GET either, for the same reason.
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1133,9 +1136,9 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // No checksum header: see the matching comment on the
+                // content-dependent Range branch above -- it covers the
+                // whole object, not this slice.
                 return Ok(resp.body(slice.to_vec()));
             }
         }
@@ -1219,9 +1222,9 @@ pub(crate) async fn cluster_get_object_inner(
             for (k, v) in &user_metadata {
                 resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
             }
-            if let Some((name, value)) = &checksum_header {
-                resp.insert_header((name.as_str(), value.as_str()));
-            }
+            // No checksum header: see the matching comment on the
+            // content-dependent Range branch above -- it covers the whole
+            // object, not this slice.
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
