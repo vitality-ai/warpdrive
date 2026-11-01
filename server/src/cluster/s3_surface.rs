@@ -51,6 +51,16 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// Inverse of `xml_escape`, needed anywhere a key/value is read back out
+/// of a request body's XML (e.g. `DeleteObjects`'s `<Key>`) instead of
+/// just being echoed into a response -- `extract_xml_tag` returns the raw
+/// text between tags with no entity decoding, so a key containing `&` (or
+/// `<`/`>`/`"`), correctly escaped by any real XML-writing client, would
+/// otherwise be used literally as e.g. `a&amp;b` instead of the real `a&b`.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+}
+
 /// Built fresh per call -- cheap (two `Arc::clone`s of state already held
 /// by `ClusterState`), and lets the auth-aware handlers below do metadata
 /// *reads* (existence/etag checks for conditional requests, HEAD) through
@@ -439,9 +449,9 @@ pub async fn cluster_s3_delete_objects_authenticated(
         let obj_body = &remaining[..obj_end];
         remaining = &remaining[obj_end..];
 
-        let Some(key) = extract_xml_tag(obj_body, "Key") else { continue };
+        let Some(key) = extract_xml_tag(obj_body, "Key").map(|k| xml_unescape(&k)) else { continue };
 
-        if let Some(version_id) = extract_xml_tag(obj_body, "VersionId") {
+        if let Some(version_id) = extract_xml_tag(obj_body, "VersionId").map(|v| xml_unescape(&v)) {
             errors_xml.push_str(&format!(
                 "    <Error><Key>{}</Key><VersionId>{}</VersionId><Code>NotImplemented</Code>\
                  <Message>Versioned delete is not supported on the distributed engine</Message></Error>\n",

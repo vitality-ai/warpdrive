@@ -59,6 +59,16 @@ pub struct ClusterState {
     /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
     /// the codec name a unit was tagged with at PUT time.
     pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
+    /// Set once at startup from whether this node was told to be a
+    /// cluster member at all (`WARPDRIVE_PEERS` or `WARPDRIVE_JOIN_VIA`
+    /// given), independent of whether `membership` has any peers *yet*.
+    /// `main.rs`'s request dispatch uses this alongside live membership to
+    /// tell "never configured for a cluster" (serve single-node, as
+    /// always) apart from "configured for a cluster but not joined yet,
+    /// or the join failed" (reject -- must not silently fall back to
+    /// single-node storage, which a client could write to and then lose
+    /// once the join completes and routing switches to the cluster).
+    pub configured_for_cluster: bool,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
     // both the part bytes and the upload "header" (status, content-type,
     // user-metadata) are ordinary objects through the existing
