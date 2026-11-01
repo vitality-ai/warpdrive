@@ -145,6 +145,16 @@ spec:
                 http://warpdrive-2.warpdrive:9710,
                 http://warpdrive-3.warpdrive:9710,
                 http://warpdrive-4.warpdrive:9710
+            # These four default to paths relative to the container's
+            # CWD (/server), outside the /data mount below -- on pod
+            # replacement that would lose the location/shard-metadata
+            # logs while the actual shard bytes under /data/storage
+            # survive, leaving persisted objects with no pin to find
+            # them by. Same fix as scripts/docker_cluster_entrypoint.sh.
+            - { name: WARPDRIVE_LOCATION_LOG,         value: /data/cluster_location.log }
+            - { name: WARPDRIVE_CONTENT_LOCATION_LOG, value: /data/cluster_content_location.log }
+            - { name: WARPDRIVE_BUCKET_CONFIG_LOG,    value: /data/cluster_bucket_config.log }
+            - { name: WARPDRIVE_SHARD_META_LOG,       value: /data/shard_meta.log }
           volumeMounts:
             - { name: data, mountPath: /data }
           readinessProbe:
