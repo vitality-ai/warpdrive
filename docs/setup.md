@@ -52,10 +52,10 @@ data shard + one parity shard, one per node, so the data is fully mirrored
 and the cluster keeps serving reads and writes if either node goes down.
 Press Ctrl-C to stop both nodes.
 
-This is the smallest real distributed-mode config: WarpDrive's erasure coding
-requires at least 1 parity shard (`m >= 1`), so a lone, unreplicated node
-isn't a supported "cluster of one" — two mirrored nodes is the floor, and
-it's a genuinely redundant deployment, not a toy.
+This is the smallest *redundant* config: WarpDrive's erasure coding requires
+at least 1 parity shard (`m >= 1`) to compute, so two mirrored nodes is the
+floor for anything that's actually fault-tolerant. A real single cluster
+node is still possible, just without erasure coding — see just below.
 
 To run more nodes with a different code, pass data-shard count and
 parity-shard count explicitly, e.g. a 5-node cluster matching the project's
@@ -69,6 +69,13 @@ Each node listens on its own port starting at `9710` (`9710`, `9711`, ...).
 Credentials default to `adminkey` / `adminsecretkey123456` for SigV4 auth —
 override with `WARPDRIVE_ADMIN_ACCESS_KEY`/`WARPDRIVE_ADMIN_SECRET_KEY` env
 vars before running the script if you want your own.
+
+A true single node (`./scripts/run_local_cluster.sh 1 0`) skips erasure
+coding entirely rather than being forced into a wasted, unsupported
+`RS(1,0)` — there's nobody else to shard across or compute parity
+against, so it just writes the plain object. This has no redundancy at
+all (unlike the `RS(1,1)` 2-node default above), so only use it for local
+testing, not for anything you'd mind losing.
 
 #### Running nodes on separate machines
 
@@ -110,10 +117,11 @@ so pointing `endpoint_url` at any node's port works the same.
 
 ## Single-node mode (not the default)
 
-A single, non-distributed process is still there for cases that don't need
-erasure coding or multi-node fault tolerance (e.g. a quick local scratch
-instance). It isn't the recommended path anymore — use the cluster above
-unless you specifically want this.
+Not to be confused with the single-node *cluster* above (`run_local_cluster.sh 1 0`,
+still the cluster code path, just without erasure coding): this is the
+original, entirely separate non-distributed process, under `/s3/...` instead
+of `/cluster/s3/...`. It isn't the recommended path anymore — use the
+cluster above unless you specifically want this.
 
 ```bash
 cd server

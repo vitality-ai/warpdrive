@@ -68,11 +68,14 @@ and measured results: [Technical Architecture](Technical-Architecture.md) and
 
 ### Starting a cluster
 
-Each node is the same binary. The smallest real cluster is 2 nodes under
-`RS(1,1)` (1 data shard + 1 parity shard per object — full mirroring,
+Each node is the same binary. The smallest *redundant* cluster is 2 nodes
+under `RS(1,1)` (1 data shard + 1 parity shard per object — full mirroring,
 tolerates 1 node down); the project's own default erasure code is `RS(3,2)`
-(5 nodes, tolerates 2 down). Every node needs the *same* peer list, including
-itself:
+(5 nodes, tolerates 2 down). A single node is also supported
+(`WARPDRIVE_RS_K=1 WARPDRIVE_RS_M=0`) — erasure coding needs at least 1
+parity shard to compute anything, so with one node it's skipped entirely
+and objects are written plain, with no redundancy. Every node needs the
+*same* peer list, including itself:
 
 ```bash
 WARPDRIVE_PEERS=http://node1:9710,http://node2:9710,http://node3:9710,http://node4:9710,http://node5:9710 \

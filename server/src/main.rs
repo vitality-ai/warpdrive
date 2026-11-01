@@ -32,7 +32,6 @@ use warp_drive::cluster::s3_surface::{
     cluster_s3_head_object, cluster_s3_head_object_authenticated,
     cluster_s3_list_objects, cluster_s3_multipart_post_authenticated, cluster_s3_put_object_authenticated,
 };
-use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
 use warp_drive::cluster::location_store::BitcaskLocationStore;
 use warp_drive::cluster::membership::Membership;
@@ -53,10 +52,16 @@ use warp_drive::cluster::packing::StripePacker;
 /// their "9" as our `k` is the wrong translation — caught after an initial
 /// run used k=9,m=6 (15 total nodes) by mistake. Per-bucket selection is
 /// deferred (see docs/Distributed-Engine-Plan.md).
+///
+/// `WARPDRIVE_RS_M=0` turns erasure coding off entirely (`PlainCoder`,
+/// below): for a single, unreplicated node there's nobody to split shards
+/// across or compute parity against, so RS would be pure overhead — the
+/// underlying `reed-solomon-erasure` crate refuses `m=0` anyway. `k` is
+/// forced to 1 in that case regardless of `WARPDRIVE_RS_K`.
 fn ec_params_from_env() -> (usize, usize) {
     let k = std::env::var("WARPDRIVE_RS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let m = std::env::var("WARPDRIVE_RS_M").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-    (k, m)
+    if m == 0 { (1, 0) } else { (k, m) }
 }
 
 /// Transport decision point (docs/Distributed-Engine-Plan.md): the
@@ -82,7 +87,7 @@ fn build_cluster_state() -> web::Data<ClusterState> {
     let state = ClusterState {
         membership: Arc::new(Membership::from_env()),
         placement: Arc::new(ComputedPlacement::new()),
-        ec: Arc::new(ReedSolomonCoder::new(k, m).expect("invalid RS(k,m) configuration")) as Arc<dyn ErasureCoder>,
+        ec: warp_drive::cluster::ec::coder_for(k, m).expect("invalid RS(k,m) configuration"),
         location_store: Arc::new(
             BitcaskLocationStore::open(&location_log).expect("failed to open location store log"),
         ),

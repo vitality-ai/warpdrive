@@ -669,7 +669,7 @@ async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state:
     if present < record.k {
         return Err(ErrorInternalServerError(format!("read quorum not met: {present}/{} shards available", record.k)));
     }
-    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m).map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    let decoder = super::ec::coder_for(record.k, record.m).map_err(|e| ErrorInternalServerError(e.to_string()))?;
     decoder.decode(&shards, record.original_len).map_err(|e| ErrorInternalServerError(e.to_string()))
 }
 
@@ -1182,7 +1182,9 @@ pub(crate) async fn cluster_get_object_inner(
     // above, but not for the decode that quorum count exists to gate.
     // `ReedSolomonCoder::new` just builds a small Galois-field table, cheap
     // enough to construct per request rather than needing a shared cache.
-    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m)
+    // `coder_for` (not `ReedSolomonCoder::new` directly) also handles
+    // `record.m == 0` (`PlainCoder`, no-EC single-node objects).
+    let decoder = super::ec::coder_for(record.k, record.m)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     let data = decoder
         .decode(&shards, record.original_len)

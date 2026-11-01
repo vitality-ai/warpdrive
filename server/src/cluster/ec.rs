@@ -158,9 +158,86 @@ impl ErasureCoder for ReedSolomonCoder {
     }
 }
 
+/// Builds the right coder for a stored record's own `k`/`m` — `PlainCoder`
+/// when `m=0` (see its doc below), `ReedSolomonCoder` otherwise. Callers
+/// that reconstruct a decoder fresh per request from `record.k`/`record.m`
+/// (rather than the node's process-wide `state.ec`, which can disagree
+/// after a restart with different `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M`) must
+/// go through this, not `ReedSolomonCoder::new` directly — a plain
+/// `ReedSolomonCoder::new(k, 0)` always fails (`Error::TooFewParityShards`
+/// from the underlying crate), which would otherwise turn every GET of a
+/// no-EC object into a 500.
+pub fn coder_for(k: usize, m: usize) -> Result<std::sync::Arc<dyn ErasureCoder>, EcError> {
+    if m == 0 {
+        Ok(std::sync::Arc::new(PlainCoder))
+    } else {
+        Ok(std::sync::Arc::new(ReedSolomonCoder::new(k, m)?))
+    }
+}
+
+/// No erasure coding at all: `k=1, m=0`, the whole object is the one
+/// "shard." For a single-node cluster there's nobody to split across or
+/// compute parity against, so RS(1,0) would be pure overhead for zero
+/// benefit — and the underlying `reed-solomon-erasure` crate refuses to
+/// construct a coder with `parity_shards == 0` anyway
+/// (`Error::TooFewParityShards`), so this isn't reachable through
+/// `ReedSolomonCoder`. A plain write/read instead: the object's bytes,
+/// unmodified, placed on exactly one peer.
+pub struct PlainCoder;
+
+impl ErasureCoder for PlainCoder {
+    fn k(&self) -> usize { 1 }
+    fn m(&self) -> usize { 0 }
+
+    fn encode(&self, data: &[u8]) -> Result<EncodedObject, EcError> {
+        Ok(EncodedObject { shards: vec![data.to_vec()], original_len: data.len() })
+    }
+
+    fn decode(&self, shards: &[Option<Vec<u8>>], original_len: usize) -> Result<Vec<u8>, EcError> {
+        let mut data = shards
+            .first()
+            .and_then(|s| s.clone())
+            .ok_or(EcError::TooFewShards)?;
+        data.truncate(original_len);
+        Ok(data)
+    }
+
+    fn encode_shards(&self, data_shards: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, EcError> {
+        if data_shards.len() != 1 {
+            return Err(EcError::Config(format!(
+                "PlainCoder expects exactly 1 data shard, got {}",
+                data_shards.len()
+            )));
+        }
+        Ok(data_shards)
+    }
+
+    fn decode_shards(&self, shards: &[Option<Vec<u8>>]) -> Result<Vec<Vec<u8>>, EcError> {
+        let shard = shards.first().and_then(|s| s.clone()).ok_or(EcError::TooFewShards)?;
+        Ok(vec![shard])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_coder_round_trips_without_any_redundancy() {
+        let coder = PlainCoder;
+        let data = b"single node, no erasure coding, just the bytes".to_vec();
+        let encoded = coder.encode(&data).unwrap();
+        assert_eq!(encoded.shards.len(), 1);
+
+        let shards: Vec<Option<Vec<u8>>> = encoded.shards.iter().cloned().map(Some).collect();
+        assert_eq!(coder.decode(&shards, encoded.original_len).unwrap(), data);
+    }
+
+    #[test]
+    fn plain_coder_decode_fails_when_the_one_shard_is_missing() {
+        let coder = PlainCoder;
+        assert!(matches!(coder.decode(&[None], 5), Err(EcError::TooFewShards)));
+    }
 
     #[test]
     fn encode_decode_round_trip_full() {
