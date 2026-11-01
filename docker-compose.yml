@@ -1,11 +1,98 @@
-version: '3.8'
+# Default: `docker compose up` starts a single-node instance (one
+# process, one container) -- matches the apt package's own default, for
+# the same reason: a lone instance has no peers to cluster with, so
+# single-node is the only sensible out-of-the-box behavior.
+#
+# Optional: `docker compose --profile cluster up` instead starts a real
+# 5-node RS(3,2) cluster (the project's own default erasure code), each
+# node its own container/process, each bind-mounted to its own directory
+# under /tmp/warpdrive-cluster/ on the host -- plain, inspectable
+# directories, not opaque Docker volumes, same spirit as
+# scripts/run_local_cluster.sh's per-node directories. Ephemeral by
+# design (it's a local dev/demo cluster, not meant to persist across a
+# reboot that clears /tmp).
+
+x-cluster-node: &cluster-node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  profiles: ["cluster"]
+  environment: &cluster-env
+    WARPDRIVE_ADMIN_ACCESS_KEY: adminkey
+    WARPDRIVE_ADMIN_SECRET_KEY: adminsecretkey123456
+    WARPDRIVE_PEERS: "http://node0:9710,http://node1:9710,http://node2:9710,http://node3:9710,http://node4:9710"
+    WARPDRIVE_RS_K: "3"
+    WARPDRIVE_RS_M: "2"
+    WARPDRIVE_LOCATION_LOG: /data/cluster_location.log
+    WARPDRIVE_CONTENT_LOCATION_LOG: /data/cluster_content_location.log
+    WARPDRIVE_BUCKET_CONFIG_LOG: /data/cluster_bucket_config.log
+    WARPDRIVE_SHARD_META_LOG: /data/shard_meta.log
+
 services:
-  ciaos-app:
-    image: ghcr.io/cia-labs/ciaos:${BUILD_HASH}
+  warpdrive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      WARPDRIVE_ADMIN_ACCESS_KEY: adminkey
+      WARPDRIVE_ADMIN_SECRET_KEY: adminsecretkey123456
     ports:
-      - 9710:9710
+      - "9710:9710"
     volumes:
-      - ciaosdata:/data
+      - warpdrive-data:/data
+
+  # Host ports 9715-9719, not 9710-9714: this profile can run alongside
+  # the default `warpdrive` service (which stays on 9710), so the two
+  # never collide regardless of which commands get run together.
+  node0:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      WARPDRIVE_SELF_ADDR: http://node0:9710
+    ports:
+      - "9715:9710"
+    volumes:
+      - /tmp/warpdrive-cluster/node0:/data
+
+  node1:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      WARPDRIVE_SELF_ADDR: http://node1:9710
+    ports:
+      - "9716:9710"
+    volumes:
+      - /tmp/warpdrive-cluster/node1:/data
+
+  node2:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      WARPDRIVE_SELF_ADDR: http://node2:9710
+    ports:
+      - "9717:9710"
+    volumes:
+      - /tmp/warpdrive-cluster/node2:/data
+
+  node3:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      WARPDRIVE_SELF_ADDR: http://node3:9710
+    ports:
+      - "9718:9710"
+    volumes:
+      - /tmp/warpdrive-cluster/node3:/data
+
+  node4:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      WARPDRIVE_SELF_ADDR: http://node4:9710
+    ports:
+      - "9719:9710"
+    volumes:
+      - /tmp/warpdrive-cluster/node4:/data
 
 volumes:
-  ciaosdata:
+  warpdrive-data:

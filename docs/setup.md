@@ -153,21 +153,30 @@ registry (the cluster engine doesn't, by design — see the User Guide).
 
 ## Docker (Optional)
 
-The published image runs single-node mode only; there's no multi-container
-cluster compose setup yet.
+**Single node** (`docker build`/`docker run` directly, or `docker compose up`
+— both give you the same single-node default, consistent with the apt
+package's own default: a lone instance has no peers to cluster with):
 
-**Build:**
 ```bash
 docker build -t warpdrive .
-```
-
-**Run:**
-```bash
 docker run -p 9710:9710 \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
   -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   warpdrive
 ```
+
+**A real local cluster**, via the same `docker-compose.yml`, opt-in behind a
+Compose profile — 5 containers (one process each) under `RS(3,2)`, each
+bind-mounted to its own plain, inspectable directory under
+`/tmp/warpdrive-cluster/` on the host (ephemeral by design, not meant to
+survive a reboot that clears `/tmp`):
+
+```bash
+docker compose --profile cluster up
+```
+
+Verified live: PUT through one container is readable from another, and
+both reads and writes survive 2 of the 5 containers being stopped.
 
 ---
 
