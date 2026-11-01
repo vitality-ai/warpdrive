@@ -52,34 +52,33 @@ cd warpdrive
 ./scripts/run_local_cluster.sh
 ```
 
-That's the whole setup. It builds the release binary, then starts **2 local
+That's the whole setup. It builds the release binary, then starts **5 local
 nodes**, each in its own data directory under `server/cluster-local/`, wired
-together as a 2-node cluster with `RS(1,1)` — every object is written as one
-data shard + one parity shard, one per node, so the data is fully mirrored.
-Press Ctrl-C to stop both nodes.
+together as a cluster with `RS(3,2)` — WarpDrive's own default erasure code
+(the same fallback `ec_params_from_env` uses if you set `WARPDRIVE_PEERS` by
+hand without `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M`). Every object is written as
+3 data shards + 2 parity shards, one per node. Press Ctrl-C to stop every
+node.
 
-**Reads, not writes, survive a node going down here.** GET still works off
-the surviving mirror with either node down. PUT/DELETE don't: WarpDrive's
-write quorum is `k+1` when `m == k` (MinIO's own rule, for exactly this
-small-cluster edge case — see `required_write_acks` in `coordinator.rs`),
-which for `RS(1,1)` is `2` — i.e. *both* nodes. Real write fault-tolerance
-needs a larger code where parity shards outnumber data shards less exactly,
-e.g. `RS(3,2)` below, where losing 2 of 5 nodes still leaves the required
-3 acks reachable.
+**Tolerates 2 node failures, for both reads and writes.** Write quorum here
+is `k=3`, reachable with only 3 of the 5 nodes up — no asterisk, unlike the
+smaller configs below.
 
-This is the smallest *redundant* config: WarpDrive's distributed engine
-always requires at least 1 parity shard (`m >= 1`) to compute, so two
-mirrored nodes is the floor. There's no "1-node cluster" mode — a single,
-unreplicated node is single-node mode (below), not a degenerate cluster.
-
-To run more nodes with a different code, pass data-shard count and
-parity-shard count explicitly, e.g. a 5-node cluster matching the project's
-own default (`RS(3,2)`, 3 data + 2 parity, tolerates 2 node failures for
-both reads and writes):
+To run a smaller local cluster instead, pass data-shard count and
+parity-shard count explicitly — the smallest *redundant* config is `1 1`
+(2 nodes, full mirroring):
 
 ```bash
-./scripts/run_local_cluster.sh 3 2
+./scripts/run_local_cluster.sh 1 1
 ```
+
+**This one tolerates a node down for reads only, not writes**: write quorum
+is `k+1` whenever `m == k` (MinIO's own rule for this edge case — see
+`required_write_acks` in `coordinator.rs`), which for `RS(1,1)` is `2` —
+i.e. *both* nodes. WarpDrive's distributed engine always requires at least
+1 parity shard (`m >= 1`) to compute, so two mirrored nodes is the floor;
+there's no "1-node cluster" mode — a single, unreplicated node is
+single-node mode (below), not a degenerate cluster.
 
 Each node listens on its own port starting at `9710` (`9710`, `9711`, ...).
 Credentials default to `adminkey` / `adminsecretkey123456` for SigV4 auth —

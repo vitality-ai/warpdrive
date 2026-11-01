@@ -4,20 +4,24 @@
 #
 # Usage: ./scripts/run_local_cluster.sh [K] [M]
 #   K = data shards, M = parity shards (RS(K,M), see server/src/main.rs).
-#   Node count = K+M. Default is K=1 M=1: the smallest real cluster —
-#   every object mirrored across both nodes. Reads tolerate one node down;
-#   writes don't (write quorum is k+1 when m==k, i.e. RS(1,1) needs both
-#   nodes up for a PUT/DELETE to succeed -- see required_write_acks in
-#   coordinator.rs). The distributed engine is always erasure-coded (M
-#   must be >= 1) -- for a single node with no redundancy, use single-node
-#   mode (`cd server && cargo run`, the plain `/s3/...` API) instead of
-#   asking this script for a 1-node cluster.
+#   Node count = K+M. Default is K=3 M=2 -- the project's own default
+#   erasure code (ec_params_from_env's fallback when WARPDRIVE_RS_K/M
+#   aren't set), so this script's default matches what you get from just
+#   setting WARPDRIVE_PEERS by hand. Tolerates 2 node failures for both
+#   reads and writes (write quorum is k=3, reachable with only 3 of 5
+#   nodes up). Pass `1 1` for the smaller 2-node mirror instead -- it
+#   tolerates a node down for reads only, not writes (write quorum is
+#   k+1 when m==k, so RS(1,1) needs both nodes up for a PUT/DELETE; see
+#   required_write_acks in coordinator.rs). The distributed engine is
+#   always erasure-coded (M must be >= 1) -- for a single node with no
+#   redundancy, use single-node mode (`cd server && cargo run`, the plain
+#   `/s3/...` API) instead of asking this script for a 1-node cluster.
 #
 # Ctrl-C stops every node.
 set -euo pipefail
 
-K="${1:-1}"
-M="${2:-1}"
+K="${1:-3}"
+M="${2:-2}"
 if [ "$M" -lt 1 ]; then
   echo "M must be >= 1 -- the distributed engine is always erasure-coded." >&2
   echo "For a single node with no redundancy, run single-node mode instead (cd server && cargo run)." >&2
