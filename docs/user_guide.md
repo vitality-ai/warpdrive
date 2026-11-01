@@ -36,7 +36,7 @@ Two things to note when running locally:
 
 ## Demo and Examples
 
-Ready to try CIAOS? Check out our comprehensive demos:
+Ready to try WarpDrive? Check out our comprehensive demos:
 
 ### 🚀 **Quick Start Demo**
 - **Location**: [`demo/`](../demo/)
@@ -49,7 +49,7 @@ Ready to try CIAOS? Check out our comprehensive demos:
 
 ### 🐍 **Python Client Demo**
 - **Location**: [`demo/pythonTestClient.py`](../demo/pythonTestClient.py)
-- **Features**: Native CIAOS API examples
+- **Features**: Native WarpDrive API examples
 
 ### 🔧 **Development Setup**
 For advanced usage and development details, see the [Developer's Documentation](../docs/setup.md).
