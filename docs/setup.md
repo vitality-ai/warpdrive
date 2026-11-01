@@ -48,13 +48,21 @@ cd warpdrive
 That's the whole setup. It builds the release binary, then starts **2 local
 nodes**, each in its own data directory under `server/cluster-local/`, wired
 together as a 2-node cluster with `RS(1,1)` — every object is written as one
-data shard + one parity shard, one per node, so the data is fully mirrored
-and the cluster keeps serving reads and writes if either node goes down.
+data shard + one parity shard, one per node, so the data is fully mirrored.
 Press Ctrl-C to stop both nodes.
+
+**Reads, not writes, survive a node going down here.** GET still works off
+the surviving mirror with either node down. PUT/DELETE don't: WarpDrive's
+write quorum is `k+1` when `m == k` (MinIO's own rule, for exactly this
+small-cluster edge case — see `required_write_acks` in `coordinator.rs`),
+which for `RS(1,1)` is `2` — i.e. *both* nodes. Real write fault-tolerance
+needs a larger code where parity shards outnumber data shards less exactly,
+e.g. `RS(3,2)` below, where losing 2 of 5 nodes still leaves the required
+3 acks reachable.
 
 This is the smallest *redundant* config: WarpDrive's erasure coding requires
 at least 1 parity shard (`m >= 1`) to compute, so two mirrored nodes is the
-floor for anything that's actually fault-tolerant. A real single cluster
+floor for anything that stores a real second copy. A real single cluster
 node is still possible, just without erasure coding — see just below.
 
 To run more nodes with a different code, pass data-shard count and

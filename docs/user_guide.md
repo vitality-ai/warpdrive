@@ -69,9 +69,14 @@ and measured results: [Technical Architecture](Technical-Architecture.md) and
 ### Starting a cluster
 
 Each node is the same binary. The smallest *redundant* cluster is 2 nodes
-under `RS(1,1)` (1 data shard + 1 parity shard per object — full mirroring,
-tolerates 1 node down); the project's own default erasure code is `RS(3,2)`
-(5 nodes, tolerates 2 down). A single node is also supported
+under `RS(1,1)` (1 data shard + 1 parity shard per object — full mirroring).
+**This tolerates 1 node down for reads only** — WarpDrive's write quorum is
+`k+1` whenever `m == k` (`required_write_acks` in `coordinator.rs`, matching
+MinIO's own rule for this edge case), which for `RS(1,1)` means both nodes
+must be up for a PUT or DELETE to succeed. The project's own default erasure
+code, `RS(3,2)` (5 nodes), does tolerate 2 nodes down for both reads *and*
+writes, since its write quorum is `k=3`, reachable with only 3 of 5 nodes
+up. A single node is also supported
 (`WARPDRIVE_RS_K=1 WARPDRIVE_RS_M=0`) — erasure coding needs at least 1
 parity shard to compute anything, so with one node it's skipped entirely
 and objects are written plain, with no redundancy. Every node needs the

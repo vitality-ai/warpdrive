@@ -5,12 +5,14 @@
 # Usage: ./scripts/run_local_cluster.sh [K] [M]
 #   K = data shards, M = parity shards (RS(K,M), see server/src/main.rs).
 #   Node count = K+M. Default is K=1 M=1: the smallest real *redundant*
-#   cluster — every object mirrored across both nodes, tolerates one node
-#   down. Pass `1 0` for a single node with no erasure coding at all (there's
-#   nobody to shard across or compute parity against with just one node, so
-#   it writes the plain object instead of a wasted RS(1,0) — not a
-#   supported config anyway, the underlying RS crate rejects 0 parity
-#   shards).
+#   cluster — every object mirrored across both nodes. Reads tolerate one
+#   node down; writes don't (write quorum is k+1 when m==k, i.e. RS(1,1)
+#   needs both nodes up for a PUT/DELETE to succeed -- see
+#   required_write_acks in coordinator.rs). Pass `1 0` for a single node
+#   with no erasure coding at all (there's nobody to shard across or
+#   compute parity against with just one node, so it writes the plain
+#   object instead of a wasted RS(1,0) — not a supported config anyway,
+#   the underlying RS crate rejects 0 parity shards).
 #
 # Ctrl-C stops every node.
 set -euo pipefail
