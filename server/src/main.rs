@@ -45,6 +45,12 @@ use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClie
 use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
 use warp_drive::cluster::packing::StripePacker;
 
+/// The one configured body-size ceiling, shared between the app-wide
+/// `PayloadConfig` (which only bounds `Bytes`/`Json`-style extractors,
+/// not raw `web::Payload`) and `buffer_payload`'s own checks below, so
+/// the two can't drift into disagreement.
+const MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
 /// RS(k, m) for the cluster layer, `k` = data shards, `m` = parity shards
 /// (`k+m` total). Dev-loop default is `k=3, m=2` (small local cluster, fast
 /// iteration). To match Fusion's own default erasure code for a real
@@ -123,16 +129,38 @@ fn not_ready_error() -> Error {
 /// use) does the same, and growing a `Vec::new()` from zero one chunk at
 /// a time instead measurably cost a few percent of PUT throughput in a
 /// side-by-side benchmark against that route.
+///
+/// Both ends are checked against `MAX_BODY_BYTES`, not just one:
+/// Content-Length is a client-supplied claim, read here before any
+/// authentication, so a declared length alone must never size an
+/// allocation unchecked (a request can otherwise force a huge
+/// `Vec::with_capacity` -- and tie up a worker waiting on bytes that
+/// never arrive -- without ever sending a body). And Content-Length can
+/// be absent, wrong, or simply ignored by a client that keeps streaming
+/// past whatever it claimed, so the running total actually received is
+/// checked on every chunk too, independent of the header.
 async fn buffer_payload(req: &HttpRequest, mut payload: web::Payload) -> Result<web::Bytes, Error> {
-    let hint = req
+    let declared_len = req
         .headers()
         .get(actix_web::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = Vec::with_capacity(hint);
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(len) = declared_len {
+        if len > MAX_BODY_BYTES {
+            return Err(actix_web::error::ErrorPayloadTooLarge(format!(
+                "declared Content-Length {len} exceeds the {MAX_BODY_BYTES}-byte limit"
+            )));
+        }
+    }
+    let mut body = Vec::with_capacity(declared_len.unwrap_or(0).min(MAX_BODY_BYTES));
     while let Some(chunk) = payload.next().await {
-        body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
+        let chunk = chunk.map_err(actix_web::error::ErrorInternalServerError)?;
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(actix_web::error::ErrorPayloadTooLarge(format!(
+                "body exceeds the {MAX_BODY_BYTES}-byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
     Ok(web::Bytes::from(body))
 }
@@ -391,7 +419,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .wrap(actix_web::middleware::Logger::default())
-            .app_data(web::PayloadConfig::default().limit(5 * 1024 * 1024 * 1024))
+            .app_data(web::PayloadConfig::default().limit(MAX_BODY_BYTES))
             .app_data(cluster_state.clone())
             // Cluster API — distributed, erasure-coded PUT/GET/DELETE.
             // Specific/internal routes registered before the generic
