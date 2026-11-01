@@ -409,6 +409,62 @@ pub async fn cluster_s3_delete_object_authenticated(
     cluster_delete_object_inner(&user_id, bucket, key, &state).await
 }
 
+/// DeleteObjects (bulk delete, `POST /{bucket}?delete`), authenticated.
+/// Each key is deleted the same way a single `DELETE` would be
+/// (`cluster_delete_object_inner`, same idempotent-on-a-missing-key
+/// semantics). A request naming a `VersionId` is rejected explicitly per
+/// key rather than silently deleting the current (only) version under a
+/// name that implies something it isn't -- the cluster engine has no
+/// versioning at all (a stated non-goal, same as single-node's own
+/// versioned paths being out of scope here), so there's nothing a
+/// `VersionId` could correctly refer to.
+pub async fn cluster_s3_delete_objects_authenticated(
+    path: web::Path<String>,
+    body: web::Bytes,
+    req: HttpRequest,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let bucket = path.into_inner();
+    let auth_result = authenticate_s3_request(&req).await?;
+    let user_id = auth_result.user_id;
+
+    let body_str = String::from_utf8_lossy(&body);
+    let mut deleted_xml = String::new();
+    let mut errors_xml = String::new();
+
+    let mut remaining: &str = &body_str;
+    while let Some(obj_start) = remaining.find("<Object>") {
+        remaining = &remaining[obj_start + "<Object>".len()..];
+        let obj_end = remaining.find("</Object>").unwrap_or(remaining.len());
+        let obj_body = &remaining[..obj_end];
+        remaining = &remaining[obj_end..];
+
+        let Some(key) = extract_xml_tag(obj_body, "Key") else { continue };
+
+        if let Some(version_id) = extract_xml_tag(obj_body, "VersionId") {
+            errors_xml.push_str(&format!(
+                "    <Error><Key>{}</Key><VersionId>{}</VersionId><Code>NotImplemented</Code>\
+                 <Message>Versioned delete is not supported on the distributed engine</Message></Error>\n",
+                xml_escape(&key), xml_escape(&version_id),
+            ));
+            continue;
+        }
+
+        match cluster_delete_object_inner(&user_id, bucket.clone(), key.clone(), &state).await {
+            Ok(_) => deleted_xml.push_str(&format!("    <Deleted><Key>{}</Key></Deleted>\n", xml_escape(&key))),
+            Err(e) => errors_xml.push_str(&format!(
+                "    <Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>\n",
+                xml_escape(&key), xml_escape(&e.to_string()),
+            )),
+        }
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"{S3_XMLNS}\">\n{deleted_xml}{errors_xml}</DeleteResult>",
+    );
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+}
+
 /// The cluster path never tracked/emitted Last-Modified, which the
 /// `s3::handlers` legacy path does (see common.rs's
 /// `last_modified_now`/`_for_header`). Real S3 SDK clients (minio-go, used
