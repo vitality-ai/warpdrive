@@ -20,6 +20,8 @@ RUN mkdir /data
 
 # Copy project files
 COPY server/ /server/
+COPY scripts/docker_cluster_entrypoint.sh /server/docker_cluster_entrypoint.sh
+RUN chmod +x /server/docker_cluster_entrypoint.sh
 
 RUN cargo build --release
 

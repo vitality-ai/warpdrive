@@ -165,18 +165,28 @@ docker run -p 9710:9710 \
   warpdrive
 ```
 
-**A real local cluster**, via the same `docker-compose.yml`, opt-in behind a
-Compose profile — 5 containers (one process each) under `RS(3,2)`, each
-bind-mounted to its own plain, inspectable directory under
-`/tmp/warpdrive-cluster/` on the host (ephemeral by design, not meant to
-survive a reboot that clears `/tmp`):
+**A local cluster, in one container.** Several `warp_drive` processes
+sharing that one container's network namespace (so they reach each other
+over plain `127.0.0.1`, no multiple containers or Docker DNS needed),
+each with its own data directory under `/data` so a single volume mount
+captures every node's state:
 
 ```bash
-docker compose --profile cluster up
+docker build -t warpdrive .
+docker run -p 9710-9714:9710-9714 -v "$(pwd)/data:/data" warpdrive \
+  /server/docker_cluster_entrypoint.sh
 ```
 
-Verified live: PUT through one container is readable from another, and
-both reads and writes survive 2 of the 5 containers being stopped.
+Defaults to `RS(3,2)` (5 processes, ports 9710-9714) — pass `K M` as
+extra args to the entrypoint for a different code, e.g. `... warpdrive
+/server/docker_cluster_entrypoint.sh 1 1` for a 2-process mirror. Verify
+against `http://localhost:9710/s3` same as single node — any node's port
+works, there's no dedicated coordinator.
+
+This is a local dev/demo convenience, same as `scripts/run_local_cluster.sh`
+on bare metal — not a production deployment story. For running a real
+cluster across multiple machines, see
+[Production Deployment](Production-Deployment.md).
 
 ---
 
