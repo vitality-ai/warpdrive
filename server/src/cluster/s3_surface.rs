@@ -51,6 +51,47 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// Inverse of `xml_escape`, needed anywhere a key/value is read back out
+/// of a request body's XML (e.g. `DeleteObjects`'s `<Key>`) instead of
+/// just being echoed into a response -- `extract_xml_tag` returns the raw
+/// text between tags with no entity decoding, so a key containing `&` (or
+/// `<`/`>`/`"`), correctly escaped by any real XML-writing client, would
+/// otherwise be used literally as e.g. `a&amp;b` instead of the real `a&b`.
+///
+/// Single-pass over the input, not chained `.replace()` calls: unescaping
+/// `&amp;` first can *create* text that looks like another entity (e.g. a
+/// key literally named `a&lt;b` is correctly escaped on the wire as
+/// `a&amp;lt;b` -- unescaping `&amp;`->`&` first turns that into the
+/// intermediate `a&lt;b`, and a later chained `.replace("&lt;", "<")`
+/// then wrongly matches *that*, corrupting the key into `a<b`). Each byte
+/// of input is consumed exactly once here, so a decoded `&` can never be
+/// re-interpreted as the start of another entity.
+const XML_ENTITIES: [(&str, char); 5] =
+    [("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>'), ("&quot;", '"'), ("&apos;", '\'')];
+
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp_pos) = rest.find('&') {
+        out.push_str(&rest[..amp_pos]);
+        let tail = &rest[amp_pos..];
+        match XML_ENTITIES.iter().find_map(|(pat, ch)| tail.strip_prefix(pat).map(|r| (*ch, r))) {
+            Some((ch, r)) => {
+                out.push(ch);
+                rest = r;
+            }
+            // Not a recognized entity -- copy the '&' literally and move
+            // past just that one byte, not the whole unmatched tail.
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Built fresh per call -- cheap (two `Arc::clone`s of state already held
 /// by `ClusterState`), and lets the auth-aware handlers below do metadata
 /// *reads* (existence/etag checks for conditional requests, HEAD) through
@@ -409,6 +450,62 @@ pub async fn cluster_s3_delete_object_authenticated(
     cluster_delete_object_inner(&user_id, bucket, key, &state).await
 }
 
+/// DeleteObjects (bulk delete, `POST /{bucket}?delete`), authenticated.
+/// Each key is deleted the same way a single `DELETE` would be
+/// (`cluster_delete_object_inner`, same idempotent-on-a-missing-key
+/// semantics). A request naming a `VersionId` is rejected explicitly per
+/// key rather than silently deleting the current (only) version under a
+/// name that implies something it isn't -- the cluster engine has no
+/// versioning at all (a stated non-goal, same as single-node's own
+/// versioned paths being out of scope here), so there's nothing a
+/// `VersionId` could correctly refer to.
+pub async fn cluster_s3_delete_objects_authenticated(
+    path: web::Path<String>,
+    body: web::Bytes,
+    req: HttpRequest,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let bucket = path.into_inner();
+    let auth_result = authenticate_s3_request(&req).await?;
+    let user_id = auth_result.user_id;
+
+    let body_str = String::from_utf8_lossy(&body);
+    let mut deleted_xml = String::new();
+    let mut errors_xml = String::new();
+
+    let mut remaining: &str = &body_str;
+    while let Some(obj_start) = remaining.find("<Object>") {
+        remaining = &remaining[obj_start + "<Object>".len()..];
+        let obj_end = remaining.find("</Object>").unwrap_or(remaining.len());
+        let obj_body = &remaining[..obj_end];
+        remaining = &remaining[obj_end..];
+
+        let Some(key) = extract_xml_tag(obj_body, "Key").map(|k| xml_unescape(&k)) else { continue };
+
+        if let Some(version_id) = extract_xml_tag(obj_body, "VersionId").map(|v| xml_unescape(&v)) {
+            errors_xml.push_str(&format!(
+                "    <Error><Key>{}</Key><VersionId>{}</VersionId><Code>NotImplemented</Code>\
+                 <Message>Versioned delete is not supported on the distributed engine</Message></Error>\n",
+                xml_escape(&key), xml_escape(&version_id),
+            ));
+            continue;
+        }
+
+        match cluster_delete_object_inner(&user_id, bucket.clone(), key.clone(), &state).await {
+            Ok(_) => deleted_xml.push_str(&format!("    <Deleted><Key>{}</Key></Deleted>\n", xml_escape(&key))),
+            Err(e) => errors_xml.push_str(&format!(
+                "    <Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>\n",
+                xml_escape(&key), xml_escape(&e.to_string()),
+            )),
+        }
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"{S3_XMLNS}\">\n{deleted_xml}{errors_xml}</DeleteResult>",
+    );
+    Ok(HttpResponse::Ok().content_type("application/xml").body(xml))
+}
+
 /// The cluster path never tracked/emitted Last-Modified, which the
 /// `s3::handlers` legacy path does (see common.rs's
 /// `last_modified_now`/`_for_header`). Real S3 SDK clients (minio-go, used
@@ -530,4 +627,46 @@ pub async fn cluster_s3_multipart_post_authenticated(
     }
 
     Err(ErrorBadRequest("invalid multipart operation"))
+}
+
+#[cfg(test)]
+mod xml_unescape_tests {
+    use super::{xml_escape, xml_unescape};
+
+    #[test]
+    fn round_trips_a_key_containing_a_literal_ampersand() {
+        assert_eq!(xml_unescape("a&amp;b"), "a&b");
+    }
+
+    #[test]
+    fn does_not_double_decode_a_key_literally_named_with_entity_text() {
+        // "a&lt;b" (literal text, 6 chars: a & l t ; b) correctly escaped
+        // is "a&amp;lt;b". A chained-.replace() decoder unescapes &amp;
+        // first, creating an intermediate "a&lt;b" that a later &lt; pass
+        // then wrongly re-decodes into "a<b". This must not happen here.
+        let literal_key = "a&lt;b";
+        let wire_encoded = xml_escape(literal_key);
+        assert_eq!(wire_encoded, "a&amp;lt;b");
+        assert_eq!(xml_unescape(&wire_encoded), literal_key);
+    }
+
+    #[test]
+    fn round_trips_all_five_entities_together() {
+        let literal = "<tag> \"quoted\" & 'apos' </tag>";
+        let encoded = xml_escape(literal);
+        // xml_escape here doesn't handle &apos; (it only escapes &,<,>,"),
+        // so only decode what it actually produced.
+        assert_eq!(xml_unescape(&encoded), literal);
+    }
+
+    #[test]
+    fn leaves_an_unrecognized_ampersand_sequence_alone() {
+        assert_eq!(xml_unescape("a&weird;b"), "a&weird;b");
+    }
+
+    #[test]
+    fn handles_doubly_escaped_ampersand() {
+        // Literal text "&amp;" (5 chars), escaped once, is "&amp;amp;".
+        assert_eq!(xml_unescape("&amp;amp;"), "&amp;");
+    }
 }

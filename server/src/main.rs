@@ -1,6 +1,8 @@
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
+use futures::StreamExt;
 use log::info;
 use log4rs;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use warp_drive::api::{put, get, append, delete, update_key, update};
@@ -28,12 +30,13 @@ use warp_drive::cluster::coordinator::{
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
 use warp_drive::cluster::s3_surface::{
-    cluster_s3_delete_object_authenticated, cluster_s3_get_object_authenticated,
+    cluster_s3_delete_object_authenticated, cluster_s3_delete_objects_authenticated,
+    cluster_s3_get_object_authenticated,
     cluster_s3_head_object, cluster_s3_head_object_authenticated,
     cluster_s3_list_objects, cluster_s3_multipart_post_authenticated, cluster_s3_put_object_authenticated,
 };
-use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::grpc_peer_client::{make_server as make_grpc_shard_server, GrpcPeerClient, GRPC_PORT_OFFSET};
+use warp_drive::cluster::ec::{ErasureCoder, ReedSolomonCoder};
 use warp_drive::cluster::location_store::BitcaskLocationStore;
 use warp_drive::cluster::membership::Membership;
 use warp_drive::cluster::peer_client::{HttpPeerClient, PeerClient};
@@ -41,6 +44,12 @@ use warp_drive::cluster::placement::ComputedPlacement;
 use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
 use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
 use warp_drive::cluster::packing::StripePacker;
+
+/// The one configured body-size ceiling, shared between the app-wide
+/// `PayloadConfig` (which only bounds `Bytes`/`Json`-style extractors,
+/// not raw `web::Payload`) and `buffer_payload`'s own checks below, so
+/// the two can't drift into disagreement.
+const MAX_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
 /// RS(k, m) for the cluster layer, `k` = data shards, `m` = parity shards
 /// (`k+m` total). Dev-loop default is `k=3, m=2` (small local cluster, fast
@@ -53,6 +62,11 @@ use warp_drive::cluster::packing::StripePacker;
 /// their "9" as our `k` is the wrong translation — caught after an initial
 /// run used k=9,m=6 (15 total nodes) by mistake. Per-bucket selection is
 /// deferred (see docs/Distributed-Engine-Plan.md).
+///
+/// `m` must be `>= 1` -- the cluster engine is always erasure-coded. A
+/// single, unreplicated node isn't a cluster config at all; use
+/// single-node mode (`/s3/...`, SQLite metadata, no EC) for that instead
+/// of asking the distributed engine to run with zero redundancy.
 fn ec_params_from_env() -> (usize, usize) {
     let k = std::env::var("WARPDRIVE_RS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let m = std::env::var("WARPDRIVE_RS_M").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
@@ -72,6 +86,207 @@ fn peer_client_from_env() -> Arc<dyn PeerClient> {
         Ok("tcp") => Arc::new(TcpPeerClient::new()),
         _ => Arc::new(GrpcPeerClient::new()),
     }
+}
+
+/// Which engine should answer `/s3/...` (and root `/{bucket}/...`) for
+/// this request. Three states, not two: a node can be configured for a
+/// cluster (`WARPDRIVE_PEERS` or `WARPDRIVE_JOIN_VIA` given at startup --
+/// `ClusterState::configured_for_cluster`) and still have no peers yet,
+/// either because a dynamic join (`WARPDRIVE_JOIN_VIA`/`WARPDRIVE_SELF_ADDR`)
+/// hasn't completed, or because it failed outright and never will.
+/// Silently falling back to single-node storage in that window would let
+/// a client write successfully, then lose that write the moment the join
+/// does complete and routing switches to the cluster -- so a
+/// configured-but-not-ready node must reject the request instead, not
+/// quietly serve it from the wrong engine.
+enum Engine {
+    SingleNode,
+    Distributed,
+    NotReady,
+}
+
+fn pick_engine(state: &ClusterState) -> Engine {
+    if !state.membership.peers().is_empty() {
+        Engine::Distributed
+    } else if state.configured_for_cluster {
+        Engine::NotReady
+    } else {
+        Engine::SingleNode
+    }
+}
+
+fn not_ready_error() -> Error {
+    actix_web::error::ErrorServiceUnavailable(
+        "this node is configured for the distributed cluster but hasn't finished joining yet \
+         (or the join failed) -- refusing to silently serve this request from single-node storage",
+    )
+}
+
+/// Buffers a streamed body into `web::Bytes`, the shape the cluster
+/// handlers need (erasure coding has to see the whole object anyway).
+/// Pre-sized from Content-Length when the client sends one -- actix's own
+/// `web::Bytes` extractor (what the unchanged `/cluster/s3/...` routes
+/// use) does the same, and growing a `Vec::new()` from zero one chunk at
+/// a time instead measurably cost a few percent of PUT throughput in a
+/// side-by-side benchmark against that route.
+///
+/// Both ends are checked against `MAX_BODY_BYTES`, not just one:
+/// Content-Length is a client-supplied claim, read here before any
+/// authentication, so a declared length alone must never size an
+/// allocation unchecked (a request can otherwise force a huge
+/// `Vec::with_capacity` -- and tie up a worker waiting on bytes that
+/// never arrive -- without ever sending a body). And Content-Length can
+/// be absent, wrong, or simply ignored by a client that keeps streaming
+/// past whatever it claimed, so the running total actually received is
+/// checked on every chunk too, independent of the header.
+async fn buffer_payload(req: &HttpRequest, mut payload: web::Payload) -> Result<web::Bytes, Error> {
+    let declared_len = req
+        .headers()
+        .get(actix_web::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(len) = declared_len {
+        if len > MAX_BODY_BYTES {
+            return Err(actix_web::error::ErrorPayloadTooLarge(format!(
+                "declared Content-Length {len} exceeds the {MAX_BODY_BYTES}-byte limit"
+            )));
+        }
+    }
+    let mut body = Vec::with_capacity(declared_len.unwrap_or(0).min(MAX_BODY_BYTES));
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(actix_web::error::ErrorInternalServerError)?;
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(actix_web::error::ErrorPayloadTooLarge(format!(
+                "body exceeds the {MAX_BODY_BYTES}-byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(web::Bytes::from(body))
+}
+
+/// PutObject dispatch: single-node streams the body (`web::Payload`) to
+/// avoid holding a large object fully in memory; the cluster path needs
+/// the whole object in memory anyway to erasure-code it, so in
+/// distributed mode this buffers the stream once up front instead of
+/// duplicating single-node's own streaming write path for no benefit.
+async fn s3_put_object_dispatch(
+    path: web::Path<(String, String)>,
+    payload: web::Payload,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    match pick_engine(&cluster_state) {
+        Engine::Distributed => {
+            let body = buffer_payload(&req, payload).await?;
+            cluster_s3_put_object_authenticated(path, body, req, cluster_state).await
+        }
+        Engine::NotReady => Err(not_ready_error()),
+        Engine::SingleNode => s3_put_object_handler(path, payload, req).await,
+    }
+}
+
+async fn s3_get_object_dispatch(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    match pick_engine(&cluster_state) {
+        Engine::Distributed => cluster_s3_get_object_authenticated(path, req, cluster_state).await,
+        Engine::NotReady => Err(not_ready_error()),
+        Engine::SingleNode => s3_get_object_handler(path, req).await,
+    }
+}
+
+async fn s3_delete_object_dispatch(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    match pick_engine(&cluster_state) {
+        Engine::Distributed => cluster_s3_delete_object_authenticated(path, req, cluster_state).await,
+        Engine::NotReady => Err(not_ready_error()),
+        Engine::SingleNode => s3_delete_object_handler(path, req).await,
+    }
+}
+
+async fn s3_head_object_dispatch(
+    path: web::Path<(String, String)>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    match pick_engine(&cluster_state) {
+        Engine::Distributed => cluster_s3_head_object_authenticated(path, req, cluster_state).await,
+        Engine::NotReady => Err(not_ready_error()),
+        Engine::SingleNode => s3_head_object_handler(path, req).await,
+    }
+}
+
+/// ListObjectsV2 dispatch (bucket-level GET). Bucket lifecycle itself
+/// (create/delete/head-bucket) stays single-node-only in both modes --
+/// the cluster engine has no bucket registry to hang that on (a
+/// deliberate, already-documented scope limit, not new here), so there's
+/// no cluster equivalent to dispatch to. Bucket-level POST is handled
+/// separately below (`s3_post_bucket_dispatch`): its `?delete` branch is
+/// an object-data-plane operation in disguise and does have a cluster
+/// equivalent, unlike the rest of bucket lifecycle.
+async fn s3_list_objects_dispatch(
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    match pick_engine(&cluster_state) {
+        Engine::Distributed => cluster_s3_list_objects(path, query, req, cluster_state).await,
+        Engine::NotReady => Err(not_ready_error()),
+        Engine::SingleNode => s3_list_objects_handler(path, query, req).await,
+    }
+}
+
+async fn s3_multipart_dispatch(
+    path: web::Path<(String, String)>,
+    query: web::Query<HashMap<String, String>>,
+    payload: web::Payload,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    match pick_engine(&cluster_state) {
+        Engine::Distributed => {
+            let body = buffer_payload(&req, payload).await?;
+            cluster_s3_multipart_post_authenticated(path, body, req, cluster_state).await
+        }
+        Engine::NotReady => Err(not_ready_error()),
+        Engine::SingleNode => s3_multipart_router(path, query, payload, req).await,
+    }
+}
+
+/// Bucket-level POST dispatch. Two very different operations share this
+/// one verb: `?delete` (DeleteObjects, bulk delete -- object-data-plane,
+/// dispatched the same way as every other object operation above) and
+/// plain POST (RFC 2.14 HTML form upload, which has no cluster
+/// equivalent and never claimed one -- stays single-node-only in both
+/// modes, same as bucket lifecycle).
+async fn s3_post_bucket_dispatch(
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+    payload: web::Payload,
+    req: HttpRequest,
+    cluster_state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    if query.contains_key("delete") {
+        match pick_engine(&cluster_state) {
+            Engine::Distributed => {
+                let body = buffer_payload(&req, payload).await?;
+                return cluster_s3_delete_objects_authenticated(path, body, req, cluster_state).await;
+            }
+            Engine::NotReady => return Err(not_ready_error()),
+            Engine::SingleNode => {}
+        }
+    }
+    // Plain POST (form upload) has no cluster equivalent and is never
+    // gated on cluster readiness -- it was never going to touch cluster
+    // storage either way.
+    s3_post_bucket_handler(path, query, payload, req).await
 }
 
 fn build_cluster_state() -> web::Data<ClusterState> {
@@ -130,6 +345,8 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
             m
         },
+        configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
+            || std::env::var("WARPDRIVE_JOIN_VIA").is_ok(),
     };
     web::Data::new(state)
 }
@@ -139,7 +356,16 @@ async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
-    info!("Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/...)");
+    // Informational only -- the real per-request decision (`distributed_mode`,
+    // below) is made from live membership, not this startup snapshot. A
+    // join-only node (WARPDRIVE_JOIN_VIA set, no WARPDRIVE_PEERS) starts
+    // with an empty peer list and only becomes a cluster member once its
+    // spawned join task (below) actually completes.
+    let configured_for_cluster = std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
+        || std::env::var("WARPDRIVE_JOIN_VIA").is_ok();
+    info!(
+        "Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/... and /, configured for cluster: {configured_for_cluster})"
+    );
 
     let _deletion_worker_handle = start_deletion_worker();
     info!("Deletion worker started in background");
@@ -193,7 +419,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .wrap(actix_web::middleware::Logger::default())
-            .app_data(web::PayloadConfig::default().limit(5 * 1024 * 1024 * 1024))
+            .app_data(web::PayloadConfig::default().limit(MAX_BODY_BYTES))
             .app_data(cluster_state.clone())
             // Cluster API — distributed, erasure-coded PUT/GET/DELETE.
             // Specific/internal routes registered before the generic
@@ -239,13 +465,13 @@ async fn main() -> std::io::Result<()> {
             .route("/s3/{bucket}",      web::put().to(s3_create_bucket_handler))
             .route("/s3/{bucket}",      web::delete().to(s3_delete_bucket_handler))
             .route("/s3/{bucket}",      web::head().to(s3_head_bucket_handler))
-            .route("/s3/{bucket}",      web::get().to(s3_list_objects_handler))
-            .route("/s3/{bucket}",      web::post().to(s3_post_bucket_handler))
-            .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
-            .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
+            .route("/s3/{bucket}",      web::get().to(s3_list_objects_dispatch))
+            .route("/s3/{bucket}",      web::post().to(s3_post_bucket_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::put().to(s3_put_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::get().to(s3_get_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::delete().to(s3_delete_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::head().to(s3_head_object_dispatch))
+            .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_dispatch))
             .route("/s3/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/s3/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             // Original native API (registered before root S3 routes to take priority on conflicts)
@@ -260,19 +486,19 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}",          web::put().to(s3_create_bucket_handler))
             .route("/{bucket}",          web::delete().to(s3_delete_bucket_handler))
             .route("/{bucket}",          web::head().to(s3_head_bucket_handler))
-            .route("/{bucket}",          web::get().to(s3_list_objects_handler))
-            .route("/{bucket}",          web::post().to(s3_post_bucket_handler))
+            .route("/{bucket}",          web::get().to(s3_list_objects_dispatch))
+            .route("/{bucket}",          web::post().to(s3_post_bucket_dispatch))
             // Trailing-slash bucket routes — aws-sdk-rust sends GET /bucket/?list-type=2
             .route("/{bucket}/",         web::put().to(s3_create_bucket_handler))
             .route("/{bucket}/",         web::delete().to(s3_delete_bucket_handler))
             .route("/{bucket}/",         web::head().to(s3_head_bucket_handler))
-            .route("/{bucket}/",         web::get().to(s3_list_objects_handler))
-            .route("/{bucket}/",         web::post().to(s3_post_bucket_handler))
-            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_handler))
-            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_handler))
-            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_handler))
-            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_handler))
-            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_router))
+            .route("/{bucket}/",         web::get().to(s3_list_objects_dispatch))
+            .route("/{bucket}/",         web::post().to(s3_post_bucket_dispatch))
+            .route("/{bucket}/{key:.*}", web::put().to(s3_put_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::get().to(s3_get_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::delete().to(s3_delete_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::head().to(s3_head_object_dispatch))
+            .route("/{bucket}/{key:.*}", web::post().to(s3_multipart_dispatch))
             .route("/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))

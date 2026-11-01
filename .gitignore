@@ -167,6 +167,7 @@ server/metadata
 # Test data files
 server/*.json
 server/logs/
+server/cluster-local/
 
 
 #tla

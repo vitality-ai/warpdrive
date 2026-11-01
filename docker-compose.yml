@@ -1,11 +1,23 @@
-version: '3.8'
+# Single-node only -- matches the apt package's own default, for the same
+# reason: a lone instance has no peers to cluster with, so this isn't a
+# "pick a mode" decision the way the local script is. For a local
+# multi-node cluster in Docker, see scripts/docker_cluster_entrypoint.sh
+# (one container, several warp_drive processes) via docs/setup.md. For a
+# real production cluster, see docs/Production-Deployment.md -- Docker
+# Compose isn't the right tool for that; it has no notion of several
+# hosts.
 services:
-  ciaos-app:
-    image: ghcr.io/cia-labs/ciaos:${BUILD_HASH}
+  warpdrive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      WARPDRIVE_ADMIN_ACCESS_KEY: adminkey
+      WARPDRIVE_ADMIN_SECRET_KEY: adminsecretkey123456
     ports:
-      - 9710:9710
+      - "9710:9710"
     volumes:
-      - ciaosdata:/data
+      - warpdrive-data:/data
 
 volumes:
-  ciaosdata:
+  warpdrive-data:

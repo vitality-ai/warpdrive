@@ -59,6 +59,16 @@ pub struct ClusterState {
     /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
     /// the codec name a unit was tagged with at PUT time.
     pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
+    /// Set once at startup from whether this node was told to be a
+    /// cluster member at all (`WARPDRIVE_PEERS` or `WARPDRIVE_JOIN_VIA`
+    /// given), independent of whether `membership` has any peers *yet*.
+    /// `main.rs`'s request dispatch uses this alongside live membership to
+    /// tell "never configured for a cluster" (serve single-node, as
+    /// always) apart from "configured for a cluster but not joined yet,
+    /// or the join failed" (reject -- must not silently fall back to
+    /// single-node storage, which a client could write to and then lose
+    /// once the join completes and routing switches to the cluster).
+    pub configured_for_cluster: bool,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
     // both the part bytes and the upload "header" (status, content-type,
     // user-metadata) are ordinary objects through the existing
@@ -1035,9 +1045,12 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // No checksum header here: it covers the *whole* object, so
+                // a client that validates whatever checksum header it's
+                // given (boto3/botocore do, unconditionally, with no
+                // Range-awareness -- confirmed by reading httpchecksum.py)
+                // would reject this partial body against it. Real S3 never
+                // sends one on a Range GET either, for the same reason.
                 if has_sparse_gaps {
                     resp.insert_header(("X-Warpd-Sparse-Coverage", "true"));
                 }
@@ -1133,9 +1146,9 @@ pub(crate) async fn cluster_get_object_inner(
                 for (k, v) in &user_metadata {
                     resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
                 }
-                if let Some((name, value)) = &checksum_header {
-                    resp.insert_header((name.as_str(), value.as_str()));
-                }
+                // No checksum header: see the matching comment on the
+                // content-dependent Range branch above -- it covers the
+                // whole object, not this slice.
                 return Ok(resp.body(slice.to_vec()));
             }
         }
@@ -1217,9 +1230,9 @@ pub(crate) async fn cluster_get_object_inner(
             for (k, v) in &user_metadata {
                 resp.insert_header((format!("x-amz-meta-{k}"), metadata_value_header(v)));
             }
-            if let Some((name, value)) = &checksum_header {
-                resp.insert_header((name.as_str(), value.as_str()));
-            }
+            // No checksum header: see the matching comment on the
+            // content-dependent Range branch above -- it covers the whole
+            // object, not this slice.
             Ok(resp.body(slice))
         }
         RangeResult::Unsatisfiable => Err(
