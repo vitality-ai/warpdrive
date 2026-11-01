@@ -56,24 +56,65 @@ For advanced usage and development details, see the [Developer's Documentation](
 
 ---
 
-## Distributed Mode (v1.0.0-beta)
+## Distributed Mode (default)
 
-Everything above is single-node mode. WarpDrive can also run as a multi-node, erasure-coded cluster. Full architecture, diagrams, and measured results: [Technical Architecture](Technical-Architecture.md) and [v1.0.0 Results](benchmarks/v1.0.0-results.md).
+Everything above is single-node mode, which still exists but is no longer the
+recommended way to run WarpDrive — see
+[`docs/setup.md`](setup.md#3-run-a-cluster) to get a local cluster running in
+one command. This section covers the distributed engine itself: a multi-node,
+erasure-coded cluster, S3-compatible end to end. Full architecture, diagrams,
+and measured results: [Technical Architecture](Technical-Architecture.md) and
+[v1.0.0 Results](benchmarks/v1.0.0-results.md).
 
 ### Starting a cluster
 
-Each node is the same binary, started with a peer list:
+Each node is the same binary. The smallest real cluster is 2 nodes under
+`RS(1,1)` (1 data shard + 1 parity shard per object — full mirroring,
+tolerates 1 node down); the project's own default erasure code is `RS(3,2)`
+(5 nodes, tolerates 2 down). Every node needs the *same* peer list, including
+itself:
 
 ```bash
 WARPDRIVE_PEERS=http://node1:9710,http://node2:9710,http://node3:9710,http://node4:9710,http://node5:9710 \
+WARPDRIVE_RS_K=3 WARPDRIVE_RS_M=2 \
+WARPDRIVE_ADMIN_ACCESS_KEY=adminkey WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   ./warp_drive
 ```
 
-A node can also join a running cluster later instead of being listed up front:
+`WARPDRIVE_RS_K`/`WARPDRIVE_RS_M` default to `3`/`2` if unset. Locally, use
+[`scripts/run_local_cluster.sh`](../scripts/run_local_cluster.sh) instead of
+wiring this up by hand (see `setup.md`).
+
+A node can also join a running cluster later instead of being listed up
+front — either by having an existing node announce it:
 
 ```bash
 curl -X POST http://node1:9710/cluster/join -d '{"peer": "http://node6:9710"}' -H "Content-Type: application/json"
 ```
+
+or by having the new node join itself at startup, which is the usual way to
+add a node on a separate host: set `WARPDRIVE_JOIN_VIA` (any existing
+cluster member's address) and `WARPDRIVE_SELF_ADDR` (this node's own address,
+as other nodes should reach it — can't be inferred from a `0.0.0.0` bind)
+together:
+
+```bash
+WARPDRIVE_JOIN_VIA=http://node1:9710 \
+WARPDRIVE_SELF_ADDR=http://node6:9710 \
+  ./warp_drive
+```
+
+### Node address and port configuration
+
+- `WARPDRIVE_PORT` — this node's listen port (default `9710`). The gRPC and
+  raw-TCP shard transports run alongside it on `port+1000` and `port+2000`.
+- `WARPDRIVE_SELF_ADDR` — the URL other nodes use to reach this one. Required
+  alongside `WARPDRIVE_JOIN_VIA` for self-join at startup; set it to whatever
+  address is actually reachable from the rest of the cluster (a LAN IP, a
+  hostname, etc.) — it is never inferred from the bind address.
+- `WARPDRIVE_PEERS` — the seed peer list (self included), comma-separated.
+- `WARPDRIVE_PEER_TRANSPORT` — `grpc` (default), `http`, or `tcp`, for the
+  peer-to-peer shard transport.
 
 ### Basic PUT/GET/DELETE
 
@@ -107,9 +148,33 @@ curl -X PUT http://localhost:9710/cluster/mybucket/data.parquet \
 
 Each entry is `[offset, length, length, codec]` in the original object's byte layout. If the resulting packed overhead exceeds `overhead_threshold_pct`, WarpDrive falls back to plain whole-object storage automatically rather than risk availability for a bad packing decision.
 
-### S3-shaped access for third-party tools (Lance, etc.)
+### Authenticated S3 access (recommended for S3 clients and third-party tools)
 
-Tools that need real S3 bucket/list semantics (not just range-GET, e.g. Lance's `object_store::aws` client) can point at `/cluster/s3/{bucket}/{key}` instead, which supports GET/PUT/HEAD/List on top of the same cluster engine. This is a deliberately minimal surface, not the same compatibility level as the single-node `/s3/` API above: no SigV4 signature verification (any `Authorization` header is accepted unchecked), no multipart upload, no LIST pagination, and `ETag`/`LastModified` are fixed placeholder values. Scoped to exactly what `object_store::aws` needs to open and read a dataset.
+`/cluster/s3/{bucket}/{key}` is the recommended way to talk to the cluster
+from a standard S3 client (boto3, aws-cli, Lance's `object_store::aws`,
+pyiceberg, Spark, etc.) — unlike the bare `/cluster/{bucket}/{key}` routes
+above, it requires real SigV4 authentication (the same verification
+single-node's `/s3/` API uses) and supports GET/PUT/HEAD/DELETE/LIST and
+full multipart upload on top of the same erasure-coded cluster engine, with
+real `ETag`/`Last-Modified`/user-metadata round-tripped from the stored
+object. The bare `/cluster/{bucket}/{key}` routes stay unauthenticated, for
+quick local testing (`curl`) without signing requests.
+
+```python
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9710/cluster/s3',
+    aws_access_key_id='adminkey',
+    aws_secret_access_key='adminsecretkey123456',
+    region_name='us-east-1',
+    config=boto3.session.Config(s3={'addressing_style': 'path'}),
+)
+```
+
+Not yet supported on this surface: bucket-level CORS/ACL and object
+versioning (no cluster bucket registry exists for the former; versioning
+is a stated non-goal) — object tagging and retention/legal-hold work the
+same as single-node.
 
 ### Read more
 
