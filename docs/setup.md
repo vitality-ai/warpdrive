@@ -153,9 +153,27 @@ registry (the cluster engine doesn't, by design — see the User Guide).
 
 ## Docker (Optional)
 
-**Single node** (`docker build`/`docker run` directly, or `docker compose up`
-— both give you the same single-node default, consistent with the apt
-package's own default: a lone instance has no peers to cluster with):
+**Pull a pre-built image** instead of building from source — rebuilt and
+pushed on every merge to `main`:
+
+```bash
+docker pull ghcr.io/vitality-ai/warpdrive:latest
+# or, same image:
+docker pull <dockerhub-username>/warpdrive:latest
+
+docker run -p 9710:9710 \
+  -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+  -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  ghcr.io/vitality-ai/warpdrive:latest
+```
+
+A specific commit's image is also kept, tagged by its SHA (`:<commit-sha>`),
+not just `:latest` — useful for pinning a deployment to a known build.
+
+**Or build from source** (`docker build`/`docker run` directly, or `docker
+compose up` — both give you the same single-node default, consistent with
+the apt package's own default: a lone instance has no peers to cluster
+with):
 
 ```bash
 docker build -t warpdrive .
