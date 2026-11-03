@@ -66,33 +66,8 @@ jobs:
         context: .
         file: ./Dockerfile
         push: true
-        tags: |
-          ghcr.io/${{ github.repository_owner }}/warpdrive:latest
-          ghcr.io/${{ github.repository_owner }}/warpdrive:${{ github.sha }}
-
-    # Skipped entirely (not a failure) until DOCKERHUB_USERNAME/DOCKERHUB_TOKEN
-    # are added as repo secrets (Settings -> Secrets and variables ->
-    # Actions): a Docker Hub account + repo named "warpdrive", and an
-    # access token with Read & Write scope from Account Settings ->
-    # Security -> Access Tokens.
-    - name: Log in to Docker Hub
-      if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
-      uses: docker/login-action@v1
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-    - name: Build and Push Docker Image to Docker Hub
-      if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile
-        push: true
-        tags: |
-          docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive:latest
-          docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive:${{ github.sha }}
-
+        tags: ghcr.io/${{ github.repository_owner }}/ciaos:${{ github.sha }}
+ 
     - name: POST request to re-deploy on portainer webhook
       run: |
         curl -X POST https://docker.cialabs.org/api/stacks/webhooks/4e3fb43a-54dc-459a-be5a-36988796405e?BUILD_HASH=${{ github.sha }} -H "Content-Type: application/json" 
