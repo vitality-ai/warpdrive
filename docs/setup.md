@@ -159,7 +159,7 @@ pushed on every merge to `main`:
 ```bash
 docker pull ghcr.io/vitality-ai/warpdrive:latest
 # or, same image:
-docker pull <dockerhub-username>/warpdrive:latest
+docker pull tejascj/warpdrive:latest
 
 docker run -p 9710:9710 \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
