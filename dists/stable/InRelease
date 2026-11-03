@@ -4,7 +4,7 @@ Hash: SHA512
 Origin: Vitality AI
 Label: Warpdrive
 Codename: stable
-Date: Tue, 03 Nov 2026 19:15:23 UTC
+Date: Tue, 03 Nov 2026 19:37:29 UTC
 Architectures: amd64
 Components: main
 Description: Warpdrive S3-compatible object storage
@@ -22,17 +22,17 @@ SHA256:
  909e609b6e4e1c5967de217c6b02b8e3d8b019d42569891d5945992d19600fa3 125 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEElhZS/fgQiDCzK9/jdpdMKgmnN7AFAmrqMssACgkQdpdMKgmn
-N7BhXxAAqXw6QNvuM2+1BrB7Z0g3BScCpcSxJGZEGb+LtdzZWCaj8kt3YKFh4oPh
-+vAiphO6JMNSWRNKjdAOXu2eZybf1/Rh7IhOeMGHvKvlyoeQ/hExksLGR4ITepDQ
-Bd/ziYJ3vw++2SaCYj46+K8ByFVKiu2njpJ+0fxvE9EstzJr0jr5RPtDdknvP7Nd
-n05IRRsA6isghi5h9LRq9DW8oU1X64ssqrGBDfmtTlD0SQGdTwfI/aUMnQTioRPI
-nqi07QzmjBxdyTozKvqQAGktwK3QMihbyu5PcP0vjQELh92/bnrPXuKvjD0GKLkY
-qFt6zVymo8KIgXcNtmLpre9La3cv35J7jlkxpkc2noZhuuSWmu/zWEnA4ZNSuucS
-ZNOswo/7Tfz9TWIxnPYmqjv2AZ57qtdooeMKKAa25Aja2qiZMRNHezhNZ+scN8G3
-0Nq6Cec4d02XigFK/wkv6AxDHW1CE7NxEkEMHjZcSB52Bo4tGoollDoe74iqobMq
-ZFFURxgvDkAdgtLXjBilMtmXs3sDy6wmZEpm5Kn/BigHoBqK+69UQu/3p+ISgFqf
-czVTJ4/b0HQeswInwtiluXsBDcEb6/7YN9tx0LmV+hB0hl+yUSVxMkA3JlyfmoNQ
-STlaitebvIK+EfHLGZPoMT8UvNLfNHCuCjkGfiBn9o/K5RwqphQ=
-=ptBY
+iQIzBAEBCgAdFiEElhZS/fgQiDCzK9/jdpdMKgmnN7AFAmrqN/kACgkQdpdMKgmn
+N7Bzzg//QBIzWH98cY/JFhyom5tDPjjLt0AppJUztIHY18ep3JaN/HJu6zuQAICQ
+b4PcQeREqEghOLeagk8dqEpUqYf79fHAa6NSW0SAHxFw5YhKqVybwoAhaDHIdpui
+EgpsEi0BAhaRbXsDhQNg+c6h4GU43rGKlZdlYSMrEerXwb+qjIcQVFGJIqwaCOyQ
+6cPXmDZBsvvXazluHHXojhhjhr+bDsSDEP2DeRkUeWTluXzaXkFcvhCRSE5fNSdk
+wpvh0NqpBy+tRNglDi9iZ4zo/RTV2Rn76iNhDjC5owC3SQPp/89xRjn4vLXqAyzo
+3hukVh4jQMQR96PhGjMbKPNHBdDLC9Sqn9X07ZqmWFDug4HSkfROh7DANQLCiVPj
+cCuDeHx33nJ+ecAKKb4b82NWDS0IctJrhLRKY0M38rtpjYwYc+CK444hNrVImaLV
+IU3pzG8SKk5lc0q2XnN7tibOlXvZrLorLuhMGdHOd/Lnorsk9CU3YFKaGeLgWohc
+FbM+wCMd/cMKKC01jI4HeX9bJ/XfY+pGNrXZpdwH5rn+XeeQuBNp45kUIvrs1E5v
+0bqwkY3FRQNuAJdJN3Pkg/3Kh86/Za+UMzXdOt8Cc2O8BgU9d+mtD7gOUESuMMHl
+piLz383W7oRH/nXiO/VsyNFvf4Kk/TmgGbpJRqX7taQ4PEPI3s8=
+=Th9n
 -----END PGP SIGNATURE-----
