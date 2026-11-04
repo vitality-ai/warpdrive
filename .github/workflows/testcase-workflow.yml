@@ -40,6 +40,90 @@ jobs:
       run: |
         pytest ciaos/test.py
 
+  # S3 compatibility test suite (the Ceph project's s3-tests, forked into
+  # vitality-ai/s3-tests) against the real S3 API -- single-node's
+  # root-form routes (main.rs registers `/{bucket}/{key:.*}` specifically
+  # for "standard boto3 / Ceph s3-tests", since the suite's own config has
+  # no notion of a URL path prefix like `/s3` or `/cluster/s3`). Forked
+  # rather than depending on upstream directly: ceph/s3-tests is itself
+  # frozen ("moved into ceph/ceph, no longer maintained here" -- its own
+  # README), so this fork is a stable, permanent copy, not a live
+  # dependency on an abandoned repo staying reachable. Pinned to a fixed
+  # commit on top of that for CI determinism.
+  #
+  # Gated on a regression against a recorded baseline, not 100% pass --
+  # see docs/TEST-COVERAGE.md for why a large, known chunk of this suite
+  # is expected to keep failing (SSE, bucket policy, bucket logging,
+  # lifecycle, deprecated SigV2, bucket ownership controls -- none
+  # implemented, all deliberate).
+  s3-compatibility-tests:
+    name: S3 compatibility test suite
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build server
+      working-directory: server
+      run: cargo build
+
+    - name: Start WarpDrive
+      working-directory: server
+      run: |
+        WARPDRIVE_ADMIN_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE \
+        WARPDRIVE_ADMIN_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
+        WARPDRIVE_ADMIN_DISPLAY_NAME="Warpdrive Admin" \
+        nohup ./target/debug/warp_drive > server.log 2>&1 &
+        for i in $(seq 1 30); do
+          curl -sf http://localhost:9710/ -o /dev/null && exit 0
+          sleep 1
+        done
+        echo "server did not come up in time"; cat server.log; exit 1
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Clone S3 compatibility test suite (pinned)
+      run: |
+        git clone https://github.com/vitality-ai/s3-tests.git s3-tests
+        cd s3-tests
+        git checkout 5b3987116eca0b4b8fa57d6b10f3db57bab196b6
+
+    - name: Install s3-tests
+      working-directory: s3-tests
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+
+    - name: Run suite
+      working-directory: s3-tests
+      # Not gated on pytest's own exit code -- a large, known-expected
+      # chunk of this suite fails (see the job-level comment above), so
+      # pytest always exits non-zero. `check_ceph_baseline.py`, next
+      # step, is the real gate (regression against a recorded baseline).
+      run: |
+        cp ../.github/ci/s3tests.conf .
+        S3TEST_CONF=s3tests.conf python -m pytest \
+          s3tests/functional/test_s3.py s3tests/functional/test_headers.py \
+          -q --junitxml=results.xml || true
+
+    - name: Check against known baseline
+      if: always()
+      working-directory: s3-tests
+      run: python3 ../.github/ci/check_s3_compat_baseline.py results.xml
+
+    - name: Upload full results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: s3-compatibility-test-results
+        path: s3-tests/results.xml
+
   # Rust server tests
   server-tests:
     name: Server tests
