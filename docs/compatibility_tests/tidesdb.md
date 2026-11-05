@@ -1,6 +1,6 @@
 # Using TidesDB with Warpdrive
 
-> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for TidesDB — no cloud account or external service required.
+> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance in single-node mode. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for TidesDB — no cloud account or external service required. The same `/s3/...` surface single-node serves is also what the distributed cluster engine serves, so this should work unchanged against a cluster — not yet re-verified there. We'll update this doc with distributed results once that run is done.
 
 TidesDB is an embedded LSM-tree key-value storage engine with an **object store mode** that uploads its internal files (SSTables, WAL, manifests) to an S3-compatible backend. Warpdrive works as that backend out of the box.
 

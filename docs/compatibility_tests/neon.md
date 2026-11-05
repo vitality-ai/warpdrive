@@ -1,6 +1,6 @@
 # Using Neon with Warpdrive
 
-> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for a locally running Neon cluster — no cloud account or external service required.
+> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance in single-node mode. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for a locally running Neon cluster — no cloud account or external service required. The same `/s3/...` surface single-node serves is also what the distributed cluster engine serves, so this should work unchanged against a cluster — not yet re-verified there. We'll update this doc with distributed results once that run is done.
 
 Neon is an open-source serverless Postgres platform that separates storage from compute. It stores all durable state — WAL segments, page layer files, and manifests — in an S3-compatible object store. Warpdrive works as that backend out of the box.
 

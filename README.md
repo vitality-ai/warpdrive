@@ -41,49 +41,15 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 Pull and run the pre-built image, no build step required:
 
 ```bash
+docker pull tejascj/warpdrive:latest
+
 docker run -p 9710:9710 \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
   -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   tejascj/warpdrive:latest
 ```
 
-See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
-
-## Performance Benchmarks
-
-WarpDrive's content-dependent placement is measured against real tools and real data, not synthetic benchmarks. Full methodology, more queries/nprobe levels, and plots in [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md).
-
-| System | Type | Workload | Result |
-|--------|------|----------|--------|
-| [DuckDB](https://duckdb.org) | Analytical SQL engine | Official TPC-H (via `dbgen`), selective query (Q6) | **149x faster** (7756.6ms → 51.9ms) via row-group pushdown |
-| [Lance](https://lancedb.github.io/lance/) | Vector search (`IVF_PQ`) | `take` latency, 20k vectors/768-dim | **Up to 41x faster**, recall@10 identical to baseline |
-| Lance | Vector search (`IVF_PQ`) | SIFT1M-small (published benchmark corpus) | **Up to 5.5x faster**, recall@10 identical to baseline |
-
-## Compatibility Tests
-
-WarpDrive is tested against real-world storage clients and databases to validate S3 compatibility. These are single-node `/s3/` API tests, separate from the distributed-engine benchmarks above. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
-
-| System | Type | Version Tested | Status | Notes |
-|--------|------|---------------|--------|-------|
-| [TidesDB](https://tidesdb.com) | Embedded LSM KV store | C library v9.3.6 / Rust crate 0.11.1 | ✅ Passing | [Full report](docs/compatibility_tests/tidesdb.md): object store mode, replication, 17/17 CI tests pass |
-| [SlateDB](https://slatedb.io) | Embedded LSM KV store | slatedb 0.14 / object_store 0.14 | ✅ Passing | [Full report](docs/compatibility_tests/slatedb.md): 1000-key write/flush/read/range-scan/delete, ISO 8601 LastModified required |
-| [Neon](https://neon.tech) | Serverless Postgres | neon main / aws-sdk-rust 1.3.3 | ✅ Passing | [Full report](docs/compatibility_tests/neon.md): pageserver + safekeeper backed by WarpDrive, full Postgres write/read verified |
-
-**In pipeline:**
-
-| System | Type |
-|--------|------|
-| [LangGraph](https://langchain-ai.github.io/langgraph/) | Agentic workflow orchestration |
-| [LlamaIndex](https://www.llamaindex.ai) | RAG / agentic data framework |
-| [Ray](https://ray.io) | Distributed ML training & serving |
-| [PyTorch Lightning](https://lightning.ai) | ML training checkpointing |
-
-## Developer's Corner
-For more advanced usage and development details, visit the [Developer's Documentation](docs/setup.md).
-
-## Smoke Test
-
-With the container above running, verify it with boto3:
+With the container running, verify it with boto3:
 
 ```bash
 pip install boto3
@@ -104,3 +70,34 @@ s3 = boto3.client(
 s3.put_object(Bucket='test-bucket', Key='hello.txt', Body=b'Hello, WarpDrive!')
 print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
 ```
+
+See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
+
+## Performance Benchmarks
+
+WarpDrive's content-dependent placement is measured with DuckDB and Lance, against their own official benchmark data. Full methodology, more queries/nprobe levels, and plots in [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md).
+
+| System | Type | Workload | Result |
+|--------|------|----------|--------|
+| [DuckDB](https://duckdb.org) | Analytical SQL engine | Official TPC-H (via `dbgen`), selective query (Q6) | **149x faster** (7756.6ms → 51.9ms) via row-group pushdown |
+| [Lance](https://lancedb.github.io/lance/) | Vector search (`IVF_PQ`) | `take` latency, 20k vectors/768-dim | **Up to 41x faster**, recall@10 identical to baseline |
+| Lance | Vector search (`IVF_PQ`) | SIFT1M-small (published benchmark corpus) | **Up to 5.5x faster**, recall@10 identical to baseline |
+
+## Compatibility Tests
+
+WarpDrive is tested against storage clients and databases to validate S3 compatibility. These are single-node `/s3/` API tests, separate from the distributed-engine benchmarks above. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
+
+| System | Type | Version Tested | Status | Notes |
+|--------|------|---------------|--------|-------|
+| [TidesDB](https://tidesdb.com) | Embedded LSM KV store | C library v9.3.6 / Rust crate 0.11.1 | ✅ Passing | [Full report](docs/compatibility_tests/tidesdb.md): object store mode, replication, 17/17 CI tests pass |
+| [SlateDB](https://slatedb.io) | Embedded LSM KV store | slatedb 0.14 / object_store 0.14 | ✅ Passing | [Full report](docs/compatibility_tests/slatedb.md): 1000-key write/flush/read/range-scan/delete, ISO 8601 LastModified required |
+| [Neon](https://neon.tech) | Serverless Postgres | neon main / aws-sdk-rust 1.3.3 | ✅ Passing | [Full report](docs/compatibility_tests/neon.md): pageserver + safekeeper backed by WarpDrive, full Postgres write/read verified |
+
+**In pipeline:**
+
+| System | Type |
+|--------|------|
+| [LangGraph](https://langchain-ai.github.io/langgraph/) | Agentic workflow orchestration |
+| [LlamaIndex](https://www.llamaindex.ai) | RAG / agentic data framework |
+| [Ray](https://ray.io) | Distributed ML training & serving |
+| [PyTorch Lightning](https://lightning.ai) | ML training checkpointing |

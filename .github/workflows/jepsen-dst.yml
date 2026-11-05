@@ -1,9 +1,13 @@
 name: jepsen-dst
 
 # Deterministic-simulation fault-injection tests (Jepsen/Elle) for the
-# distributed engine. Runs on every PR to main and on demand.
+# distributed engine. Runs on every PR to main, on every push to main
+# (a merge can combine two individually-safe branches into something a
+# single PR's own run never saw), and on demand.
 on:
   pull_request:
+    branches: [ "main" ]
+  push:
     branches: [ "main" ]
   workflow_dispatch: {}
 
