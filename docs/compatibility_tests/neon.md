@@ -1,6 +1,6 @@
 # Using Neon with Warpdrive
 
-> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance in single-node mode. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for a locally running Neon cluster — no cloud account or external service required. The same `/s3/...` surface single-node serves is also what the distributed cluster engine serves, so this should work unchanged against a cluster — not yet re-verified there. We'll update this doc with distributed results once that run is done.
+> **Note:** This guide was originally written and validated against a locally built, single-node Warpdrive instance. It has since also been validated against a real 5-node distributed cluster — see [Distributed cluster results](#distributed-cluster-results) at the end of this doc. Both modes serve the exact same `/s3/...` surface, so the setup and examples below apply unchanged to either.
 
 Neon is an open-source serverless Postgres platform that separates storage from compute. It stores all durable state — WAL segments, page layer files, and manifests — in an S3-compatible object store. Warpdrive works as that backend out of the box.
 
@@ -221,3 +221,26 @@ As Postgres receives writes, Neon accumulates objects in Warpdrive automatically
 - `index_part.json` is rewritten on every layer flush to track the current file set
 
 All of these — `PutObject`, `GetObject`, `ListObjectsV2`, `DeleteObjects` — were verified working against Warpdrive in this integration.
+
+## Distributed cluster results
+
+This pass used Neon's official pre-built images instead of the from-source build above — `neondatabase/neon:latest` (pageserver, safekeeper, storage_broker) and `neondatabase/compute-node-v17:latest`, both on Docker Hub and GHCR — and Neon's own [`docker-compose/docker-compose.yml`](https://github.com/neondatabase/neon/blob/main/docker-compose/docker-compose.yml), with its bundled MinIO service removed and `remote_storage`/`--remote-storage` repointed at a real 5-node Warpdrive cluster (the published `tejascj/warpdrive:latest` image, one container per node on separate GCP VMs, `RS(3,2)`):
+
+- `pageserver_config/pageserver.toml`: `remote_storage={ endpoint='http://<cluster-node>:9710', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/pageserver' }`
+- Each `safekeeperN`'s `--remote-storage` flag: same endpoint/bucket, `prefix_in_bucket='/safekeeper/'`
+- `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` on `pageserver` and every `safekeeperN`: Warpdrive's admin credentials
+- The `neon` bucket created once up front via `aws s3api create-bucket`, same as the single-node setup above
+- `compute1`'s own Dockerfile needed one unrelated fix: its base image (`compute-node-v17`) is Debian bullseye, whose security repo has since gone EOL (archived, 404s against `deb.debian.org`) — pointed apt at `archive.debian.org` instead, nothing to do with Warpdrive
+
+**A real bug was found and fixed in this pass.** The pageserver's tenant got stuck in `Attaching` state forever, retrying a download of `tenants/<id>/tenant-manifest-00000001.json` — an object that doesn't exist yet on a brand-new tenant, so the correct response is a clean 404. The pageserver's own log showed why: `error parsing XML: no root element`. Warpdrive's cluster/distributed S3 surface was returning a 404 with a plain-text body (`content-type: text/plain`) instead of the S3-spec XML error document single-node already returns for the same case — boto3 and aws-cli tolerate that silently, but Neon's Rust `remote_storage` crate doesn't, and treated the unparseable body as a retriable failure instead of "object doesn't exist." Fixed by converting the cluster surface's error responses to the same XML format single-node uses (see the project's commit history for `s3_err`/`s3_error` in `server/src/cluster/`).
+
+Re-verified after the fix, redeployed across all 5 cluster nodes:
+
+- `curl`'d the raw 404 directly: real `<Error><Code>NoSuchKey</Code>...</Error>` XML, confirmed via boto3 (`Code: NoSuchKey`, not a bare `404`)
+- Restarted `pageserver` and `compute1`: the tenant moved from `Attaching` to `Active`
+- `psql` inside the `compute1` container: `CREATE TABLE test (id serial, val text); INSERT INTO test (val) VALUES ('hello'), ('world'); SELECT * FROM test;` returned both rows correctly
+- After a `CHECKPOINT`, `ListObjectsV2` against the `neon` bucket showed real objects: `tenant-manifest-00000001.json`, two timelines' `index_part.json`, `initdb.tar.zst`, page layer files (`...00000000014EE248-00000000014EE2C1-00000001`, 23MB), and safekeeper WAL segments (`...sk2.partial`, 5-6MB each)
+
+Full write path confirmed end to end: real Postgres, through Neon's pageserver and safekeepers, landing real layer files and WAL in a distributed Warpdrive cluster — not just a single node.
+
+**Not exercised in this pass:** `CopyObject` and `ListObjectVersions` (used by Neon's time-travel recovery, not by ordinary read/write traffic), and the multi-safekeeper quorum/failover path specifically (all 3 safekeepers stayed healthy throughout this run).
