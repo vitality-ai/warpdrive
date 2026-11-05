@@ -1,6 +1,6 @@
 # Using SlateDB with Warpdrive
 
-> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for SlateDB — no cloud account or external service required.
+> **Note:** This guide was written and validated against a locally built and locally running Warpdrive instance in single-node mode. Warpdrive was compiled from source (`cargo build --release`), started on `localhost:9710`, and used as the S3 backend for SlateDB — no cloud account or external service required. The same `/s3/...` surface single-node serves is also what the distributed cluster engine serves, so this should work unchanged against a cluster — not yet re-verified there. We'll update this doc with distributed results once that run is done.
 
 SlateDB is an embedded LSM-tree key-value storage engine built entirely on object storage. Every write is persisted as an SSTable file uploaded to an S3-compatible backend. Warpdrive works as that backend out of the box.
 
