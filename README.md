@@ -101,6 +101,3 @@ WarpDrive is tested against real-world storage clients and databases to validate
 | [LlamaIndex](https://www.llamaindex.ai) | RAG / agentic data framework |
 | [Ray](https://ray.io) | Distributed ML training & serving |
 | [PyTorch Lightning](https://lightning.ai) | ML training checkpointing |
-
-## Developer's Corner
-For more advanced usage and development details, visit the [Developer's Documentation](docs/setup.md).
