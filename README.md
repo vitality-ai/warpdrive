@@ -38,6 +38,15 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 
 ## Getting Started
 
+Pull and run the pre-built image, no build step required:
+
+```bash
+docker run -p 9710:9710 \
+  -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+  -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  tejascj/warpdrive:latest
+```
+
 See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
 
 ## Performance Benchmarks
@@ -71,3 +80,27 @@ WarpDrive is tested against real-world storage clients and databases to validate
 
 ## Developer's Corner
 For more advanced usage and development details, visit the [Developer's Documentation](docs/setup.md).
+
+## Smoke Test
+
+With the container above running, verify it with boto3:
+
+```bash
+pip install boto3
+```
+
+```python
+import boto3
+
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9710/s3',
+    aws_access_key_id='adminkey',
+    aws_secret_access_key='adminsecretkey123456',
+    region_name='us-east-1',
+    config=boto3.session.Config(s3={'addressing_style': 'path'}),
+)
+
+s3.put_object(Bucket='test-bucket', Key='hello.txt', Body=b'Hello, WarpDrive!')
+print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
+```
