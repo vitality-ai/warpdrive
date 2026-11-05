@@ -75,7 +75,7 @@ See the [User Guide](docs/user_guide.md) for installation, configuration, and AP
 
 ## Performance Benchmarks
 
-WarpDrive's content-dependent placement is measured against real tools and real data, not synthetic benchmarks. Full methodology, more queries/nprobe levels, and plots in [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md).
+WarpDrive's content-dependent placement is measured with DuckDB and Lance, against their own official benchmark data. Full methodology, more queries/nprobe levels, and plots in [`docs/benchmarks/v1.0.0-results.md`](docs/benchmarks/v1.0.0-results.md).
 
 | System | Type | Workload | Result |
 |--------|------|----------|--------|
@@ -85,7 +85,7 @@ WarpDrive's content-dependent placement is measured against real tools and real 
 
 ## Compatibility Tests
 
-WarpDrive is tested against real-world storage clients and databases to validate S3 compatibility. These are single-node `/s3/` API tests, separate from the distributed-engine benchmarks above. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
+WarpDrive is tested against storage clients and databases to validate S3 compatibility. These are single-node `/s3/` API tests, separate from the distributed-engine benchmarks above. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
 
 | System | Type | Version Tested | Status | Notes |
 |--------|------|---------------|--------|-------|
