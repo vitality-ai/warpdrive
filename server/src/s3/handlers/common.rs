@@ -100,6 +100,26 @@ pub(crate) fn s3_error(status: StatusCode, code: &str, message: &str, resource: 
         .body(body)
 }
 
+/// Same S3-spec XML body as `s3_error`, but as an `actix_web::Error` rather
+/// than an `HttpResponse` -- for call sites several layers below the actual
+/// handler (behind `?`, not a direct `return Ok(...)`), where restructuring
+/// every intermediate `Result<T, Error>` to carry an `HttpResponse` instead
+/// isn't practical. `InternalError::from_response` makes this `Error`'s own
+/// `ResponseError::error_response()` return exactly the XML response given
+/// here, instead of actix's default (a plain-text rendering of the cause),
+/// which is what every generic `actix_web::error::Error***(..)` helper
+/// produces -- the gap that let the cluster/distributed S3 path return
+/// non-XML error bodies to strict S3 clients (e.g. Neon's Rust
+/// `remote_storage`, which fails to parse a non-XML body on a 404 and
+/// retries forever instead of treating it as "object doesn't exist yet").
+pub(crate) fn s3_err(status: StatusCode, code: &str, message: &str, resource: &str) -> actix_web::Error {
+    actix_web::error::InternalError::from_response(
+        message.to_string(),
+        s3_error(status, code, message, resource),
+    )
+    .into()
+}
+
 /// Return 404 NoSuchBucket if the bucket is not registered for this user.
 pub(super) fn require_bucket(db: &MetadataService, bucket: &str) -> Result<(), HttpResponse> {
     match db.bucket_exists(bucket) {

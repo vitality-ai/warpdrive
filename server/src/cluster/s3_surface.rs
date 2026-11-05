@@ -25,9 +25,11 @@
 //! doc. No multipart upload, no pagination on LIST still apply; those
 //! remain explicit non-goals for this surface, not gaps from this pass.
 
-use actix_web::error::{ErrorBadRequest, ErrorNotFound};
 use actix_web::{web, Error, HttpRequest, HttpResponse};
+use actix_web::http::StatusCode;
 use std::sync::Arc;
+
+use crate::s3::handlers::common::s3_err;
 
 use super::coordinator::{
     cluster_abort_multipart_upload_inner, cluster_complete_multipart_upload_inner,
@@ -120,7 +122,7 @@ pub async fn cluster_s3_head_object(
     } else if let Some(record) = state.location_store.get(user_id, &bucket, &key) {
         (record.original_len as u64, record.etag)
     } else {
-        return Err(ErrorNotFound("object not found"));
+        return Err(s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", &key));
     };
 
     let mut resp = HttpResponse::Ok();
@@ -198,7 +200,7 @@ pub async fn cluster_s3_put_object_authenticated(
     if qmap.contains_key("partNumber") && qmap.contains_key("uploadId") {
         let upload_id = qmap.get("uploadId").cloned().unwrap_or_default();
         let part_number: i32 = qmap.get("partNumber").and_then(|s| s.parse().ok())
-            .ok_or_else(|| ErrorBadRequest("partNumber must be an integer"))?;
+            .ok_or_else(|| s3_err(StatusCode::BAD_REQUEST, "InvalidArgument", "partNumber must be an integer", &key))?;
         let etag = cluster_upload_part_inner(&user_id, &bucket, &upload_id, part_number, body, &state).await?;
         let mut resp = HttpResponse::Ok();
         if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(&etag) {
@@ -219,13 +221,13 @@ pub async fn cluster_s3_put_object_authenticated(
             let mode = extract_xml_tag(&xml, "Mode").unwrap_or_default();
             let retain_until = extract_xml_tag(&xml, "RetainUntilDate").unwrap_or_default();
             if retain_until.is_empty() {
-                return Err(ErrorBadRequest("RetainUntilDate is required"));
+                return Err(s3_err(StatusCode::BAD_REQUEST, "InvalidArgument", "RetainUntilDate is required", &key));
             }
             return cluster_put_object_retention_inner(&user_id, &bucket, &key, &mode, &retain_until, &state).await;
         }
         let status = extract_xml_tag(&xml, "Status").unwrap_or_default();
         if status != "ON" && status != "OFF" {
-            return Err(ErrorBadRequest("Legal hold Status must be ON or OFF"));
+            return Err(s3_err(StatusCode::BAD_REQUEST, "InvalidArgument", "Legal hold Status must be ON or OFF", &key));
         }
         return cluster_put_object_legal_hold_inner(&user_id, &bucket, &key, status == "ON", &state).await;
     }
@@ -239,7 +241,7 @@ pub async fn cluster_s3_put_object_authenticated(
         let cur_etag = if obj_exists { db.get_object_full(&bucket, &key)?.etag.unwrap_or_default() } else { String::new() };
         if let Some(ref im) = if_match {
             if !obj_exists {
-                return Err(ErrorNotFound("The specified key does not exist."));
+                return Err(s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", &key));
             }
             if im != "*" && normalize_etag(im) != normalize_etag(&cur_etag) {
                 return Ok(s3_precondition_failed(&resource));
@@ -337,7 +339,8 @@ pub async fn cluster_s3_put_object_authenticated(
         let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
         if let Ok(hv) = actix_web::http::header::HeaderValue::from_str(value) {
             resp.headers_mut().insert(
-                actix_web::http::header::HeaderName::try_from(header_name).map_err(ErrorBadRequest)?,
+                actix_web::http::header::HeaderName::try_from(header_name)
+                    .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key2))?,
                 hv,
             );
         }
@@ -390,7 +393,7 @@ pub async fn cluster_s3_get_object_authenticated(
     }
     if qmap.contains_key("retention") {
         let (mode, until) = cluster_get_object_retention(&user_id, &bucket, &key, &state)?
-            .ok_or_else(|| ErrorNotFound("object does not have a retention configuration"))?;
+            .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "object does not have a retention configuration", &key))?;
         let xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Retention xmlns=\"{S3_XMLNS}\"><Mode>{mode}</Mode><RetainUntilDate>{until}</RetainUntilDate></Retention>",
         );
@@ -616,7 +619,7 @@ pub async fn cluster_s3_multipart_post_authenticated(
         }
         requested.sort_by_key(|(n, _)| *n);
         if requested.is_empty() {
-            return Err(ErrorBadRequest("the XML you provided was not well-formed or did not validate"));
+            return Err(s3_err(StatusCode::BAD_REQUEST, "MalformedXML", "the XML you provided was not well-formed or did not validate", &key));
         }
         let (final_etag, _size) = cluster_complete_multipart_upload_inner(&user_id, &bucket, &key, upload_id, &requested, &state).await?;
         let xml = format!(
@@ -626,7 +629,7 @@ pub async fn cluster_s3_multipart_post_authenticated(
         return Ok(HttpResponse::Ok().content_type("application/xml").body(xml));
     }
 
-    Err(ErrorBadRequest("invalid multipart operation"))
+    Err(s3_err(StatusCode::BAD_REQUEST, "InvalidRequest", "invalid multipart operation", &key))
 }
 
 #[cfg(test)]

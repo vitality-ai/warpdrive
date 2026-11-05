@@ -10,8 +10,10 @@
 //! actually true (see the architecture doc for why recomputing on every
 //! read would break that guarantee).
 
-use actix_web::error::{ErrorBadRequest, ErrorForbidden, ErrorInternalServerError, ErrorNotFound, ErrorPayloadTooLarge};
+use actix_web::error::{ErrorBadRequest, ErrorInternalServerError, ErrorNotFound};
 use actix_web::{web, Error, HttpResponse};
+use actix_web::http::StatusCode;
+use crate::s3::handlers::common::s3_err;
 use futures::future::join_all;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -323,7 +325,7 @@ pub(crate) async fn cluster_put_object_inner(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("STREAMING-"))
     {
-        web::Bytes::from(decode_aws_chunked_payload(&body).map_err(ErrorBadRequest)?)
+        web::Bytes::from(decode_aws_chunked_payload(&body).map_err(|e| s3_err(StatusCode::BAD_REQUEST, "InvalidRequest", &e, &key))?)
     } else {
         body
     };
@@ -335,7 +337,7 @@ pub(crate) async fn cluster_put_object_inner(
     // that can ever create a new mapping for a key -- rather than leaving
     // it as an unenforced assumption -- so that assumption actually holds.
     if key.contains('\0') {
-        return Err(ErrorBadRequest("object key must not contain a NUL byte"));
+        return Err(s3_err(StatusCode::BAD_REQUEST, "InvalidArgument", "object key must not contain a NUL byte", &key));
     }
 
     // Content-dependent placement is a *bucket*-level decision
@@ -453,19 +455,18 @@ async fn put_object_plain(
     let request_start = std::time::Instant::now();
     let peers = state.membership.peers();
     if peers.is_empty() {
-        return Err(ErrorInternalServerError(
-            "no peers configured (set WARPDRIVE_PEERS or join the cluster first)",
-        ));
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError",
+            "no peers configured (set WARPDRIVE_PEERS or join the cluster first)", &key));
     }
 
     let k = state.ec.k();
     let m = state.ec.m();
     if peers.len() < k + m {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "need at least {} peers for RS({k},{m}), have {}",
             k + m,
             peers.len()
-        )));
+        ), &key));
     }
 
     // #159: a shard this transport can't carry used to fail silently deep
@@ -476,11 +477,11 @@ async fn put_object_plain(
     let shard_len = body.len().div_ceil(k).max(1);
     if let Some(max) = state.peer_client.max_shard_size() {
         if shard_len > max {
-            return Err(ErrorPayloadTooLarge(format!(
+            return Err(s3_err(StatusCode::PAYLOAD_TOO_LARGE, "EntityTooLarge", &format!(
                 "object too large for RS({k},{m}): each shard would be {shard_len} bytes, \
                  over this transport's {max}-byte limit (raise WARPDRIVE_GRPC_MAX_MESSAGE_SIZE, \
                  pick a larger k, or switch WARPDRIVE_PEER_TRANSPORT to http/tcp)"
-            )));
+            ), &key));
         }
     }
 
@@ -492,7 +493,7 @@ async fn put_object_plain(
     let encoded = state
         .ec
         .encode(&body)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
     state.timing.encode.record(t0.elapsed());
 
     let required_acks = required_write_acks(k, m);
@@ -530,9 +531,9 @@ async fn put_object_plain(
     state.timing.shard_fanout.record(t0.elapsed());
     let acked = results.iter().filter(|r| r.is_ok()).count();
     if acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "write quorum not met: {acked}/{required_acks} peers acknowledged (RS({k},{m}))"
-        )));
+        ), &key));
     }
 
     // Pin the resolved placement — this, not the hash function, is what
@@ -628,17 +629,17 @@ async fn put_object_plain(
     );
     state.timing.location_replicate.record(t0.elapsed());
     if loc_acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "location pin quorum not met: {loc_acked}/{required_acks} peers stored the placement record \
              (shard data was written, but the object may not be findable from every node)"
-        )));
+        ), &key));
     }
     if cleanup_acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
              {cleanup_acked}/{required_acks} peers acknowledged the tombstone (a GET on an unacknowledged \
              peer may still return the old packed bytes)"
-        )));
+        ), &key));
     }
 
     state.timing.total.record(request_start.elapsed());
@@ -656,7 +657,7 @@ async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state:
     let record = state
         .location_store
         .get(user_id, bucket, key)
-        .ok_or_else(|| ErrorNotFound("object not found"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
 
     let wire_key = if record.version.is_empty() {
         key.to_string()
@@ -677,10 +678,10 @@ async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state:
     }
     let present = shards.iter().filter(|s| s.is_some()).count();
     if present < record.k {
-        return Err(ErrorInternalServerError(format!("read quorum not met: {present}/{} shards available", record.k)));
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!("read quorum not met: {present}/{} shards available", record.k), key));
     }
-    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m).map_err(|e| ErrorInternalServerError(e.to_string()))?;
-    decoder.decode(&shards, record.original_len).map_err(|e| ErrorInternalServerError(e.to_string()))
+    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m).map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), key))?;
+    decoder.decode(&shards, record.original_len).map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), key))
 }
 
 /// Synthetic key for one multipart part's bytes, stored via the ordinary
@@ -748,7 +749,7 @@ pub(crate) async fn cluster_upload_part_inner(
     user_id: &str, bucket: &str, upload_id: &str, part_number: i32, body: web::Bytes, state: &web::Data<ClusterState>,
 ) -> Result<String, Error> {
     if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
-        return Err(ErrorNotFound("no such upload"));
+        return Err(s3_err(StatusCode::NOT_FOUND, "NoSuchUpload", "no such upload", upload_id));
     }
 
     let etag = crate::s3::handlers::common::md5_etag(&body);
@@ -763,7 +764,7 @@ pub(crate) async fn cluster_upload_part_inner(
 /// key+size). Sorted by part number.
 pub(crate) fn cluster_list_parts_inner(user_id: &str, bucket: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<Vec<(i32, String, u64)>, Error> {
     if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
-        return Err(ErrorNotFound("no such upload"));
+        return Err(s3_err(StatusCode::NOT_FOUND, "NoSuchUpload", "no such upload", upload_id));
     }
     let prefix = multipart_part_prefix(upload_id);
     let mut parts: Vec<(i32, String, u64)> = state
@@ -794,7 +795,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let meta_record = state
         .location_store
         .get(user_id, bucket, &multipart_meta_key(upload_id))
-        .ok_or_else(|| ErrorNotFound("no such upload"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchUpload", "no such upload", upload_id))?;
 
     // Validate every part up front (cheap local index lookups, no network),
     // bailing out on the first missing/mismatched part exactly like the
@@ -809,10 +810,10 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
         let stored = state
             .location_store
             .get(user_id, bucket, &part_key)
-            .ok_or_else(|| ErrorBadRequest("one or more of the specified parts could not be found"))?;
+            .ok_or_else(|| s3_err(StatusCode::BAD_REQUEST, "InvalidPart", "one or more of the specified parts could not be found", &part_key))?;
         let stored_etag = stored.etag.unwrap_or_default();
         if crate::s3::handlers::common::normalize_etag(client_etag) != crate::s3::handlers::common::normalize_etag(&stored_etag) {
-            return Err(ErrorBadRequest("one or more of the specified parts could not be found"));
+            return Err(s3_err(StatusCode::BAD_REQUEST, "InvalidPart", "one or more of the specified parts could not be found", &part_key));
         }
         validated.push((part_key, stored_etag));
     }
@@ -894,7 +895,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
 /// without writing a final object.
 pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: &str, upload_id: &str, state: &web::Data<ClusterState>) -> Result<(), Error> {
     if state.location_store.get(user_id, bucket, &multipart_meta_key(upload_id)).is_none() {
-        return Err(ErrorNotFound("no such upload"));
+        return Err(s3_err(StatusCode::NOT_FOUND, "NoSuchUpload", "no such upload", upload_id));
     }
     let prefix = multipart_part_prefix(upload_id);
     let part_keys: Vec<String> = state.location_store.list(user_id, bucket, &prefix).into_iter().map(|(k, _)| k).collect();
@@ -979,10 +980,10 @@ fn verify_object_checksum(
     if crate::s3::handlers::checksum::verify_checksum(&algo, data, expected) {
         Ok(())
     } else {
-        Err(ErrorInternalServerError(format!(
+        Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "data integrity check failed for bucket={bucket} key={key}: reconstructed object does not \
              match its stored {algo_str} checksum -- refusing to return possibly-corrupted data"
-        )))
+        ), key))
     }
 }
 
@@ -1086,7 +1087,7 @@ pub(crate) async fn cluster_get_object_inner(
     let record = state
         .location_store
         .get(user_id, &bucket, &key)
-        .ok_or_else(|| ErrorNotFound("object not found"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", &key))?;
     let total_len = record.original_len as u64;
     let etag = record.etag.clone();
     let content_type = record.content_type.clone();
@@ -1181,10 +1182,10 @@ pub(crate) async fn cluster_get_object_inner(
 
     let present = shards.iter().filter(|s| s.is_some()).count();
     if present < record.k {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "read quorum not met: {present}/{} shards available",
             record.k
-        )));
+        ), &key));
     }
 
     // Decode with *this object's own* k/m, not the node's process-wide
@@ -1196,10 +1197,10 @@ pub(crate) async fn cluster_get_object_inner(
     // `ReedSolomonCoder::new` just builds a small Galois-field table, cheap
     // enough to construct per request rather than needing a shared cache.
     let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
     let data = decoder
         .decode(&shards, record.original_len)
-        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
 
     // Verify the reconstructed object against its stored checksum before
     // ever returning it -- every object has one by default now (see
@@ -1318,13 +1319,13 @@ pub(crate) async fn cluster_delete_object_inner(
         if let (Some(mode), Some(until)) = (&record.retention_mode, &record.retain_until) {
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
             if until.as_str() > now.as_str() {
-                return Err(ErrorForbidden(format!(
+                return Err(s3_err(StatusCode::FORBIDDEN, "AccessDenied", &format!(
                     "object is locked under {mode} retention until {until}"
-                )));
+                ), &key));
             }
         }
         if record.legal_hold {
-            return Err(ErrorForbidden("object has an active legal hold"));
+            return Err(s3_err(StatusCode::FORBIDDEN, "AccessDenied", "object has an active legal hold", &key));
         }
     }
 
@@ -1352,10 +1353,10 @@ pub(crate) async fn cluster_delete_object_inner(
     let plain_acked = replicate_location_delete(state, user_id, &bucket, &key, &peers).await;
     let packed_acked = replicate_content_location_delete(state, user_id, &bucket, &key, &peers).await;
     if plain_acked < required_acks || packed_acked < required_acks {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "tombstone quorum not met: plain {plain_acked}/{required_acks}, \
              packed {packed_acked}/{required_acks} peers acknowledged"
-        )));
+        ), &key));
     }
 
     // Real S3 semantics (and real S3 SDKs, e.g. minio-go used by
@@ -1392,7 +1393,7 @@ pub async fn cluster_put_retention(
     // simply having no retention support -- that's a different, clearer
     // error than claiming the key doesn't exist at all.
     if state.content_location_store.get(UNAUTHENTICATED_USER, &bucket, &key).is_some() {
-        return Err(packed_object_lock_not_implemented());
+        return Err(packed_object_lock_not_implemented(&key));
     }
 
     let mut record = state
@@ -1448,9 +1449,9 @@ pub(crate) async fn cluster_put_object_tagging_inner(
         record.tags = tags;
         let acked = replicate_content_location_put(state, &record, &peers).await;
         if acked < peers.len() {
-            return Err(ErrorInternalServerError(format!(
+            return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
                 "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
-            )));
+            ), key));
         }
         return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
     }
@@ -1459,14 +1460,14 @@ pub(crate) async fn cluster_put_object_tagging_inner(
         record.tags = tags;
         let acked = replicate_location_put(state, &record, &peers).await;
         if acked < peers.len() {
-            return Err(ErrorInternalServerError(format!(
+            return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
                 "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
-            )));
+            ), key));
         }
         return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
     }
 
-    Err(ErrorNotFound("object not found"))
+    Err(s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))
 }
 
 /// Reads an object's tags -- a pure local lookup, same precedence
@@ -1481,7 +1482,7 @@ pub(crate) fn cluster_get_object_tagging(
     if let Some(record) = state.location_store.get(user_id, bucket, key) {
         return Ok(record.tags);
     }
-    Err(ErrorNotFound("object not found"))
+    Err(s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))
 }
 
 /// Clears an object's tags -- same shape as the put side above, just an
@@ -1501,10 +1502,11 @@ pub(crate) async fn cluster_delete_object_tagging_inner(
 // a silent no-op that would let a packed object bypass locking entirely.
 // ---------------------------------------------------------------------------
 
-fn packed_object_lock_not_implemented() -> Error {
-    ErrorInternalServerError(
+fn packed_object_lock_not_implemented(key: &str) -> Error {
+    s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError",
         "object-lock (retention/legal-hold) is not implemented for content-dependent \
          (packed) objects -- a documented, carried-forward gap, not a silent no-op",
+        key,
     )
 }
 
@@ -1518,24 +1520,24 @@ pub(crate) async fn cluster_put_object_retention_inner(
     user_id: &str, bucket: &str, key: &str, mode: &str, retain_until: &str, state: &web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     if mode != "GOVERNANCE" && mode != "COMPLIANCE" {
-        return Err(ErrorBadRequest("mode must be GOVERNANCE or COMPLIANCE"));
+        return Err(s3_err(StatusCode::BAD_REQUEST, "InvalidArgument", "mode must be GOVERNANCE or COMPLIANCE", key));
     }
     if state.content_location_store.get(user_id, bucket, key).is_some() {
-        return Err(packed_object_lock_not_implemented());
+        return Err(packed_object_lock_not_implemented(key));
     }
     let mut record = state
         .location_store
         .get(user_id, bucket, key)
-        .ok_or_else(|| ErrorNotFound("object not found"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
     record.retention_mode = Some(mode.to_string());
     record.retain_until = Some(retain_until.to_string());
 
     let peers = state.membership.peers();
     let acked = replicate_location_put(state, &record, &peers).await;
     if acked < peers.len() {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "retention update requires every peer to ack: {acked}/{} acknowledged", peers.len()
-        )));
+        ), key));
     }
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
@@ -1548,20 +1550,20 @@ pub(crate) async fn cluster_put_object_legal_hold_inner(
     user_id: &str, bucket: &str, key: &str, legal_hold: bool, state: &web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     if state.content_location_store.get(user_id, bucket, key).is_some() {
-        return Err(packed_object_lock_not_implemented());
+        return Err(packed_object_lock_not_implemented(key));
     }
     let mut record = state
         .location_store
         .get(user_id, bucket, key)
-        .ok_or_else(|| ErrorNotFound("object not found"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
     record.legal_hold = legal_hold;
 
     let peers = state.membership.peers();
     let acked = replicate_location_put(state, &record, &peers).await;
     if acked < peers.len() {
-        return Err(ErrorInternalServerError(format!(
+        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "legal-hold update requires every peer to ack: {acked}/{} acknowledged", peers.len()
-        )));
+        ), key));
     }
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
@@ -1573,12 +1575,12 @@ pub(crate) fn cluster_get_object_retention(
     user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
 ) -> Result<Option<(String, String)>, Error> {
     if state.content_location_store.get(user_id, bucket, key).is_some() {
-        return Err(packed_object_lock_not_implemented());
+        return Err(packed_object_lock_not_implemented(key));
     }
     let record = state
         .location_store
         .get(user_id, bucket, key)
-        .ok_or_else(|| ErrorNotFound("object not found"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
     Ok(match (record.retention_mode, record.retain_until) {
         (Some(mode), Some(until)) => Some((mode, until)),
         _ => None,
@@ -1590,12 +1592,12 @@ pub(crate) fn cluster_get_object_legal_hold(
     user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>,
 ) -> Result<bool, Error> {
     if state.content_location_store.get(user_id, bucket, key).is_some() {
-        return Err(packed_object_lock_not_implemented());
+        return Err(packed_object_lock_not_implemented(key));
     }
     let record = state
         .location_store
         .get(user_id, bucket, key)
-        .ok_or_else(|| ErrorNotFound("object not found"))?;
+        .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
     Ok(record.legal_hold)
 }
 
