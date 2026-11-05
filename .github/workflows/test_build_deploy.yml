@@ -99,12 +99,3 @@ jobs:
         tags: |
           docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive:latest
           docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive:${{ github.sha }}
-
-  deploy:
-    needs: [docker_publish_ghcr, docker_publish_dockerhub]
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: POST request to re-deploy on portainer webhook
-      run: |
-        curl -X POST https://docker.cialabs.org/api/stacks/webhooks/4e3fb43a-54dc-459a-be5a-36988796405e?BUILD_HASH=${{ github.sha }} -H "Content-Type: application/json"
