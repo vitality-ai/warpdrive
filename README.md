@@ -85,13 +85,13 @@ WarpDrive's content-dependent placement is measured with DuckDB and Lance, again
 
 ## Compatibility Tests
 
-WarpDrive is tested against storage clients and databases to validate S3 compatibility. These are single-node `/s3/` API tests, separate from the distributed-engine benchmarks above. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
+WarpDrive is tested against storage clients and databases to validate S3 compatibility, against both single-node and the distributed cluster engine. Full results in [`docs/compatibility_tests/`](docs/compatibility_tests/).
 
 | System | Type | Version Tested | Status | Notes |
 |--------|------|---------------|--------|-------|
-| [TidesDB](https://tidesdb.com) | Embedded LSM KV store | C library v9.3.6 / Rust crate 0.11.1 | ✅ Passing | [Full report](docs/compatibility_tests/tidesdb.md): object store mode, replication, 17/17 CI tests pass |
-| [SlateDB](https://slatedb.io) | Embedded LSM KV store | slatedb 0.14 / object_store 0.14 | ✅ Passing | [Full report](docs/compatibility_tests/slatedb.md): 1000-key write/flush/read/range-scan/delete, ISO 8601 LastModified required |
-| [Neon](https://neon.tech) | Serverless Postgres | neon main / aws-sdk-rust 1.3.3 | ✅ Passing | [Full report](docs/compatibility_tests/neon.md): pageserver + safekeeper backed by WarpDrive, full Postgres write/read verified |
+| [TidesDB](https://tidesdb.com) | Embedded LSM KV store | C library v9.3.6 / Rust crate 0.11.1 | ✅ Passing | [Full report](docs/compatibility_tests/tidesdb.md): object store mode and replication pass on a 5-node distributed cluster, same as single-node; single-node also passes TidesDB's own 17/17 CI test suite |
+| [SlateDB](https://slatedb.io) | Embedded LSM KV store | slatedb 0.14 / object_store 0.14 | ✅ Passing | [Full report](docs/compatibility_tests/slatedb.md): 1000-key write/flush/read/range-scan/delete passes on a 5-node distributed cluster, same as single-node |
+| [Neon](https://neon.tech) | Serverless Postgres | neon main / aws-sdk-rust 1.3.3 | ✅ Passing | [Full report](docs/compatibility_tests/neon.md): pageserver + safekeeper backed by a 5-node distributed WarpDrive cluster, full Postgres write/read verified |
 
 **In pipeline:**
 
