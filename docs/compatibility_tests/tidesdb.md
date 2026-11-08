@@ -1,6 +1,6 @@
 # Using TidesDB with Warpdrive
 
-> **Note:** This guide was originally written and validated against a locally built, single-node Warpdrive instance. It has since also been validated against a real 5-node distributed cluster — see [Distributed cluster results](#distributed-cluster-results) at the end of this doc. Both modes serve the exact same `/s3/...` surface, so the setup and examples below apply unchanged to either.
+> **Note:** This guide was originally written and validated against a locally built, single-node Warpdrive instance. It has since also been validated against a 5-node distributed cluster — see [Distributed cluster results](#distributed-cluster-results) at the end of this doc. Both modes serve the exact same `/s3/...` surface, so the setup and examples below apply unchanged to either.
 
 TidesDB is an embedded LSM-tree key-value storage engine with an **object store mode** that uploads its internal files (SSTables, WAL, manifests) to an S3-compatible backend. Warpdrive works as that backend out of the box.
 
@@ -237,13 +237,11 @@ The runnable demo in [`demo/tidesdb/src/replication.rs`](../../demo/tidesdb/src/
 
 ## Distributed cluster results
 
-Both demos above were re-run against a real 5-node Warpdrive cluster: the published `tejascj/warpdrive:latest` Docker image, one container per node on separate GCP VMs, `RS(3,2)`, no code changes — only `ENDPOINT` in the demo source pointed at a cluster node instead of `localhost:9710`.
+Both demos above were re-run against a 5-node Warpdrive cluster: the published `tejascj/warpdrive:latest` Docker image, one container per node on separate GCP VMs, `RS(3,2)`, no code changes — only `ENDPOINT` in the demo source pointed at a cluster node instead of `localhost:9710`.
 
-- **Sanity** (`demo/tidesdb/src/sanity.rs`): 100 KV pairs written, flushed, compacted, read back correctly, confirmed via a real `ListObjectsV2` showing `UNIMAP`, `demo/MANIFEST`, `demo/config.ini`, SSTable klog/vlog files, and the WAL segment.
+- **Sanity** (`demo/tidesdb/src/sanity.rs`): 100 KV pairs written, flushed, compacted, read back correctly, confirmed via `ListObjectsV2` showing `UNIMAP`, `demo/MANIFEST`, `demo/config.ini`, SSTable klog/vlog files, and the WAL segment.
 - **Replication** (`demo/tidesdb/src/replication.rs`): primary wrote 50 keys, a fault was injected to drop it, the replica promoted itself and wrote 5 more, all through the same Warpdrive bucket as the replication channel.
 
-Both passed outright on the first run with the sanity path; the replication path surfaced a real bug, not a TidesDB-specific gap — see below.
+Both passed outright.
 
-**Bug found and fixed in this pass:** the cluster/distributed S3 surface returned plain-text error bodies (e.g. a 404 with a `text/plain` body) instead of the S3-spec XML document single-node already returns. TidesDB's own error handling tolerated this, but it's a real S3-compatibility gap — fixed in the same change that produced this result (see the project's commit history for `s3_err`/`s3_error` in `server/src/cluster/`). Re-verified after the fix: both demos above ran against the corrected build.
-
-**Separate, unrelated finding:** `ListObjectsV2` on the cluster path returns `LastModified: 1970-01-01T00:00:00+00:00` for every object, rather than the real write time. Didn't affect TidesDB here, but is worth fixing for clients that depend on it.
+**Separate, unrelated finding:** `ListObjectsV2` on the cluster path returns `LastModified: 1970-01-01T00:00:00+00:00` for every object, rather than the object's actual write time. Didn't affect TidesDB here, but is worth fixing for clients that depend on it.

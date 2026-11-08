@@ -1,6 +1,6 @@
 # Using SlateDB with Warpdrive
 
-> **Note:** This guide was originally written and validated against a locally built, single-node Warpdrive instance. It has since also been validated against a real 5-node distributed cluster — see [Distributed cluster results](#distributed-cluster-results) at the end of this doc. Both modes serve the exact same `/s3/...` surface, so the setup and examples below apply unchanged to either.
+> **Note:** This guide was originally written and validated against a locally built, single-node Warpdrive instance. It has since also been validated against a 5-node distributed cluster — see [Distributed cluster results](#distributed-cluster-results) at the end of this doc. Both modes serve the exact same `/s3/...` surface, so the setup and examples below apply unchanged to either.
 
 SlateDB is an embedded LSM-tree key-value storage engine built entirely on object storage. Every write is persisted as an SSTable file uploaded to an S3-compatible backend. Warpdrive works as that backend out of the box.
 
@@ -163,8 +163,6 @@ All operations complete successfully against a locally running Warpdrive instanc
 
 ## Distributed cluster results
 
-The same demo was re-run against a real 5-node Warpdrive cluster: the published `tejascj/warpdrive:latest` Docker image, one container per node on separate GCP VMs, `RS(3,2)`, no code changes — only `ENDPOINT` in `demo/slatedb/src/sanity.rs` pointed at a cluster node instead of `localhost:9710`.
+The same demo was re-run against a 5-node Warpdrive cluster: the published `tejascj/warpdrive:latest` Docker image, one container per node on separate GCP VMs, `RS(3,2)`, no code changes — only `ENDPOINT` in `demo/slatedb/src/sanity.rs` pointed at a cluster node instead of `localhost:9710`.
 
-All of it passed on the first run, no fix needed on SlateDB's side: 1000 keys written and flushed as real SSTable uploads, spot-checked reads correct, the range scan correct, the delete-then-confirm-gone sequence correct.
-
-A real bug was found and fixed during this same pass, affecting the cluster surface generally rather than anything SlateDB-specific — see [TidesDB's distributed results](tidesdb.md#distributed-cluster-results) for the details (plain-text vs. S3-XML error bodies). SlateDB's `object_store` crate tolerated the original plain-text bodies, so this result holds against both the before- and after-fix builds.
+All of it passed on the first run, no fix needed on SlateDB's side: 1000 keys written and flushed as SSTable uploads, spot-checked reads correct, the range scan correct, the delete-then-confirm-gone sequence correct.
