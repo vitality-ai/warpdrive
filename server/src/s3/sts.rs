@@ -26,11 +26,21 @@ lazy_static! {
         .build()
         .expect("failed to create reqwest client");
     static ref JWKS_CACHE: RwLock<Option<(JwkSet, Instant)>> = RwLock::new(None);
+    /// Serializes forced JWKS refreshes so concurrent kid-misses coalesce
+    /// into one real outbound fetch instead of each firing their own, and
+    /// tracks when the last *forced* refresh happened (distinct from the
+    /// general cache's own fetched_at, which a routine non-forced fetch
+    /// also updates and so can't be used to rate-limit forced ones).
+    static ref JWKS_REFRESH_LOCK: tokio::sync::Mutex<Option<Instant>> = tokio::sync::Mutex::new(None);
     /// One entry per temporary access_key_id, minted by AssumeRoleWithWebIdentity.
     static ref STS_SESSIONS: RwLock<HashMap<String, StsSession>> = RwLock::new(HashMap::new());
 }
 
 const JWKS_CACHE_TTL_SECS: u64 = 300;
+/// Floor on how often an unknown `kid` can force a fresh JWKS fetch at all,
+/// regardless of request volume -- bounds the worst case to one outbound
+/// request to the IdP per this many seconds.
+const JWKS_FORCED_REFRESH_COOLDOWN_SECS: u64 = 5;
 const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 const MIN_SESSION_TTL_SECS: u64 = 900;
 
@@ -143,17 +153,43 @@ async fn fetch_jwks(jwks_url: &str, force_refresh: bool) -> Result<JwkSet, Strin
     Ok(set)
 }
 
+/// Coalesces concurrent forced refreshes into a single real fetch, and
+/// rate-limits how often an unknown `kid` can trigger one at all. `/sts` is
+/// unauthenticated by design (the token itself is the credential), so
+/// without this an attacker could submit a stream of tokens with bogus `kid`
+/// values and force an outbound request to the configured IdP's JWKS
+/// endpoint on every single one.
+async fn force_refresh_jwks_rate_limited(jwks_url: &str) -> Result<JwkSet, String> {
+    let mut last_forced = JWKS_REFRESH_LOCK.lock().await;
+    // Someone else may have already force-refreshed while we were waiting
+    // for the lock (or we did, moments ago, for a different kid) -- if that
+    // happened within the cooldown window, reuse whatever the cache holds
+    // now instead of making another outbound request.
+    if let Some(last) = *last_forced {
+        if last.elapsed() < Duration::from_secs(JWKS_FORCED_REFRESH_COOLDOWN_SECS) {
+            if let Some((ref set, _)) = *JWKS_CACHE.read() {
+                return Ok(set.clone());
+            }
+        }
+    }
+    let result = fetch_jwks(jwks_url, true).await;
+    if result.is_ok() {
+        *last_forced = Some(Instant::now());
+    }
+    result
+}
+
 /// Resolves a signing key by `kid`. A cache miss doesn't immediately fail the
 /// token: the IdP may have rotated its signing key since our cache was last
-/// populated, so this forces one fresh fetch and retries before giving up --
-/// otherwise a real key rotation would deny valid tokens for up to
-/// `JWKS_CACHE_TTL_SECS`.
+/// populated, so this forces one fresh (rate-limited, coalesced) fetch and
+/// retries before giving up -- otherwise a real key rotation would deny
+/// valid tokens for up to `JWKS_CACHE_TTL_SECS`.
 async fn find_jwk(jwks_url: &str, kid: &str) -> Result<Option<jsonwebtoken::jwk::Jwk>, String> {
     let jwks = fetch_jwks(jwks_url, false).await?;
     if let Some(j) = jwks.find(kid) {
         return Ok(Some(j.clone()));
     }
-    let jwks = fetch_jwks(jwks_url, true).await?;
+    let jwks = force_refresh_jwks_rate_limited(jwks_url).await?;
     Ok(jwks.find(kid).cloned())
 }
 
@@ -655,9 +691,13 @@ JSqZUCTqwsWiGEaCDBqH8Q";
     /// Serves `bodies[0]` for the first request, `bodies[1]` for every
     /// request after that -- stands in for an IdP whose JWKS endpoint
     /// starts returning a newly-rotated key set partway through the test.
-    fn spawn_rotating_jwks_server(bodies: Vec<String>) -> String {
+    /// Also counts real requests received, so a test can assert that a
+    /// burst of calls produced far fewer outbound fetches than calls.
+    fn spawn_rotating_jwks_server(bodies: Vec<String>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local_addr");
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count_for_server = request_count.clone();
         std::thread::spawn(move || {
             let mut call = 0usize;
             for stream in listener.incoming() {
@@ -667,6 +707,7 @@ JSqZUCTqwsWiGEaCDBqH8Q";
                 };
                 let mut buf = [0u8; 1024];
                 let _ = std::io::Read::read(&mut stream, &mut buf);
+                request_count_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let body = bodies[call.min(bodies.len() - 1)].clone();
                 call += 1;
                 let response = format!(
@@ -677,12 +718,12 @@ JSqZUCTqwsWiGEaCDBqH8Q";
                 let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
             }
         });
-        format!("http://{addr}/jwks")
+        (format!("http://{addr}/jwks"), request_count)
     }
 
     #[tokio::test]
-    async fn find_jwk_force_refreshes_on_a_cache_miss_instead_of_failing_immediately() {
-        let jwks_url = spawn_rotating_jwks_server(vec![
+    async fn find_jwk_force_refreshes_on_a_cache_miss_but_rate_limits_and_coalesces_it() {
+        let (jwks_url, request_count) = spawn_rotating_jwks_server(vec![
             jwks_json(&[(TEST_KID_A, TEST_N_A)]),             // before "rotation": only key A
             jwks_json(&[(TEST_KID_A, TEST_N_A), (TEST_KID_B, TEST_N_B)]), // after: A and B
         ]);
@@ -690,6 +731,7 @@ JSqZUCTqwsWiGEaCDBqH8Q";
         // Primes the cache with the pre-rotation JWKS (key A only).
         let found_a = find_jwk(&jwks_url, TEST_KID_A).await.expect("fetch ok");
         assert!(found_a.is_some());
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // Key B isn't in the cached set yet -- this must force a fresh
         // fetch and find it there, not just report it missing because the
@@ -698,6 +740,29 @@ JSqZUCTqwsWiGEaCDBqH8Q";
         assert!(
             found_b.is_some(),
             "a newly-rotated-in key should be found via a forced refresh, not rejected"
+        );
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // A flood of lookups for a kid that will never exist, fired
+        // concurrently -- every one of them hits the cache-miss path. The
+        // refresh we just did above is still within the cooldown window, so
+        // none of these should make a real outbound request: an
+        // unauthenticated caller spamming bogus key IDs must not be able to
+        // force one IdP request per attempt.
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let url = jwks_url.clone();
+            handles.push(tokio::spawn(async move { find_jwk(&url, "nonexistent-kid").await }));
+        }
+        for h in handles {
+            let result = h.await.expect("task join").expect("fetch ok");
+            assert!(result.is_none(), "a truly nonexistent kid must still resolve to None");
+        }
+        let count_after_flood = request_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count_after_flood <= 3,
+            "20 bogus-kid lookups within the cooldown window should produce only a handful of \
+             real fetches via coalescing/rate-limiting, got {count_after_flood}"
         );
     }
 }
