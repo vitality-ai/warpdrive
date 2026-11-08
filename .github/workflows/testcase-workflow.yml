@@ -57,3 +57,77 @@ jobs:
     - name: Run server tests
       working-directory: server
       run: cargo test
+
+  # External-IAM federation: AssumeRoleWithWebIdentity against a real
+  # Keycloak container, with an unmodified boto3 STS client -- not a
+  # mocked/self-signed-token substitute. Separate job (not folded into
+  # server-tests) since it stands up its own Docker service and has a
+  # materially different failure mode (an IdP-integration regression,
+  # not a Rust unit-test regression).
+  sts-oidc-tests:
+    name: STS/OIDC federation tests (Keycloak)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies and build artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: server
+
+    - name: Build release binary
+      working-directory: server
+      run: cargo build --release --bin warp_drive
+
+    - name: Set up Python
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.11"
+
+    - name: Install Python test dependencies
+      run: pip install -r server/tests/python/requirements.txt
+
+    - name: Start Keycloak
+      run: |
+        docker run -d --name keycloak -p 8080:8080 \
+          -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin \
+          quay.io/keycloak/keycloak:latest start-dev
+
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:8080/realms/master/.well-known/openid-configuration > /dev/null; then
+            echo "Keycloak is up"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Keycloak did not become ready in time"
+        docker logs keycloak
+        exit 1
+
+    - name: Start WarpDrive (OIDC-federated)
+      # Runs from server/ because log4rs::init_file loads "server_log.yaml"
+      # via a relative path, which only resolves from that directory.
+      working-directory: server
+      run: |
+        WARPDRIVE_PORT=9710 \
+        WARPDRIVE_STORAGE_PATH=/tmp/warpdrive_sts_ci_storage \
+        WARPDRIVE_OIDC_ISSUER="http://localhost:8080/realms/warpdrive" \
+        WARPDRIVE_OIDC_AUDIENCE="warpdrive-client" \
+        WARPDRIVE_OIDC_JWKS_URL="http://localhost:8080/realms/warpdrive/protocol/openid-connect/certs" \
+        WARPDRIVE_OIDC_USER_CLAIM="sub" \
+        WARPDRIVE_OIDC_BUCKETS_CLAIM="buckets" \
+        WARPDRIVE_OIDC_DEFAULT_BUCKETS="sts-tenant-default" \
+          ./target/release/warp_drive &
+        for i in $(seq 1 15); do
+          curl -sf http://localhost:9710/ > /dev/null && exit 0
+          sleep 1
+        done
+        echo "WarpDrive did not become ready in time"
+        exit 1
+
+    - name: Run STS/OIDC round-trip tests
+      run: python3 server/tests/python/sts_oidc_test.py

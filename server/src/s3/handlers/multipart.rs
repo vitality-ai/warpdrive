@@ -291,6 +291,13 @@ pub async fn s3_upload_part_copy_handler(
     };
     let src_key = percent_decode(&src_key_enc);
 
+    // Same gap as CopyObject (copy.rs) -- authenticate_s3_request only
+    // checked the destination bucket against this session's scope.
+    if !auth_result.allows_bucket(&src_bucket) {
+        return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied",
+                           "Access Denied", &format!("/{}/{}", src_bucket, src_key)));
+    }
+
     let src_meta = if let Some(ref vid) = copy_source_version_id {
         match db.get_object_version(&src_bucket, &src_key, vid) {
             Ok(m) if !m.is_delete_marker => m,

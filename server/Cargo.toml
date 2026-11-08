@@ -58,6 +58,8 @@ flate2 = "1.0"
 percent-encoding = "2"
 actix-multipart = "0.6"
 parking_lot = "0.12"
+jsonwebtoken = "9"
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.11"

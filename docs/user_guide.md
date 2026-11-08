@@ -5,6 +5,20 @@
 > For setup instructions, see the [Developer's Documentation](../docs/setup.md).  
 > Once our cloud offering is available, we will update this guide with details for connecting to the managed service. However if you are a developer we suggest you follow our [Developer's Documentation](../docs/setup.md) which is self contained to get you started.  
 
+## Table of Contents
+
+- [Getting Started](#getting-started)
+  - [Configuration](#configuration)
+- [Demo and Examples](#demo-and-examples)
+- [Distributed Mode (default)](#distributed-mode-default)
+  - [Starting a cluster](#starting-a-cluster)
+  - [Node address and port configuration](#node-address-and-port-configuration)
+  - [Basic PUT/GET/DELETE](#basic-putgetdelete)
+  - [Content-dependent placement (optional, per-bucket)](#content-dependent-placement-optional-per-bucket)
+  - [Authenticated S3 access (recommended for S3 clients and third-party tools)](#authenticated-s3-access-recommended-for-s3-clients-and-third-party-tools)
+  - [Federated auth via your own OIDC provider (STS)](#federated-auth-via-your-own-oidc-provider-sts)
+  - [Read more](#read-more)
+
 ## Getting Started
 
 Warpdrive is S3-compatible. Any client or library that speaks S3 follows the same semantics. The example below uses **boto3**, and works identically whether the server is running single-node or as a [distributed cluster](#distributed-mode-default) — same URL, same client code either way; which engine answers it is a server-startup decision, not something the client specifies.
@@ -203,6 +217,84 @@ Not yet supported on this surface: bucket-level CORS/ACL and object
 versioning (no cluster bucket registry exists for the former; versioning
 is a stated non-goal) — object tagging and retention/legal-hold work the
 same as single-node.
+
+### Federated auth via your own OIDC provider (STS)
+
+Instead of distributing the shared admin key pair, you can point WarpDrive at
+your own OIDC identity provider — Keycloak, Dex, Okta, or anything else that
+issues standard signed JWTs with a JWKS endpoint. A client authenticates to
+your IdP as it normally would, then exchanges that token for temporary,
+bucket-scoped SigV4 credentials via WarpDrive's own STS-compatible
+`AssumeRoleWithWebIdentity` endpoint — the same request/response contract
+MinIO and Ceph RGW use, so an unmodified AWS SDK's STS client already knows
+how to speak it.
+
+Configure the IdP once, server-side:
+
+| Env var | Required | Meaning |
+|---|---|---|
+| `WARPDRIVE_OIDC_ISSUER` | Yes | Your IdP's issuer URL (must match the token's `iss` claim exactly). |
+| `WARPDRIVE_OIDC_AUDIENCE` | Yes | Expected `aud` claim — the client ID/audience your IdP issues tokens for. |
+| `WARPDRIVE_OIDC_JWKS_URL` | Yes | Where to fetch signing keys, e.g. Keycloak's `.../protocol/openid-connect/certs`. Fetched and cached (5 min TTL). |
+| `WARPDRIVE_OIDC_USER_CLAIM` | No (default `sub`) | Claim whose value becomes the WarpDrive `user_id` for owner/tagging/retention checks. |
+| `WARPDRIVE_OIDC_BUCKETS_CLAIM` | No | Claim holding a JSON array of bucket names this identity is scoped to. |
+| `WARPDRIVE_OIDC_DEFAULT_BUCKETS` | No | Comma-separated fallback bucket list, used **only when the buckets claim is absent from the token entirely** (or `WARPDRIVE_OIDC_BUCKETS_CLAIM` isn't configured at all). If the claim *is* present but empty (`[]`) or the wrong type, that's treated as an explicit "no access" and the request is denied — it does **not** fall back to this default. At least one of the two must resolve to a non-empty list, or the request is denied. |
+| `WARPDRIVE_OIDC_SESSION_TTL_SECS` | No (default `3600`) | Max session lifetime; also caps any `DurationSeconds` the client requests (floor 900s, matching AWS STS). |
+
+Example against a local Keycloak realm:
+
+```bash
+WARPDRIVE_OIDC_ISSUER="http://localhost:8080/realms/warpdrive" \
+WARPDRIVE_OIDC_AUDIENCE="warpdrive-client" \
+WARPDRIVE_OIDC_JWKS_URL="http://localhost:8080/realms/warpdrive/protocol/openid-connect/certs" \
+WARPDRIVE_OIDC_BUCKETS_CLAIM="buckets" \
+  ./warp_drive
+```
+
+A client exchanges its OIDC token for temporary credentials, then uses them exactly like any other S3 credentials:
+
+```python
+import boto3
+
+sts = boto3.client("sts", endpoint_url="http://localhost:9710/sts", region_name="us-east-1")
+resp = sts.assume_role_with_web_identity(
+    RoleArn="arn:aws:iam::000000000000:role/warpdrive-user",  # not yet evaluated — see note below
+    RoleSessionName="my-session",
+    WebIdentityToken=id_token,  # from your OIDC provider
+)
+creds = resp["Credentials"]
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://localhost:9710/s3",
+    aws_access_key_id=creds["AccessKeyId"],
+    aws_secret_access_key=creds["SecretAccessKey"],
+    aws_session_token=creds["SessionToken"],
+    region_name="us-east-1",
+    config=boto3.session.Config(s3={"addressing_style": "path"}),
+)
+s3.put_object(Bucket="my-bucket", Key="hello.txt", Body=b"hello")
+```
+
+`POST /sts` itself is intentionally unauthenticated — the OIDC token *is* the
+credential being verified. Sessions live in memory only, on whichever node
+served the `AssumeRoleWithWebIdentity` call — lost on that node's restart
+(by design — a client just calls `AssumeRoleWithWebIdentity` again), and
+**not shared with any other cluster node**. In a multi-node deployment, this
+means a session minted on node A is unknown to node B: either route a given
+client's STS exchange and its subsequent S3 requests to the same node
+(sticky routing/node affinity at your load balancer), or call
+`AssumeRoleWithWebIdentity` against each node you expect to send S3 requests
+to and use the resulting per-node credentials accordingly. There's no
+cluster-wide session replication today.
+
+**Current scope, intentionally:** one configured issuer at a time; identity
+and bucket-level scoping only, not fine-grained per-action policy (a session
+either can or can't touch a bucket, same shape as `allowed_buckets` elsewhere
+in this guide); `RoleArn` is accepted and echoed back for AWS SDK
+compatibility but not yet evaluated against a role catalog; STS sessions are
+not yet supported over presigned URLs, only the standard `Authorization`
+header path. These are real, separately-scoped follow-ups, not silent gaps.
 
 ### Read more
 
