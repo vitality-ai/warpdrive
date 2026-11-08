@@ -109,6 +109,9 @@ jobs:
         exit 1
 
     - name: Start WarpDrive (OIDC-federated)
+      # Runs from server/ because log4rs::init_file loads "server_log.yaml"
+      # via a relative path, which only resolves from that directory.
+      working-directory: server
       run: |
         WARPDRIVE_PORT=9710 \
         WARPDRIVE_STORAGE_PATH=/tmp/warpdrive_sts_ci_storage \
@@ -117,7 +120,7 @@ jobs:
         WARPDRIVE_OIDC_JWKS_URL="http://localhost:8080/realms/warpdrive/protocol/openid-connect/certs" \
         WARPDRIVE_OIDC_USER_CLAIM="sub" \
         WARPDRIVE_OIDC_DEFAULT_BUCKETS="sts-test-bucket" \
-          server/target/release/warp_drive &
+          ./target/release/warp_drive &
         for i in $(seq 1 15); do
           curl -sf http://localhost:9710/ > /dev/null && exit 0
           sleep 1
