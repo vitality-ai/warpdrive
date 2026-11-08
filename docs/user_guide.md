@@ -238,7 +238,7 @@ Configure the IdP once, server-side:
 | `WARPDRIVE_OIDC_JWKS_URL` | Yes | Where to fetch signing keys, e.g. Keycloak's `.../protocol/openid-connect/certs`. Fetched and cached (5 min TTL). |
 | `WARPDRIVE_OIDC_USER_CLAIM` | No (default `sub`) | Claim whose value becomes the WarpDrive `user_id` for owner/tagging/retention checks. |
 | `WARPDRIVE_OIDC_BUCKETS_CLAIM` | No | Claim holding a JSON array of bucket names this identity is scoped to. |
-| `WARPDRIVE_OIDC_DEFAULT_BUCKETS` | No | Comma-separated fallback bucket list, used when the token has no buckets claim (or none is configured). At least one of this or the buckets claim must resolve to a non-empty list, or the request is denied. |
+| `WARPDRIVE_OIDC_DEFAULT_BUCKETS` | No | Comma-separated fallback bucket list, used **only when the buckets claim is absent from the token entirely** (or `WARPDRIVE_OIDC_BUCKETS_CLAIM` isn't configured at all). If the claim *is* present but empty (`[]`) or the wrong type, that's treated as an explicit "no access" and the request is denied — it does **not** fall back to this default. At least one of the two must resolve to a non-empty list, or the request is denied. |
 | `WARPDRIVE_OIDC_SESSION_TTL_SECS` | No (default `3600`) | Max session lifetime; also caps any `DurationSeconds` the client requests (floor 900s, matching AWS STS). |
 
 Example against a local Keycloak realm:
@@ -277,8 +277,16 @@ s3.put_object(Bucket="my-bucket", Key="hello.txt", Body=b"hello")
 ```
 
 `POST /sts` itself is intentionally unauthenticated — the OIDC token *is* the
-credential being verified. Sessions live in memory only (lost on restart, by
-design — a client just calls `AssumeRoleWithWebIdentity` again).
+credential being verified. Sessions live in memory only, on whichever node
+served the `AssumeRoleWithWebIdentity` call — lost on that node's restart
+(by design — a client just calls `AssumeRoleWithWebIdentity` again), and
+**not shared with any other cluster node**. In a multi-node deployment, this
+means a session minted on node A is unknown to node B: either route a given
+client's STS exchange and its subsequent S3 requests to the same node
+(sticky routing/node affinity at your load balancer), or call
+`AssumeRoleWithWebIdentity` against each node you expect to send S3 requests
+to and use the resulting per-node credentials accordingly. There's no
+cluster-wide session replication today.
 
 **Current scope, intentionally:** one configured issuer at a time; identity
 and bucket-level scoping only, not fine-grained per-action policy (a session

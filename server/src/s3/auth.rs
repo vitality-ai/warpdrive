@@ -63,6 +63,18 @@ pub struct S3AuthResult {
     pub is_anonymous: bool,
 }
 
+impl S3AuthResult {
+    /// Whether this authenticated identity is allowed to touch `bucket` —
+    /// the same rule `authenticate_s3_request_inner` already applies to the
+    /// request's own path bucket, exposed so handlers that read a *second*
+    /// bucket out-of-band (e.g. CopyObject/UploadPartCopy's `x-amz-copy-source`
+    /// header) can apply the identical scope check to it instead of only
+    /// checking the destination and trusting the source implicitly.
+    pub fn allows_bucket(&self, bucket: &str) -> bool {
+        self.allow_all_buckets || self.allowed_buckets.iter().any(|b| b == bucket)
+    }
+}
+
 /// Static admin display name, e.g. for `<Owner><DisplayName>` in ACL XML.
 /// Defaults to match `s3-tests.conf`'s `[s3 main] display_name`.
 pub fn admin_display_name() -> String {
@@ -995,6 +1007,31 @@ mod tests {
         /// similar, depending on which one's remove_var lands first. Every test
         /// that touches either env var holds this for its full duration.
         static ref ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    }
+
+    fn test_auth_result(allow_all_buckets: bool, allowed_buckets: Vec<&str>) -> S3AuthResult {
+        S3AuthResult {
+            access_key: "test".to_string(),
+            user_id: "test-user".to_string(),
+            owner_display_name: "Test".to_string(),
+            bucket: "whatever".to_string(),
+            allowed_buckets: allowed_buckets.into_iter().map(str::to_string).collect(),
+            allow_all_buckets,
+            is_anonymous: false,
+        }
+    }
+
+    #[actix_web::test]
+    async fn allows_bucket_checks_a_bucket_outside_the_request_path_too() {
+        // This is what CopyObject/UploadPartCopy rely on to scope-check the
+        // *source* bucket from x-amz-copy-source, separately from whatever
+        // bucket authenticate_s3_request already checked for the request path.
+        let scoped = test_auth_result(false, vec!["bucket-a"]);
+        assert!(scoped.allows_bucket("bucket-a"));
+        assert!(!scoped.allows_bucket("bucket-b"), "a bucket outside the session's scope must be denied");
+
+        let admin = test_auth_result(true, vec![]);
+        assert!(admin.allows_bucket("anything"), "allow_all_buckets must bypass the scope list entirely");
     }
 
     #[actix_web::test]

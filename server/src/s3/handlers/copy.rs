@@ -47,6 +47,15 @@ pub async fn s3_copy_object_handler(
     };
     let src_key = percent_decode(&src_key_enc);
 
+    // authenticate_s3_request only checked the destination (the path
+    // bucket) against this session's scope -- without this, a session
+    // restricted to one bucket could still read out of any other bucket
+    // its owner has, just by naming it in x-amz-copy-source.
+    if !auth_result.allows_bucket(&src_bucket) {
+        return Ok(s3_error(StatusCode::FORBIDDEN, "AccessDenied",
+                           "Access Denied", &format!("/{}/{}", src_bucket, src_key)));
+    }
+
     info!("S3 CopyObject: {}/{} → {}/{}", src_bucket, src_key, dst_bucket, dst_key);
 
     let db = MetadataService::new(&auth_result.user_id)?;

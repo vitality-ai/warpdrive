@@ -194,16 +194,38 @@ async fn find_jwk(jwks_url: &str, kid: &str) -> Result<Option<jsonwebtoken::jwk:
 }
 
 /// Shared between the handler and its tests so both exercise the exact same
-/// validation rules -- in particular `validate_nbf`, which this crate leaves
-/// off by default. Without it a correctly-signed token with a future "not
-/// before" time would be accepted immediately instead of being rejected
-/// until it actually becomes valid.
+/// validation rules.
+///
+/// Two gotchas this crate has, both handled here: `validate_nbf` defaults to
+/// false (without it a correctly-signed token with a future "not before"
+/// time would be accepted immediately), and `set_audience`/`set_issuer`
+/// alone only check `aud`/`iss` *when present* -- a token that omits either
+/// claim entirely still passes. `set_required_spec_claims` closes that:
+/// `exp`/`iss`/`aud` must actually be in the token, not just valid if present.
 fn build_validation(alg: jsonwebtoken::Algorithm, audience: &str, issuer: &str) -> jsonwebtoken::Validation {
     let mut validation = jsonwebtoken::Validation::new(alg);
     validation.set_audience(&[audience]);
     validation.set_issuer(&[issuer]);
     validation.validate_nbf = true;
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     validation
+}
+
+/// Resolves the bucket scope for a session from the token's claims. Falls
+/// back to the configured default scope only when the buckets claim is
+/// *absent from the token entirely* -- if the IdP bothered to include it but
+/// set it to an empty array or the wrong JSON type, that's an explicit
+/// statement of "no access", not a reason to grant the (usually broader)
+/// default scope instead. Either way, an empty result here is the caller's
+/// cue to reject the request outright, not silently widen it.
+fn resolve_allowed_buckets(claims: &serde_json::Value, buckets_claim: Option<&str>, default_buckets: &[String]) -> Vec<String> {
+    match buckets_claim.and_then(|c| claims.get(c)) {
+        Some(v) => v
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        None => default_buckets.to_vec(),
+    }
 }
 
 /// Drops expired entries. Called on every new-session insertion rather than
@@ -391,14 +413,7 @@ pub async fn sts_assume_role_with_web_identity(
         }
     };
 
-    let allowed_buckets: Vec<String> = config
-        .buckets_claim
-        .as_ref()
-        .and_then(|claim_name| claims.get(claim_name))
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-        .filter(|v: &Vec<String>| !v.is_empty())
-        .unwrap_or_else(|| config.default_buckets.clone());
+    let allowed_buckets = resolve_allowed_buckets(&claims, config.buckets_claim.as_deref(), &config.default_buckets);
 
     if allowed_buckets.is_empty() {
         return Ok(sts_error_response(
@@ -674,6 +689,75 @@ JSqZUCTqwsWiGEaCDBqH8Q";
         let valid_token = sign_test_token(TEST_PRIV_PEM_A, TEST_KID_A, -60, 3600);
         let result = jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation);
         assert!(result.is_ok(), "a token with a past nbf should be accepted: {:?}", result.err());
+    }
+
+    #[test]
+    fn build_validation_requires_exp_iss_and_aud_to_actually_be_present() {
+        // set_audience()/set_issuer() alone only validate those claims *if
+        // present* -- a token omitting them entirely still passed before
+        // set_required_spec_claims was added. Sign one with sub+exp only,
+        // no iss/aud at all (unlike sign_test_token, which always includes
+        // them), and confirm it's now rejected.
+        #[derive(serde::Serialize)]
+        struct ClaimsMissingIssAud {
+            sub: &'static str,
+            exp: i64,
+        }
+        let claims = ClaimsMissingIssAud {
+            sub: "test-subject",
+            exp: chrono::Utc::now().timestamp() + 3600,
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(TEST_KID_A.to_string());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_PRIV_PEM_A.as_bytes()).unwrap();
+        let token_missing_iss_aud = jsonwebtoken::encode(&header, &claims, &key).unwrap();
+
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_components(TEST_N_A, TEST_E).unwrap();
+        let validation = build_validation(jsonwebtoken::Algorithm::RS256, TEST_AUDIENCE, TEST_ISSUER);
+        let result = jsonwebtoken::decode::<serde_json::Value>(&token_missing_iss_aud, &decoding_key, &validation);
+        assert!(result.is_err(), "a token with no iss/aud claims at all must be rejected, not silently accepted");
+
+        // Sanity: a token with all three present and correct still passes.
+        let full_token = sign_test_token(TEST_PRIV_PEM_A, TEST_KID_A, -60, 3600);
+        let result = jsonwebtoken::decode::<serde_json::Value>(&full_token, &decoding_key, &validation);
+        assert!(result.is_ok(), "a token with all required claims present should be accepted: {:?}", result.err());
+    }
+
+    #[test]
+    fn resolve_allowed_buckets_falls_back_to_default_only_when_claim_is_truly_absent() {
+        let default_buckets = vec!["default-bucket".to_string()];
+
+        // No buckets_claim configured at all -> default.
+        let claims = serde_json::json!({"sub": "x"});
+        assert_eq!(resolve_allowed_buckets(&claims, None, &default_buckets), default_buckets);
+
+        // buckets_claim configured, but the key isn't in the token -> default.
+        assert_eq!(
+            resolve_allowed_buckets(&claims, Some("buckets"), &default_buckets),
+            default_buckets
+        );
+
+        // Claim present with real values -> those, not the default.
+        let claims = serde_json::json!({"buckets": ["a", "b"]});
+        assert_eq!(
+            resolve_allowed_buckets(&claims, Some("buckets"), &default_buckets),
+            vec!["a".to_string(), "b".to_string()]
+        );
+
+        // Claim present but an empty array -> explicit deny (empty), not a
+        // fallback to the broader default scope.
+        let claims = serde_json::json!({"buckets": []});
+        assert_eq!(
+            resolve_allowed_buckets(&claims, Some("buckets"), &default_buckets),
+            Vec::<String>::new()
+        );
+
+        // Claim present but the wrong JSON type -> also an explicit deny.
+        let claims = serde_json::json!({"buckets": "not-an-array"});
+        assert_eq!(
+            resolve_allowed_buckets(&claims, Some("buckets"), &default_buckets),
+            Vec::<String>::new()
+        );
     }
 
     fn jwks_json(entries: &[(&str, &str)]) -> String {
