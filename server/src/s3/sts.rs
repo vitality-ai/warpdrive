@@ -28,10 +28,13 @@ lazy_static! {
     static ref JWKS_CACHE: RwLock<Option<(JwkSet, Instant)>> = RwLock::new(None);
     /// Serializes forced JWKS refreshes so concurrent kid-misses coalesce
     /// into one real outbound fetch instead of each firing their own, and
-    /// tracks when the last *forced* refresh happened (distinct from the
-    /// general cache's own fetched_at, which a routine non-forced fetch
-    /// also updates and so can't be used to rate-limit forced ones).
-    static ref JWKS_REFRESH_LOCK: tokio::sync::Mutex<Option<Instant>> = tokio::sync::Mutex::new(None);
+    /// tracks when the last *forced* refresh happened and whether it
+    /// succeeded -- distinct from the general cache's own fetched_at
+    /// (which a routine non-forced fetch also updates and so can't be used
+    /// to rate-limit forced ones), and distinct from whether `JWKS_CACHE`
+    /// merely has *some* value (which could be stale data from an earlier
+    /// success, left over while the most recent forced attempt failed).
+    static ref JWKS_REFRESH_LOCK: tokio::sync::Mutex<Option<(Instant, bool)>> = tokio::sync::Mutex::new(None);
     /// One entry per temporary access_key_id, minted by AssumeRoleWithWebIdentity.
     static ref STS_SESSIONS: RwLock<HashMap<String, StsSession>> = RwLock::new(HashMap::new());
 }
@@ -161,21 +164,30 @@ async fn fetch_jwks(jwks_url: &str, force_refresh: bool) -> Result<JwkSet, Strin
 /// endpoint on every single one.
 async fn force_refresh_jwks_rate_limited(jwks_url: &str) -> Result<JwkSet, String> {
     let mut last_forced = JWKS_REFRESH_LOCK.lock().await;
-    // Someone else may have already force-refreshed while we were waiting
-    // for the lock (or we did, moments ago, for a different kid) -- if that
-    // happened within the cooldown window, reuse whatever the cache holds
-    // now instead of making another outbound request.
-    if let Some(last) = *last_forced {
+    // Someone else may have already attempted a forced refresh while we
+    // were waiting for the lock (or we did, moments ago, for a different
+    // kid) -- if that happened within the cooldown window, don't make
+    // another outbound request regardless of whether that attempt
+    // succeeded. Recording the timestamp on failure too (below) is what
+    // makes this reachable during an IdP outage: without it, a flood of
+    // bogus-kid requests would retry the real (failing) fetch on every
+    // single one for as long as the IdP stayed down -- exactly when it
+    // least needs more load.
+    if let Some((last, succeeded)) = *last_forced {
         if last.elapsed() < Duration::from_secs(JWKS_FORCED_REFRESH_COOLDOWN_SECS) {
-            if let Some((ref set, _)) = *JWKS_CACHE.read() {
-                return Ok(set.clone());
+            if succeeded {
+                if let Some((ref set, _)) = *JWKS_CACHE.read() {
+                    return Ok(set.clone());
+                }
             }
+            return Err(format!(
+                "a forced JWKS refresh failed recently and is rate-limited; \
+                 retry after the {JWKS_FORCED_REFRESH_COOLDOWN_SECS}s cooldown"
+            ));
         }
     }
     let result = fetch_jwks(jwks_url, true).await;
-    if result.is_ok() {
-        *last_forced = Some(Instant::now());
-    }
+    *last_forced = Some((Instant::now(), result.is_ok()));
     result
 }
 
@@ -494,6 +506,17 @@ pub async fn sts_assume_role_with_web_identity(
 mod tests {
     use super::*;
 
+    lazy_static! {
+        /// `JWKS_CACHE`/`JWKS_REFRESH_LOCK` are process-global singletons (by
+        /// design -- one configured issuer), but Rust runs tests in this
+        /// module on multiple threads by default. Without this, two tests
+        /// that each spin up their own fake JWKS server and populate the one
+        /// shared cache race and intermittently fail depending on which
+        /// one's state the other reads mid-test. Every test that touches
+        /// `find_jwk`/`fetch_jwks` holds this for its full duration.
+        static ref JWKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    }
+
     #[test]
     fn form_decode_handles_plus_as_space_and_percent_escapes() {
         assert_eq!(form_decode("a+b%20c"), "a b c");
@@ -807,6 +830,9 @@ JSqZUCTqwsWiGEaCDBqH8Q";
 
     #[tokio::test]
     async fn find_jwk_force_refreshes_on_a_cache_miss_but_rate_limits_and_coalesces_it() {
+        let _guard = JWKS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *JWKS_CACHE.write() = None;
+        *JWKS_REFRESH_LOCK.lock().await = None;
         let (jwks_url, request_count) = spawn_rotating_jwks_server(vec![
             jwks_json(&[(TEST_KID_A, TEST_N_A)]),             // before "rotation": only key A
             jwks_json(&[(TEST_KID_A, TEST_N_A), (TEST_KID_B, TEST_N_B)]), // after: A and B
@@ -847,6 +873,48 @@ JSqZUCTqwsWiGEaCDBqH8Q";
             count_after_flood <= 3,
             "20 bogus-kid lookups within the cooldown window should produce only a handful of \
              real fetches via coalescing/rate-limiting, got {count_after_flood}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_refresh_rate_limit_also_applies_after_a_failed_attempt() {
+        let _guard = JWKS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *JWKS_CACHE.write() = None;
+        *JWKS_REFRESH_LOCK.lock().await = None;
+        let (jwks_url, request_count) = spawn_rotating_jwks_server(vec![
+            jwks_json(&[(TEST_KID_A, TEST_N_A)]), // first request succeeds, seeds the cache
+            "not valid json".to_string(),         // every request after that fails to parse
+        ]);
+
+        // Seed the cache with a normal (non-forced) fetch.
+        let found_a = find_jwk(&jwks_url, TEST_KID_A).await.expect("fetch ok");
+        assert!(found_a.is_some());
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Kid B isn't cached -- forces a refresh, which now hits the
+        // broken server and fails. This is the attempt that must still get
+        // recorded for rate-limiting purposes even though it failed.
+        let result = find_jwk(&jwks_url, TEST_KID_B).await;
+        assert!(result.is_err(), "a failing JWKS endpoint must surface as an error, not panic or silently succeed");
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // A flood of further kid-misses while the endpoint is still
+        // broken -- every one of them must still be rate-limited, not
+        // retry the real (failing) fetch on every single attempt.
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let url = jwks_url.clone();
+            handles.push(tokio::spawn(async move { find_jwk(&url, "still-nonexistent").await }));
+        }
+        for h in handles {
+            let result = h.await.expect("task join");
+            assert!(result.is_err(), "a failing JWKS endpoint must keep surfacing as an error, not go quiet");
+        }
+        let count_after_flood = request_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count_after_flood <= 4,
+            "20 lookups against a failing endpoint, within the cooldown window, should still only \
+             produce a handful of real attempts, got {count_after_flood}"
         );
     }
 }

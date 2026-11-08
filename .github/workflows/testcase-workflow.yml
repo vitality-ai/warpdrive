@@ -119,7 +119,8 @@ jobs:
         WARPDRIVE_OIDC_AUDIENCE="warpdrive-client" \
         WARPDRIVE_OIDC_JWKS_URL="http://localhost:8080/realms/warpdrive/protocol/openid-connect/certs" \
         WARPDRIVE_OIDC_USER_CLAIM="sub" \
-        WARPDRIVE_OIDC_DEFAULT_BUCKETS="sts-test-bucket" \
+        WARPDRIVE_OIDC_BUCKETS_CLAIM="buckets" \
+        WARPDRIVE_OIDC_DEFAULT_BUCKETS="sts-tenant-default" \
           ./target/release/warp_drive &
         for i in $(seq 1 15); do
           curl -sf http://localhost:9710/ > /dev/null && exit 0
