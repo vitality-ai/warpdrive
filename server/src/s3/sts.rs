@@ -120,8 +120,8 @@ fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
-async fn fetch_jwks(jwks_url: &str) -> Result<JwkSet, String> {
-    {
+async fn fetch_jwks(jwks_url: &str, force_refresh: bool) -> Result<JwkSet, String> {
+    if !force_refresh {
         let cache = JWKS_CACHE.read();
         if let Some((ref set, fetched_at)) = *cache {
             if fetched_at.elapsed() < Duration::from_secs(JWKS_CACHE_TTL_SECS) {
@@ -141,6 +141,43 @@ async fn fetch_jwks(jwks_url: &str) -> Result<JwkSet, String> {
     let set: JwkSet = serde_json::from_str(&text).map_err(|e| format!("parsing JWKS JSON: {e}"))?;
     *JWKS_CACHE.write() = Some((set.clone(), Instant::now()));
     Ok(set)
+}
+
+/// Resolves a signing key by `kid`. A cache miss doesn't immediately fail the
+/// token: the IdP may have rotated its signing key since our cache was last
+/// populated, so this forces one fresh fetch and retries before giving up --
+/// otherwise a real key rotation would deny valid tokens for up to
+/// `JWKS_CACHE_TTL_SECS`.
+async fn find_jwk(jwks_url: &str, kid: &str) -> Result<Option<jsonwebtoken::jwk::Jwk>, String> {
+    let jwks = fetch_jwks(jwks_url, false).await?;
+    if let Some(j) = jwks.find(kid) {
+        return Ok(Some(j.clone()));
+    }
+    let jwks = fetch_jwks(jwks_url, true).await?;
+    Ok(jwks.find(kid).cloned())
+}
+
+/// Shared between the handler and its tests so both exercise the exact same
+/// validation rules -- in particular `validate_nbf`, which this crate leaves
+/// off by default. Without it a correctly-signed token with a future "not
+/// before" time would be accepted immediately instead of being rejected
+/// until it actually becomes valid.
+fn build_validation(alg: jsonwebtoken::Algorithm, audience: &str, issuer: &str) -> jsonwebtoken::Validation {
+    let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.set_audience(&[audience]);
+    validation.set_issuer(&[issuer]);
+    validation.validate_nbf = true;
+    validation
+}
+
+/// Drops expired entries. Called on every new-session insertion rather than
+/// only from `lookup_session`'s access path -- a normal refresh cycle mints a
+/// new access_key_id each time, so an old, now-expired entry may never be
+/// looked up again and would otherwise sit in the map for the life of the
+/// process.
+fn evict_expired_sessions(sessions: &mut HashMap<String, StsSession>) {
+    let now = Instant::now();
+    sessions.retain(|_, s| s.expires_at > now);
 }
 
 fn random_token(len: usize) -> String {
@@ -267,8 +304,15 @@ pub async fn sts_assume_role_with_web_identity(
         }
     };
 
-    let jwks = match fetch_jwks(&config.jwks_url).await {
-        Ok(j) => j,
+    let jwk = match find_jwk(&config.jwks_url, &kid).await {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return Ok(sts_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidIdentityToken",
+                "No signing key in the IdP's JWKS matches this token's 'kid', even after a forced refresh",
+            ))
+        }
         Err(e) => {
             return Ok(sts_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -277,17 +321,7 @@ pub async fn sts_assume_role_with_web_identity(
             ))
         }
     };
-    let jwk = match jwks.find(&kid) {
-        Some(j) => j,
-        None => {
-            return Ok(sts_error_response(
-                StatusCode::BAD_REQUEST,
-                "InvalidIdentityToken",
-                "No signing key in the IdP's JWKS matches this token's 'kid'",
-            ))
-        }
-    };
-    let decoding_key = match jsonwebtoken::DecodingKey::from_jwk(jwk) {
+    let decoding_key = match jsonwebtoken::DecodingKey::from_jwk(&jwk) {
         Ok(k) => k,
         Err(e) => {
             return Ok(sts_error_response(
@@ -298,9 +332,7 @@ pub async fn sts_assume_role_with_web_identity(
         }
     };
 
-    let mut validation = jsonwebtoken::Validation::new(header.alg);
-    validation.set_audience(&[config.audience.clone()]);
-    validation.set_issuer(&[config.issuer.clone()]);
+    let validation = build_validation(header.alg, &config.audience, &config.issuer);
     let claims = match jsonwebtoken::decode::<serde_json::Value>(&web_identity_token, &decoding_key, &validation) {
         Ok(data) => data.claims,
         Err(e) => {
@@ -351,16 +383,20 @@ pub async fn sts_assume_role_with_web_identity(
     let expires_at = Instant::now() + Duration::from_secs(ttl_secs);
     let expiration_rfc3339 = (chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
 
-    STS_SESSIONS.write().insert(
-        access_key_id.clone(),
-        StsSession {
-            secret_access_key: secret_access_key.clone(),
-            session_token: session_token.clone(),
-            user_id: user_id.clone(),
-            allowed_buckets: allowed_buckets.clone(),
-            expires_at,
-        },
-    );
+    {
+        let mut sessions = STS_SESSIONS.write();
+        evict_expired_sessions(&mut sessions);
+        sessions.insert(
+            access_key_id.clone(),
+            StsSession {
+                secret_access_key: secret_access_key.clone(),
+                session_token: session_token.clone(),
+                user_id: user_id.clone(),
+                allowed_buckets: allowed_buckets.clone(),
+                expires_at,
+            },
+        );
+    }
     debug!(
         "STS: issued session access_key={}... user_id={} buckets={:?} ttl_secs={}",
         &access_key_id[..8.min(access_key_id.len())],
@@ -455,5 +491,213 @@ mod tests {
         let cred = lookup_session(&access_key).expect("session should be live");
         assert_eq!(cred.user_id, "u");
         assert_eq!(cred.allowed_buckets, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn evict_expired_sessions_drops_only_expired_entries() {
+        let mut sessions = HashMap::new();
+        let make = |secs_from_now: i64| StsSession {
+            secret_access_key: "s".to_string(),
+            session_token: "t".to_string(),
+            user_id: "u".to_string(),
+            allowed_buckets: vec!["b".to_string()],
+            expires_at: if secs_from_now >= 0 {
+                Instant::now() + Duration::from_secs(secs_from_now as u64)
+            } else {
+                Instant::now() - Duration::from_secs((-secs_from_now) as u64)
+            },
+        };
+        sessions.insert("expired-1".to_string(), make(-10));
+        sessions.insert("expired-2".to_string(), make(-1));
+        sessions.insert("live".to_string(), make(60));
+
+        evict_expired_sessions(&mut sessions);
+
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key("live"));
+    }
+
+    // --- RS256 fixtures (test-only keypairs, no relation to any real IdP) ---
+
+    const TEST_PRIV_PEM_A: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC77JCKKqLO5Ew9
+OJO17km+bykWertF5Na8aDmAob5li2ZEntIQsPBWvt0XVk7LuHRfK+bmVXP8NFn5
+0J5iyge0M0kDqBwKj0fBB2aqt0uJBX0Hbi8RV5+gOgY6DWyybvgc9wnKy3C5VxXn
+Kvo/iYBrfVq90V3sz/0DnLyajPyFFMYAJq5sYPuWz+umysC0t1CxBYj97UV+/9Dy
+iS9o9x0DEyJ9Hbh82eVfgSxVXYsaxrk2jpwRYWX0wqjQWXfqpFrxVfQsGu473JVP
+UtXCM9doZ+8dNZ5o9PAV1HsNWtezkLFhMFt5m5H3x+G0Sf8m9VR+PJJNdJPn2MGx
+iu9mfx5/AgMBAAECggEAP2Y6BUMJFj+TMPxLaQ9xNZwPApR5ZcUkZP/Mlob60wtK
+f1ANkq//BWTy9hKaFsSuDgWjqoWd0bJfwJYPOUjrfHHo6iDnBPD9xjOXAXVBOILv
+gXg8zN8A7W9l9mPdDf2+GxeE6DPmXcDxlMG9F35uItVxraRaybAJrhRM1N9HuiWJ
+JyFltRbicFb9sz3R1Vq3D76QyteBMwdnlE7ocfG22nXMSE87Av+84wEXDTFKLbz7
+ZW7WOoinZiNrBwGVfJlKV4b9v/gYGceg4m2D+BvMqgrYy6igXlgyv4DW37ocUl8s
+1qSlKVPjaITF7KbKYcm90H+t/0GFFlCytePGGMPvUQKBgQD0G73mHOZt5YzzLyG8
++5K6OvUyn6DZQu532Z+/zHWrhxsfRNBrv+atgeBkolZ4qmZyqIUDN49ECSff1D1+
+PRNJNnvnjNUppE1657naorc65CKPbYsPA6X+/uqLgYUHxg+XKMtbpQ8g9X4F0Qu0
+71lXr77Jmr89n1ILBpuzho02PQKBgQDFFCcNqO1ZENBR8XK447jhRqSJHLEEHWam
+sxXLxCAVEBih0hHXMNeGGr1PDGLlhpfirJQsERwBAVD+W0zmdKNOWGVqiRz278pC
+7b259rXG5U3ixZRUQ8swc0qobLlaDabnWLpD9VOhAjGbxdNir/pJhdSpv+Pm1LKb
+c5V0XxlvawKBgH7FhXpi2dyK0QdeG8RcVhf3FG3E7rDGDLgbQdZGpXl+AbzcbOz4
+TSEgiNtaX1PtEqVLFUDVcsafhqC8RW8w4ror3G8k+XLVzBMfEqsTw9qGrdgUyJn0
+iBmEY2Qt0Ft4JZKX8fxXHSM9usPki5LclmZuc8OZZOXovp/RP70dDGr1AoGAcnnG
+RZT+aWHu3+pULTl5xsF2CX71A+LgIayc2IPP7uwuorCXVFw2lNsrY6NaPuDzkOOW
+HhLCJYNSPK1j+el+gp+uKTgD7xxSbJYUQtUfuaywlS0Xf+rxN++ASlz9PWX4sSFE
+8Pyr2zafAlDi/MwjollusjuYchjStqFpCvPCnokCgYEAsFB9CbgzwFIc7W+oSBSq
+pOJg7ErDvEqRM3qGT37QuMSA/frXqBm4mKt8i4bizrw3Q5+6PLeUWywgZJ7rQWzK
+90VAzzeJ+dN+vU89cbGnZpD4g80HXJKNYLllgFKJ2Ye7rCmdUxNrzh/+sk2iAWDi
+Aw4iZ2K6Bxj1vR5UsdcApR0=
+-----END PRIVATE KEY-----";
+    const TEST_N_A: &str = "\
+u-yQiiqizuRMPTiTte5Jvm8pFnq7ReTWvGg5gKG-ZYtmRJ7SELDwVr7dF1ZOy7h0\
+Xyvm5lVz_DRZ-dCeYsoHtDNJA6gcCo9HwQdmqrdLiQV9B24vEVefoDoGOg1ssm74\
+HPcJystwuVcV5yr6P4mAa31avdFd7M_9A5y8moz8hRTGACaubGD7ls_rpsrAtLdQ\
+sQWI_e1Ffv_Q8okvaPcdAxMifR24fNnlX4EsVV2LGsa5No6cEWFl9MKo0Fl36qRa\
+8VX0LBruO9yVT1LVwjPXaGfvHTWeaPTwFdR7DVrXs5CxYTBbeZuR98fhtEn_JvVU\
+fjySTXST59jBsYrvZn8efw";
+    const TEST_E: &str = "AQAB";
+    const TEST_KID_A: &str = "test-kid-a";
+
+    const TEST_PRIV_PEM_B: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDRSORVXcUqws/u
+0sg/pT+i6/L0O1qwPuWtvGXd/DuOXxAdp9dqhuhfpycA7RuAxqqa+RIwwJCItGp/
+aNeaeXK7slbsEHgQrCLqPYCHN/5c0wrOpq8AtP7UG8SQPl44CN3JRPiJRlkPu1j/
+meEkJCUxc0QkZrsqPJS/rSBaziXjPsVeEMla5ZyYF8IhhobhRraGu3VxkCboHNOq
+BXJdNRN1TUVKc6mMq9QR7cGhP1NC+hpKB22eclhfISHop6p8uTpcP9V1aaW4mIOT
+s4wDio/uj9yqKi5Z3pcB86yJAerYDtOGj61nDd/BxqAVf23EDxslKplQJOrCxaIY
+RoIMGofxAgMBAAECggEAAnwFCeZlEs7hPQqPigHiMYLvjWqu9uyoOVnFM89svZHv
+VQrLCd60H36SffZSn0K8f755Ms72aEkMApsyBAlxDT1evsqrQjdo6rL0Naa6hEuV
+E0LzTOTZKZdyy+uRnsSsLVl+QdLt97vXoKEpBQ7Qyjd+FZiKnEO/2E6r1agg1wPA
+PBD57WewZafNHN/IU+djGJ0MUoG6MXbmuVaIeXeo9Oo5b1SwJABExpnVwnCmUkOs
+dM1DCP1dY5SYlBEU6Sa+Vgx7C/m5/Mr1gRwXA4L1VLtGeTSmX+FE4HzZ5RgPKDhI
+eAZiSOBnegPkr6+ciQ2WW2XikS6kZmJgh6N60vu1YQKBgQD8DfQh79yOwvpQ5poC
+OzgXJzD/ova+UpzoTNsu/O7lVRzqHK8bd4blOBXXSlXUXpMz5AnCrLpOHnrWhjL3
+ERf7+oLjB6vHPy1Ompi4VGVNw1rNAzvPEMPi7D/ceGsWzEoSflCw3S2yf/zNWQPr
+a9vrH/bHReFGd2gpdPHWTdtv3QKBgQDUj4yIXK71stQkArDk1YizHa8BeF9D/xfg
+wXC9yDWWkvelCDc86OrDydkc7CpllW6PX4Cuz13BjP5tYznO+931En9iJ7qXOpaL
+KUeJc0SR5pDMXiu2o2GHagdD6HXXPqBVALny6RK77RnhWlPzUZQfPmCVJNkq3d1/
+3zbnekmBJQKBgQCnktNTWLfnBgQLkzSi9SIWaozt+DdZU21UF/zE4Y4mVA7UKtvU
+RAQgEsiaiKZFedcd8ab3kYSPeT4rr67kia3LbcJlE+2FmyARGUEdk6aCK7YLhPHX
+eYryLCVM+5Ye4xT/9JDK9VFzUhoNn/e2JdBhIrAbzf62rZ5HqaM62ipg1QKBgQCX
+WGpggVWV3bGMvlnDZYMCvcTo0BNMr+oJftJOXqpBPv2TBQmHlfPqWeL74+/ACqkA
+7qgKT93avRA/RKJZjR4ZrAUFF3KU0QN1rHuiE2+kTr2Utgx761K6/zSTFoYpLw8r
+1uuPWIKdShHeUdlqaxCDOn+8UdNK4VQgAwftwzVo/QKBgQDhxUIGE0RuiJI8bu38
+f7QnWkZoyj0VMXAZECo8zVhKz+N3Vvmawy3OH9QgCxCBeN4AtF3f1qaZcsU6fu6J
+T7HcxCF1WY/hFrPB95BmOUI1boySrAZTTKnZ2KOY7Y2qfhVyTm0WjQskzv30W5+i
+xosKqnn9mbPFjt/fL3klOFa7Fw==
+-----END PRIVATE KEY-----";
+    const TEST_N_B: &str = "\
+0UjkVV3FKsLP7tLIP6U_ouvy9DtasD7lrbxl3fw7jl8QHafXaoboX6cnAO0bgMaq\
+mvkSMMCQiLRqf2jXmnlyu7JW7BB4EKwi6j2Ahzf-XNMKzqavALT-1BvEkD5eOAjd\
+yUT4iUZZD7tY_5nhJCQlMXNEJGa7KjyUv60gWs4l4z7FXhDJWuWcmBfCIYaG4Ua2\
+hrt1cZAm6BzTqgVyXTUTdU1FSnOpjKvUEe3BoT9TQvoaSgdtnnJYXyEh6KeqfLk6\
+XD_VdWmluJiDk7OMA4qP7o_cqiouWd6XAfOsiQHq2A7Tho-tZw3fwcagFX9txA8b\
+JSqZUCTqwsWiGEaCDBqH8Q";
+    const TEST_KID_B: &str = "test-kid-b";
+
+    const TEST_ISSUER: &str = "https://test-idp.example/";
+    const TEST_AUDIENCE: &str = "test-audience";
+
+    fn sign_test_token(priv_pem: &str, kid: &str, nbf_offset_secs: i64, exp_offset_secs: i64) -> String {
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            sub: &'a str,
+            aud: &'a str,
+            iss: &'a str,
+            nbf: i64,
+            exp: i64,
+            iat: i64,
+        }
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims {
+            sub: "test-subject",
+            aud: TEST_AUDIENCE,
+            iss: TEST_ISSUER,
+            nbf: now + nbf_offset_secs,
+            exp: now + exp_offset_secs,
+            iat: now,
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(priv_pem.as_bytes()).expect("valid test private key");
+        jsonwebtoken::encode(&header, &claims, &key).expect("signing a test token should never fail")
+    }
+
+    #[test]
+    fn build_validation_rejects_a_not_yet_valid_token() {
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_components(TEST_N_A, TEST_E).unwrap();
+
+        // Signed validly, but with nbf 5 minutes in the future.
+        let future_token = sign_test_token(TEST_PRIV_PEM_A, TEST_KID_A, 300, 3600);
+        let validation = build_validation(jsonwebtoken::Algorithm::RS256, TEST_AUDIENCE, TEST_ISSUER);
+        let result = jsonwebtoken::decode::<serde_json::Value>(&future_token, &decoding_key, &validation);
+        assert!(result.is_err(), "a token not yet valid (future nbf) must be rejected");
+
+        // Sanity: the same validation accepts an otherwise-identical token
+        // whose nbf has already passed, so this isn't failing for some
+        // unrelated reason (wrong audience/issuer/signature).
+        let valid_token = sign_test_token(TEST_PRIV_PEM_A, TEST_KID_A, -60, 3600);
+        let result = jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation);
+        assert!(result.is_ok(), "a token with a past nbf should be accepted: {:?}", result.err());
+    }
+
+    fn jwks_json(entries: &[(&str, &str)]) -> String {
+        let keys: Vec<String> = entries
+            .iter()
+            .map(|(kid, n)| {
+                format!(
+                    r#"{{"kty":"RSA","use":"sig","alg":"RS256","kid":"{kid}","n":"{n}","e":"{TEST_E}"}}"#
+                )
+            })
+            .collect();
+        format!(r#"{{"keys":[{}]}}"#, keys.join(","))
+    }
+
+    /// Serves `bodies[0]` for the first request, `bodies[1]` for every
+    /// request after that -- stands in for an IdP whose JWKS endpoint
+    /// starts returning a newly-rotated key set partway through the test.
+    fn spawn_rotating_jwks_server(bodies: Vec<String>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            let mut call = 0usize;
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = bodies[call.min(bodies.len() - 1)].clone();
+                call += 1;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        format!("http://{addr}/jwks")
+    }
+
+    #[tokio::test]
+    async fn find_jwk_force_refreshes_on_a_cache_miss_instead_of_failing_immediately() {
+        let jwks_url = spawn_rotating_jwks_server(vec![
+            jwks_json(&[(TEST_KID_A, TEST_N_A)]),             // before "rotation": only key A
+            jwks_json(&[(TEST_KID_A, TEST_N_A), (TEST_KID_B, TEST_N_B)]), // after: A and B
+        ]);
+
+        // Primes the cache with the pre-rotation JWKS (key A only).
+        let found_a = find_jwk(&jwks_url, TEST_KID_A).await.expect("fetch ok");
+        assert!(found_a.is_some());
+
+        // Key B isn't in the cached set yet -- this must force a fresh
+        // fetch and find it there, not just report it missing because the
+        // (still within-TTL) cached set doesn't have it.
+        let found_b = find_jwk(&jwks_url, TEST_KID_B).await.expect("fetch ok");
+        assert!(
+            found_b.is_some(),
+            "a newly-rotated-in key should be found via a forced refresh, not rejected"
+        );
     }
 }
