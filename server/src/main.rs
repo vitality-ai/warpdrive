@@ -44,6 +44,7 @@ use warp_drive::cluster::placement::ComputedPlacement;
 use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
 use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
 use warp_drive::cluster::packing::StripePacker;
+use warp_drive::s3::sts::sts_assume_role_with_web_identity;
 
 /// The one configured body-size ceiling, shared between the app-wide
 /// `PayloadConfig` (which only bounds `Bytes`/`Json`-style extractors,
@@ -421,6 +422,12 @@ async fn main() -> std::io::Result<()> {
             .wrap(actix_web::middleware::Logger::default())
             .app_data(web::PayloadConfig::default().limit(MAX_BODY_BYTES))
             .app_data(cluster_state.clone())
+            // STS-compatible AssumeRoleWithWebIdentity: lets an operator federate
+            // auth to their own external OIDC IdP instead of the admin pair or
+            // Vitality Console. Unauthenticated by design (it IS the auth
+            // mechanism); registered first so the literal "/sts" path can't be
+            // shadowed by the generic {bucket} routes below.
+            .route("/sts", web::post().to(sts_assume_role_with_web_identity))
             // Cluster API — distributed, erasure-coded PUT/GET/DELETE.
             // Specific/internal routes registered before the generic
             // {bucket}/{key:.*} catch-alls so they aren't shadowed.

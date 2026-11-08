@@ -879,6 +879,47 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
         }
     }
 
+    // --- STS/OIDC federated session (AssumeRoleWithWebIdentity) ---
+    // Lets an operator point WarpDrive at their own external IdP instead of using
+    // the admin pair or Vitality Console. See `crate::s3::sts`.
+    if let Some(sess) = crate::s3::sts::lookup_session(&access_key) {
+        let provided_token = req
+            .headers()
+            .get("x-amz-security-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided_token != sess.session_token {
+            warn!(
+                "S3 auth: STS session token missing/mismatched for access_key={}",
+                access_key_log_prefix(&access_key)
+            );
+            return Err(s3_access_denied(
+                "Invalid or missing X-Amz-Security-Token for temporary credentials",
+            ));
+        }
+        verify_sigv4(req, &sess.secret_access_key, &parsed)?;
+        if !bucket.is_empty() && !sess.allowed_buckets.iter().any(|b| b == &bucket) {
+            warn!(
+                "S3 auth: FORBIDDEN path_bucket={:?} not in STS session scope {:?}",
+                bucket, sess.allowed_buckets
+            );
+            return Err(ErrorForbidden("Bucket is not in this session's scope"));
+        }
+        debug!(
+            "S3 auth: STS session OK user={} path_bucket={:?}",
+            sess.user_id, bucket
+        );
+        return Ok(S3AuthResult {
+            access_key,
+            owner_display_name: sess.user_id.clone(),
+            user_id: sess.user_id,
+            bucket,
+            allowed_buckets: sess.allowed_buckets,
+            allow_all_buckets: false,
+            is_anonymous: false,
+        });
+    }
+
     // --- Vitality Console path ---
     let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
 
