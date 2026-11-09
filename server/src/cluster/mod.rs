@@ -15,6 +15,7 @@ pub mod location_store;
 pub mod content_location_store;
 pub mod metadata_store;
 pub mod bucket_config;
+pub mod bucket_registry;
 pub mod coordinator;
 pub mod packed;
 pub mod pushdown;

@@ -25,7 +25,8 @@ use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
     cluster_internal_put_content_location, cluster_internal_delete_content_location, cluster_content_record,
-    cluster_put_bucket_config, cluster_internal_put_bucket_config,
+    cluster_put_bucket_config, cluster_internal_put_bucket_config, cluster_internal_claim_bucket,
+    cluster_put_bucket_policy, cluster_internal_put_bucket_policy,
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
@@ -43,6 +44,7 @@ use warp_drive::cluster::peer_client::{HttpPeerClient, PeerClient};
 use warp_drive::cluster::placement::ComputedPlacement;
 use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
 use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
+use warp_drive::cluster::bucket_registry::{BitcaskBucketRegistry, BucketRegistry};
 use warp_drive::cluster::packing::StripePacker;
 use warp_drive::s3::sts::sts_assume_role_with_web_identity;
 
@@ -341,6 +343,13 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             )
             .expect("failed to open bucket config store log"),
         ) as Arc<dyn BucketConfigStore>,
+        bucket_registry: Arc::new(
+            BitcaskBucketRegistry::open(
+                std::env::var("WARPDRIVE_BUCKET_REGISTRY_LOG")
+                    .unwrap_or_else(|_| "cluster_bucket_registry.log".to_string()),
+            )
+            .expect("failed to open bucket registry log"),
+        ) as Arc<dyn BucketRegistry>,
         column_codecs: {
             let mut m: std::collections::HashMap<String, Arc<dyn ColumnCodec>> = std::collections::HashMap::new();
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
@@ -441,6 +450,8 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/content_location", web::delete().to(cluster_internal_delete_content_location))
             .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
             .route("/cluster/_internal/bucket_config", web::post().to(cluster_internal_put_bucket_config))
+            .route("/cluster/_internal/bucket_registry/claim", web::post().to(cluster_internal_claim_bucket))
+            .route("/cluster/_internal/bucket_registry/policy", web::post().to(cluster_internal_put_bucket_policy))
             .route("/cluster/_internal/pushdown_filter", web::post().to(cluster_internal_pushdown_filter))
             .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
             .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
@@ -457,6 +468,7 @@ async fn main() -> std::io::Result<()> {
             // upgrade). The bare /cluster/{bucket}/{key:.*} routes below are
             // untouched and stay fully unauthenticated.
             .route("/cluster/s3/{bucket}", web::get().to(cluster_s3_list_objects))
+            .route("/cluster/s3/{bucket}", web::put().to(cluster_put_bucket_policy))
             .route("/cluster/s3/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object_authenticated))
             .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_s3_put_object_authenticated))
             .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_s3_get_object_authenticated))
