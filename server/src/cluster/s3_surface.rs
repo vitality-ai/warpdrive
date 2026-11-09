@@ -32,6 +32,7 @@ use std::sync::Arc;
 use crate::s3::handlers::common::s3_err;
 
 use super::coordinator::{
+    check_bucket_ownership_readonly, check_or_claim_bucket_ownership,
     cluster_abort_multipart_upload_inner, cluster_complete_multipart_upload_inner,
     cluster_create_multipart_upload_inner, cluster_delete_object_inner, cluster_delete_object_tagging_inner,
     cluster_get_object_inner, cluster_get_object_legal_hold, cluster_get_object_retention, cluster_get_object_tagging,
@@ -143,6 +144,7 @@ pub async fn cluster_s3_head_object_authenticated(
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
+    check_bucket_ownership_readonly(&state, &bucket, &auth_result.user_id, auth_result.allow_all_buckets)?;
     let db = cluster_metadata_service(&state, &auth_result.user_id)?;
 
     let meta = db.get_object_full(&bucket, &key)?;
@@ -192,6 +194,7 @@ pub async fn cluster_s3_put_object_authenticated(
     let (bucket, key) = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
     let user_id = auth_result.user_id;
+    check_or_claim_bucket_ownership(&state, &bucket, &user_id, auth_result.allow_all_buckets).await?;
 
     // Query-param dispatch, same order and same query-key names as
     // single-node's `s3_put_object_handler` (object.rs), so a client sees
@@ -383,6 +386,7 @@ pub async fn cluster_s3_get_object_authenticated(
     let (bucket, key) = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
     let user_id = auth_result.user_id;
+    check_bucket_ownership_readonly(&state, &bucket, &user_id, auth_result.allow_all_buckets)?;
 
     // Same query-param dispatch order as single-node's
     // `s3_get_object_handler`.
@@ -440,6 +444,7 @@ pub async fn cluster_s3_delete_object_authenticated(
     let (bucket, key) = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
     let user_id = auth_result.user_id;
+    check_bucket_ownership_readonly(&state, &bucket, &user_id, auth_result.allow_all_buckets)?;
 
     let qmap = req_query_map(&req);
     if let Some(upload_id) = qmap.get("uploadId") {
@@ -471,6 +476,7 @@ pub async fn cluster_s3_delete_objects_authenticated(
     let bucket = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
     let user_id = auth_result.user_id;
+    check_bucket_ownership_readonly(&state, &bucket, &user_id, auth_result.allow_all_buckets)?;
 
     let body_str = String::from_utf8_lossy(&body);
     let mut deleted_xml = String::new();
@@ -534,10 +540,23 @@ pub async fn cluster_s3_list_objects(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let bucket = path.into_inner();
-    let prefix = query.get("prefix").cloned().unwrap_or_default();
     let auth_result = authenticate_s3_request(&req).await?;
     let user_id = &auth_result.user_id;
+    check_bucket_ownership_readonly(&state, &bucket, user_id, auth_result.allow_all_buckets)?;
 
+    // `?policy` -- raw storage/retrieval only (see coordinator.rs's own
+    // doc), no Effect/Principal/Action evaluation. Shares this route since
+    // GET /cluster/s3/{bucket} is already ListObjectsV2's path and actix
+    // can't route the same method+path to two different handlers.
+    if query.contains_key("policy") {
+        let policy_json = state.bucket_registry.get(&bucket).and_then(|o| o.policy_json);
+        return match policy_json {
+            Some(p) => Ok(HttpResponse::Ok().content_type("application/json").body(p)),
+            None => Err(s3_err(StatusCode::NOT_FOUND, "NoSuchBucketPolicy", "The bucket policy does not exist", &format!("/{bucket}"))),
+        };
+    }
+
+    let prefix = query.get("prefix").cloned().unwrap_or_default();
     let mut entries = state.location_store.list(user_id, &bucket, &prefix);
     entries.extend(state.content_location_store.list(user_id, &bucket, &prefix));
     entries.sort();
@@ -585,6 +604,7 @@ pub async fn cluster_s3_multipart_post_authenticated(
     let (bucket, key) = path.into_inner();
     let auth_result = authenticate_s3_request(&req).await?;
     let user_id = auth_result.user_id;
+    check_or_claim_bucket_ownership(&state, &bucket, &user_id, auth_result.allow_all_buckets).await?;
     let qmap = req_query_map(&req);
 
     if qmap.contains_key("uploads") {
