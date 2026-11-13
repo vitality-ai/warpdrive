@@ -118,7 +118,7 @@ spec:
             matchLabels: { app: warpdrive }
       containers:
         - name: warpdrive
-          image: ghcr.io/vitality-ai/warpdrive:latest   # build from this repo's Dockerfile
+          image: tejascj/warpdrive:latest   # multi-arch (amd64, arm64), built from this repo's Dockerfile
           ports:
             - { containerPort: 9710 }
             - { containerPort: 10710 }
