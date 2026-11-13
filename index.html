@@ -661,31 +661,55 @@
 
       <div class="tab-bar">
         <button class="tab-btn active" onclick="switchTab(event,'apt')">apt (Linux)</button>
-        <button class="tab-btn" onclick="switchTab(event,'cargo')">Build from source</button>
+        <button class="tab-btn" onclick="switchTab(event,'binary')">Binary</button>
         <button class="tab-btn" onclick="switchTab(event,'docker')">Docker</button>
+        <button class="tab-btn" onclick="switchTab(event,'cargo')">Build from source</button>
       </div>
 
       <!-- apt -->
       <div class="tab-panel active" id="tab-apt">
         <div class="platform-row">
           <span class="badge badge-green">amd64 / x86_64</span>
-          <span class="badge badge-muted">arm64 — coming soon</span>
-          <span class="badge badge-muted">macOS — coming soon</span>
-          <span class="badge badge-muted">Windows — coming soon</span>
+          <span class="badge badge-muted">arm64: use the Binary or Docker tab</span>
         </div>
         <div class="code-block">
           <pre><span class="cm"># Add the Warpdrive apt repository</span>
-curl -fsSL https://releases.warpdrive.dev/gpg \
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://vitality-ai.github.io/warpdrive/gpg.key \
   | sudo gpg --dearmor -o /etc/apt/keyrings/warpdrive.gpg
 
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/warpdrive.gpg] \
-  https://releases.warpdrive.dev/apt stable main" \
+  https://vitality-ai.github.io/warpdrive stable main" \
   | sudo tee /etc/apt/sources.list.d/warpdrive.list
 
 sudo apt-get update &amp;&amp; sudo apt-get install -y warpdrive</pre>
         </div>
         <div class="platform-note">
           Requires Ubuntu 20.04+ or Debian 11+. The binary is <code>warp_drive</code> after install.
+        </div>
+      </div>
+
+      <!-- binary -->
+      <div class="tab-panel" id="tab-binary">
+        <div class="platform-row">
+          <span class="badge badge-green">Linux amd64</span>
+          <span class="badge badge-green">Linux arm64</span>
+          <span class="badge badge-green">macOS Apple Silicon</span>
+        </div>
+        <div class="code-block">
+          <pre><span class="cm"># Pick your platform: linux-amd64, linux-arm64 or darwin-arm64</span>
+TAG=v1.0.0-beta
+PLATFORM=darwin-arm64
+curl -fLO https://github.com/vitality-ai/warpdrive/releases/download/$TAG/warp_drive-$TAG-$PLATFORM.tar.gz
+tar -xzf warp_drive-$TAG-$PLATFORM.tar.gz
+<span class="kw">cd</span> warp_drive-$TAG-$PLATFORM
+
+WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
+WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
+  ./warp_drive</pre>
+        </div>
+        <div class="platform-note">
+          Or download the archive for your platform from <a href="https://github.com/vitality-ai/warpdrive/releases">GitHub Releases</a>. Start <code>warp_drive</code> from the extracted folder. It reads <code>server_log.yaml</code> from its working directory and keeps its data there too. Linux binaries need glibc 2.35+ (Ubuntu 22.04+, Debian 12+). On macOS, a binary downloaded through a browser is quarantined because it isn't notarized. Run <code>xattr -d com.apple.quarantine warp_drive</code> first.
         </div>
       </div>
 
@@ -726,7 +750,7 @@ docker run -d \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
   -e WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
   -v $(pwd)/data:/data \
-  ghcr.io/vitality-ai/warpdrive:latest</pre>
+  tejascj/warpdrive:latest</pre>
         </div>
         <div class="platform-note">
           A <code>docker-compose.yml</code> is available in the repo for local development.
