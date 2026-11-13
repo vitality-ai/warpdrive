@@ -61,6 +61,13 @@ parking_lot = "0.12"
 jsonwebtoken = "9"
 rand = "0.8"
 
+[features]
+# Compile SQLite into the binary instead of linking the system libsqlite3.
+# The release-binaries workflow turns this on so a downloaded warp_drive
+# runs on a machine with no libsqlite3 installed. Docker and the .deb keep
+# the default (system libsqlite3), which their base images already provide.
+bundled-sqlite = ["rusqlite/bundled"]
+
 [build-dependencies]
 tonic-build = "0.11"
 protoc-bin-vendored = "3"
