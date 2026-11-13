@@ -1,0 +1,90 @@
+# Attaches prebuilt warp_drive binaries to a GitHub Release, so users who
+# don't want Docker or apt can download one file and run it.
+#
+# Runs when a release is published. For a release that already exists,
+# run it by hand (Actions -> release-binaries -> Run workflow) with the tag.
+#
+# Linux builds on Ubuntu 22.04 runners so the binary links against glibc
+# 2.35 and runs on Ubuntu 22.04+ and Debian 12+. SQLite is compiled in
+# (bundled-sqlite), so the only runtime dependency is libc.
+name: release-binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach binaries to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-22.04
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+          - target: darwin-arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ env.TAG }}
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build warp_drive
+      working-directory: server
+      run: cargo build --release --locked --bin warp_drive --features bundled-sqlite
+
+    # warp_drive reads server_log.yaml from its working directory at
+    # startup (the .deb ships it to /var/lib/warpdrive for the same
+    # reason), so the archive carries it next to the binary.
+    - name: Package
+      run: |
+        name="warp_drive-${TAG}-${{ matrix.target }}"
+        mkdir "$name"
+        cp server/target/release/warp_drive server/server_log.yaml LICENSE "$name/"
+        tar -czf "$name.tar.gz" "$name"
+        shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+        echo "ASSET=$name" >> "$GITHUB_ENV"
+
+    # Extract the archive into an empty directory and start it from there,
+    # the way a user would, so an archive that can't start is never
+    # attached to a release.
+    - name: Smoke test the archive
+      run: |
+        dir="$(mktemp -d)"
+        tar -xzf "$ASSET.tar.gz" -C "$dir"
+        cd "$dir/$ASSET"
+        WARPDRIVE_ADMIN_ACCESS_KEY=smokekey \
+        WARPDRIVE_ADMIN_SECRET_KEY=smokesecretkey123456 \
+          ./warp_drive > "$dir/log" 2>&1 &
+        pid=$!
+        for _ in $(seq 1 30); do
+          if curl -s -o /dev/null http://127.0.0.1:9710/; then
+            kill "$pid"
+            exit 0
+          fi
+          sleep 1
+        done
+        cat "$dir/log"
+        exit 1
+
+    - name: Upload to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release upload "$TAG" "$ASSET.tar.gz" "$ASSET.tar.gz.sha256" --clobber

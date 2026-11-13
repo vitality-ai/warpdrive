@@ -38,7 +38,7 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 
 ## Getting Started
 
-Pull and run the pre-built image, no build step required:
+Pull and run the pre-built image, no build step required. It's published for both `linux/amd64` and `linux/arm64`, so it runs natively on Apple Silicon too:
 
 ```bash
 docker pull tejascj/warpdrive:latest
@@ -49,7 +49,21 @@ docker run -p 9710:9710 \
   tejascj/warpdrive:latest
 ```
 
-With the container running, verify it with boto3:
+Or skip Docker and download a prebuilt binary (Linux amd64/arm64, macOS Apple Silicon) from [GitHub Releases](https://github.com/vitality-ai/warpdrive/releases). Run it with the same two keys:
+
+```bash
+tar -xzf warp_drive-<tag>-<platform>.tar.gz
+cd warp_drive-<tag>-<platform>
+WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  ./warp_drive
+```
+
+Start it from the extracted folder. It reads `server_log.yaml` from its working directory and keeps its data there too.
+
+On macOS, a binary downloaded through a browser is quarantined because it isn't notarized. Clear that with `xattr -d com.apple.quarantine warp_drive` before running it. Downloads with `curl` or `gh release download` aren't quarantined.
+
+With WarpDrive running, verify it with boto3:
 
 ```bash
 pip install boto3
@@ -67,6 +81,7 @@ s3 = boto3.client(
     config=boto3.session.Config(s3={'addressing_style': 'path'}),
 )
 
+s3.create_bucket(Bucket='test-bucket')
 s3.put_object(Bucket='test-bucket', Key='hello.txt', Body=b'Hello, WarpDrive!')
 print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
 ```
