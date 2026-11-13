@@ -1,0 +1,22 @@
+$ python3 tpch_duckdb_benchmark.py http://127.0.0.1:9710 1.0 /Users/cj/cj/personal/claude/warpdrive-distributed/server/cluster-local/node0/logs/application.log
+
+Reusing existing data/lineitem_sf1.0_sorted.parquet (208.5 MB)
+Extracting real column-chunk byte offsets (column_chunk granularity)...
+  962 units, 208462188 bytes, full coverage verified
+Uploading to plain bucket (tpchplain)...
+Uploading to FAC-packed bucket (tpchivf)...
+
+Verifying both buckets are byte-identical to the real file and pyarrow-readable...
+  both buckets verified byte-identical.
+
+Running the real official TPC-H Q1 and Q6 against both buckets...
+
+=== Q6 ===
+  tpchplain: median 754.0ms over 2 runs, result rows=1
+    server-side evidence: no range-GET stripe-touch lines found (plain bucket has no stripe concept)
+  tpchivf: median 70.0ms over 5 runs, result rows=1
+    server-side evidence: 246 range-GETs, touched 246/32472 stripe-slots (avg 1.0 of 132 stripes/request)
+
+=== Q1 ===
+  tpchivf: median 585.2ms over 5 runs, result rows=4
+    server-side evidence: 1068 range-GETs, touched 2322/140976 stripe-slots (avg 2.2 of 132 stripes/request)

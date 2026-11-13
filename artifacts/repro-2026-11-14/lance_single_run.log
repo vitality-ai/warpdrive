@@ -1,0 +1,26 @@
+$ python3 lance_demo.py http://127.0.0.1:9710
+
+data fragment file: data/11110110100111011011110162eaf542cc9a34a2314775bc31.lance
+Real row-batch units extracted and verified: 1001 units, 61475306 bytes, full coverage confirmed.
+Uploading to plain bucket (lanceplain)...
+Uploading to ivf_centroid-configured bucket (lanceivf)...
+
+Opening both buckets via Lance's own S3 client...
+  lanceplain: opened OK, count_rows=20000 (expected 20000)
+  lanceivf: opened OK, count_rows=20000 (expected 20000)
+
+=== nprobe=4 ===
+  lanceplain: median 56.5ms over 9 queries (rows returned: 10)
+  lanceivf: median 21.2ms over 9 queries (rows returned: 10)
+
+=== nprobe=16 ===
+  lanceplain: median 56.3ms over 9 queries (rows returned: 10)
+  lanceivf: median 24.1ms over 9 queries (rows returned: 10)
+
+=== nprobe=40 ===
+  lanceplain: median 55.7ms over 9 queries (rows returned: 10)
+  lanceivf: median 28.3ms over 9 queries (rows returned: 10)
+
+--- server-side stripe-touch evidence (bucket=lanceivf, from application.log) ---
+aux-idx:        n=499 avg_touched=2.63 of 96 total stripes
+data-fragment:  n=331 avg_touched=1.00 of 167 total stripes

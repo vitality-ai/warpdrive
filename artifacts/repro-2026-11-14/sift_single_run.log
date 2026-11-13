@@ -1,0 +1,29 @@
+$ python3 sift_benchmark.py http://127.0.0.1:9710
+
+Loading real SIFT1M (small) benchmark data...
+  base: (10000, 128), queries: (100, 128), groundtruth: (100, 100)
+Building real Lance IVF_PQ index: 10000 vectors, dim=128, partitions=100...
+  aux units: 102, 310853 bytes, coverage verified
+  data-fragment units: 502, 5136669 bytes, coverage verified
+Uploading to plain bucket (siftplain)...
+Uploading to packed bucket (siftivf)...
+  siftplain: opened OK, count_rows=10000 (expected 10000)
+  siftivf: opened OK, count_rows=10000 (expected 10000)
+
+Running real queries from the benchmark's own query set, checking real recall@10...
+
+=== nprobe=5 ===
+  siftplain: median 1.64ms over 99 queries, mean recall@10=0.714 (over all 100 real queries)
+  siftivf: median 1.50ms over 99 queries, mean recall@10=0.714 (over all 100 real queries)
+
+=== nprobe=10 ===
+  siftplain: median 1.30ms over 99 queries, mean recall@10=0.744 (over all 100 real queries)
+  siftivf: median 1.26ms over 99 queries, mean recall@10=0.744 (over all 100 real queries)
+
+=== nprobe=20 ===
+  siftplain: median 1.67ms over 99 queries, mean recall@10=0.747 (over all 100 real queries)
+  siftivf: median 1.52ms over 99 queries, mean recall@10=0.747 (over all 100 real queries)
+
+--- server-side stripe-touch evidence (bucket=siftivf, from application.log) ---
+aux-idx:        n=211 avg_touched=2.60 of 37 total stripes
+data-fragment:  n=302 avg_touched=1.01 of 84 total stripes
