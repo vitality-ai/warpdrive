@@ -153,19 +153,20 @@ registry (the cluster engine doesn't, by design — see the User Guide).
 
 ## Docker (Optional)
 
-**Pull a pre-built image** instead of building from source — rebuilt and
-pushed on every merge to `main`:
+**Pull a pre-built image** instead of building from source. It's rebuilt
+and pushed on every merge to `main`, for both `linux/amd64` and
+`linux/arm64`. Docker picks the right one for your machine:
 
 ```bash
-docker pull ghcr.io/vitality-ai/warpdrive:latest
-# or, same image:
 docker pull tejascj/warpdrive:latest
 
 docker run -p 9710:9710 \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
   -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
-  ghcr.io/vitality-ai/warpdrive:latest
+  tejascj/warpdrive:latest
 ```
+
+`tejascj/warpdrive` on Docker Hub is the only published image.
 
 A specific commit's image is also kept, tagged by its SHA (`:<commit-sha>`),
 not just `:latest` — useful for pinning a deployment to a known build.
