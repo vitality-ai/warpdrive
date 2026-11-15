@@ -307,6 +307,39 @@ pub fn parse_authorization_header(auth_header: &str) -> Result<(String, String),
 /// SHA256 hash of empty body (for GET/HEAD etc.)
 const EMPTY_PAYLOAD_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// The signature only covers `x-amz-content-sha256`, so the body must be checked against it.
+/// Returns a 400 XAmzContentSHA256Mismatch response when the header is a hex SHA-256 that
+/// doesn't match `body`. Non-hash values (UNSIGNED-PAYLOAD, STREAMING-*) pass through.
+pub fn payload_hash_mismatch(req: &HttpRequest, body: &[u8]) -> Option<HttpResponse> {
+    use sha2::{Digest, Sha256};
+    let claimed = req.headers().get("x-amz-content-sha256")?.to_str().ok()?.trim();
+    if claimed.len() != 64 || !claimed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let actual = hex::encode(Sha256::digest(body));
+    if claimed.eq_ignore_ascii_case(&actual) {
+        return None;
+    }
+    warn!("x-amz-content-sha256 mismatch on {} {}", req.method(), req.path());
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\n\
+           <Code>XAmzContentSHA256Mismatch</Code>\n\
+           <Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message>\n\
+           <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\n\
+           <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\n\
+           <RequestId>warpdrive</RequestId>\n\
+         </Error>",
+        claimed.to_ascii_lowercase(), actual
+    );
+    Some(
+        HttpResponse::BadRequest()
+            .content_type("application/xml")
+            .insert_header(("x-amz-request-id", "warpdrive"))
+            .body(body),
+    )
+}
+
 /// Verify AWS SigV4 signature. Returns Ok(()) if the request signature matches.
 fn verify_sigv4(
     req: &HttpRequest,
@@ -1355,6 +1388,32 @@ mod tests {
         let (status, body) = error_code(verify_sigv4(&req, "s3cret", &parsed).unwrap_err());
         assert_eq!(status, 403);
         assert!(body.contains("AccessDenied"), "{body}");
+    }
+
+    fn req_with_content_sha(v: &str) -> HttpRequest {
+        test::TestRequest::put().uri("/s3/b/k").insert_header(("x-amz-content-sha256", v)).to_http_request()
+    }
+
+    #[actix_web::test]
+    async fn payload_hash_must_match_the_body() {
+        let body = b"original-body-A";
+        let good = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body));
+        assert!(payload_hash_mismatch(&req_with_content_sha(&good), body).is_none());
+        assert!(payload_hash_mismatch(&req_with_content_sha(&good.to_uppercase()), body).is_none());
+
+        let resp = payload_hash_mismatch(&req_with_content_sha(&good), b"TAMPERED-BODY-B").expect("swapped body must be rejected");
+        assert_eq!(resp.status().as_u16(), 400);
+        let xml = futures::executor::block_on(actix_web::body::to_bytes(resp.into_body())).unwrap();
+        assert!(String::from_utf8_lossy(&xml).contains("XAmzContentSHA256Mismatch"));
+    }
+
+    #[actix_web::test]
+    async fn non_hash_payload_markers_are_not_checked() {
+        for v in ["UNSIGNED-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", "not-hex", ""] {
+            assert!(payload_hash_mismatch(&req_with_content_sha(v), b"anything").is_none(), "{v}");
+        }
+        let no_header = test::TestRequest::put().uri("/s3/b/k").to_http_request();
+        assert!(payload_hash_mismatch(&no_header, b"anything").is_none());
     }
 
     #[actix_web::test]

@@ -5,7 +5,7 @@ use log::{info, warn};
 
 use std::collections::HashMap;
 
-use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, ADMIN_USER_ID};
+use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, payload_hash_mismatch, ADMIN_USER_ID};
 use crate::service::metadata_service::MetadataService;
 
 use super::common::*;
@@ -349,6 +349,7 @@ pub async fn s3_delete_objects_handler(
         })?;
         body_bytes.extend_from_slice(&chunk);
     }
+    if let Some(resp) = payload_hash_mismatch(&req, &body_bytes) { return Ok(resp); }
     let body = String::from_utf8_lossy(&body_bytes);
 
     struct ObjReq {

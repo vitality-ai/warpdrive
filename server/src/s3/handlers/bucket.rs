@@ -5,7 +5,7 @@ use log::info;
 
 use std::collections::HashMap;
 
-use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous};
+use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, payload_hash_mismatch};
 use crate::service::metadata_service::MetadataService;
 
 use super::common::*;
@@ -126,6 +126,7 @@ pub async fn s3_create_bucket_handler(
         while let Some(chunk) = payload.next().await {
             body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
         }
+        if let Some(resp) = payload_hash_mismatch(&req, &body) { return Ok(resp); }
         if qmap.contains_key("acl") {
             return s3_put_bucket_acl_inner(&bucket, &body, &req).await;
         }
@@ -146,6 +147,7 @@ pub async fn s3_create_bucket_handler(
         let chunk = chunk.map_err(actix_web::error::ErrorInternalServerError)?;
         body_bytes.extend_from_slice(&chunk);
     }
+    if let Some(resp) = payload_hash_mismatch(&req, &body_bytes) { return Ok(resp); }
     let body = String::from_utf8_lossy(&body_bytes);
 
     let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
