@@ -543,8 +543,8 @@ impl MetadataStorage for SQLiteMetadataStore {
         SQLiteMetadataStore::put_object_v2(self, user_id, bucket, key, metadata)
     }
 
-    fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
-        SQLiteMetadataStore::get_pending_deletions(self, limit)
+    fn get_pending_deletions(&self, after_id: i64, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+        SQLiteMetadataStore::get_pending_deletions(self, after_id, limit)
     }
 
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
@@ -553,6 +553,10 @@ impl MetadataStorage for SQLiteMetadataStore {
 
     fn cleanup_old_deletions(&self) -> Result<usize, Error> {
         SQLiteMetadataStore::cleanup_old_deletions(self)
+    }
+
+    fn referenced_extents(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
+        SQLiteMetadataStore::referenced_extents(self, user_id, bucket)
     }
 
     fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
@@ -772,6 +776,17 @@ impl MetadataStorage for SQLiteMetadataStore {
     }
 }
 
+/// Queue the extents of the object rows about to be hard-deleted (caller holds the lock).
+fn queue_extents_of_rows(conn: &Connection, user_id: &str, bucket: &str, key: &str, extra_where: &str) -> Result<(), Error> {
+    let sql = format!(
+        "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list)
+         SELECT user, bucket, key, offset_size_list FROM objects
+         WHERE user=?1 AND bucket=?2 AND key=?3 AND offset_size_list IS NOT NULL{extra_where}"
+    );
+    conn.execute(&sql, params![user_id, bucket, key]).map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(())
+}
+
 /// Deletion queue — WAL for background storage GC
 impl SQLiteMetadataStore {
     pub fn queue_deletion(&self, user_id: &str, bucket: &str, key: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
@@ -785,17 +800,17 @@ impl SQLiteMetadataStore {
         Ok(())
     }
 
-    pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+    pub fn get_pending_deletions(&self, after_id: i64, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
         let conn = DB_CONN.lock();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, bucket, key, offset_size_list, created_at
              FROM deletion_queue
-             WHERE processed = FALSE
-             ORDER BY created_at ASC
-             LIMIT ?1",
+             WHERE processed = FALSE AND id > ?1
+             ORDER BY id ASC
+             LIMIT ?2",
         ).map_err(actix_web::error::ErrorInternalServerError)?;
 
-        let rows = stmt.query_map(params![limit], |row| {
+        let rows = stmt.query_map(params![after_id, limit], |row| {
             let offset_size_bytes: Vec<u8> = row.get(4)?;
             let offset_size_list = crate::util::serializer::deserialize_offset_size(&offset_size_bytes)
                 .map_err(|_| rusqlite::Error::InvalidColumnType(4, "BLOB".to_string(), rusqlite::types::Type::Blob))?;
@@ -833,6 +848,44 @@ impl SQLiteMetadataStore {
         ).map_err(actix_web::error::ErrorInternalServerError)?;
         info!("Cleaned up {} old deletion events", count);
         Ok(count)
+    }
+
+    pub fn referenced_extents(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
+        let conn = DB_CONN.lock();
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT offset_size_list FROM objects
+                 WHERE user = ?1 AND bucket = ?2 AND offset_size_list IS NOT NULL",
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+            let rows = stmt.query_map(params![user_id, bucket], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(actix_web::error::ErrorInternalServerError)?;
+            for row in rows {
+                blobs.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT p.extents_blob FROM multipart_parts p
+                 JOIN multipart_uploads u ON u.upload_id = p.upload_id
+                 WHERE u.user_id = ?1 AND u.bucket = ?2 AND u.status = 'in_progress'",
+            ).map_err(actix_web::error::ErrorInternalServerError)?;
+            let rows = stmt.query_map(params![user_id, bucket], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(actix_web::error::ErrorInternalServerError)?;
+            for row in rows {
+                blobs.push(row.map_err(actix_web::error::ErrorInternalServerError)?);
+            }
+        }
+        drop(conn);
+        let mut extents = Vec::new();
+        for blob in blobs {
+            if blob.is_empty() {
+                continue;
+            }
+            // Unparseable blob: fail the pass rather than risk erasing live data.
+            extents.extend(crate::util::serializer::deserialize_offset_size(&blob)?);
+        }
+        Ok(extents)
     }
 }
 
@@ -1239,6 +1292,7 @@ impl SQLiteMetadataStore {
 
         match versioning.as_str() {
             "disabled" => {
+                queue_extents_of_rows(&conn, user_id, bucket, key, "")?;
                 conn.execute(
                     "DELETE FROM objects WHERE user=?1 AND bucket=?2 AND key=?3",
                     params![user_id, bucket, key],
@@ -1262,6 +1316,7 @@ impl SQLiteMetadataStore {
             }
             _ /* "suspended" */ => {
                 // Delete the existing null-version object (if it exists) and insert a null-version delete marker.
+                queue_extents_of_rows(&conn, user_id, bucket, key, " AND version_id='null'")?;
                 conn.execute(
                     "DELETE FROM objects WHERE user=?1 AND bucket=?2 AND key=?3 AND version_id='null'",
                     params![user_id, bucket, key],
@@ -1873,5 +1928,24 @@ mod tests {
 
         store.delete_bucket(user_id, bucket).unwrap();
         assert!(!store.bucket_exists(user_id, bucket).unwrap());
+    }
+
+    #[test]
+    fn unversioned_delete_queues_extents_and_drops_references() {
+        let store = SQLiteMetadataStore::new();
+        let (user_id, bucket, key) = ("test_user_gc", "test-gc-bucket-unversioned", "doc.pdf");
+        let extents = vec![(4096, 100), (8192, 50)];
+        store.put_metadata(user_id, bucket, key, &Metadata::from_offset_size_list(extents.clone())).unwrap();
+        assert!(store.referenced_extents(user_id, bucket).unwrap().contains(&(4096, 100)));
+
+        store.delete_object_v2(user_id, bucket, key).unwrap();
+
+        assert!(store.referenced_extents(user_id, bucket).unwrap().is_empty());
+        let queued: Vec<_> = store.get_pending_deletions(0, i32::MAX).unwrap().into_iter()
+            .filter(|e| e.user_id == user_id && e.bucket == bucket && e.key == key)
+            .collect();
+        assert_eq!(queued.len(), 1, "a hard delete must queue its extents exactly once");
+        assert_eq!(queued[0].offset_size_list, extents);
+        store.mark_deletion_processed(queued[0].id).unwrap();
     }
 }

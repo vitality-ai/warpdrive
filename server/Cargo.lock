@@ -3238,6 +3238,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "lazy_static",
+ "libc",
  "log",
  "log-mdc",
  "log4rs",

@@ -201,9 +201,12 @@ pub trait MetadataStorage: Send + Sync {
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error>;
 
     // --- Deletion WAL ---
-    fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
+    /// Pending events with `id > after_id`, oldest first.
+    fn get_pending_deletions(&self, after_id: i64, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error>;
     fn cleanup_old_deletions(&self) -> Result<usize, Error>;
+    /// Extents still referenced in (user, bucket): every object version plus in-progress multipart parts.
+    fn referenced_extents(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error>;
 
     // --- CORS ---
     fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error>;

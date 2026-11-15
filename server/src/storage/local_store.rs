@@ -124,6 +124,39 @@ fn get_storage_directory() -> PathBuf {
 }
 
 /// Local XFS binary storage implementation
+/// Erase `[offset, offset+size)` so it reads back as zeros. Punches a hole (frees blocks,
+/// keeps file length) on Linux; falls back to overwriting with zeros.
+fn erase_range(file: &File, offset: u64, size: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                size as libc::off_t,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EOPNOTSUPP) {
+            return Err(err);
+        }
+    }
+    const CHUNK: u64 = 1 << 20;
+    let zeros = vec![0u8; CHUNK.min(size) as usize];
+    let mut done = 0;
+    while done < size {
+        let n = CHUNK.min(size - done);
+        file.write_all_at(&zeros[..n as usize], offset + done)?;
+        done += n;
+    }
+    Ok(())
+}
+
 pub struct LocalXFSBinaryStore;
 
 impl LocalXFSBinaryStore {
@@ -218,14 +251,23 @@ impl Storage for LocalXFSBinaryStore {
     }
     
     fn delete(&self, user_id: &str, bucket: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
-        // Queue deletion event in SQLite for background worker to process
-        use crate::metadata::sqlite_store::SQLiteMetadataStore;
-        let metadata_store = SQLiteMetadataStore::new();
-        // Key is not part of the low-level contract anymore; deletion is range-based
-        metadata_store.queue_deletion(user_id, bucket, "", offset_size_list)?;
-        
-        debug!("Queued deletion event for user {} bucket {} with {} chunks", 
-              user_id, bucket, offset_size_list.len());
+        // Physically erase the ranges. Request paths queue via MetadataService::queue_deletion;
+        // only the deletion worker calls this, after checking nothing still references them.
+        let file_path = self.get_bucket_file_path(user_id, bucket);
+        if !file_path.exists() {
+            return Ok(());
+        }
+        let file = cached_file(user_id, bucket, &file_path).map_err(ErrorInternalServerError)?;
+        let len = file.metadata().map_err(ErrorInternalServerError)?.len();
+        for &(offset, size) in offset_size_list {
+            if size == 0 || offset >= len {
+                continue;
+            }
+            let size = size.min(len - offset);
+            erase_range(&file, offset, size).map_err(ErrorInternalServerError)?;
+        }
+        file.sync_data().map_err(ErrorInternalServerError)?;
+        debug!("Erased {} ranges for user {} bucket {}", offset_size_list.len(), user_id, bucket);
         Ok(())
     }
 
@@ -269,6 +311,26 @@ mod tests {
         store.delete(user_id, bucket, &[(offset, size)]).unwrap();
     }
     
+    #[test]
+    fn delete_erases_bytes_and_leaves_neighbours_intact() {
+        let store = LocalXFSBinaryStore::new();
+        let (user_id, bucket) = ("test_user_erase", "test_bucket_erase");
+        let before = b"KEEP-BEFORE".to_vec();
+        let secret = vec![0xAB; 64 * 1024 + 7]; // spans several fs blocks, unaligned
+        let after = b"KEEP-AFTER".to_vec();
+        let a = store.write(user_id, bucket, &before).unwrap();
+        let s = store.write(user_id, bucket, &secret).unwrap();
+        let b = store.write(user_id, bucket, &after).unwrap();
+
+        store.delete(user_id, bucket, &[s]).unwrap();
+
+        assert_eq!(store.read(user_id, bucket, s.0, s.1).unwrap(), vec![0u8; secret.len()]);
+        assert_eq!(store.read(user_id, bucket, a.0, a.1).unwrap(), before);
+        assert_eq!(store.read(user_id, bucket, b.0, b.1).unwrap(), after);
+        // Erasing again (or past EOF) is a no-op, not an error.
+        store.delete(user_id, bucket, &[s, (u64::MAX - 10, 5)]).unwrap();
+    }
+
     #[test]
     fn test_local_xfs_binary_store_error_cases() {
         let store = LocalXFSBinaryStore::new();

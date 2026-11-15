@@ -18,7 +18,7 @@ pub trait Storage: Send + Sync {
     /// Read `size` bytes from `offset` for a `user_id` and `bucket`
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error>;
 
-    /// Delete previously written ranges by queuing/logging deletion for background processing
+    /// Physically erase previously written ranges (called by the deletion worker only)
     fn delete(&self, user_id: &str, bucket: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error>;
 
     /// Verify data integrity for the specified range

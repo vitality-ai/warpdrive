@@ -267,9 +267,9 @@ impl MetadataStorage for MockMetadataStore {
         Ok((None, old_extents))
     }
 
-    fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+    fn get_pending_deletions(&self, after_id: i64, limit: i32) -> Result<Vec<DeletionEvent>, Error> {
         let q = self.deletion_queue.lock();
-        Ok(q.iter().take(limit.max(0) as usize).cloned().collect())
+        Ok(q.iter().filter(|e| e.id > after_id).take(limit.max(0) as usize).cloned().collect())
     }
 
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
@@ -279,6 +279,14 @@ impl MetadataStorage for MockMetadataStore {
 
     fn cleanup_old_deletions(&self) -> Result<usize, Error> {
         Ok(0)
+    }
+
+    fn referenced_extents(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
+        let data = self.data.lock();
+        Ok(data.get(user_id)
+            .and_then(|b| b.get(bucket))
+            .map(|objs| objs.values().flat_map(|m| m.to_offset_size_list()).collect())
+            .unwrap_or_default())
     }
 
     fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error> {
@@ -314,10 +322,16 @@ impl MetadataStorage for MockMetadataStore {
     }
 
     fn delete_object_v2(&self, user_id: &str, bucket: &str, key: &str) -> Result<VersioningDeleteResult, Error> {
-        self.data.lock()
+        let removed = self.data.lock()
             .get_mut(user_id)
             .and_then(|u| u.get_mut(bucket))
             .and_then(|b| b.remove(key));
+        if let Some(m) = removed {
+            let extents = m.to_offset_size_list();
+            if !extents.is_empty() {
+                self.queue_deletion(user_id, bucket, key, &extents)?;
+            }
+        }
         Ok(VersioningDeleteResult::Deleted)
     }
 

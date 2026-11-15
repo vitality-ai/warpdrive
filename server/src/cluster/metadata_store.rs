@@ -184,7 +184,7 @@ impl MetadataStorage for ClusterMetadataStore {
         Err(not_supported("put_object_v2"))
     }
 
-    fn get_pending_deletions(&self, _limit: i32) -> Result<Vec<DeletionEvent>, Error> {
+    fn get_pending_deletions(&self, _after_id: i64, _limit: i32) -> Result<Vec<DeletionEvent>, Error> {
         Err(not_supported("get_pending_deletions (no deletion-GC worker exists in cluster mode)"))
     }
 
@@ -194,6 +194,10 @@ impl MetadataStorage for ClusterMetadataStore {
 
     fn cleanup_old_deletions(&self) -> Result<usize, Error> {
         Err(not_supported("cleanup_old_deletions (no deletion-GC worker exists in cluster mode)"))
+    }
+
+    fn referenced_extents(&self, _user_id: &str, _bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
+        Err(not_supported("referenced_extents (no deletion-GC worker exists in cluster mode)"))
     }
 
     fn set_bucket_cors(&self, _bucket: &str, _cors_xml: &str) -> Result<(), Error> {
@@ -576,6 +580,6 @@ mod tests {
         assert!(s.get_multipart_upload("upload1").is_err());
         assert!(s.get_object_lock("b1", "k1", "").is_err());
         assert!(s.get_bucket_cors("b1").is_err());
-        assert!(s.get_pending_deletions(10).is_err());
+        assert!(s.get_pending_deletions(0, 10).is_err());
     }
 }

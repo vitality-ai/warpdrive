@@ -141,8 +141,8 @@ impl MetadataService {
         self.store.queue_deletion(&self.user, bucket, key, offset_size_list)
     }
 
-    pub fn get_pending_deletions(&self, limit: i32) -> Result<Vec<crate::metadata::sqlite_store::DeletionEvent>, Error> {
-        self.store.get_pending_deletions(limit)
+    pub fn get_pending_deletions(&self, after_id: i64, limit: i32) -> Result<Vec<crate::metadata::sqlite_store::DeletionEvent>, Error> {
+        self.store.get_pending_deletions(after_id, limit)
     }
 
     pub fn mark_deletion_processed(&self, id: i64) -> Result<(), Error> {
@@ -151,6 +151,10 @@ impl MetadataService {
 
     pub fn cleanup_old_deletions(&self) -> Result<usize, Error> {
         self.store.cleanup_old_deletions()
+    }
+
+    pub fn referenced_extents(&self, user_id: &str, bucket: &str) -> Result<Vec<(u64, u64)>, Error> {
+        self.store.referenced_extents(user_id, bucket)
     }
 
     // --- CORS ---
