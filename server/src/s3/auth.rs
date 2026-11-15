@@ -454,7 +454,44 @@ fn verify_sigv4(
         );
         return Err(s3_access_denied("Signature does not match"));
     }
+    check_request_time(amz_date, &parsed.date, chrono::Utc::now().timestamp())
+}
+
+/// Same window AWS allows between x-amz-date and server time.
+const MAX_REQUEST_SKEW_SECS: i64 = 15 * 60;
+
+/// Reject a header-signed request outside the skew window, or whose credential-scope
+/// day differs from x-amz-date. Without this a captured request could be replayed forever.
+fn check_request_time(amz_date: &str, scope_date: &str, now: i64) -> Result<(), Error> {
+    let signed_at = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| s3_access_denied("Invalid x-amz-date format"))?
+        .and_utc()
+        .timestamp();
+    if amz_date.get(..8) != Some(scope_date) {
+        return Err(s3_access_denied("Credential scope date does not match x-amz-date"));
+    }
+    if (now - signed_at).abs() > MAX_REQUEST_SKEW_SECS {
+        warn!("SigV4 request time too skewed (x-amz-date={}, skew={}s)", amz_date, now - signed_at);
+        return Err(request_time_too_skewed());
+    }
     Ok(())
+}
+
+fn request_time_too_skewed() -> Error {
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\n\
+           <Code>RequestTimeTooSkewed</Code>\n\
+           <Message>The difference between the request time and the current time is too large.</Message>\n\
+           <MaxAllowedSkewMilliseconds>900000</MaxAllowedSkewMilliseconds>\n\
+           <RequestId>warpdrive</RequestId>\n\
+         </Error>";
+    actix_web::error::InternalError::from_response(
+        "RequestTimeTooSkewed",
+        HttpResponse::Forbidden()
+            .content_type("application/xml")
+            .insert_header(("x-amz-request-id", "warpdrive"))
+            .body(body),
+    ).into()
 }
 
 /// Percent-decode a string (e.g. "test%2F" -> "test/"). Required so we build the same
@@ -1244,5 +1281,89 @@ mod tests {
         invalidate_s3_credential_cache(access_key);
         std::env::remove_var("VITALITY_CONSOLE_URL");
         std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
+    }
+
+    /// Header-signed GET for `/s3/b/k`, signed at `signed_at` with scope day `scope_date`.
+    fn build_header_signed_get(secret_key: &str, signed_at: chrono::DateTime<chrono::Utc>, scope_date: &str) -> (HttpRequest, ParsedAuthHeader) {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        type HmacSha256 = Hmac<Sha256>;
+        let hmac = |key: &[u8], msg: &[u8]| {
+            let mut m = HmacSha256::new_from_slice(key).unwrap();
+            m.update(msg);
+            m.finalize().into_bytes().to_vec()
+        };
+
+        let amz_date = signed_at.format("%Y%m%dT%H%M%SZ").to_string();
+        let canonical_request = format!(
+            "GET\n/s3/b/k\n\nhost:localhost\nx-amz-content-sha256:{EMPTY_PAYLOAD_HASH}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{EMPTY_PAYLOAD_HASH}"
+        );
+        let scope = format!("{scope_date}/us-east-1/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let k = hmac(format!("AWS4{secret_key}").as_bytes(), scope_date.as_bytes());
+        let k = hmac(&k, b"us-east-1");
+        let k = hmac(&k, b"s3");
+        let k = hmac(&k, b"aws4_request");
+        let signature = hex::encode(hmac(&k, string_to_sign.as_bytes()));
+
+        let auth = format!("AWS4-HMAC-SHA256 Credential=AKIA/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}");
+        let req = test::TestRequest::default()
+            .method(actix_web::http::Method::GET)
+            .uri("/s3/b/k")
+            .insert_header(("host", "localhost"))
+            .insert_header(("x-amz-content-sha256", EMPTY_PAYLOAD_HASH))
+            .insert_header(("x-amz-date", amz_date))
+            .insert_header(("Authorization", auth.clone()))
+            .to_http_request();
+        (req, parse_authorization_header_full(&auth).unwrap())
+    }
+
+    fn error_code(e: Error) -> (u16, String) {
+        let resp = e.error_response();
+        let status = resp.status().as_u16();
+        let body = actix_web::body::to_bytes(resp.into_body());
+        let body = futures::executor::block_on(body).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
+        (status, body)
+    }
+
+    #[actix_web::test]
+    async fn header_signed_request_within_window_verifies() {
+        let now = chrono::Utc::now();
+        let (req, parsed) = build_header_signed_get("s3cret", now, &now.format("%Y%m%d").to_string());
+        assert!(verify_sigv4(&req, "s3cret", &parsed).is_ok());
+    }
+
+    #[actix_web::test]
+    async fn header_signed_request_outside_window_is_too_skewed() {
+        for offset_min in [-16i64, 16, -60 * 24 * 365 * 6] {
+            let at = chrono::Utc::now() + chrono::Duration::minutes(offset_min);
+            let (req, parsed) = build_header_signed_get("s3cret", at, &at.format("%Y%m%d").to_string());
+            let (status, body) = error_code(verify_sigv4(&req, "s3cret", &parsed).unwrap_err());
+            assert_eq!(status, 403, "offset {offset_min} min");
+            assert!(body.contains("RequestTimeTooSkewed"), "offset {offset_min} min: {body}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn header_signed_request_with_mismatched_scope_date_is_rejected() {
+        let now = chrono::Utc::now();
+        let other_day = (now - chrono::Duration::days(2)).format("%Y%m%d").to_string();
+        let (req, parsed) = build_header_signed_get("s3cret", now, &other_day);
+        let (status, body) = error_code(verify_sigv4(&req, "s3cret", &parsed).unwrap_err());
+        assert_eq!(status, 403);
+        assert!(body.contains("AccessDenied"), "{body}");
+    }
+
+    #[actix_web::test]
+    async fn request_time_window_boundaries() {
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap().and_hms_opt(3, 4, 5).unwrap().and_utc().timestamp();
+        assert!(check_request_time("20260102T030405Z", "20260102", at + 900).is_ok());
+        assert!(check_request_time("20260102T030405Z", "20260102", at - 900).is_ok());
+        assert!(check_request_time("20260102T030405Z", "20260102", at + 901).is_err());
+        assert!(check_request_time("20260102T030405Z", "20260101", at).is_err());
+        assert!(check_request_time("garbage", "20260102", at).is_err());
     }
 }
