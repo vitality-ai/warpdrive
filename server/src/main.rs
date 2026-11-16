@@ -21,6 +21,7 @@ use warp_drive::s3::handlers::{
     s3_post_bucket_handler,
 };
 use warp_drive::service::deletion_worker::start_deletion_worker;
+use warp_drive::s3::auth::payload_hash_mismatch;
 use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
@@ -162,6 +163,9 @@ async fn buffer_payload(req: &HttpRequest, mut payload: web::Payload) -> Result<
             )));
         }
         body.extend_from_slice(&chunk);
+    }
+    if let Some(resp) = payload_hash_mismatch(req, &body) {
+        return Err(actix_web::error::InternalError::from_response("XAmzContentSHA256Mismatch", resp).into());
     }
     Ok(web::Bytes::from(body))
 }

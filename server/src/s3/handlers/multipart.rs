@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json;
 
-use crate::s3::auth::authenticate_s3_request;
+use crate::s3::auth::{authenticate_s3_request, payload_hash_mismatch};
 use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::{StorageService, StorageMode};
 use crate::service::user_context::UserContext;
@@ -189,6 +189,7 @@ pub async fn s3_upload_part_handler(
         })?;
         body.extend_from_slice(&chunk);
     }
+    if let Some(resp) = payload_hash_mismatch(&req, &body) { return Ok(resp); }
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     // web::block: `Storage::write` now does a real (group-committed) fsync
@@ -449,6 +450,7 @@ pub async fn s3_complete_multipart_upload_handler(
         })?;
         body_bytes.extend_from_slice(&chunk);
     }
+    if let Some(resp) = payload_hash_mismatch(&req, &body_bytes) { return Ok(resp); }
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     let raw_parts = parse_complete_multipart_xml(&body_str);

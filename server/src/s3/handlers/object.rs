@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::metadata::Metadata;
-use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, create_authenticated_request, ADMIN_USER_ID};
+use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_anonymous, create_authenticated_request, payload_hash_mismatch, ADMIN_USER_ID};
 use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
@@ -48,6 +48,7 @@ pub async fn s3_put_object_handler(
             while let Some(chunk) = payload.next().await {
                 body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
             }
+            if let Some(resp) = payload_hash_mismatch(&req, &body) { return Ok(resp); }
             return s3_put_object_tagging_inner(&bucket, &key, &body, &req).await;
         }
         if query.contains_key("acl") {
@@ -56,6 +57,7 @@ pub async fn s3_put_object_handler(
             while let Some(chunk) = payload.next().await {
                 body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
             }
+            if let Some(resp) = payload_hash_mismatch(&req, &body) { return Ok(resp); }
             return s3_put_object_acl_inner(&bucket, &key, &body, &req).await;
         }
         if query.contains_key("retention") || query.contains_key("legal-hold") {
@@ -64,6 +66,7 @@ pub async fn s3_put_object_handler(
             while let Some(chunk) = payload.next().await {
                 body.extend_from_slice(&chunk.map_err(actix_web::error::ErrorInternalServerError)?);
             }
+            if let Some(resp) = payload_hash_mismatch(&req, &body) { return Ok(resp); }
             if query.contains_key("retention") {
                 return s3_put_object_retention_inner(&bucket, &key, &body, &req).await;
             }
@@ -200,6 +203,14 @@ pub async fn s3_put_object_handler(
             actix_web::error::ErrorInternalServerError(msg)
         })?;
         offset_size_list.push(pair);
+    }
+
+    // Chunks are already on disk: reject before the metadata commit and queue them for erasure.
+    if let Some(resp) = payload_hash_mismatch(&req, &body_buf) {
+        if !offset_size_list.is_empty() {
+            db.queue_deletion(&bucket, &key, &offset_size_list).ok();
+        }
+        return Ok(resp);
     }
 
     let size = body_buf.len() as u64;
