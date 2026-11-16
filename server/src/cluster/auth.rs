@@ -1,8 +1,10 @@
 //! Shared-secret authentication for node-to-node cluster traffic: the HTTP
-//! `/cluster/*` control and data routes, and the gRPC and raw-TCP shard ports.
+//! `/cluster/*` control and data routes, the native `/put` `/get` ... API (the
+//! HTTP shard transport), and the gRPC and raw-TCP shard ports.
 //! Every node in a cluster is started with the same `WARPDRIVE_CLUSTER_SECRET`;
 //! peers send it with every call and a node rejects anything without it.
-//! Single-node servers don't expose any of these, so they never need it.
+//! Single-node servers don't expose the cluster routes or ports, and reject
+//! the native API unless a secret is set.
 
 use lazy_static::lazy_static;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -81,6 +83,23 @@ pub fn path_requires_secret(path: &str) -> bool {
     !(p == "/cluster/s3" || p.starts_with("/cluster/s3/") || OPEN_PATHS.contains(&p))
 }
 
+/// Whether this is a call to the native API (`api.rs`). It picks the user
+/// from a plain `User` header, so it must never be reachable without the
+/// secret. Matches method and segment count exactly, so S3 requests to a
+/// bucket that happens to be named `get`, `put`, ... are unaffected.
+pub fn is_native_api(method: &str, path: &str) -> bool {
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    matches!(
+        (method, segs.first().copied().unwrap_or(""), segs.len()),
+        ("POST", "put", 2)
+            | ("GET" | "HEAD", "get", 2)
+            | ("POST", "append", 2)
+            | ("DELETE", "delete", 2)
+            | ("PUT", "update_key", 3)
+            | ("POST", "update", 2)
+    )
+}
+
 /// Default headers for reqwest clients that call peers.
 pub fn peer_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -124,6 +143,19 @@ mod tests {
         for p in ["/s3/b/k", "/b/k", "/clusterx/join", "/cluster/s3", "/cluster/s3/b/k",
                   "/cluster/_internal/timing", "/cluster/_internal/shard_timing/"] {
             assert!(!path_requires_secret(p), "{p} should not require the secret");
+        }
+    }
+
+    #[test]
+    fn native_api_rules() {
+        for (m, p) in [("POST", "/put/k"), ("GET", "/get/k"), ("HEAD", "/get/k"), ("POST", "/append/k"),
+                       ("DELETE", "/delete/k"), ("PUT", "/update_key/a/b"), ("POST", "/update/k")] {
+            assert!(is_native_api(m, p), "{m} {p} is native");
+        }
+        // S3 calls to buckets named like native routes, and other shapes, are not.
+        for (m, p) in [("PUT", "/put/k"), ("GET", "/get"), ("GET", "/get/a/b"), ("DELETE", "/delete"),
+                       ("GET", "/s3/get/k"), ("PUT", "/update_key/a"), ("GET", "/b/k")] {
+            assert!(!is_native_api(m, p), "{m} {p} is not native");
         }
     }
 }

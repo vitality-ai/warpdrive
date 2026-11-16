@@ -478,13 +478,17 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            // Cluster secret check. Tests both the raw and the decoded path, so
-            // a percent-encoded spelling of a /cluster route is caught too.
+            // Cluster secret check: /cluster routes in cluster mode, and the
+            // native API always (it trusts a plain User header). Tests both the
+            // raw and the decoded path, so a percent-encoded spelling is caught too.
             .wrap_fn(move |req, srv| {
                 use actix_web::dev::Service as _;
                 use warp_drive::cluster::auth;
-                let denied = configured_for_cluster
-                    && (auth::path_requires_secret(req.path()) || auth::path_requires_secret(req.match_info().as_str()))
+                let method = req.method().as_str();
+                let needs_secret = |p: &str| {
+                    (configured_for_cluster && auth::path_requires_secret(p)) || auth::is_native_api(method, p)
+                };
+                let denied = (needs_secret(req.path()) || needs_secret(req.match_info().as_str()))
                     && !auth::provided_secret_ok(req.headers().get(auth::SECRET_HEADER).map(|v| v.as_bytes()));
                 if denied {
                     log::warn!("rejected {} {} from {:?}: cluster secret missing or wrong",
@@ -531,7 +535,8 @@ async fn main() -> std::io::Result<()> {
             .route("/s3/{bucket}/{key:.*}", web::post().to(s3_multipart_dispatch))
             .route("/s3/{bucket}",          web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/s3/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
-            // Original native API (registered before root S3 routes to take priority on conflicts)
+            // Original native API (registered before root S3 routes to take priority on conflicts).
+            // Internal: requires the cluster secret (see the wrap_fn above).
             .service(put)
             .service(get)
             .service(append)

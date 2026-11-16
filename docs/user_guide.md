@@ -144,6 +144,9 @@ WARPDRIVE_SELF_ADDR=http://node6:9710 \
   bare `/cluster/{bucket}/{key}` routes must send it as the
   `x-warpdrive-cluster-secret` header. `/cluster/s3/...` uses SigV4 instead.
   A single-node server exposes no `/cluster` routes and opens no shard ports.
+  The internal native API (`/put`, `/get`, `/delete`, ...; the HTTP shard
+  transport) also requires the header, in both modes; with no secret set it
+  is closed.
 - `WARPDRIVE_PEER_TRANSPORT` — `grpc` (default), `http`, or `tcp`, for the
   peer-to-peer shard transport.
 
