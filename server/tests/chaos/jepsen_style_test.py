@@ -102,6 +102,7 @@ def start_node(i):
         "STORAGE_DIRECTORY": os.path.join(d, "storage"),
         "WARPDRIVE_ADMIN_ACCESS_KEY": ACCESS_KEY,
         "WARPDRIVE_ADMIN_SECRET_KEY": SECRET_KEY,
+        "WARPDRIVE_CLUSTER_SECRET": "chaos-test-cluster-secret",
         "RUST_LOG": "warn",
     })
     out = open(os.path.join(d, "stdout.log"), "a")

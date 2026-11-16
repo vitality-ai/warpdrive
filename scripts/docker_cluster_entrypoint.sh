@@ -21,6 +21,8 @@ NODES=$((K + M))
 BASE_PORT="${WARPDRIVE_BASE_PORT:-9710}"
 ACCESS_KEY="${WARPDRIVE_ADMIN_ACCESS_KEY:-adminkey}"
 SECRET_KEY="${WARPDRIVE_ADMIN_SECRET_KEY:-adminsecretkey123456}"
+# Shared by every node; peers reject calls without it. Set your own outside local dev.
+CLUSTER_SECRET="${WARPDRIVE_CLUSTER_SECRET:-local-dev-cluster-secret}"
 BIN="/server/target/release/warp_drive"
 
 PEERS=""
@@ -57,6 +59,7 @@ for i in $(seq 0 $((NODES - 1))); do
     WARPDRIVE_RS_M="$M" \
     WARPDRIVE_ADMIN_ACCESS_KEY="$ACCESS_KEY" \
     WARPDRIVE_ADMIN_SECRET_KEY="$SECRET_KEY" \
+    WARPDRIVE_CLUSTER_SECRET="$CLUSTER_SECRET" \
     STORAGE_DIRECTORY="$node_dir/storage" \
     WARPDRIVE_LOCATION_LOG="$node_dir/cluster_location.log" \
     WARPDRIVE_CONTENT_LOCATION_LOG="$node_dir/cluster_content_location.log" \

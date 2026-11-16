@@ -92,6 +92,7 @@ itself:
 
 ```bash
 WARPDRIVE_PEERS=http://node1:9710,http://node2:9710,http://node3:9710,http://node4:9710,http://node5:9710 \
+WARPDRIVE_CLUSTER_SECRET=<same 16+ char value on every node> \
 WARPDRIVE_ADMIN_ACCESS_KEY=adminkey WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   ./warp_drive
 ```
@@ -113,7 +114,7 @@ A node can also join a running cluster later instead of being listed up
 front — either by having an existing node announce it:
 
 ```bash
-curl -X POST http://node1:9710/cluster/join -d '{"peer": "http://node6:9710"}' -H "Content-Type: application/json"
+curl -X POST http://node1:9710/cluster/join -d '{"peer": "http://node6:9710"}' -H "Content-Type: application/json" -H "x-warpdrive-cluster-secret: $WARPDRIVE_CLUSTER_SECRET"
 ```
 
 or by having the new node join itself at startup, which is the usual way to
@@ -137,6 +138,12 @@ WARPDRIVE_SELF_ADDR=http://node6:9710 \
   address is actually reachable from the rest of the cluster (a LAN IP, a
   hostname, etc.) — it is never inferred from the bind address.
 - `WARPDRIVE_PEERS` — the seed peer list (self included), comma-separated.
+- `WARPDRIVE_CLUSTER_SECRET` — required in cluster mode, identical on every
+  node (16+ printable ASCII chars). Peers send it on every HTTP, gRPC and TCP
+  call; a node refuses to start in cluster mode without it. Clients calling the
+  bare `/cluster/{bucket}/{key}` routes must send it as the
+  `x-warpdrive-cluster-secret` header. `/cluster/s3/...` uses SigV4 instead.
+  A single-node server exposes no `/cluster` routes and opens no shard ports.
 - `WARPDRIVE_PEER_TRANSPORT` — `grpc` (default), `http`, or `tcp`, for the
   peer-to-peer shard transport.
 
@@ -145,9 +152,10 @@ WARPDRIVE_SELF_ADDR=http://node6:9710 \
 The cluster API mirrors the single-node API, under `/cluster/{bucket}/{key}` instead of the S3 paths:
 
 ```bash
-curl -X PUT http://localhost:9710/cluster/mybucket/myobject --data-binary @file.bin
-curl http://localhost:9710/cluster/mybucket/myobject -o file.bin
-curl -X DELETE http://localhost:9710/cluster/mybucket/myobject
+H="x-warpdrive-cluster-secret: $WARPDRIVE_CLUSTER_SECRET"
+curl -X PUT -H "$H" http://localhost:9710/cluster/mybucket/myobject --data-binary @file.bin
+curl -H "$H" http://localhost:9710/cluster/mybucket/myobject -o file.bin
+curl -X DELETE -H "$H" http://localhost:9710/cluster/mybucket/myobject
 ```
 
 Any node can serve any request, there's no dedicated coordinator to route to: a PUT's placement pin is replicated to every known peer (quorum-acked, so one briefly-unreachable peer doesn't fail an otherwise-healthy write), not just the peers holding shard data. Placement, erasure coding (Reed-Solomon), and quorum reads/writes all happen automatically, with no extra configuration required.
@@ -158,7 +166,7 @@ By default, an object is erasure-coded as a single whole-object stripe. A bucket
 
 ```bash
 curl -X PUT http://localhost:9710/cluster/_admin/bucket_config/mybucket \
-  -H "Content-Type: application/json" \
+  -H "$H" -H "Content-Type: application/json" \
   -d '{"packer_name": "fac", "overhead_threshold_pct": 100.0}'
 ```
 
@@ -166,7 +174,7 @@ curl -X PUT http://localhost:9710/cluster/_admin/bucket_config/mybucket \
 
 ```bash
 curl -X PUT http://localhost:9710/cluster/mybucket/data.parquet \
-  --data-binary @data.parquet \
+  -H "$H" --data-binary @data.parquet \
   -H 'x-warpd-computable-units: [[0, 1024, 1024, "opaque"], [1024, 2048, 2048, "opaque"]]'
 ```
 
@@ -184,8 +192,8 @@ this requires real SigV4 authentication (the same verification
 single-node's API uses) and supports GET/PUT/HEAD/DELETE/LIST and full
 multipart upload on top of the erasure-coded cluster engine, with real
 `ETag`/`Last-Modified`/user-metadata round-tripped from the stored
-object. The bare `/cluster/{bucket}/{key}` routes stay unauthenticated,
-for quick local testing (`curl`) without signing requests.
+object. The bare `/cluster/{bucket}/{key}` routes take no SigV4, only the
+cluster secret header, for quick local testing (`curl`) without signing requests.
 
 ```python
 s3 = boto3.client(

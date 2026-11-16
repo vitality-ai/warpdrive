@@ -1,6 +1,7 @@
 //! Distributed object engine: membership, placement, erasure coding, and the
 //! coordinator that ties them together. See docs/Distributed-Engine-Plan.md.
 
+pub mod auth;
 pub mod ec;
 pub mod packing;
 pub mod placement;

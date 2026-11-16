@@ -31,6 +31,8 @@ NODES=$((K + M))
 BASE_PORT="${WARPDRIVE_BASE_PORT:-9710}"
 ACCESS_KEY="${WARPDRIVE_ADMIN_ACCESS_KEY:-adminkey}"
 SECRET_KEY="${WARPDRIVE_ADMIN_SECRET_KEY:-adminsecretkey123456}"
+# Shared by every node; peers reject calls without it. Set your own outside local dev.
+CLUSTER_SECRET="${WARPDRIVE_CLUSTER_SECRET:-local-dev-cluster-secret}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$SCRIPT_DIR/../server"
@@ -75,6 +77,7 @@ for i in $(seq 0 $((NODES - 1))); do
     WARPDRIVE_RS_M="$M" \
     WARPDRIVE_ADMIN_ACCESS_KEY="$ACCESS_KEY" \
     WARPDRIVE_ADMIN_SECRET_KEY="$SECRET_KEY" \
+    WARPDRIVE_CLUSTER_SECRET="$CLUSTER_SECRET" \
     exec "$BIN" > node.out 2>&1
   ) &
   PIDS+=($!)

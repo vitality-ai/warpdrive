@@ -15,6 +15,7 @@ use tokio::sync::OnceCell;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
+use super::auth;
 use super::peer_client::PeerClient;
 use super::shard_proto::shard_service_client::ShardServiceClient;
 use super::shard_proto::shard_service_server::{ShardService, ShardServiceServer};
@@ -58,9 +59,28 @@ lazy_static! {
 #[derive(Default)]
 pub struct ShardServiceImpl;
 
+fn require_cluster_secret<T>(request: &Request<T>) -> Result<(), Status> {
+    let provided = request.metadata().get(auth::SECRET_HEADER).map(|v| v.as_bytes());
+    if auth::provided_secret_ok(provided) {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("cluster secret missing or wrong"))
+    }
+}
+
+/// Wraps an outgoing message with this node's cluster secret.
+fn with_secret<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(Ok(v)) = auth::secret().map(tonic::metadata::MetadataValue::try_from) {
+        request.metadata_mut().insert(auth::SECRET_HEADER, v);
+    }
+    request
+}
+
 #[tonic::async_trait]
 impl ShardService for ShardServiceImpl {
     async fn put_shard(&self, request: Request<PutShardRequest>) -> Result<Response<PutShardResponse>, Status> {
+        require_cluster_secret(&request)?;
         let req = request.into_inner();
         // #161: store_shard/load_shard do synchronous file I/O plus a
         // Bitcask log append (write lock + writeln! + flush). Calling
@@ -84,6 +104,7 @@ impl ShardService for ShardServiceImpl {
     }
 
     async fn get_shard(&self, request: Request<GetShardRequest>) -> Result<Response<GetShardResponse>, Status> {
+        require_cluster_secret(&request)?;
         let req = request.into_inner();
         let data = tokio::task::spawn_blocking(move || {
             load_shard(&req.user_id, &req.bucket, &req.key, req.shard_idx as usize).map_err(|e| e.to_string())
@@ -249,13 +270,13 @@ impl PeerClient for GrpcPeerClient {
 
         let t0 = std::time::Instant::now();
         let result = client
-            .put_shard(PutShardRequest {
+            .put_shard(with_secret(PutShardRequest {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 shard_idx: shard_idx as u32,
                 data,
                 user_id: user_id.to_string(),
-            })
+            }))
             .await;
         CLIENT_TIMING.rpc_call.record(t0.elapsed());
         result.map_err(|e| ErrorBadGateway(format!("put_shard to {peer} failed: {e}")))?;
@@ -265,12 +286,12 @@ impl PeerClient for GrpcPeerClient {
     async fn get_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
         let mut client = self.client_for(peer).await?;
         let resp = client
-            .get_shard(GetShardRequest {
+            .get_shard(with_secret(GetShardRequest {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 shard_idx: shard_idx as u32,
                 user_id: user_id.to_string(),
-            })
+            }))
             .await
             .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} failed: {e}")))?;
         Ok(resp.into_inner().data)

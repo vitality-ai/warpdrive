@@ -24,7 +24,11 @@ async fn main() {
     let payload_bytes: usize = args[5].parse().unwrap();
 
     let payload = vec![0xCDu8; payload_bytes];
-    let client = reqwest::Client::new();
+    // Bare /cluster routes need the cluster secret (WARPDRIVE_CLUSTER_SECRET).
+    let client = reqwest::Client::builder()
+        .default_headers(warp_drive::cluster::auth::peer_headers())
+        .build()
+        .expect("failed to build reqwest client");
     let completed = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
     let stop_at = Instant::now() + Duration::from_secs(duration_secs);

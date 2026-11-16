@@ -313,6 +313,7 @@ fn build_cluster_state() -> web::Data<ClusterState> {
         location_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(3))
+            .default_headers(warp_drive::cluster::auth::peer_headers())
             .build()
             .expect("failed to build location_http client"),
         timing: Arc::new(warp_drive::cluster::timing_stats::TimingStats::default()),
@@ -352,6 +353,53 @@ fn build_cluster_state() -> web::Data<ClusterState> {
     web::Data::new(state)
 }
 
+/// Every `/cluster/*` route; registered only in cluster mode.
+fn register_cluster_routes(cfg: &mut web::ServiceConfig) {
+    // Cluster API — distributed, erasure-coded PUT/GET/DELETE.
+    // Specific/internal routes registered before the generic
+    // {bucket}/{key:.*} catch-alls so they aren't shadowed.
+    cfg.route("/cluster/join", web::post().to(cluster_join))
+        .route("/cluster/_internal/timing", web::get().to(cluster_timing_stats))
+        .route("/cluster/_internal/shard_timing", web::get().to(cluster_shard_server_timing))
+        .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
+        .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
+        .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
+        .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))
+        .route("/cluster/_internal/content_location", web::delete().to(cluster_internal_delete_content_location))
+        .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
+        .route("/cluster/_internal/bucket_config", web::post().to(cluster_internal_put_bucket_config))
+        .route("/cluster/_internal/pushdown_filter", web::post().to(cluster_internal_pushdown_filter))
+        .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
+        .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
+        .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
+        // Minimal S3-protocol surface (s3_surface.rs) — a distinct "s3/" prefix
+        // so it never collides with the generic {bucket}/{key:.*} routes
+        // below. Phase 3: PUT/GET/DELETE/HEAD here now go through
+        // authenticate_s3_request (same SigV4 verification single-node
+        // uses) via dedicated *_authenticated handlers that delegate to
+        // the *_inner functions for the actual EC/placement work -- a
+        // deliberate, intended breaking change for this prefix
+        // specifically (it was always documented as "no SigV4
+        // verification... not a production S3 surface"; this is the
+        // upgrade). The bare /cluster/{bucket}/{key:.*} routes below take no
+        // SigV4; like every other non-s3 /cluster route they need the
+        // cluster secret (cluster::auth).
+        .route("/cluster/s3/{bucket}", web::get().to(cluster_s3_list_objects))
+        .route("/cluster/s3/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object_authenticated))
+        .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_s3_put_object_authenticated))
+        .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_s3_get_object_authenticated))
+        .route("/cluster/s3/{bucket}/{key:.*}", web::delete().to(cluster_s3_delete_object_authenticated))
+        .route("/cluster/s3/{bucket}/{key:.*}", web::post().to(cluster_s3_multipart_post_authenticated))
+        .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))
+        .route("/cluster/{bucket}/{key:.*}", web::get().to(cluster_get_object))
+        .route("/cluster/{bucket}/{key:.*}", web::delete().to(cluster_delete_object))
+        .route("/cluster/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object));
+}
+
+async fn cluster_disabled() -> HttpResponse {
+    HttpResponse::NotFound().body("cluster API is not enabled on a single-node server")
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
@@ -367,6 +415,13 @@ async fn main() -> std::io::Result<()> {
     info!(
         "Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/... and /, configured for cluster: {configured_for_cluster})"
     );
+    if configured_for_cluster {
+        if let Err(e) = warp_drive::cluster::auth::validate_configured() {
+            log::error!("{e}");
+            eprintln!("warp_drive: {e}");
+            std::process::exit(1);
+        }
+    }
 
     let _deletion_worker_handle = start_deletion_worker();
     info!("Deletion worker started in background");
@@ -388,37 +443,59 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    // gRPC shard server runs alongside actix-web, on port+1000 — the
-    // other half of the transport decision point. Always runs regardless
-    // of which PeerClient is selected for outbound calls, so either node
-    // in a benchmark pair can be dialed over gRPC.
-    let grpc_port = port + GRPC_PORT_OFFSET;
-    tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
-        info!("Starting gRPC shard server on {addr}");
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(make_grpc_shard_server())
-            .serve(addr)
-            .await
-        {
-            log::error!("gRPC shard server failed: {e}");
-        }
-    });
+    // Shard servers are peer-only, so a single-node server doesn't open
+    // these ports at all; in cluster mode both require the cluster secret.
+    if configured_for_cluster {
+        // gRPC shard server runs alongside actix-web, on port+1000 — the
+        // other half of the transport decision point. Runs on every cluster
+        // node regardless of which PeerClient is selected for outbound calls, so either node
+        // in a benchmark pair can be dialed over gRPC.
+        let grpc_port = port + GRPC_PORT_OFFSET;
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
+            info!("Starting gRPC shard server on {addr}");
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(make_grpc_shard_server())
+                .serve(addr)
+                .await
+            {
+                log::error!("gRPC shard server failed: {e}");
+            }
+        });
 
-    // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
-    // candidate, also always running regardless of which PeerClient is
-    // selected for outbound calls.
-    let tcp_port = port + TCP_PORT_OFFSET;
-    tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{tcp_port}").parse().expect("invalid TCP bind address");
-        info!("Starting raw-TCP shard server on {addr}");
-        if let Err(e) = serve_tcp_shard(addr).await {
-            log::error!("TCP shard server failed: {e}");
-        }
-    });
+        // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
+        // candidate, also running on every cluster node regardless of which
+        // PeerClient is selected for outbound calls.
+        let tcp_port = port + TCP_PORT_OFFSET;
+        tokio::spawn(async move {
+            let addr = format!("0.0.0.0:{tcp_port}").parse().expect("invalid TCP bind address");
+            info!("Starting raw-TCP shard server on {addr}");
+            if let Err(e) = serve_tcp_shard(addr).await {
+                log::error!("TCP shard server failed: {e}");
+            }
+        });
+    }
 
     HttpServer::new(move || {
         App::new()
+            // Cluster secret check. Tests both the raw and the decoded path, so
+            // a percent-encoded spelling of a /cluster route is caught too.
+            .wrap_fn(move |req, srv| {
+                use actix_web::dev::Service as _;
+                use warp_drive::cluster::auth;
+                let denied = configured_for_cluster
+                    && (auth::path_requires_secret(req.path()) || auth::path_requires_secret(req.match_info().as_str()))
+                    && !auth::provided_secret_ok(req.headers().get(auth::SECRET_HEADER).map(|v| v.as_bytes()));
+                if denied {
+                    log::warn!("rejected {} {} from {:?}: cluster secret missing or wrong",
+                        req.method(), req.path(), req.peer_addr());
+                    let resp = HttpResponse::Forbidden().body("cluster secret missing or wrong");
+                    futures::future::Either::Left(futures::future::ready(Ok(req.into_response(resp).map_into_right_body())))
+                } else {
+                    let fut = srv.call(req);
+                    futures::future::Either::Right(async move { fut.await.map(|r| r.map_into_left_body()) })
+                }
+            })
             .wrap(actix_web::middleware::Logger::default())
             .app_data(web::PayloadConfig::default().limit(MAX_BODY_BYTES))
             .app_data(cluster_state.clone())
@@ -428,44 +505,17 @@ async fn main() -> std::io::Result<()> {
             // mechanism); registered first so the literal "/sts" path can't be
             // shadowed by the generic {bucket} routes below.
             .route("/sts", web::post().to(sts_assume_role_with_web_identity))
-            // Cluster API — distributed, erasure-coded PUT/GET/DELETE.
-            // Specific/internal routes registered before the generic
-            // {bucket}/{key:.*} catch-alls so they aren't shadowed.
-            .route("/cluster/join", web::post().to(cluster_join))
-            .route("/cluster/_internal/timing", web::get().to(cluster_timing_stats))
-            .route("/cluster/_internal/shard_timing", web::get().to(cluster_shard_server_timing))
-            .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
-            .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
-            .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
-            .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))
-            .route("/cluster/_internal/content_location", web::delete().to(cluster_internal_delete_content_location))
-            .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
-            .route("/cluster/_internal/bucket_config", web::post().to(cluster_internal_put_bucket_config))
-            .route("/cluster/_internal/pushdown_filter", web::post().to(cluster_internal_pushdown_filter))
-            .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
-            .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
-            .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
-            // Minimal S3-protocol surface (s3_surface.rs) — a distinct "s3/" prefix
-            // so it never collides with the generic {bucket}/{key:.*} routes
-            // below. Phase 3: PUT/GET/DELETE/HEAD here now go through
-            // authenticate_s3_request (same SigV4 verification single-node
-            // uses) via dedicated *_authenticated handlers that delegate to
-            // the *_inner functions for the actual EC/placement work -- a
-            // deliberate, intended breaking change for this prefix
-            // specifically (it was always documented as "no SigV4
-            // verification... not a production S3 surface"; this is the
-            // upgrade). The bare /cluster/{bucket}/{key:.*} routes below are
-            // untouched and stay fully unauthenticated.
-            .route("/cluster/s3/{bucket}", web::get().to(cluster_s3_list_objects))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object_authenticated))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::put().to(cluster_s3_put_object_authenticated))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::get().to(cluster_s3_get_object_authenticated))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::delete().to(cluster_s3_delete_object_authenticated))
-            .route("/cluster/s3/{bucket}/{key:.*}", web::post().to(cluster_s3_multipart_post_authenticated))
-            .route("/cluster/{bucket}/{key:.*}", web::put().to(cluster_put_object))
-            .route("/cluster/{bucket}/{key:.*}", web::get().to(cluster_get_object))
-            .route("/cluster/{bucket}/{key:.*}", web::delete().to(cluster_delete_object))
-            .route("/cluster/{bucket}/{key:.*}", web::head().to(cluster_s3_head_object))
+            // Cluster API: only on a node configured for a cluster. On a single
+            // node, any /cluster path is a 404, so nobody can join it or touch
+            // the cluster internals.
+            .configure(move |cfg| {
+                if configured_for_cluster {
+                    register_cluster_routes(cfg);
+                } else {
+                    cfg.route("/cluster", web::to(cluster_disabled))
+                        .route("/cluster/{tail:.*}", web::to(cluster_disabled));
+                }
+            })
             // S3-compatible API — prefixed form (/s3/...)
             .route("/s3",               web::get().to(s3_list_buckets_handler))
             .route("/s3/",              web::get().to(s3_list_buckets_handler))

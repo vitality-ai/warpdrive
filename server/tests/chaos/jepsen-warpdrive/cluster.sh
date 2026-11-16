@@ -21,6 +21,7 @@ N="${WD_N:-5}"
 BASE_PORT="${WD_BASE_PORT:-9710}"
 ACCESS_KEY="${WD_ACCESS_KEY:-AKIAIOSFODNN7EXAMPLE}"
 SECRET_KEY="${WD_SECRET_KEY:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}"
+CLUSTER_SECRET="${WD_CLUSTER_SECRET:-jepsen-test-cluster-secret}"
 
 # iptables needs root. In the dev container we run as root; on a CI runner we
 # are not, so use sudo there. Detect once.
@@ -53,6 +54,7 @@ start_node() {
     STORAGE_DIRECTORY="$d/storage" \
     WARPDRIVE_ADMIN_ACCESS_KEY="$ACCESS_KEY" \
     WARPDRIVE_ADMIN_SECRET_KEY="$SECRET_KEY" \
+    WARPDRIVE_CLUSTER_SECRET="$CLUSTER_SECRET" \
     RUST_LOG=warn \
     "$BIN" >"$d/stdout.log" 2>&1 ) &
   echo $! > "$(pidfile "$i")"

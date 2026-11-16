@@ -87,6 +87,7 @@ impl HttpPeerClient {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .default_headers(super::auth::peer_headers())
             .build()
             .expect("failed to build reqwest client for HttpPeerClient");
         Self { client }

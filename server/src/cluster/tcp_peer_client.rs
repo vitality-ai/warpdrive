@@ -32,6 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
+use super::auth;
 use super::peer_client::PeerClient;
 use super::shard_storage::{load_shard, store_shard};
 use super::shard_wire_generated::shardwire::{
@@ -64,6 +65,36 @@ async fn write_framed(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<(
     stream.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     stream.write_all(bytes).await?;
     stream.flush().await
+}
+
+/// Client half of the connection handshake: send the cluster secret as the
+/// first frame and wait for the server's ack before any shard request.
+async fn client_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
+    write_framed(stream, auth::secret().unwrap_or("").as_bytes()).await?;
+    if read_framed(stream).await? == auth::HANDSHAKE_OK {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cluster handshake rejected"))
+    }
+}
+
+/// Server half: read one small frame and accept the connection only if it
+/// is the cluster secret. The length is capped before allocating, since the
+/// peer isn't trusted yet.
+async fn server_handshake(stream: &mut TcpStream) -> bool {
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+        return false;
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > auth::MAX_HANDSHAKE_LEN {
+        return false;
+    }
+    let mut buf = vec![0u8; len];
+    if stream.read_exact(&mut buf).await.is_err() || !auth::provided_secret_ok(Some(&buf)) {
+        return false;
+    }
+    write_framed(stream, auth::HANDSHAKE_OK).await.is_ok()
 }
 
 async fn read_framed(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -156,10 +187,17 @@ impl TcpPeerClient {
             // returns also never releases the semaphore permit acquired
             // above, so it would eventually exhaust this peer's whole
             // pool, not just this one call.
-            None => tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(endpoint))
-                .await
-                .map_err(|_| ErrorBadGateway(format!("tcp connect to {endpoint} timed out")))?
-                .map_err(|e| ErrorBadGateway(format!("tcp connect to {endpoint} failed: {e}")))?,
+            None => {
+                let mut s = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(endpoint))
+                    .await
+                    .map_err(|_| ErrorBadGateway(format!("tcp connect to {endpoint} timed out")))?
+                    .map_err(|e| ErrorBadGateway(format!("tcp connect to {endpoint} failed: {e}")))?;
+                tokio::time::timeout(std::time::Duration::from_secs(3), client_handshake(&mut s))
+                    .await
+                    .map_err(|_| ErrorBadGateway(format!("tcp handshake with {endpoint} timed out")))?
+                    .map_err(|e| ErrorBadGateway(format!("tcp handshake with {endpoint} failed: {e}")))?;
+                s
+            }
         };
         Ok((stream, permit))
     }
@@ -384,6 +422,13 @@ async fn handle_request(body: &[u8]) -> Vec<u8> {
 }
 
 async fn handle_connection(mut stream: TcpStream) {
+    let authed = tokio::time::timeout(std::time::Duration::from_secs(5), server_handshake(&mut stream))
+        .await
+        .unwrap_or(false);
+    if !authed {
+        log::warn!("TCP shard server: rejected connection from {:?} (cluster secret missing or wrong)", stream.peer_addr().ok());
+        return;
+    }
     loop {
         let body = match read_framed(&mut stream).await {
             Ok(b) => b,

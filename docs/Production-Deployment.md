@@ -138,6 +138,10 @@ spec:
               value: "http://$(HOSTNAME).warpdrive:9710"
             # Static, since replicas is fixed above -- all 5 ordinals,
             # same list on every pod.
+            # Same value on every pod; peers reject calls without it.
+            - name: WARPDRIVE_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef: { name: warpdrive-cluster, key: secret }
             - name: WARPDRIVE_PEERS
               value: >-
                 http://warpdrive-0.warpdrive:9710,

@@ -29,6 +29,7 @@ pub async fn join_cluster_via(bootstrap: &str, self_addr: &str, membership: &Mem
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(3))
+        .default_headers(super::auth::peer_headers())
         .build()
         .expect("failed to build join client");
 
