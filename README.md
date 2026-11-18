@@ -38,7 +38,7 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 
 ## Getting Started
 
-Pull and run the pre-built image, no build step required:
+Pull and run the pre-built image:
 
 ```bash
 docker pull ghcr.io/vitality-ai/warpdrive:latest
