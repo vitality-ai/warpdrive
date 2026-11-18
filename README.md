@@ -38,7 +38,7 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 
 ## Getting Started
 
-Pull and run the pre-built image, no build step required. It's published for both `linux/amd64` and `linux/arm64`, so it runs natively on Apple Silicon too:
+Pull and run the pre-built image, no build step required:
 
 ```bash
 docker pull ghcr.io/vitality-ai/warpdrive:latest
