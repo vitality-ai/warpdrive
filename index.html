@@ -660,14 +660,33 @@
       <p class="section-sub">Warpdrive ships as a single native binary. Choose your install method below.</p>
 
       <div class="tab-bar">
-        <button class="tab-btn active" onclick="switchTab(event,'apt')">apt (Linux)</button>
+        <button class="tab-btn active" onclick="switchTab(event,'docker')">Docker</button>
+        <button class="tab-btn" onclick="switchTab(event,'apt')">apt (Linux)</button>
         <button class="tab-btn" onclick="switchTab(event,'binary')">Binary</button>
-        <button class="tab-btn" onclick="switchTab(event,'docker')">Docker</button>
         <button class="tab-btn" onclick="switchTab(event,'cargo')">Build from source</button>
       </div>
 
+      <!-- docker -->
+      <div class="tab-panel active" id="tab-docker">
+        <div class="platform-row">
+          <span class="badge badge-green">amd64</span>
+          <span class="badge badge-green">arm64</span>
+        </div>
+        <div class="code-block">
+          <pre>docker pull ghcr.io/vitality-ai/warpdrive:latest
+
+docker run -p 9710:9710 \
+  -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+  -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  ghcr.io/vitality-ai/warpdrive:latest</pre>
+        </div>
+        <div class="platform-note">
+          The same image is also on Docker Hub as <code>tejascj/warpdrive:latest</code>. A <code>docker-compose.yml</code> is available in the repo for local development.
+        </div>
+      </div>
+
       <!-- apt -->
-      <div class="tab-panel active" id="tab-apt">
+      <div class="tab-panel" id="tab-apt">
         <div class="platform-row">
           <span class="badge badge-green">amd64 / x86_64</span>
           <span class="badge badge-muted">arm64: use the Binary or Docker tab</span>
@@ -704,8 +723,8 @@ curl -fLO https://github.com/vitality-ai/warpdrive/releases/download/$TAG/warp_d
 tar -xzf warp_drive-$TAG-$PLATFORM.tar.gz
 <span class="kw">cd</span> warp_drive-$TAG-$PLATFORM
 
-WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
-WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
+WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   ./warp_drive</pre>
         </div>
         <div class="platform-note">
@@ -728,32 +747,12 @@ git clone https://github.com/vitality-ai/warpdrive
 cargo build --release
 
 <span class="cm"># Run (must be executed from warpdrive/server/)</span>
-WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
-WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
+WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   ./target/release/warp_drive</pre>
         </div>
         <div class="platform-note">
           The server needs a writable <code>storage/</code> and <code>logs/</code> directory in the working directory. It listens on port <code>9710</code> by default.
-        </div>
-      </div>
-
-      <!-- docker -->
-      <div class="tab-panel" id="tab-docker">
-        <div class="platform-row">
-          <span class="badge badge-green">amd64</span>
-          <span class="badge badge-green">arm64</span>
-        </div>
-        <div class="code-block">
-          <pre><span class="cm"># Run with Docker</span>
-docker run -d \
-  -p 9710:9710 \
-  -e WARPDRIVE_ADMIN_ACCESS_KEY=mykey \
-  -e WARPDRIVE_ADMIN_SECRET_KEY=mysecret \
-  -v $(pwd)/data:/data \
-  ghcr.io/vitality-ai/warpdrive:latest</pre>
-        </div>
-        <div class="platform-note">
-          The same image is also on Docker Hub as <code>tejascj/warpdrive:latest</code>. A <code>docker-compose.yml</code> is available in the repo for local development.
         </div>
       </div>
 
@@ -766,7 +765,7 @@ docker run -d \
 python3 - &lt;&lt;EOF
 import boto3
 s3 = boto3.client('s3', endpoint_url='http://localhost:9710',
-    aws_access_key_id='mykey', aws_secret_access_key='mysecret',
+    aws_access_key_id='adminkey', aws_secret_access_key='adminsecretkey123456',
     region_name='us-east-1',
     config=boto3.session.Config(s3={'addressing_style': 'path'}))
 s3.create_bucket(Bucket='test')
