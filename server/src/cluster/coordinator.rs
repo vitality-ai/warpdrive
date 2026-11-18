@@ -929,7 +929,8 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
-    HttpResponse::Ok().content_type("text/plain").body(state.timing.summary())
+    let body = format!("{}sync_count={}\n", state.timing.summary(), crate::storage::group_commit::sync_count());
+    HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
 /// Server-side breakdown of `store_shard` (the gRPC `ShardService::put_shard`
