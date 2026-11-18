@@ -119,6 +119,13 @@ pub struct LocationRecord {
     /// record written before this field existed.
     #[serde(default)]
     pub tags: Vec<(String, String)>,
+    /// RFC 5 prototype: a small object's bytes, base64, stored in the record
+    /// itself instead of as erasure-coded shards. The record is replicated
+    /// to every node with the same write quorum, so a PUT is one round and
+    /// a GET is served from the receiving node's own copy. `None` for an
+    /// object stored as shards.
+    #[serde(default)]
+    pub inline_data: Option<String>,
 }
 
 pub trait LocationStore: Send + Sync {
@@ -352,6 +359,7 @@ mod tests {
             checksum_value: None,
             checksum_type: None,
             tags: Vec::new(),
+            inline_data: None,
         }
     }
 

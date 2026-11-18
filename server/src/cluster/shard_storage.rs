@@ -143,15 +143,18 @@ pub fn store_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize, dat
 
     let t0 = Instant::now();
     let (offset, size) = store().write(user_id, bucket, data)?;
+    let storage_us = t0.elapsed().as_micros();
     SERVER_TIMING.storage_write.record(t0.elapsed());
 
     let t0 = Instant::now();
     SHARD_META_STORE
         .put(&sk, offset, size)
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    let meta_us = t0.elapsed().as_micros();
     SERVER_TIMING.meta_put.record(t0.elapsed());
 
     SERVER_TIMING.total.record(request_start.elapsed());
+    log::info!("trace shard_put key={key} idx={shard_idx} bytes={} storage_write_us={storage_us} meta_put_us={meta_us} total_us={}", data.len(), request_start.elapsed().as_micros());
     Ok(())
 }
 

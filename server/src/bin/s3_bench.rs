@@ -7,6 +7,9 @@
 //! Prints one CSV line per phase:
 //!   phase,payload_bytes,concurrency,ops,errors,throughput_ops_s,mean_us,p50_us,p90_us,p99_us
 //!
+//! Set S3_BENCH_TRACE=<file> to also write one line per request:
+//!   phase,start_unix_us,latency_us,ok,key
+//!
 //! Usage: s3_bench <url> <path_prefix> <bucket> <concurrency> <duration_secs> <payload_bytes>
 //!   path_prefix: "/s3", "/cluster/s3" or "" for the root routes
 //! Example: s3_bench http://127.0.0.1:9710 /s3 bench 32 10 4096
@@ -64,6 +67,7 @@ fn sign(method: &str, host: &str, path: &str, body: &[u8]) -> Vec<(String, Strin
 
 struct PhaseResult {
     latencies_us: Vec<u64>,
+    trace: Vec<(u128, u64, bool, String)>,
     errors: u64,
     error_samples: Vec<String>,
 }
@@ -84,6 +88,7 @@ async fn run_phase(
         let (keys, payload, errors, samples) = (Arc::clone(&keys), Arc::clone(&payload), Arc::clone(&errors), Arc::clone(&samples));
         handles.push(tokio::spawn(async move {
             let mut lat = Vec::new();
+            let mut trace = Vec::new();
             let mut written = Vec::new();
             let mut i: usize = 0;
             while Instant::now() < stop_at {
@@ -103,6 +108,7 @@ async fn run_phase(
                 for (k, v) in &headers {
                     req = req.header(k.as_str(), v.as_str());
                 }
+                let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
                 let t0 = Instant::now();
                 let res = req.send().await;
                 let ok = match res {
@@ -124,6 +130,7 @@ async fn run_phase(
                         false
                     }
                 };
+                trace.push((started, t0.elapsed().as_micros() as u64, ok, key.clone()));
                 if ok {
                     lat.push(t0.elapsed().as_micros() as u64);
                     if write_keys { written.push(key); }
@@ -132,18 +139,20 @@ async fn run_phase(
                 }
                 i += 1;
             }
-            (lat, written)
+            (lat, written, trace)
         }));
     }
     let mut all = Vec::new();
     let mut written = Vec::new();
+    let mut trace = Vec::new();
     for h in handles {
-        let (lat, w) = h.await.unwrap();
+        let (lat, w, t) = h.await.unwrap();
         all.extend(lat);
         written.extend(w);
+        trace.extend(t);
     }
     let error_samples = samples.lock().unwrap().clone();
-    (PhaseResult { latencies_us: all, errors: errors.load(Ordering::Relaxed), error_samples }, written)
+    (PhaseResult { latencies_us: all, trace, errors: errors.load(Ordering::Relaxed), error_samples }, written)
 }
 
 fn pct(sorted: &[u64], p: f64) -> u64 {
@@ -165,6 +174,13 @@ fn report(phase: &str, payload: usize, concurrency: usize, duration: Duration, m
     );
     for s in &r.error_samples {
         eprintln!("{phase} error sample: {s}");
+    }
+    if let Ok(path) = std::env::var("S3_BENCH_TRACE") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).expect("trace file");
+        for (start, lat, ok, key) in &r.trace {
+            writeln!(f, "{phase},{start},{lat},{ok},{key}").unwrap();
+        }
     }
 }
 

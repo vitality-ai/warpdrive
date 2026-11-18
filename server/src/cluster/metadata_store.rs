@@ -466,6 +466,7 @@ mod tests {
             checksum_value: meta.checksum_value,
             checksum_type: meta.checksum_type,
             tags: Vec::new(),
+            inline_data: None,
         }
     }
 
