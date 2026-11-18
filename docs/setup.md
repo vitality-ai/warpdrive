@@ -197,9 +197,6 @@ docker run -p 9710:9710 \
 The same image is also on Docker Hub as `tejascj/warpdrive:latest`, if
 your network can't reach `ghcr.io`.
 
-Besides `:latest`, each image is tagged with its version, for example
-`:v1.0.0-beta`. Pin a deployment to that tag instead of `:latest`.
-
 **Or build from source** (`docker build`/`docker run` directly, or `docker
 compose up` — both give you the same single-node default, consistent with
 the apt package's own default: a lone instance has no peers to cluster
