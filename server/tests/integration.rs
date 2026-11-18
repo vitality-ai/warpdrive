@@ -55,6 +55,7 @@ async fn test_basic_api_endpoints() {
     let status = resp.status();
     println!("Response Status: {:?}", status);
     println!("Response Headers:");
+    println!("Just added to fake a change:");
     for (name, value) in resp.headers() {
         println!("  {}: {:?}", name, value);
     }
