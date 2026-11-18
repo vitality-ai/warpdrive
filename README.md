@@ -38,15 +38,15 @@ Full writeup, plots, and methodology: [`docs/benchmarks/v1.0.0-results.md`](docs
 
 ## Getting Started
 
-Pull and run the pre-built image, no build step required:
+Pull and run the pre-built image:
 
 ```bash
-docker pull tejascj/warpdrive:latest
+docker pull ghcr.io/vitality-ai/warpdrive:latest
 
 docker run -p 9710:9710 \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
   -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
-  tejascj/warpdrive:latest
+  ghcr.io/vitality-ai/warpdrive:latest
 ```
 
 With the container running, verify it with boto3:
@@ -67,11 +67,12 @@ s3 = boto3.client(
     config=boto3.session.Config(s3={'addressing_style': 'path'}),
 )
 
+s3.create_bucket(Bucket='test-bucket')
 s3.put_object(Bucket='test-bucket', Key='hello.txt', Body=b'Hello, WarpDrive!')
 print(s3.get_object(Bucket='test-bucket', Key='hello.txt')['Body'].read())
 ```
 
-See the [User Guide](docs/user_guide.md) for installation, configuration, and API usage examples.
+Other ways to install (Docker Hub, prebuilt binaries, building from source) are in the [Developer's Guide](docs/setup.md). See the [User Guide](docs/user_guide.md) for configuration and API usage examples.
 
 ## Performance Benchmarks
 

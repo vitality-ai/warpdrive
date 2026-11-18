@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     steps:
     - uses: actions/checkout@v4
@@ -38,64 +37,136 @@ jobs:
       run: |
         cargo clippy -- -A warnings  # report only errors
 
-  docker_publish_ghcr:
+  # The Docker image is published to GHCR (ghcr.io/vitality-ai/warpdrive,
+  # the one the docs lead with) and to Docker Hub, tagged :latest only.
+  # Each architecture builds
+  # natively on its own runner (QEMU would make a release cargo build far
+  # slower) and is pushed by digest to both registries at once.
+  # docker_publish then tags the same two digests in each registry, so one
+  # `docker pull` picks amd64 or arm64 by itself.
+  #
+  # GHCR uses the workflow's own GITHUB_TOKEN. Docker Hub is skipped (not
+  # failed) until DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are set as repo
+  # secrets (Settings -> Secrets and variables -> Actions).
+  docker_build:
     needs: test_and_lint
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
 
+    env:
+      DOCKERHUB_TOKEN_SET: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/warpdrive
+      DOCKERHUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive
+
     steps:
     - uses: actions/checkout@v4
 
-    - name: Log in to the GitHub Container Registry
-      uses: docker/login-action@v1
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build and Push Docker Image to ghcr
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile
-        push: true
-        tags: |
-          ghcr.io/${{ github.repository_owner }}/warpdrive:latest
-          ghcr.io/${{ github.repository_owner }}/warpdrive:${{ github.sha }}
-
-  docker_publish_dockerhub:
-    needs: test_and_lint
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    env:
-      DOCKERHUB_TOKEN_SET: ${{ secrets.DOCKERHUB_TOKEN != '' }}
-
-    steps:
-    - uses: actions/checkout@v4
-
-    # Skipped entirely (not a failure) until DOCKERHUB_USERNAME/DOCKERHUB_TOKEN
-    # are added as repo secrets (Settings -> Secrets and variables ->
-    # Actions): a Docker Hub account + repo named "warpdrive", and an
-    # access token with Read & Write scope from Account Settings ->
-    # Security -> Access Tokens.
     - name: Log in to Docker Hub
       if: ${{ env.DOCKERHUB_TOKEN_SET == 'true' }}
-      uses: docker/login-action@v1
+      uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and Push Docker Image to Docker Hub
-      if: ${{ env.DOCKERHUB_TOKEN_SET == 'true' }}
-      uses: docker/build-push-action@v5
+    - name: Pick registries
+      id: names
+      run: |
+        names="$GHCR_IMAGE"
+        if [ "$DOCKERHUB_TOKEN_SET" = true ]; then names="$names,$DOCKERHUB_IMAGE"; fi
+        echo "names=$names" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push ${{ matrix.platform }} by digest
+      id: build
+      uses: docker/build-push-action@v6
       with:
         context: .
         file: ./Dockerfile
-        push: true
-        tags: |
-          docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive:latest
-          docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive:${{ github.sha }}
+        platforms: ${{ matrix.platform }}
+        outputs: type=image,"name=${{ steps.names.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
+
+    - name: Save digest
+      env:
+        DIGEST: ${{ steps.build.outputs.digest }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/digests"
+        touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+    - name: Upload digest
+      uses: actions/upload-artifact@v4
+      with:
+        name: digest-${{ strategy.job-index }}
+        path: ${{ runner.temp }}/digests/*
+        if-no-files-found: error
+        retention-days: 1
+
+  docker_publish:
+    needs: docker_build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      DOCKERHUB_TOKEN_SET: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/warpdrive
+      DOCKERHUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive
+
+    steps:
+    - name: Download digests
+      uses: actions/download-artifact@v4
+      with:
+        path: ${{ runner.temp }}/digests
+        pattern: digest-*
+        merge-multiple: true
+
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Log in to Docker Hub
+      if: ${{ env.DOCKERHUB_TOKEN_SET == 'true' }}
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Tag multi-arch image as latest, then check both architectures
+      working-directory: ${{ runner.temp }}/digests
+      run: |
+        images=("$GHCR_IMAGE")
+        if [ "$DOCKERHUB_TOKEN_SET" = true ]; then images+=("$DOCKERHUB_IMAGE"); fi
+        for image in "${images[@]}"; do
+          # One digest file per architecture, named by its sha256.
+          sources=()
+          for digest in *; do sources+=("$image@sha256:$digest"); done
+          docker buildx imagetools create -t "$image:latest" "${sources[@]}"
+          docker buildx imagetools inspect "$image:latest" | tee "$RUNNER_TEMP/inspect.txt"
+          grep -q 'linux/amd64' "$RUNNER_TEMP/inspect.txt"
+          grep -q 'linux/arm64' "$RUNNER_TEMP/inspect.txt"
+        done
