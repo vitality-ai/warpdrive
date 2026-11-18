@@ -596,3 +596,55 @@ request lands on) and grows to ~3x once the full 5-node cluster is actually
 in play on both sides. This is now the number to use going forward: it
 isolates the actual server comparison from any client-harness difference,
 which the earlier `load_gen_auth`-vs-`warp` numbers did not.
+
+## 2026-10-23 — Sprint restart: chasing a 150-300x client/handler timing gap
+
+New investigation session, same 5-node `us-east1-c` fleet (restarted from
+stopped, `n2-standard-2`, `pd-balanced` disks -- confirmed this run, not
+local SSD, contrary to an earlier assumption; worth noting as a real
+difference from the hardware used in the MinIO-comparison entries above).
+Reusing the server's own built-in timing instrumentation
+(`/cluster/_internal/timing`, `/cluster/_internal/grpc_client_timing`)
+surfaced a large, real gap: a pre-existing code comment in
+`grpc_peer_client.rs` notes the shard-write handler itself takes ~0.07ms,
+but the coordinator observes ~10-20ms per peer RPC -- roughly 150-300x,
+too large to be real handler work.
+
+**Dead end already ruled out before this entry** (not re-run): actix
+worker-thread count (default 2 vs. 32 on this 2-vCPU box) does not move
+throughput at all (1212.7 vs 1223.0 req/s, identical within noise) despite
+a real ~1.5x increase in context-switch rate -- `us+sy` CPU is already
+pinned near 100% either way, so thread count isn't the lever.
+
+**Hypothesis tried: `tcp_nodelay`.** tonic's `Endpoint` (gRPC client) and
+`Server::builder()` (gRPC server) both default `tcp_nodelay` to `false`,
+meaning Nagle's algorithm can hold small outgoing TCP segments for up to
+~40ms waiting to coalesce with more data before sending. Every shard-write
+and metadata RPC in this cluster is tiny (a few KB at most) -- a textbook
+match for exactly this gotcha, and a very plausible single-line explanation
+for a 10-20ms-per-RPC number that shouldn't be anywhere near that high.
+
+Added `.tcp_nodelay(true)` to both the client `Endpoint` builder
+(`grpc_peer_client.rs`) and the server `Server::builder()` (`main.rs`,
+gRPC shard server). Rebuilt natively on `chaos-node-0` (matching the
+fleet's actual x86_64 arch -- cross-compiling from this session's ARM64 Mac
+was not attempted), distributed the binary to all 5 nodes, restarted.
+
+First comparison looked like a regression (1298.8 req/s on the old binary's
+very first post-restart run vs. 1250.5 on the new one) -- but a single run
+right after a cold restart is not a safe baseline (per this user's standing
+"verify, don't estimate" rule), so re-ran 3 clean back-to-back trials on
+each binary instead of trusting the first number either way:
+
+```
+baseline (no tcp_nodelay), concurrency=64, 3 runs: 1199.1 / 1199.8 / 1219.2 req/s  (mean ~1206)
+tcp_nodelay=true,          concurrency=64, 4 runs: 1250.5 / 1241.2 / 1250.7 / 1237.0 req/s  (mean ~1245)
+```
+
+A real, reproducible **~3-4% win**, tight and consistent across repeated
+runs on both sides -- not noise, but nowhere near explaining the 150-300x
+handler-vs-RPC gap the timing endpoints showed. Nagle's algorithm is a real
+but minor contributor to that gap; something else is the dominant cost.
+Shipped (kept on), since it's a real, free, zero-risk win with no durability
+or correctness implications -- but the search for the dominant cost
+continues below/in-branch.
