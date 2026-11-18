@@ -1,15 +1,20 @@
 name: jepsen-dst
 
 # Deterministic-simulation fault-injection tests (Jepsen/Elle) for the
-# distributed engine. Runs on every PR to main, on every push to main
-# (a merge can combine two individually-safe branches into something a
-# single PR's own run never saw), and on demand.
+# distributed engine. Runs on every PR to main, on every push to main, and
+# on demand.
+#
+# On PRs and pushes to main, testcase-workflow.yml calls this workflow
+# (workflow_call) with prebuilt-binary: true, so it uses that run's shared
+# release build. A manual run builds the binary itself.
 on:
-  pull_request:
-    branches: [ "main" ]
-  push:
-    branches: [ "main" ]
   workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      prebuilt-binary:
+        description: Download the warp_drive-release artifact instead of building
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,21 +29,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download server binary
+        if: ${{ inputs.prebuilt-binary }}
+        uses: actions/download-artifact@v4
+        with:
+          name: warp_drive-release
+          path: server/target/release
+
+      # Artifacts don't keep the executable bit.
+      - name: Make the binary executable
+        if: ${{ inputs.prebuilt-binary }}
+        run: chmod +x server/target/release/warp_drive
+
       - name: Set up Rust
+        if: ${{ !inputs.prebuilt-binary }}
         uses: dtolnay/rust-toolchain@stable
 
       # Caches ~/.cargo/registry, ~/.cargo/git and server/target, keyed on
       # Cargo.lock. Without this every run recompiled the full dependency
       # tree from scratch, which dominated the job's wall time.
       - name: Cache Rust dependencies and build artifacts
+        if: ${{ !inputs.prebuilt-binary }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
 
       - name: Install build dependencies
+        if: ${{ !inputs.prebuilt-binary }}
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - name: Build release binary
+        if: ${{ !inputs.prebuilt-binary }}
         working-directory: server
         run: cargo build --release --bin warp_drive
 

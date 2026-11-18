@@ -4,6 +4,10 @@ name: testcase-workflow
 on:
   pull_request:
     branches: [ "main" ]
+  # A merge can combine two branches that each passed on their own into
+  # something neither PR's run tested, so every push to main runs too.
+  push:
+    branches: [ "main" ]
   # Manual run: the S3 compatibility job runs the full suite and reports
   # which tests are ready to enable, without failing.
   workflow_dispatch: {}
@@ -43,6 +47,34 @@ jobs:
       run: |
         pytest ciaos/test.py
 
+  # Builds the release server once per run. The S3 compatibility, STS and
+  # Jepsen jobs download this binary instead of each compiling their own.
+  build-server:
+    name: Build server (release)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies and build artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: server
+
+    - name: Build release binary
+      working-directory: server
+      run: cargo build --release --locked --bin warp_drive
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: warp_drive-release
+        path: server/target/release/warp_drive
+        if-no-files-found: error
+        retention-days: 1
+
   # S3 compatibility suite: the Ceph project's s3-tests, forked into
   # vitality-ai/s3-tests and pinned to a commit. Upstream ceph/s3-tests
   # moved into ceph/ceph and is no longer maintained, so the fork is a
@@ -58,6 +90,7 @@ jobs:
   # lists the passing tests that aren't enabled yet. It never fails.
   s3-compatibility-tests:
     name: S3 compatibility suite (5-node cluster)
+    needs: build-server
     runs-on: ubuntu-latest
     env:
       WARPDRIVE_ADMIN_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
@@ -66,12 +99,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
+    - name: Download server binary
+      uses: actions/download-artifact@v4
+      with:
+        name: warp_drive-release
+        path: server/target/release
 
-    - name: Build server
-      working-directory: server
-      run: cargo build --release --locked --bin warp_drive
+    # Artifacts don't keep the executable bit.
+    - run: chmod +x server/target/release/warp_drive
 
     - name: Start a 5-node RS(3,2) cluster
       run: .github/ci/start_cluster.sh server/target/release/warp_drive "$RUNNER_TEMP/cluster"
@@ -136,15 +171,14 @@ jobs:
     name: Server tests
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache Rust dependencies and build artifacts
+      uses: Swatinem/rust-cache@v2
       with:
-        toolchain: stable
-        override: true
-    - name: Build server
-      working-directory: server
-      run: cargo build
+        workspaces: server
+    # cargo test builds everything it needs, so there's no separate build step.
     - name: Run server tests
       working-directory: server
       run: cargo test
@@ -157,22 +191,20 @@ jobs:
   # not a Rust unit-test regression).
   sts-oidc-tests:
     name: STS/OIDC federation tests (Keycloak)
+    needs: build-server
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache Rust dependencies and build artifacts
-      uses: Swatinem/rust-cache@v2
+    - name: Download server binary
+      uses: actions/download-artifact@v4
       with:
-        workspaces: server
+        name: warp_drive-release
+        path: server/target/release
 
-    - name: Build release binary
-      working-directory: server
-      run: cargo build --release --bin warp_drive
+    # Artifacts don't keep the executable bit.
+    - run: chmod +x server/target/release/warp_drive
 
     - name: Set up Python
       uses: actions/setup-python@v3
@@ -222,3 +254,11 @@ jobs:
 
     - name: Run STS/OIDC round-trip tests
       run: python3 server/tests/python/sts_oidc_test.py
+
+  # Jepsen/Elle DST, defined in jepsen-dst.yml. On a PR it runs from here so
+  # it can use the binary from build-server.
+  jepsen-dst:
+    needs: build-server
+    uses: ./.github/workflows/jepsen-dst.yml
+    with:
+      prebuilt-binary: true
