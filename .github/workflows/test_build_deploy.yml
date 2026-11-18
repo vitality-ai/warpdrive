@@ -38,7 +38,9 @@ jobs:
         cargo clippy -- -A warnings  # report only errors
 
   # The Docker image is published to GHCR (ghcr.io/vitality-ai/warpdrive,
-  # the one the docs lead with) and to Docker Hub. Each architecture builds
+  # the one the docs lead with) and to Docker Hub, tagged :latest and
+  # :v<version from server/Cargo.toml> (e.g. :v1.0.0-beta). Both registries
+  # are public, so commit SHAs aren't used as tags. Each architecture builds
   # natively on its own runner (QEMU would make a release cargo build far
   # slower) and is pushed by digest to both registries at once.
   # docker_publish then tags the same two digests in each registry, so one
@@ -131,6 +133,20 @@ jobs:
       DOCKERHUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/warpdrive
 
     steps:
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: server/Cargo.toml
+        sparse-checkout-cone-mode: false
+
+    # Image tag v<version>, e.g. v1.0.0-beta, the same name as the git tag
+    # and the release binaries.
+    - name: Read version from Cargo.toml
+      id: version
+      run: |
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' server/Cargo.toml | head -1)
+        if [ -z "$version" ]; then echo "no version in server/Cargo.toml"; exit 1; fi
+        echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
     - name: Download digests
       uses: actions/download-artifact@v4
       with:
@@ -155,8 +171,10 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Tag multi-arch image as latest and commit SHA, then check both architectures
+    - name: Tag multi-arch image as latest and version, then check both architectures
       working-directory: ${{ runner.temp }}/digests
+      env:
+        VERSION_TAG: ${{ steps.version.outputs.tag }}
       run: |
         images=("$GHCR_IMAGE")
         if [ "$DOCKERHUB_TOKEN_SET" = true ]; then images+=("$DOCKERHUB_IMAGE"); fi
@@ -166,9 +184,9 @@ jobs:
           for digest in *; do sources+=("$image@sha256:$digest"); done
           docker buildx imagetools create \
             -t "$image:latest" \
-            -t "$image:${GITHUB_SHA}" \
+            -t "$image:$VERSION_TAG" \
             "${sources[@]}"
-          docker buildx imagetools inspect "$image:${GITHUB_SHA}" | tee "$RUNNER_TEMP/inspect.txt"
+          docker buildx imagetools inspect "$image:$VERSION_TAG" | tee "$RUNNER_TEMP/inspect.txt"
           grep -q 'linux/amd64' "$RUNNER_TEMP/inspect.txt"
           grep -q 'linux/arm64' "$RUNNER_TEMP/inspect.txt"
         done
