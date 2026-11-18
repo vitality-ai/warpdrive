@@ -151,6 +151,34 @@ registry (the cluster engine doesn't, by design — see the User Guide).
 
 ---
 
+## Prebuilt binaries
+
+Each [GitHub Release](https://github.com/vitality-ai/warpdrive/releases)
+has `warp_drive` archives for Linux amd64, Linux arm64 and macOS Apple
+Silicon. SQLite is compiled in, so the only runtime dependency is libc.
+Linux binaries need glibc 2.35+ (Ubuntu 22.04+, Debian 12+).
+
+```bash
+TAG=v1.0.0-beta
+PLATFORM=darwin-arm64   # or linux-amd64, linux-arm64
+curl -fLO https://github.com/vitality-ai/warpdrive/releases/download/$TAG/warp_drive-$TAG-$PLATFORM.tar.gz
+tar -xzf warp_drive-$TAG-$PLATFORM.tar.gz
+cd warp_drive-$TAG-$PLATFORM
+WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
+WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
+  ./warp_drive
+```
+
+Start it from the extracted folder. It reads `server_log.yaml` from its
+working directory and keeps its data there too.
+
+On macOS, a binary downloaded through a browser is quarantined because it
+isn't notarized. Clear that with `xattr -d com.apple.quarantine warp_drive`
+before running it. Downloads with `curl` or `gh release download` aren't
+quarantined.
+
+---
+
 ## Docker (Optional)
 
 **Pull a pre-built image** instead of building from source. It's rebuilt
@@ -158,15 +186,16 @@ and pushed on every merge to `main`, for both `linux/amd64` and
 `linux/arm64`. Docker picks the right one for your machine:
 
 ```bash
-docker pull tejascj/warpdrive:latest
+docker pull ghcr.io/vitality-ai/warpdrive:latest
 
 docker run -p 9710:9710 \
   -e WARPDRIVE_ADMIN_ACCESS_KEY=adminkey \
   -e WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
-  tejascj/warpdrive:latest
+  ghcr.io/vitality-ai/warpdrive:latest
 ```
 
-`tejascj/warpdrive` on Docker Hub is the only published image.
+The same image is also on Docker Hub as `tejascj/warpdrive:latest`, if
+your network can't reach `ghcr.io`.
 
 A specific commit's image is also kept, tagged by its SHA (`:<commit-sha>`),
 not just `:latest` — useful for pinning a deployment to a known build.
