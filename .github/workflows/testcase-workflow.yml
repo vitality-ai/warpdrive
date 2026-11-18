@@ -4,6 +4,10 @@ name: testcase-workflow
 on:
   pull_request:
     branches: [ "main" ]
+  # A merge can combine two branches that each passed on their own into
+  # something neither PR's run tested, so every push to main runs too.
+  push:
+    branches: [ "main" ]
   # Manual run: the S3 compatibility job runs the full suite and reports
   # which tests are ready to enable, without failing.
   workflow_dispatch: {}

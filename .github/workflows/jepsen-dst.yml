@@ -1,16 +1,13 @@
 name: jepsen-dst
 
 # Deterministic-simulation fault-injection tests (Jepsen/Elle) for the
-# distributed engine. Runs on every PR to main, on every push to main
-# (a merge can combine two individually-safe branches into something a
-# single PR's own run never saw), and on demand.
+# distributed engine. Runs on every PR to main, on every push to main, and
+# on demand.
 #
-# On a PR, testcase-workflow.yml calls this workflow (workflow_call) with
-# prebuilt-binary: true, so it uses that run's shared release build instead
-# of compiling its own. On push and manual runs it builds the binary itself.
+# On PRs and pushes to main, testcase-workflow.yml calls this workflow
+# (workflow_call) with prebuilt-binary: true, so it uses that run's shared
+# release build. A manual run builds the binary itself.
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch: {}
   workflow_call:
     inputs:
