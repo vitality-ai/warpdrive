@@ -33,6 +33,8 @@ struct Cfg {
     warm_x: f64,     // warm-up churn before measuring
     writers: usize,
     readers: usize,
+    read_rate: f64,  // total reads per second across readers (open loop); 0 = as fast as possible
+    direct: bool,    // reads bypass the page cache (O_DIRECT, Linux)
     compact: bool,
     hot_frac: f64,
     seed: u64,
@@ -43,7 +45,7 @@ fn parse() -> Cfg {
     let mut c = Cfg {
         dir: PathBuf::from("/mnt/nvme/segbench"), segment_mb: 256, umax: 0.5, policy: "costbenefit".into(),
         layout: "C".into(), copy: "cfr".into(), rate_mbps: 50.0, live_gb: 6.0, churn_x: 4.0, warm_x: 2.0,
-        writers: 8, readers: 4, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
+        writers: 8, readers: 4, read_rate: 200.0, direct: true, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
     };
     let a: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -62,6 +64,8 @@ fn parse() -> Cfg {
             "--warm-x" => c.warm_x = v.parse().unwrap(),
             "--writers" => c.writers = v.parse().unwrap(),
             "--readers" => c.readers = v.parse().unwrap(),
+            "--read-rate" => c.read_rate = v.parse().unwrap(),
+            "--direct" => c.direct = v == "1",
             "--compact" => c.compact = v == "1",
             "--hot-frac" => c.hot_frac = v.parse().unwrap(),
             "--seed" => c.seed = v.parse().unwrap(),
@@ -83,7 +87,7 @@ impl Rng {
 
 // ------------------------------------------------------------------ state
 struct Obj { seg: u64, off: u64, len: u64, pos: usize }
-struct Seg { file: Arc<File>, len: u64, live: u64, sealed: bool, survivor: bool, newest: Instant }
+struct Seg { file: Arc<File>, rfile: Arc<File>, len: u64, live: u64, sealed: bool, survivor: bool, newest: Instant }
 
 struct Inner {
     objs: HashMap<u64, Obj>,
@@ -131,7 +135,16 @@ fn seg_path(cfg: &Cfg, id: u64, surv: bool) -> PathBuf {
 fn new_segment(sh: &Shared, st: &mut Inner, surv: bool) -> u64 {
     let id = st.next_seg; st.next_seg += 1;
     let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(seg_path(&sh.cfg, id, surv)).unwrap();
-    st.segs.insert(id, Seg { file: Arc::new(f), len: 0, live: 0, sealed: false, survivor: surv, newest: Instant::now() });
+    let f = Arc::new(f);
+    // Readers use their own handle, opened with O_DIRECT so reads always go to the device.
+    #[cfg(target_os = "linux")]
+    let rf = if sh.cfg.direct {
+        use std::os::unix::fs::OpenOptionsExt;
+        Arc::new(OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(seg_path(&sh.cfg, id, surv)).unwrap())
+    } else { Arc::clone(&f) };
+    #[cfg(not(target_os = "linux"))]
+    let rf = Arc::clone(&f);
+    st.segs.insert(id, Seg { file: f, rfile: rf, len: 0, live: 0, sealed: false, survivor: surv, newest: Instant::now() });
     id
 }
 
@@ -300,23 +313,35 @@ fn delete(sh: &Shared, st: &mut Inner, id: u64) {
 
 fn reader(sh: Arc<Shared>, rid: u64) {
     let mut r = Rng(sh.cfg.seed * 31 + rid * 7 + 3);
-    let mut buf = vec![0u8; 4 << 20];
+    // O_DIRECT needs a block-aligned buffer.
+    let layout = std::alloc::Layout::from_size_align(4 << 20, 4096).unwrap();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, 4 << 20) };
+    // Open loop: each reader issues reads on a fixed schedule. Latency is measured
+    // from the scheduled time, so queueing behind a slow read is counted.
+    let interval = if sh.cfg.read_rate > 0.0 { Some(Duration::from_secs_f64(sh.cfg.readers as f64 / sh.cfg.read_rate)) } else { None };
+    let mut next = Instant::now() + Duration::from_millis(rid * 3);
     while !sh.stop.load(Relaxed) {
+        let sched = if let Some(iv) = interval {
+            let now = Instant::now();
+            if next > now { std::thread::sleep(next - now); }
+            let t = next; next += iv; t
+        } else { Instant::now() };
         let pick = {
             let st = sh.st.lock().unwrap();
             if st.ids.is_empty() { None } else {
                 let id = st.ids[(r.next() as usize) % st.ids.len()];
                 let o = &st.objs[&id];
-                st.segs.get(&o.seg).map(|s| (Arc::clone(&s.file), o.off, o.len))
+                st.segs.get(&o.seg).map(|s| (Arc::clone(&s.rfile), o.off, o.len))
             }
         };
         let Some((f, off, len)) = pick else { std::thread::sleep(Duration::from_millis(1)); continue };
-        let t0 = Instant::now();
         // The file may have been unlinked after the lookup; the open handle still reads.
         let _ = f.read_exact_at(&mut buf[..len as usize], off);
         sh.rd_ops.fetch_add(1, Relaxed);
-        if sh.measuring.load(Relaxed) { sh.rlat.lock().unwrap().push(t0.elapsed().as_micros() as u32); }
+        if sh.measuring.load(Relaxed) { sh.rlat.lock().unwrap().push(sched.elapsed().as_micros() as u32); }
     }
+    unsafe { std::alloc::dealloc(ptr, layout) };
 }
 
 // ------------------------------------------------------------------ compactor

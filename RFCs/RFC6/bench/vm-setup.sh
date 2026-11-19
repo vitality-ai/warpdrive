@@ -5,7 +5,7 @@ set -e
 DEV=$(lsblk -dpno NAME,MODEL | awk '/nvme_card|NVMe|Google EphemeralDisk/{print $1; exit}')
 [ -z "$DEV" ] && DEV=/dev/nvme0n1
 sudo apt-get -qq update >/dev/null
-sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y build-essential xfsprogs parted >/dev/null
+sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y build-essential xfsprogs parted sysstat fio >/dev/null
 sudo parted -s "$DEV" mklabel gpt mkpart xfs 0% 50% mkpart ext4 50% 100%
 sleep 2
 sudo mkfs.xfs -f -q "${DEV}p1"
