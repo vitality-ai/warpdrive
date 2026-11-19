@@ -163,17 +163,105 @@ pub struct StaleReply {
     pub current_seq: u64,
 }
 
-/// Sends one request per peer (this node included, through the same
-/// internal call) and collects each peer's answer.
-async fn send_to_peers<F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, build: F) -> Vec<PeerReply>
-where
-    F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
-{
+/// One ordered record write, as sent to a peer or applied on this node.
+pub(crate) enum RecordOp {
+    PutLocation(LocationRecord),
+    UpdateLocation(LocationRecord),
+    DeleteLocation(DeleteKeyRequest),
+    PutContent(ContentDependentRecord),
+    UpdateContent(ContentDependentRecord),
+    DeleteContent(DeleteKeyRequest),
+}
+
+/// How a store answered one record write, without the replaced value.
+pub(crate) enum OpOutcome {
+    Applied,
+    Stale(u64),
+    VersionMismatch,
+}
+
+impl<R> From<Applied<R>> for OpOutcome {
+    fn from(a: Applied<R>) -> Self {
+        match a {
+            Applied::Yes { .. } => OpOutcome::Applied,
+            Applied::Stale { current_seq } => OpOutcome::Stale(current_seq),
+            Applied::VersionMismatch => OpOutcome::VersionMismatch,
+        }
+    }
+}
+
+impl RecordOp {
+    /// Applies the write to this node's stores. Blocking: it waits for the
+    /// write to be durable.
+    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore) -> std::io::Result<OpOutcome> {
+        Ok(match self {
+            RecordOp::PutLocation(r) => loc.put(r)?.into(),
+            RecordOp::UpdateLocation(r) => loc.update(r)?.into(),
+            RecordOp::DeleteLocation(d) => loc.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
+            RecordOp::PutContent(r) => content.put(r)?.into(),
+            RecordOp::UpdateContent(r) => content.update(r)?.into(),
+            RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            RecordOp::PutLocation(_) => "location pin",
+            RecordOp::UpdateLocation(_) => "location update",
+            RecordOp::DeleteLocation(_) => "location tombstone",
+            RecordOp::PutContent(_) => "content-location pin",
+            RecordOp::UpdateContent(_) => "content-location update",
+            RecordOp::DeleteContent(_) => "content-location tombstone",
+        }
+    }
+
+    fn request(&self, client: &reqwest::Client, peer: &str) -> reqwest::RequestBuilder {
+        let base = format!("{}/cluster/_internal", peer.trim_end_matches('/'));
+        match self {
+            RecordOp::PutLocation(r) => client.post(format!("{base}/location")).json(r),
+            RecordOp::UpdateLocation(r) => client.post(format!("{base}/location/update")).json(r),
+            RecordOp::DeleteLocation(d) => client.delete(format!("{base}/location")).json(d),
+            RecordOp::PutContent(r) => client.post(format!("{base}/content_location")).json(r),
+            RecordOp::UpdateContent(r) => client.post(format!("{base}/content_location/update")).json(r),
+            RecordOp::DeleteContent(d) => client.delete(format!("{base}/content_location")).json(d),
+        }
+    }
+}
+
+/// Applies `op` on this node, off the async thread.
+async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let label = op.label();
+    match tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await {
+        Ok(Ok(OpOutcome::Applied)) => PeerReply::Applied,
+        Ok(Ok(OpOutcome::Stale(seq))) => PeerReply::Stale(seq),
+        Ok(Ok(OpOutcome::VersionMismatch)) => PeerReply::Failed,
+        Ok(Err(e)) => {
+            warn!("{label}: applying on this node failed: {e}");
+            PeerReply::Failed
+        }
+        Err(e) => {
+            warn!("{label}: local apply task failed: {e}");
+            PeerReply::Failed
+        }
+    }
+}
+
+/// Sends one write per peer and collects each peer's answer. This node's
+/// own copy is applied directly, not over HTTP: a request to itself would
+/// need a free HTTP worker on this node, and with every worker busy waiting
+/// on replication, there might be none.
+async fn send_to_peers(state: &ClusterState, peers: &[String], make: &dyn Fn() -> RecordOp) -> Vec<PeerReply> {
+    let me = self_addr();
     let requests = peers.iter().map(|peer| {
-        let client = state.location_http.clone();
-        let url = format!("{}/cluster/_internal/{path_suffix}", peer.trim_end_matches('/'));
-        let req = build(&client, &url);
+        let op = make();
+        let label = op.label();
+        let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
+        let req = (!is_self).then(|| op.request(&state.location_http, peer));
         async move {
+            let Some(req) = req else {
+                return apply_locally(state, op).await;
+            };
             match req.send().await {
                 Ok(r) if r.status().is_success() => PeerReply::Applied,
                 Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<StaleReply>().await {
@@ -200,8 +288,8 @@ where
 /// Rounds of restamp-and-resend before an ordered write gives up.
 const ORDERED_WRITE_ROUNDS: usize = 3;
 
-/// Sends an ordered record write (`record_log`) to every peer and returns
-/// how many applied it.
+/// Sends an ordered record write (`ordered`) to every peer and returns how
+/// many applied it.
 ///
 /// A peer that already holds a newer write for the key answers 409 with
 /// its `seq`. That happens when two writes to one key race, or when this
@@ -209,15 +297,10 @@ const ORDERED_WRITE_ROUNDS: usize = 3;
 /// write came last from the client's point of view, so it's stamped above
 /// the highest `seq` seen and sent again to every peer. Peers that applied
 /// the first send apply the restamped copy too, since it's newer.
-async fn replicate_ordered<B, F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, mut seq: u64, body: B, build: F) -> usize
-where
-    B: Fn(u64) -> serde_json::Value,
-    F: Fn(&reqwest::Client, &str, &serde_json::Value) -> reqwest::RequestBuilder,
-{
+async fn replicate_ordered(state: &ClusterState, peers: &[String], mut seq: u64, make: impl Fn(u64) -> RecordOp) -> usize {
     let mut acked = 0;
     for round in 0..ORDERED_WRITE_ROUNDS {
-        let payload = body(seq);
-        let replies = send_to_peers(state, peers, path_suffix, label, |client, url| build(client, url, &payload)).await;
+        let replies = send_to_peers(state, peers, &|| make(seq)).await;
         acked = replies.iter().filter(|r| matches!(r, PeerReply::Applied)).count();
         let newest = replies.iter().filter_map(|r| if let PeerReply::Stale(s) = r { Some(*s) } else { None }).max();
         match newest {
@@ -225,7 +308,7 @@ where
             Some(newest) if round + 1 < ORDERED_WRITE_ROUNDS => {
                 super::hlc::observe(newest);
                 seq = super::hlc::now();
-                log::debug!("{label}: a peer holds a newer write (seq {newest}), resending at seq {seq}");
+                log::debug!("{}: a peer holds a newer write (seq {newest}), resending at seq {seq}", make(seq).label());
             }
             Some(_) => {}
         }
@@ -233,71 +316,57 @@ where
     acked
 }
 
-fn to_json<T: Serialize>(v: &T) -> serde_json::Value {
-    serde_json::to_value(v).expect("record types serialize to JSON")
+fn restamped<T: Clone>(r: &T, seq: u64, set: impl FnOnce(&mut T, u64)) -> T {
+    let mut r = r.clone();
+    set(&mut r, seq);
+    r
 }
 
 /// Replicates a new version's `LocationRecord` to every peer in `peers`.
 /// Returns how many applied it.
-async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
-    replicate_ordered(state, peers, "location", "location pin", record.seq, |seq| {
-        let mut r = record.clone();
-        r.seq = seq;
-        to_json(&r)
-    }, |client, url, body| client.post(url).json(body)).await
+pub(crate) async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, record.seq, |seq| RecordOp::PutLocation(restamped(record, seq, |r, s| r.seq = s))).await
 }
 
 /// Replicates a metadata change (tags, retention) to the version `record`
 /// names. A peer whose live version differs refuses it (412).
-async fn replicate_location_update(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
-    replicate_ordered(state, peers, "location/update", "location update", record.seq, |seq| {
-        let mut r = record.clone();
-        r.seq = seq;
-        to_json(&r)
-    }, |client, url, body| client.post(url).json(body)).await
+pub(crate) async fn replicate_location_update(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, record.seq, |seq| RecordOp::UpdateLocation(restamped(record, seq, |r, s| r.seq = s))).await
 }
 
 /// Content-dependent counterpart of `replicate_location_put`.
 pub(crate) async fn replicate_content_location_put(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
-    replicate_ordered(state, peers, "content_location", "content-location pin", record.seq, |seq| {
-        let mut r = record.clone();
-        r.seq = seq;
-        to_json(&r)
-    }, |client, url, body| client.post(url).json(body)).await
+    replicate_ordered(state, peers, record.seq, |seq| RecordOp::PutContent(restamped(record, seq, |r, s| r.seq = s))).await
 }
 
 /// Content-dependent counterpart of `replicate_location_update`.
 async fn replicate_content_location_update(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
-    replicate_ordered(state, peers, "content_location/update", "content-location update", record.seq, |seq| {
-        let mut r = record.clone();
-        r.seq = seq;
-        to_json(&r)
-    }, |client, url, body| client.post(url).json(body)).await
+    replicate_ordered(state, peers, record.seq, |seq| RecordOp::UpdateContent(restamped(record, seq, |r, s| r.seq = s))).await
+}
+
+fn delete_req(user_id: &str, bucket: &str, key: &str, seq: u64) -> DeleteKeyRequest {
+    DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq }
 }
 
 /// Replicates a tombstone for `(user_id, bucket, key)` at `seq` to every
 /// peer in `peers`.
 pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, seq: u64, peers: &[String]) -> usize {
-    replicate_ordered(state, peers, "location", "location tombstone", seq, |seq| {
-        to_json(&DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq })
-    }, |client, url, body| client.delete(url).json(body)).await
+    replicate_ordered(state, peers, seq, |seq| RecordOp::DeleteLocation(delete_req(user_id, bucket, key, seq))).await
 }
 
 /// Content-location counterpart of `replicate_location_delete`. Also used
 /// by a plain PUT to clear a packed record left by an earlier write of the
 /// same key, since GET checks the packed store first.
 pub(crate) async fn replicate_content_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, seq: u64, peers: &[String]) -> usize {
-    replicate_ordered(state, peers, "content_location", "content-location tombstone", seq, |seq| {
-        to_json(&DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq })
-    }, |client, url, body| client.delete(url).json(body)).await
+    replicate_ordered(state, peers, seq, |seq| RecordOp::DeleteContent(delete_req(user_id, bucket, key, seq))).await
 }
 
 /// Turns a store's answer into the internal endpoint's response.
-fn applied_response<R>(applied: Applied<R>) -> HttpResponse {
-    match applied {
-        Applied::Yes { .. } => HttpResponse::Ok().finish(),
-        Applied::Stale { current_seq } => HttpResponse::Conflict().json(StaleReply { current_seq }),
-        Applied::VersionMismatch => HttpResponse::PreconditionFailed().finish(),
+fn outcome_response(outcome: OpOutcome) -> HttpResponse {
+    match outcome {
+        OpOutcome::Applied => HttpResponse::Ok().finish(),
+        OpOutcome::Stale(current_seq) => HttpResponse::Conflict().json(StaleReply { current_seq }),
+        OpOutcome::VersionMismatch => HttpResponse::PreconditionFailed().finish(),
     }
 }
 
@@ -1875,21 +1944,15 @@ pub async fn cluster_internal_put_content_location(
     body: web::Json<super::content_location_store::ContentDependentRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    // `put` now does a real (group-committed) fsync -- see
-    // `storage::group_commit`'s module doc. Calling it directly here
-    // would block this actix worker's whole event loop for the fsync's
-    // duration, which also starves group commit of the concurrent
-    // callers it needs to batch well (measured locally: throughput fell
-    // ~99% without this). `web::block` matches what single-node's own
-    // PUT path (`s3/handlers/object.rs`) already does for the same
-    // underlying reason.
-    let store = Arc::clone(&state.content_location_store);
-    let record = body.into_inner();
-    let applied = web::block(move || store.put(record).map_err(|e| e.to_string()))
+    // web::block: the write waits for a group-committed sync, which would
+    // otherwise block this worker's event loop.
+    let op = RecordOp::PutContent(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(applied_response(applied))
+    Ok(outcome_response(outcome))
 }
 
 /// Receiving side of a content-location metadata update (tags).
@@ -1897,13 +1960,15 @@ pub async fn cluster_internal_update_content_location(
     body: web::Json<super::content_location_store::ContentDependentRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let store = Arc::clone(&state.content_location_store);
-    let record = body.into_inner();
-    let applied = web::block(move || store.update(record).map_err(|e| e.to_string()))
+    // web::block: the write waits for a group-committed sync, which would
+    // otherwise block this worker's event loop.
+    let op = RecordOp::UpdateContent(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(applied_response(applied))
+    Ok(outcome_response(outcome))
 }
 
 /// Receiving side of location-pin replication: just store whatever record
@@ -1914,14 +1979,15 @@ pub async fn cluster_internal_put_location(
     body: web::Json<LocationRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    // See `cluster_internal_put_content_location`'s matching comment.
-    let store = Arc::clone(&state.location_store);
-    let record = body.into_inner();
-    let applied = web::block(move || store.put(record).map_err(|e| e.to_string()))
+    // web::block: the write waits for a group-committed sync, which would
+    // otherwise block this worker's event loop.
+    let op = RecordOp::PutLocation(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(applied_response(applied))
+    Ok(outcome_response(outcome))
 }
 
 /// Receiving side of a location metadata update (tags, retention, legal
@@ -1930,13 +1996,15 @@ pub async fn cluster_internal_update_location(
     body: web::Json<LocationRecord>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let store = Arc::clone(&state.location_store);
-    let record = body.into_inner();
-    let applied = web::block(move || store.update(record).map_err(|e| e.to_string()))
+    // web::block: the write waits for a group-committed sync, which would
+    // otherwise block this worker's event loop.
+    let op = RecordOp::UpdateLocation(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(applied_response(applied))
+    Ok(outcome_response(outcome))
 }
 
 /// `(bucket, key)` for the internal tombstone-replication endpoints,
@@ -1971,15 +2039,15 @@ pub async fn cluster_internal_delete_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    // See `cluster_internal_put_content_location`'s matching comment:
-    // `delete` fsyncs a tombstone append too.
-    let store = Arc::clone(&state.location_store);
-    let DeleteKeyRequest { user_id, bucket, key, seq } = body.into_inner();
-    let applied = web::block(move || store.delete(&user_id, &bucket, &key, seq).map_err(|e| e.to_string()))
+    // web::block: the write waits for a group-committed sync, which would
+    // otherwise block this worker's event loop.
+    let op = RecordOp::DeleteLocation(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(applied_response(applied))
+    Ok(outcome_response(outcome))
 }
 
 /// Receiving side of content-location tombstone replication — the
@@ -1988,13 +2056,15 @@ pub async fn cluster_internal_delete_content_location(
     body: web::Json<DeleteKeyRequest>,
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    let store = Arc::clone(&state.content_location_store);
-    let DeleteKeyRequest { user_id, bucket, key, seq } = body.into_inner();
-    let applied = web::block(move || store.delete(&user_id, &bucket, &key, seq).map_err(|e| e.to_string()))
+    // web::block: the write waits for a group-committed sync, which would
+    // otherwise block this worker's event loop.
+    let op = RecordOp::DeleteContent(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(applied_response(applied))
+    Ok(outcome_response(outcome))
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
