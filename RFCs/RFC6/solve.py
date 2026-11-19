@@ -52,12 +52,32 @@ run_name = lambda f, v: "base" if v == FACTORS[f][1] else f"{f}-{v}"
 cand = [(f, v) for f, (vals, _) in FACTORS.items() for v in vals]
 
 
+def device_wa(d, name, trial, fg_mbs):
+    """Device write MB/s (iostat, measured window) / customer MB/s. None without iostat."""
+    f = os.path.join(d, "mon", f"{name}-t{trial}.iostat")
+    if not os.path.exists(f) or fg_mbs <= 0:
+        return None
+    hdr, w = None, []
+    for l in open(f):
+        t = l.split()
+        if t and t[0].startswith("Device"):
+            hdr = t
+        elif hdr and t and t[0].startswith("nvme"):
+            w.append(float(dict(zip(hdr, t))["wMB/s"]) * 1.048576)
+    w = w[len(w) // 3:]
+    return statistics.mean(w) / fg_mbs if w else None
+
+
 def load(d):
     by = defaultdict(dict)
     for fn in sorted(glob.glob(os.path.join(d, "matrix-*.jsonl"))):
         for l in open(fn):
             if l.strip():
-                r = json.loads(l); by[r["name"]][r["trial"]] = r["r"]
+                r = json.loads(l)
+                dwa = device_wa(d, r["name"], r["trial"], r["r"]["fg_mbs"])
+                r["r"]["device_wa"] = dwa if dwa is not None else r["r"]["wa"]
+                r["r"]["wa_source"] = "device" if dwa is not None else "counted"
+                by[r["name"]][r["trial"]] = r["r"]
     return by
 
 
@@ -79,7 +99,7 @@ def sa_growth(d, name):
 S = load(a.space)
 L = load(a.latency) if a.latency else S
 trials_s = sorted({t for n in S.values() for t in n})
-M_SPACE = {"sa": lambda r: r["phys_sa_mean"], "wa": lambda r: r["wa"]}
+M_SPACE = {"sa": lambda r: r["phys_sa_mean"], "wa": lambda r: r["device_wa"]}
 M_LAT = {"wp99": lambda r: r.get("w_p99_us", r["wp99_med_us"]) / 1000,
          "rp99": lambda r: r.get("r_p99_us", r["rp99_med_us"]) / 1000}
 
@@ -135,6 +155,8 @@ with open(os.path.join(a.out, "solve.md"), "w") as out:
               + ("" if a.latency else " (**writers at full speed, not a fixed load: p99 here is queueing-dominated, a stand-in only**)") + ".\n\n")
     out.write(f"Rules: write p99 <= {a.wp99_ms} ms, read p99 <= {a.rp99_ms} ms, WA <= {wa_cap:.2f}"
               + (f" (= min({a.max_wa}, ceiling {a.ceiling_mbs:.0f} / demand {a.demand_mbs:.0f}))" if a.ceiling_mbs and a.demand_mbs else "") + ".\n\n")
+    src = {r["wa_source"] for n in S.values() for r in n.values()}
+    out.write(f"WA source: {', '.join(sorted(src))} (device = iostat writes / customer writes).\n\n")
     out.write(f"Baseline: space amp {B['sa']:.2f}, WA {B['wa']:.2f}, write p99 {B['wp99']:.1f} ms, read p99 {B['rp99']:.1f} ms.\n\n")
     r = solve()
     out.write("**Pick:**\n\n" + hdr)
