@@ -1,9 +1,9 @@
-"""RFC 6: ordered record writes, checked live on a local 3-node RS(2,1) cluster.
+"""Ordered record writes, checked live on a local 3-node RS(2,1) cluster.
 
 Start the cluster first:
     WARPDRIVE_BASE_PORT=19710 ./scripts/run_local_cluster.sh 2 1
 then:
-    python3 rfc6_ordered_records_test.py ../../cluster-local
+    python3 ordered_records_test.py ../../cluster-local
 
 
 Checks, through S3 and through each node's record log:
