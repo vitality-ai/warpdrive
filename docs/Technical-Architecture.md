@@ -4,44 +4,38 @@
 
 WarpDrive is an S3-compatible object store for disaggregated data systems
 and AI/ML workloads. Its storage layout follows Facebook's Haystack paper:
-objects are appended to large files, and a small metadata record points at
-each one.
+objects are appended to large files, and a small record points at each one.
 
-Today one binary contains two engines:
+The architecture is set by [RFC 5](../RFCs/RFC5/RFC5-one-object-service.md):
+one S3 module and one object service, with everything below them pluggable.
+A single node is a one-node cluster. The migration is in progress, see
+[Implementation status](#implementation-status).
 
-- **Cluster engine** (the default): a multi-node, erasure-coded engine with
-  pluggable placement. Any node can coordinate a request. See
-  [Cluster engine](#cluster-engine-distributed-mode).
-- **Single-node engine**: one process with SQLite metadata. It has the most
-  complete S3 implementation. See [Single-node engine](#single-node-engine).
+## Composable design
 
-Each has its own S3 handlers, which is why some S3 features work on a single
-node but not yet on a cluster. RFC 5 replaces the two engines with one object
-service built from pluggable components. See
-[Composable design (RFC 5)](#composable-design-rfc-5).
+![Composable design](diagrams/06-composable-design.svg)
 
-Measured results: [`docs/benchmarks/v1.0.0-results.md`](benchmarks/v1.0.0-results.md).
+| Component | What plugs in |
+|---|---|
+| `MetadataStore` | Replicated `LocationStore` (default), SQLite (optional, single node), Raft (later) |
+| `PlacementPolicy` | Rendezvous hash (default), content-dependent packing, WASM policies |
+| Layout / codec | RS(k,m), RS(1,0) on one node, packed stripes, column codecs |
+| Storage | Append-only bucket files, segments with space reclamation (RFC 3) |
+| Transport | gRPC (default), TCP, HTTP, `Local` on one node |
+| Capabilities | Pushdown queries, computable units, packed range reads |
 
-## Code modules and how they talk
+## How a request flows
 
-**Today:** one `warp_drive` binary (`server/src/`) holds both engines, behind
-the same `/s3` URL. The router sends a request to the single-node handlers
-when the node has no peers, and to the cluster handlers when it does. RFC 5
-merges them into one handler set (see [Composable design](#composable-design-rfc-5)).
-
-![Code modules](diagrams/04-code-modules.svg)
+![Request path](diagrams/04-code-modules.svg)
 
 | Module | Role |
 |---|---|
-| `main.rs` | HTTP routes, picks the engine |
-| `s3/` | SigV4 and STS auth, single-node S3 handlers |
-| `service/` | Metadata and storage services, background deletion |
-| `metadata/` | SQLite metadata: buckets, versions, ACLs, multipart |
-| `cluster/s3_surface.rs` | Cluster S3 handlers |
-| `cluster/coordinator.rs` | Cluster PUT, GET and DELETE: placement, erasure coding, quorum |
-| `cluster/*_store.rs` | Location records, replicated to every node |
+| `s3/` | SigV4 and STS auth, the S3 handlers |
+| Object service | S3 semantics: versions, ACLs, multipart, Object Lock, listing |
+| `cluster/coordinator.rs` | Placement, erasure coding, quorum |
+| `cluster/location_store.rs` | Object records, replicated to every node |
 | `cluster/*_peer_client.rs` | Moves shards between nodes |
-| `storage/` | Append-only bucket files with batched fsync, used by both engines |
+| `storage/` | Append-only bucket files with batched fsync |
 
 ### How nodes talk to each other
 
@@ -53,73 +47,33 @@ merges them into one handler set (see [Composable design](#composable-design-rfc
 - **Internal routes aren't authenticated yet** (#157). Keep them on a
   private network.
 
-## Composable design (RFC 5)
+## Single node
 
-**Status:** proposed. The first performance work is in PR #217. The rest of
-this document describes the code as it is today.
+A single node runs the same engine as a cluster, with one peer and RS(1,0).
 
-One S3 module and one object service, with everything below them pluggable.
+![Single node](diagrams/07-single-node.svg)
 
-![Composable design](diagrams/06-composable-design.svg)
+- One data shard, no parity: losing the disk loses the data.
+- `LocationStore` holds metadata by default. SQLite is an option.
+- The `Local` transport skips the network.
 
-| Today | With RFC 5 |
-|---|---|
-| Two S3 handler sets, single node and cluster | One |
-| SQLite on a single node, read-only metadata on a cluster | Replicated `LocationStore` everywhere, SQLite optional |
-| A single node is its own engine | A one-node cluster running RS(1,0), no redundancy |
-| Shards to self go over the network | `Local` transport on one node |
+## Implementation status
 
-Each migration step must keep the Ceph suite and the performance benchmarks
-from regressing. Details:
-[`RFCs/RFC5/RFC5-one-object-service.md`](../RFCs/RFC5/RFC5-one-object-service.md).
+| Step | What | Status |
+|---|---|---|
+| T1, T2 | Inline small objects (opt-in), one less sync per PUT | Done, PR #217 |
+| 1 | Component traits around today's code | Not started |
+| 2 | Object service extracted from the single-node handlers | Not started |
+| 3 | Writable cluster `MetadataStore` on `LocationStore` | Not started |
+| 4 | One S3 module: cluster handlers removed | Not started |
+| 5 | RS(1,0) and `Local` transport, single node on the cluster engine | Not started |
 
-## Single-node engine
+Until steps 4 and 5 land, the code still has two S3 handler sets behind the
+same `/s3` URL: `s3/handlers/` with SQLite for a node without peers, and
+`cluster/s3_surface.rs` for a node with peers. The cluster set has the gaps
+listed under [Cluster engine internals](#cluster-engine-internals).
 
-**Today:** used when a node starts without `WARPDRIVE_PEERS` or
-`WARPDRIVE_JOIN_VIA`, with SQLite metadata (`MetadataBackend::default()`).
-It has the most complete S3 support ([`TEST-COVERAGE.md`](TEST-COVERAGE.md))
-and no redundancy. With RFC 5, a single node runs the cluster engine as a
-one-node cluster, with `LocationStore` metadata by default and SQLite
-optional.
-
-![Single-node engine](diagrams/07-single-node.svg)
-
-### Request sequence (PUT and GET)
-
-```mermaid
-sequenceDiagram
-    participant C as S3 client
-    participant API as main.rs router
-    participant AUTH as s3/auth.rs
-    participant SVC as StorageService
-    participant META as MetadataService
-    participant BIN as local_store.rs
-    participant DB as SQLite
-
-    C->>API: PUT /bucket/key (SigV4-signed)
-    API->>AUTH: authenticate_s3_request
-    AUTH-->>API: ok, or 403
-    API->>SVC: write_object(body)
-    SVC->>BIN: append to this user's file for the bucket
-    BIN-->>SVC: (offset, size), after a group-commit fsync
-    API->>META: put_object_full(bucket, key, metadata)
-    META->>DB: INSERT object row (extents, ETag, version)
-    API-->>C: 200 OK
-
-    C->>API: GET /bucket/key (SigV4-signed)
-    API->>AUTH: authenticate_s3_request
-    API->>META: get_object_full(bucket, key)
-    META->>DB: SELECT object row
-    DB-->>META: extents, or none (404)
-    API->>SVC: read_object(extents)
-    SVC->>BIN: read those byte ranges
-    BIN-->>SVC: bytes
-    API-->>C: 200/206 + bytes
-```
-
-Known gap: deleted space is never reclaimed (#218).
-
-## Cluster engine (distributed mode)
+## Cluster engine internals
 
 Correctness review log: [`docs/reviews/v1.0.0-beta-code-review.md`](reviews/v1.0.0-beta-code-review.md).
 

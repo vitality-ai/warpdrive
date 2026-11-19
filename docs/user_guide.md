@@ -23,7 +23,7 @@
 
 Warpdrive is S3-compatible. Any client or library that speaks S3 works with it. The example below uses **boto3**. The URL and client code are the same whether the server runs single-node or as a [distributed cluster](#distributed-mode-default). Which engine answers is decided when the server starts, not by the client.
 
-Some S3 features work on a single node but not yet on a cluster, among them object versions, ACLs, CopyObject, form POST uploads and paginated listing. [Technical Architecture](Technical-Architecture.md#cluster-engine-distributed-mode) lists them. RFC 5 brings both engines to the same feature set.
+Some S3 features work on a single node but not yet on a cluster, among them object versions, ACLs, CopyObject, form POST uploads and paginated listing. [Technical Architecture](Technical-Architecture.md#implementation-status) lists them. RFC 5 brings both engines to the same feature set.
 
 ```bash
 pip install boto3

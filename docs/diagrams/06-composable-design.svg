@@ -83,5 +83,5 @@
 <text x="1127.5" y="353.0" font-size="20" text-anchor="middle" fill="#1e1e1e">Capabilities</text>
 <text x="1127.5" y="375.0" font-size="14.5" text-anchor="middle" fill="#495057">pushdown</text>
 <text x="1127.5" y="393.0" font-size="14.5" text-anchor="middle" fill="#495057">range reads</text>
-<text x="620" y="455" font-size="15" text-anchor="middle" fill="#495057">RFC 5 target. Each component can be swapped per deployment, bucket or request.</text>
+<text x="620" y="455" font-size="15" text-anchor="middle" fill="#495057">Each component can be swapped per deployment, bucket or request.</text>
 </svg>
