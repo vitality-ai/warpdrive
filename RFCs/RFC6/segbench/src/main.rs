@@ -36,6 +36,7 @@ struct Cfg {
     read_rate: f64,  // total reads per second across readers (open loop); 0 = as fast as possible
     direct: bool,    // reads bypass the page cache (O_DIRECT, Linux)
     prealloc: bool,  // fallocate each segment to its full size when it's created
+    write_rate: f64, // total customer write MB/s (open loop); 0 = as fast as possible
     compact: bool,
     hot_frac: f64,
     seed: u64,
@@ -46,7 +47,7 @@ fn parse() -> Cfg {
     let mut c = Cfg {
         dir: PathBuf::from("/mnt/nvme/segbench"), segment_mb: 256, umax: 0.5, policy: "costbenefit".into(),
         layout: "C".into(), copy: "cfr".into(), rate_mbps: 50.0, live_gb: 6.0, churn_x: 4.0, warm_x: 2.0,
-        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
+        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, write_rate: 0.0, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
     };
     let a: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -68,6 +69,7 @@ fn parse() -> Cfg {
             "--read-rate" => c.read_rate = v.parse().unwrap(),
             "--direct" => c.direct = v == "1",
             "--prealloc" => c.prealloc = v == "1",
+            "--write-rate" => c.write_rate = v.parse().unwrap(),
             "--compact" => c.compact = v == "1",
             "--hot-frac" => c.hot_frac = v.parse().unwrap(),
             "--seed" => c.seed = v.parse().unwrap(),
@@ -272,9 +274,20 @@ fn writer(sh: Arc<Shared>, wid: u64) {
     let mut r = Rng(sh.cfg.seed * 7919 + wid * 104729 + 1);
     let buf = vec![0xA5u8; 4 << 20];
     let (hot_mean, cold_mean) = lifetimes(&sh.cfg);
+    // Open loop: each writer owns 1/writers of the target rate and schedules its next
+    // write from the bytes it just wrote. Latency counts from the scheduled time, so
+    // falling behind shows up as latency instead of disappearing.
+    let per_writer = sh.cfg.write_rate * 1e6 / sh.cfg.writers as f64;
+    let mut next = Instant::now() + Duration::from_millis(wid * 7);
     while !sh.stop.load(Relaxed) {
         let len = obj_size(&mut r);
-        let t0 = Instant::now();
+        let t0 = if per_writer > 0.0 {
+            let now = Instant::now();
+            if next > now { std::thread::sleep(next - now); }
+            let t = next;
+            next += Duration::from_secs_f64(len as f64 / per_writer);
+            t
+        } else { Instant::now() };
         let (seg, off, f) = { let mut st = sh.st.lock().unwrap(); reserve(&sh, &mut st, len, false) };
         f.write_all_at(&buf[..len as usize], off).unwrap();
         durable(&sh, &[seg]);
