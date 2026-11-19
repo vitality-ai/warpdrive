@@ -709,6 +709,17 @@ async fn put_object_plain(
              (shard data was written, but the object may not be findable from every node)"
         ), &key));
     }
+
+    // Quorum can be met without this node: its own copy of either broadcast
+    // can fail while the others succeed. This node is the one the client
+    // reads back from first, so its copy must show the new object before
+    // the PUT succeeds. Both checks are in memory, so the usual case pays
+    // nothing. Only a failed self-delivery costs a local write.
+    ensure_local_copy_is_current(state, &record).await.map_err(|e| {
+        s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
+            "wrote the new object, but could not update this node's own copy of its records: {e}"
+        ), &key)
+    })?;
     if cleanup_acked < required_acks {
         return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
@@ -728,6 +739,33 @@ async fn put_object_plain(
         t_end.duration_since(request_start).as_micros(),
     );
     Ok(HttpResponse::Ok().finish())
+}
+
+/// Makes this node's own records match a PUT it just coordinated: the new
+/// plain record present, and no packed record left for the key (GET checks
+/// the packed store first). Writes locally only what the broadcast didn't.
+async fn ensure_local_copy_is_current(state: &ClusterState, record: &LocationRecord) -> Result<(), String> {
+    let (user_id, bucket, key) = (record.user_id.clone(), record.bucket.clone(), record.key.clone());
+    let plain_missing = state.location_store.get(&user_id, &bucket, &key).is_none_or(|r| r.version != record.version);
+    let packed_left = state.content_location_store.get(&user_id, &bucket, &key).is_some();
+    if !plain_missing && !packed_left {
+        return Ok(());
+    }
+    log::warn!("PUT {bucket}/{key}: this node's own copy missed the broadcast, writing it locally");
+    let loc = Arc::clone(&state.location_store);
+    let content = Arc::clone(&state.content_location_store);
+    let record = record.clone();
+    web::block(move || {
+        if plain_missing {
+            loc.put(record).map_err(|e| e.to_string())?;
+        }
+        if packed_left {
+            content.delete(&user_id, &bucket, &key).map_err(|e| e.to_string())?;
+        }
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {e}"))?
 }
 
 /// Fetches and EC-decodes a plain object's full bytes -- the same fetch
