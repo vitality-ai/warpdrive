@@ -149,7 +149,7 @@ Full table: `results/results.md`.
 
 CPU flamegraphs of the coordinator (4 KB, concurrency 16): `results/flame_B0.svg`, `results/flame_B3.svg`.
 
-**Caveats:** 2 trials per point (spread at 4 KB within ~1-2%). One client, all requests coordinated by node 0. Concurrency sweep is 1 trial. B0 has no sync counter, so its syncs/PUT is read from B1, which runs the same path.
+**Caveats:** Every variant logged at INFO on every request (access log plus trace lines, written to `logs/application.log`), so absolute numbers include logging cost for all of them, `main` too. Next runs: headline numbers at WARN, traces in separate or sampled runs. 2 trials per point (spread at 4 KB within ~1-2%). One client, all requests coordinated by node 0. Concurrency sweep is 1 trial. B0 has no sync counter, so its syncs/PUT is read from B1, which runs the same path.
 
 ## Performance gates
 
