@@ -37,6 +37,11 @@ pub trait KvEngine<V>: Send + Sync {
     fn put(&self, key: String, value: V) -> io::Result<()>;
     /// Durably removes `key`. Removing a missing key is not an error.
     fn delete(&self, key: &str) -> io::Result<()>;
+    /// Durably sets `key` to `value` only if `check`, given the current
+    /// value, returns `Ok`. The check and the write are atomic with respect
+    /// to every other write to the engine. Returns the value it replaced,
+    /// or `check`'s error without writing anything.
+    fn put_if<T>(&self, key: String, value: V, check: impl FnOnce(Option<&V>) -> Result<(), T>) -> io::Result<Result<Option<V>, T>>;
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
@@ -51,7 +56,8 @@ pub trait KvEngine<V>: Send + Sync {
 /// do point lookups.
 pub trait Index<V>: Default + Send + Sync {
     fn get(&self, key: &str) -> Option<&V>;
-    fn insert(&mut self, key: String, value: V);
+    /// Returns the value it replaced.
+    fn insert(&mut self, key: String, value: V) -> Option<V>;
     fn remove(&mut self, key: &str);
     fn len(&self) -> usize;
     fn for_each(&self, f: impl FnMut(&String, &V));
@@ -62,8 +68,8 @@ impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
     fn get(&self, key: &str) -> Option<&V> {
         BTreeMap::get(self, key)
     }
-    fn insert(&mut self, key: String, value: V) {
-        BTreeMap::insert(self, key, value);
+    fn insert(&mut self, key: String, value: V) -> Option<V> {
+        BTreeMap::insert(self, key, value)
     }
     fn remove(&mut self, key: &str) {
         BTreeMap::remove(self, key);
@@ -88,8 +94,8 @@ impl<V: Send + Sync> Index<V> for HashMap<String, V> {
     fn get(&self, key: &str) -> Option<&V> {
         HashMap::get(self, key)
     }
-    fn insert(&mut self, key: String, value: V) {
-        HashMap::insert(self, key, value);
+    fn insert(&mut self, key: String, value: V) -> Option<V> {
+        HashMap::insert(self, key, value)
     }
     fn remove(&mut self, key: &str) {
         HashMap::remove(self, key);
@@ -143,7 +149,9 @@ where
                     continue;
                 }
                 match serde_json::from_str::<(String, Option<V>)>(line) {
-                    Ok((key, Some(v))) => index.insert(key, v),
+                    Ok((key, Some(v))) => {
+                        index.insert(key, v);
+                    }
                     Ok((key, None)) => index.remove(&key),
                     // Only the last line can be a torn write from a crash
                     // mid-append (#152), so only that one is skipped. A
@@ -199,6 +207,25 @@ where
             ticket
         };
         self.log.sync_ticket(ticket)
+    }
+
+    fn put_if<T>(&self, key: String, value: V, check: impl FnOnce(Option<&V>) -> Result<(), T>) -> io::Result<Result<Option<V>, T>> {
+        // Serialized before taking the lock, as in `put`. A refused write
+        // wastes the serialization, which is cheap next to the sync.
+        let line = Self::line(&key, Some(&value))?;
+        let (ticket, previous) = {
+            let _write_guard = self.write_lock.lock();
+            // Writers are serialized by `write_lock`, so the value checked
+            // here is still current when the index is updated below.
+            if let Err(e) = check(self.index.read().get(&key)) {
+                return Ok(Err(e));
+            }
+            let ticket = self.log.append_line(&line)?;
+            let previous = self.index.write().insert(key, value);
+            (ticket, previous)
+        };
+        self.log.sync_ticket(ticket)?;
+        Ok(Ok(previous))
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
@@ -317,6 +344,16 @@ mod tests {
         let want = vec![("p/a".to_string(), 1), ("p/b".to_string(), 2)];
         assert_eq!(b.scan_prefix("p/", |k, v| Some((k.to_string(), *v))), want);
         assert_eq!(h.scan_prefix("p/", |k, v| Some((k.to_string(), *v))), want);
+    }
+
+    #[test]
+    fn put_if_writes_only_when_the_check_passes_and_returns_what_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        assert_eq!(e.put_if("k".into(), 5, |cur| if cur.is_none() { Ok(()) } else { Err("exists") }).unwrap(), Ok(None));
+        assert_eq!(e.put_if("k".into(), 6, |cur| if cur.is_none() { Ok(()) } else { Err("exists") }).unwrap(), Err("exists"));
+        assert_eq!(e.put_if("k".into(), 7, |cur| if cur == Some(&5) { Ok(()) } else { Err("changed") }).unwrap(), Ok(Some(5)));
+        assert_eq!(open(&dir).get("k"), Some(7), "a refused write left nothing in the log");
     }
 
     #[test]

@@ -24,6 +24,7 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
 use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
+    cluster_internal_update_location, cluster_internal_update_content_location,
     cluster_internal_put_content_location, cluster_internal_delete_content_location, cluster_content_record,
     cluster_put_bucket_config, cluster_internal_put_bucket_config,
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
@@ -437,6 +438,8 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
+            .route("/cluster/_internal/location/update", web::post().to(cluster_internal_update_location))
+            .route("/cluster/_internal/content_location/update", web::post().to(cluster_internal_update_content_location))
             .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))
             .route("/cluster/_internal/content_location", web::delete().to(cluster_internal_delete_content_location))
             .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))

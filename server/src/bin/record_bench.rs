@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-
+use warp_drive::cluster::hlc;
 use warp_drive::cluster::location_store::{BitcaskLocationStore, LocationRecord, LocationStore};
 
 fn record(key: &str, seq: u64) -> LocationRecord {
@@ -23,6 +23,7 @@ fn record(key: &str, seq: u64) -> LocationRecord {
         m: 2,
         original_len: 4096,
         version: format!("{seq:x}-0"),
+        seq,
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
@@ -64,7 +65,7 @@ fn main() {
                 std::thread::spawn(move || {
                     for i in 0..per {
                         let key = format!("obj/{t}/{i}");
-                        store.put(record(&key, i as u64)).unwrap();
+                        store.put(record(&key, hlc::now())).unwrap();
                     }
                 })
             })

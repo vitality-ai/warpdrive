@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
+use super::location_store::record_key;
+use super::ordered::{OrderedRecord, OrderedStore};
+pub use super::ordered::{Applied, Entry};
+use crate::storage::kv_engine::BitcaskEngine;
 
 /// One stripe's placement pin: which peers hold its `k+m` shards, the
 /// shared bin size (`capacity`, what every shard in this stripe is padded
@@ -102,6 +105,9 @@ pub struct ContentDependentRecord {
     /// field existed, whose shards are at the old, unversioned key.
     #[serde(default)]
     pub version: String,
+    /// See `LocationRecord::seq`.
+    #[serde(default)]
+    pub seq: u64,
     /// True when the caller's own `units_header` left part of the body
     /// uncovered (`verify_stripes_reconstruct_original` allows this --
     /// see its doc -- a legitimate choice for a caller like a row-group
@@ -185,69 +191,80 @@ impl ContentDependentRecord {
 }
 
 pub trait ContentLocationStore: Send + Sync {
-    fn put(&self, record: ContentDependentRecord) -> io::Result<()>;
+    /// See `LocationStore::put`: same ordering rule, other record shape.
+    fn put(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>>;
+    /// See `LocationStore::update`.
+    fn update(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>>;
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord>;
-    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()>;
-    /// See `LocationStore::list` — same minimal-S3-surface purpose, for the
-    /// content-dependent half of a bucket's objects.
+    fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<ContentDependentRecord>>;
+    fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<ContentDependentRecord>>;
+    /// See `LocationStore::list`, for the content-dependent half of a
+    /// bucket's objects.
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
-    /// See `LocationStore::compact` — same reasoning and same mechanism
-    /// (#163), applied to this store's own log.
+    /// See `LocationStore::compact`.
     fn compact(&self) -> io::Result<()>;
 }
 
-/// Length-prefixed, same scheme and same reasoning as `location_store.rs`'s
-/// `record_key` (#150: a plain `/` separator lets bucket `a/b` + key `c`
-/// and bucket `a` + key `b/c` collide onto the same index entry; the same
-/// risk applies one level up to `user_id`, so it gets the same treatment).
-fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
-    format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
+impl OrderedRecord for ContentDependentRecord {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
 }
 
-/// `ContentLocationStore` on a per-node `KvEngine`, same layout and
-/// reasoning as `BitcaskLocationStore`.
-pub struct BitcaskContentLocationStore<E = BitcaskEngine<ContentDependentRecord>> {
-    engine: E,
+/// `ContentLocationStore` on ordered records over a per-node `KvEngine`.
+pub struct BitcaskContentLocationStore<E = BitcaskEngine<Entry<ContentDependentRecord>>> {
+    log: OrderedStore<ContentDependentRecord, E>,
 }
 
 impl BitcaskContentLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self { engine: BitcaskEngine::open(log_path, "content location")? })
+        Ok(Self { log: OrderedStore::new(BitcaskEngine::open(log_path, "content location")?) })
     }
 
     pub fn path(&self) -> &Path {
-        self.engine.path()
+        self.log.engine().path()
     }
 }
 
-impl<E: KvEngine<ContentDependentRecord>> BitcaskContentLocationStore<E> {
+impl<E: crate::storage::kv_engine::KvEngine<Entry<ContentDependentRecord>>> BitcaskContentLocationStore<E> {
     /// The store on any engine.
     pub fn with_engine(engine: E) -> Self {
-        Self { engine }
+        Self { log: OrderedStore::new(engine) }
     }
 }
 
-impl<E: KvEngine<ContentDependentRecord>> ContentLocationStore for BitcaskContentLocationStore<E> {
-    fn put(&self, record: ContentDependentRecord) -> io::Result<()> {
-        self.engine.put(record_key(&record.user_id, &record.bucket, &record.key), record)
+impl<E: crate::storage::kv_engine::KvEngine<Entry<ContentDependentRecord>>> ContentLocationStore for BitcaskContentLocationStore<E> {
+    fn put(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>> {
+        self.log.put(record_key(&record.user_id, &record.bucket, &record.key), record)
+    }
+
+    fn update(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>> {
+        self.log.update(record_key(&record.user_id, &record.bucket, &record.key), record)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord> {
-        self.engine.get(&record_key(user_id, bucket, key))
+        self.log.get(&record_key(user_id, bucket, key))
     }
 
-    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
-        self.engine.delete(&record_key(user_id, bucket, key))
+    fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<ContentDependentRecord>> {
+        self.log.entry(&record_key(user_id, bucket, key))
+    }
+
+    fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<ContentDependentRecord>> {
+        self.log.delete(record_key(user_id, bucket, key), seq)
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
         let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
-        self.engine.scan_prefix(&full_prefix, |k, r| Some((k[bucket_prefix.len()..].to_string(), r.original_len as u64)))
+        self.log.list_live(&full_prefix, |k, r| (k[bucket_prefix.len()..].to_string(), r.original_len as u64))
     }
 
     fn compact(&self) -> io::Result<()> {
-        self.engine.compact()
+        self.log.compact()
     }
 }
 
@@ -279,6 +296,7 @@ mod tests {
                 bins: vec![vec!["u0".into()], vec!["u1".into()], vec![]],
             }],
             version: "v1".to_string(),
+            seq: 1,
             has_sparse_gaps: false,
             sorted_unit_locations: Vec::new(),
             etag: None,
@@ -378,7 +396,7 @@ mod tests {
         assert_eq!(store.get("alice", "logs", "k1").unwrap(), alice_rec);
         assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec);
 
-        store.delete("alice", "logs", "k1").unwrap();
+        store.delete("alice", "logs", "k1", 2).unwrap();
         assert!(store.get("alice", "logs", "k1").is_none());
         assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec, "deleting alice's record must not touch bob's");
     }
@@ -408,7 +426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
         store.put(sample("b1", "k1")).unwrap();
-        store.delete("u1", "b1", "k1").unwrap();
+        store.delete("u1", "b1", "k1", 2).unwrap();
         assert!(store.get("u1", "b1", "k1").is_none());
     }
 
@@ -469,7 +487,7 @@ mod tests {
         store.put(sample("b1", "keep")).unwrap();
         for i in 0..20 {
             store.put(sample("b1", &format!("churn{i}"))).unwrap();
-            store.delete("u1", "b1", &format!("churn{i}")).unwrap();
+            store.delete("u1", "b1", &format!("churn{i}"), 2).unwrap();
         }
         let size_before = std::fs::metadata(&log_path).unwrap().len();
 
@@ -500,40 +518,5 @@ mod tests {
         store.put(sample("b1", "k2")).unwrap();
         assert_eq!(store.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
         assert_eq!(store.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
-    }
-
-    /// Same invariant and same reasoning as `location_store.rs`'s matching
-    /// test (#155): the live index and a fresh replay of the log must
-    /// always agree, however a concurrent put/delete race on the same key
-    /// actually resolved.
-    #[test]
-    fn concurrent_put_delete_on_the_same_key_never_diverges_log_from_index() {
-        use std::thread;
-
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("cloc.log");
-        let store = std::sync::Arc::new(BitcaskContentLocationStore::open(&log_path).unwrap());
-
-        let handles: Vec<_> = (0..16)
-            .map(|t| {
-                let store = std::sync::Arc::clone(&store);
-                thread::spawn(move || {
-                    for i in 0..50 {
-                        if (t + i) % 2 == 0 {
-                            store.put(sample("b1", "racykey")).unwrap();
-                        } else {
-                            let _ = store.delete("u1", "b1", "racykey");
-                        }
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let live = store.get("u1", "b1", "racykey");
-        let replayed = BitcaskContentLocationStore::open(&log_path).unwrap().get("u1", "b1", "racykey");
-        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

@@ -452,6 +452,7 @@ mod tests {
             m: 1,
             original_len: size,
             version: "v1".to_string(),
+            seq: 1,
             retention_mode: None,
             retain_until: None,
             legal_hold: false,

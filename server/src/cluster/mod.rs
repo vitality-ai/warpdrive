@@ -11,6 +11,8 @@ pub mod shard_storage;
 pub mod peer_client;
 pub mod grpc_peer_client;
 pub mod tcp_peer_client;
+pub mod hlc;
+pub mod ordered;
 pub mod location_store;
 pub mod content_location_store;
 pub mod metadata_store;

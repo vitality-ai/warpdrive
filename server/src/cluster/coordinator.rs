@@ -23,7 +23,7 @@ use std::sync::Arc;
 use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
 use super::content_location_store::{ContentDependentRecord, ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
-use super::location_store::{LocationRecord, LocationStore, ObjectS3Metadata, UNAUTHENTICATED_USER};
+use super::location_store::{Applied, LocationRecord, LocationStore, ObjectS3Metadata, UNAUTHENTICATED_USER};
 use super::membership::Membership;
 use super::packing::StripePacker;
 use super::peer_client::PeerClient;
@@ -148,16 +148,24 @@ fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderVal
         .collect()
 }
 
-/// Shared fan-out for every `replicate_*` function below: build one request
-/// per peer (symmetric, including this node, via the same internal HTTP
-/// call -- no special self-case), send them all concurrently, and count
-/// how many succeeded. `build` constructs the actual `RequestBuilder`
-/// (method + body) for a given peer's URL -- the one thing that genuinely
-/// differs between a location/content-location put/delete -- everything
-/// else (fan-out, success/failure counting, the warn! on a bad response or
-/// a transport error) was previously duplicated four times, once per
-/// record-shape/verb combination.
-async fn replicate_to_peers<F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, build: F) -> usize
+/// How one peer answered a record write.
+enum PeerReply {
+    Applied,
+    /// The peer has a newer write for the key (409, `current_seq`).
+    Stale(u64),
+    /// Refused for another reason, or unreachable.
+    Failed,
+}
+
+/// Body of a 409 from a record-write endpoint: the peer's current `seq`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StaleReply {
+    pub current_seq: u64,
+}
+
+/// Sends one request per peer (this node included, through the same
+/// internal call) and collects each peer's answer.
+async fn send_to_peers<F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, build: F) -> Vec<PeerReply>
 where
     F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 {
@@ -167,52 +175,130 @@ where
         let req = build(&client, &url);
         async move {
             match req.send().await {
-                Ok(r) if r.status().is_success() => true,
+                Ok(r) if r.status().is_success() => PeerReply::Applied,
+                Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<StaleReply>().await {
+                    Ok(s) => PeerReply::Stale(s.current_seq),
+                    Err(e) => {
+                        warn!("{label} replication to {peer}: unreadable 409 body: {e}");
+                        PeerReply::Failed
+                    }
+                },
                 Ok(r) => {
                     warn!("{label} replication to {peer} returned {}", r.status());
-                    false
+                    PeerReply::Failed
                 }
                 Err(e) => {
                     warn!("{label} replication to {peer} failed: {e}");
-                    false
+                    PeerReply::Failed
                 }
             }
         }
     });
-    join_all(requests).await.into_iter().filter(|ok| *ok).count()
+    join_all(requests).await
 }
 
-/// Replicate a `LocationRecord` to every peer in `peers`. Returns how many
-/// acknowledged.
+/// Rounds of restamp-and-resend before an ordered write gives up.
+const ORDERED_WRITE_ROUNDS: usize = 3;
+
+/// Sends an ordered record write (`record_log`) to every peer and returns
+/// how many applied it.
+///
+/// A peer that already holds a newer write for the key answers 409 with
+/// its `seq`. That happens when two writes to one key race, or when this
+/// node's clock is behind the node that wrote the record. Either way, this
+/// write came last from the client's point of view, so it's stamped above
+/// the highest `seq` seen and sent again to every peer. Peers that applied
+/// the first send apply the restamped copy too, since it's newer.
+async fn replicate_ordered<B, F>(state: &ClusterState, peers: &[String], path_suffix: &str, label: &str, mut seq: u64, body: B, build: F) -> usize
+where
+    B: Fn(u64) -> serde_json::Value,
+    F: Fn(&reqwest::Client, &str, &serde_json::Value) -> reqwest::RequestBuilder,
+{
+    let mut acked = 0;
+    for round in 0..ORDERED_WRITE_ROUNDS {
+        let payload = body(seq);
+        let replies = send_to_peers(state, peers, path_suffix, label, |client, url| build(client, url, &payload)).await;
+        acked = replies.iter().filter(|r| matches!(r, PeerReply::Applied)).count();
+        let newest = replies.iter().filter_map(|r| if let PeerReply::Stale(s) = r { Some(*s) } else { None }).max();
+        match newest {
+            None => return acked,
+            Some(newest) if round + 1 < ORDERED_WRITE_ROUNDS => {
+                super::hlc::observe(newest);
+                seq = super::hlc::now();
+                log::debug!("{label}: a peer holds a newer write (seq {newest}), resending at seq {seq}");
+            }
+            Some(_) => {}
+        }
+    }
+    acked
+}
+
+fn to_json<T: Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).expect("record types serialize to JSON")
+}
+
+/// Replicates a new version's `LocationRecord` to every peer in `peers`.
+/// Returns how many applied it.
 async fn replicate_location_put(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
-    replicate_to_peers(state, peers, "location", "location pin", |client, url| client.post(url).json(record)).await
+    replicate_ordered(state, peers, "location", "location pin", record.seq, |seq| {
+        let mut r = record.clone();
+        r.seq = seq;
+        to_json(&r)
+    }, |client, url, body| client.post(url).json(body)).await
 }
 
-/// Content-dependent counterpart of `replicate_location_put` -- same
-/// reasoning, same mechanism, just the other record shape. Used by
-/// Phase 4's tagging support, which (unlike retention) applies to packed
-/// objects too.
-async fn replicate_content_location_put(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
-    replicate_to_peers(state, peers, "content_location", "content-location pin", |client, url| client.post(url).json(record)).await
+/// Replicates a metadata change (tags, retention) to the version `record`
+/// names. A peer whose live version differs refuses it (412).
+async fn replicate_location_update(state: &ClusterState, record: &LocationRecord, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, "location/update", "location update", record.seq, |seq| {
+        let mut r = record.clone();
+        r.seq = seq;
+        to_json(&r)
+    }, |client, url, body| client.post(url).json(body)).await
 }
 
-/// Replicate a tombstone (delete) for `(user_id, bucket, key)` to every
+/// Content-dependent counterpart of `replicate_location_put`.
+pub(crate) async fn replicate_content_location_put(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, "content_location", "content-location pin", record.seq, |seq| {
+        let mut r = record.clone();
+        r.seq = seq;
+        to_json(&r)
+    }, |client, url, body| client.post(url).json(body)).await
+}
+
+/// Content-dependent counterpart of `replicate_location_update`.
+async fn replicate_content_location_update(state: &ClusterState, record: &ContentDependentRecord, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, "content_location/update", "content-location update", record.seq, |seq| {
+        let mut r = record.clone();
+        r.seq = seq;
+        to_json(&r)
+    }, |client, url, body| client.post(url).json(body)).await
+}
+
+/// Replicates a tombstone for `(user_id, bucket, key)` at `seq` to every
 /// peer in `peers`.
-pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
-    let body = DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string() };
-    replicate_to_peers(state, peers, "location", "location tombstone", |client, url| client.delete(url).json(&body)).await
+pub(crate) async fn replicate_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, seq: u64, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, "location", "location tombstone", seq, |seq| {
+        to_json(&DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq })
+    }, |client, url, body| client.delete(url).json(body)).await
 }
 
-/// Content-location counterpart of `replicate_location_delete` — needed so
-/// a plain PUT that overwrites a key previously packed can clear the stale
-/// `ContentLocationStore` pin (see `put_object_plain`'s overwrite handling)
-/// and so `cluster_delete_object` can tombstone a packed object, neither of
-/// which was possible before: a packed object lived *only* in
-/// `ContentLocationStore`, which DELETE never touched, and a plain overwrite
-/// never cleared the packed pin GET still preferred.
-pub(crate) async fn replicate_content_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, peers: &[String]) -> usize {
-    let body = DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string() };
-    replicate_to_peers(state, peers, "content_location", "content-location tombstone", |client, url| client.delete(url).json(&body)).await
+/// Content-location counterpart of `replicate_location_delete`. Also used
+/// by a plain PUT to clear a packed record left by an earlier write of the
+/// same key, since GET checks the packed store first.
+pub(crate) async fn replicate_content_location_delete(state: &ClusterState, user_id: &str, bucket: &str, key: &str, seq: u64, peers: &[String]) -> usize {
+    replicate_ordered(state, peers, "content_location", "content-location tombstone", seq, |seq| {
+        to_json(&DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq })
+    }, |client, url, body| client.delete(url).json(body)).await
+}
+
+/// Turns a store's answer into the internal endpoint's response.
+fn applied_response<R>(applied: Applied<R>) -> HttpResponse {
+    match applied {
+        Applied::Yes { .. } => HttpResponse::Ok().finish(),
+        Applied::Stale { current_seq } => HttpResponse::Conflict().json(StaleReply { current_seq }),
+        Applied::VersionMismatch => HttpResponse::PreconditionFailed().finish(),
+    }
 }
 
 /// Attaches `x-warpd-placement` (`plain`|`packed`) and, when a packing
@@ -620,6 +706,7 @@ async fn put_object_plain(
         m,
         original_len: body.len(),
         version,
+        seq: super::hlc::now(),
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
@@ -688,9 +775,10 @@ async fn put_object_plain(
             let user_id_owned = user_id.to_string();
             let bucket_owned = bucket.clone();
             let key_owned = key.clone();
-            let result = web::block(move || store.delete(&user_id_owned, &bucket_owned, &key_owned).map_err(|e| e.to_string())).await;
+            let seq = record.seq;
+            let result = web::block(move || store.delete(&user_id_owned, &bucket_owned, &key_owned, seq).map_err(|e| e.to_string())).await;
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => log::warn!("stale content-location pin cleanup failed for {bucket}/{key}: {e}"),
                 Err(e) => log::warn!("stale content-location pin cleanup blocking task failed for {bucket}/{key}: {e}"),
             }
@@ -700,7 +788,7 @@ async fn put_object_plain(
     let t0 = std::time::Instant::now();
     let (loc_acked, cleanup_acked) = tokio::join!(
         replicate_location_put(&state, &record, &peers),
-        replicate_content_location_delete(&state, user_id, &bucket, &key, &peers),
+        replicate_content_location_delete(&state, user_id, &bucket, &key, record.seq, &peers),
     );
     state.timing.location_replicate.record(t0.elapsed());
     if loc_acked < required_acks {
@@ -755,12 +843,15 @@ async fn ensure_local_copy_is_current(state: &ClusterState, record: &LocationRec
     let loc = Arc::clone(&state.location_store);
     let content = Arc::clone(&state.content_location_store);
     let record = record.clone();
+    // Stale answers are fine here: they mean this node already holds a
+    // newer write for the key, which is what a reader should see.
     web::block(move || {
+        let seq = record.seq;
         if plain_missing {
             loc.put(record).map_err(|e| e.to_string())?;
         }
         if packed_left {
-            content.delete(&user_id, &bucket, &key).map_err(|e| e.to_string())?;
+            content.delete(&user_id, &bucket, &key, seq).map_err(|e| e.to_string())?;
         }
         Ok::<_, String>(())
     })
@@ -980,37 +1071,13 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     };
     put_object_plain(user_id, bucket, final_key, &body, state, &s3_meta).await?;
 
-    // Local-only cleanup of the now-dead header/part records (no tombstone
-    // replication to peers) -- a storage-reclamation gap, not a
-    // correctness one: this project has no compaction/GC anywhere yet
-    // (see RFC3), so leftover shard bytes on peers already accumulate
-    // the same way for ordinary deletes. Tracked as the same class of
-    // future work, not a new gap introduced here.
-    //
-    // web::block: `delete` now does a real group-commit fsync per call
-    // (see `storage::group_commit`'s module doc), so this whole loop (one
-    // blocking task, not one per part) must run off the actix worker's
-    // event loop the same way the single-object delete paths were fixed.
-    {
-        let store = Arc::clone(&state.location_store);
-        let user_id_owned = user_id.to_string();
-        let bucket_owned = bucket.to_string();
-        let upload_id_owned = upload_id.to_string();
-        let part_numbers: Vec<i32> = requested.iter().map(|(n, _)| *n).collect();
-        let result = web::block(move || {
-            store.delete(&user_id_owned, &bucket_owned, &multipart_meta_key(&upload_id_owned))?;
-            for part_number in part_numbers {
-                store.delete(&user_id_owned, &bucket_owned, &multipart_part_key(&upload_id_owned, part_number))?;
-            }
-            Ok::<_, std::io::Error>(())
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("multipart cleanup failed for {bucket}/{upload_id}: {e}"),
-            Err(e) => log::warn!("multipart cleanup blocking task failed for {bucket}/{upload_id}: {e}"),
-        }
-    }
+    // The header and part records are dead now. Tombstones go to every
+    // peer, like any DELETE, so every node drops the records and can
+    // reclaim the parts' shards (RFC 6). Best effort: the object is
+    // already written, so a missed tombstone doesn't fail the request.
+    let mut dead_keys = vec![multipart_meta_key(upload_id)];
+    dead_keys.extend(requested.iter().map(|(n, _)| multipart_part_key(upload_id, *n)));
+    delete_upload_records(state, user_id, bucket, upload_id, &dead_keys).await;
 
     Ok((final_etag, total_size))
 }
@@ -1024,28 +1091,23 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
     let prefix = multipart_part_prefix(upload_id);
     let part_keys: Vec<String> = state.location_store.list(user_id, bucket, &prefix).into_iter().map(|(k, _)| k).collect();
 
-    // Best-effort local cleanup, same "storage-reclamation gap, not a
-    // correctness one" reasoning as the matching cleanup in
-    // `cluster_complete_multipart_upload_inner` -- a failure here doesn't
-    // fail the abort itself. web::block (one blocking task, not one per
-    // part): `delete` now does a real group-commit fsync per call.
-    let store = Arc::clone(&state.location_store);
-    let user_id_owned = user_id.to_string();
-    let bucket_owned = bucket.to_string();
-    let upload_id_owned = upload_id.to_string();
-    let result = web::block(move || {
-        for part_key in part_keys {
-            store.delete(&user_id_owned, &bucket_owned, &part_key)?;
-        }
-        store.delete(&user_id_owned, &bucket_owned, &multipart_meta_key(&upload_id_owned))
-    })
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!("multipart abort cleanup failed for {bucket}/{upload_id}: {e}"),
-        Err(e) => log::warn!("multipart abort cleanup blocking task failed for {bucket}/{upload_id}: {e}"),
-    }
+    let mut dead_keys = part_keys;
+    dead_keys.push(multipart_meta_key(upload_id));
+    delete_upload_records(state, user_id, bucket, upload_id, &dead_keys).await;
     Ok(())
+}
+
+/// Tombstones a multipart upload's header and part records on every peer.
+/// Logs, and doesn't fail, when a tombstone misses quorum.
+async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, bucket: &str, upload_id: &str, keys: &[String]) {
+    let peers = state.membership.peers();
+    let required = required_write_acks(state.ec.k(), state.ec.m());
+    let seq = super::hlc::now();
+    let acks = join_all(keys.iter().map(|k| replicate_location_delete(state, user_id, bucket, k, seq, &peers))).await;
+    let missed = acks.iter().filter(|a| **a < required).count();
+    if missed > 0 {
+        warn!("multipart cleanup for {bucket}/{upload_id}: {missed}/{} record tombstones missed quorum", keys.len());
+    }
 }
 
 /// Diagnostic endpoint: phase-level latency breakdown for `cluster_put_object`,
@@ -1484,8 +1546,11 @@ pub(crate) async fn cluster_delete_object_inner(
         .unwrap_or_else(|| (state.ec.k(), state.ec.m()));
     let required_acks = required_write_acks(k, m);
 
-    let plain_acked = replicate_location_delete(state, user_id, &bucket, &key, &peers).await;
-    let packed_acked = replicate_content_location_delete(state, user_id, &bucket, &key, &peers).await;
+    let seq = super::hlc::now();
+    let (plain_acked, packed_acked) = tokio::join!(
+        replicate_location_delete(state, user_id, &bucket, &key, seq, &peers),
+        replicate_content_location_delete(state, user_id, &bucket, &key, seq, &peers),
+    );
     if plain_acked < required_acks || packed_acked < required_acks {
         return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "tombstone quorum not met: plain {plain_acked}/{required_acks}, \
@@ -1552,7 +1617,8 @@ pub async fn cluster_put_retention(
     // cluster_put_bucket_config just above: this is a fact every
     // coordinator must agree on, not a write quorum is enough for.
     let peers = state.membership.peers();
-    let acked = replicate_location_put(&state, &record, &peers).await;
+    record.seq = super::hlc::now();
+    let acked = replicate_location_update(&state, &record, &peers).await;
     if acked < peers.len() {
         return Err(ErrorInternalServerError(format!(
             "retention update requires every peer to ack: {acked}/{} acknowledged",
@@ -1581,7 +1647,8 @@ pub(crate) async fn cluster_put_object_tagging_inner(
 
     if let Some(mut record) = state.content_location_store.get(user_id, bucket, key) {
         record.tags = tags;
-        let acked = replicate_content_location_put(state, &record, &peers).await;
+        record.seq = super::hlc::now();
+        let acked = replicate_content_location_update(state, &record, &peers).await;
         if acked < peers.len() {
             return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
                 "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
@@ -1592,7 +1659,8 @@ pub(crate) async fn cluster_put_object_tagging_inner(
 
     if let Some(mut record) = state.location_store.get(user_id, bucket, key) {
         record.tags = tags;
-        let acked = replicate_location_put(state, &record, &peers).await;
+        record.seq = super::hlc::now();
+        let acked = replicate_location_update(state, &record, &peers).await;
         if acked < peers.len() {
             return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
                 "tagging update requires every peer to ack: {acked}/{} acknowledged", peers.len()
@@ -1666,8 +1734,9 @@ pub(crate) async fn cluster_put_object_retention_inner(
     record.retention_mode = Some(mode.to_string());
     record.retain_until = Some(retain_until.to_string());
 
+    record.seq = super::hlc::now();
     let peers = state.membership.peers();
-    let acked = replicate_location_put(state, &record, &peers).await;
+    let acked = replicate_location_update(state, &record, &peers).await;
     if acked < peers.len() {
         return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "retention update requires every peer to ack: {acked}/{} acknowledged", peers.len()
@@ -1692,8 +1761,9 @@ pub(crate) async fn cluster_put_object_legal_hold_inner(
         .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
     record.legal_hold = legal_hold;
 
+    record.seq = super::hlc::now();
     let peers = state.membership.peers();
-    let acked = replicate_location_put(state, &record, &peers).await;
+    let acked = replicate_location_update(state, &record, &peers).await;
     if acked < peers.len() {
         return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "legal-hold update requires every peer to ack: {acked}/{} acknowledged", peers.len()
@@ -1815,11 +1885,25 @@ pub async fn cluster_internal_put_content_location(
     // underlying reason.
     let store = Arc::clone(&state.content_location_store);
     let record = body.into_inner();
-    web::block(move || store.put(record).map_err(|e| e.to_string()))
+    let applied = web::block(move || store.put(record).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok().finish())
+    Ok(applied_response(applied))
+}
+
+/// Receiving side of a content-location metadata update (tags).
+pub async fn cluster_internal_update_content_location(
+    body: web::Json<super::content_location_store::ContentDependentRecord>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let store = Arc::clone(&state.content_location_store);
+    let record = body.into_inner();
+    let applied = web::block(move || store.update(record).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
+    Ok(applied_response(applied))
 }
 
 /// Receiving side of location-pin replication: just store whatever record
@@ -1833,11 +1917,26 @@ pub async fn cluster_internal_put_location(
     // See `cluster_internal_put_content_location`'s matching comment.
     let store = Arc::clone(&state.location_store);
     let record = body.into_inner();
-    web::block(move || store.put(record).map_err(|e| e.to_string()))
+    let applied = web::block(move || store.put(record).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok().finish())
+    Ok(applied_response(applied))
+}
+
+/// Receiving side of a location metadata update (tags, retention, legal
+/// hold). Refused with 412 if this node's live version differs.
+pub async fn cluster_internal_update_location(
+    body: web::Json<LocationRecord>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let store = Arc::clone(&state.location_store);
+    let record = body.into_inner();
+    let applied = web::block(move || store.update(record).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
+    Ok(applied_response(applied))
 }
 
 /// `(bucket, key)` for the internal tombstone-replication endpoints,
@@ -1863,6 +1962,8 @@ pub struct DeleteKeyRequest {
     pub user_id: String,
     pub bucket: String,
     pub key: String,
+    /// The tombstone's place in the key's write order (`hlc`).
+    pub seq: u64,
 }
 
 /// Receiving side of tombstone replication.
@@ -1873,12 +1974,12 @@ pub async fn cluster_internal_delete_location(
     // See `cluster_internal_put_content_location`'s matching comment:
     // `delete` fsyncs a tombstone append too.
     let store = Arc::clone(&state.location_store);
-    let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
-    web::block(move || store.delete(&user_id, &bucket, &key).map_err(|e| e.to_string()))
+    let DeleteKeyRequest { user_id, bucket, key, seq } = body.into_inner();
+    let applied = web::block(move || store.delete(&user_id, &bucket, &key, seq).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok().finish())
+    Ok(applied_response(applied))
 }
 
 /// Receiving side of content-location tombstone replication — the
@@ -1888,12 +1989,12 @@ pub async fn cluster_internal_delete_content_location(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let store = Arc::clone(&state.content_location_store);
-    let DeleteKeyRequest { user_id, bucket, key } = body.into_inner();
-    web::block(move || store.delete(&user_id, &bucket, &key).map_err(|e| e.to_string()))
+    let DeleteKeyRequest { user_id, bucket, key, seq } = body.into_inner();
+    let applied = web::block(move || store.delete(&user_id, &bucket, &key, seq).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok().finish())
+    Ok(applied_response(applied))
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -2058,7 +2159,7 @@ mod tests {
     #[test]
     fn delete_key_request_round_trips_keys_with_url_special_characters() {
         for key in ["victim?x", "victim#x", "victim%3Fx", "a b", "a/b/c", "100%"] {
-            let req = DeleteKeyRequest { user_id: "u1".to_string(), bucket: "b".to_string(), key: key.to_string() };
+            let req = DeleteKeyRequest { user_id: "u1".to_string(), bucket: "b".to_string(), key: key.to_string(), seq: 7 };
             let json = serde_json::to_string(&req).unwrap();
             let decoded: DeleteKeyRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded.key, key, "round-trip mismatch for key {key:?}");
