@@ -1,0 +1,8 @@
+# Allocation microbenchmark: baseline settings, XFS allocation varied. name|fs|args
+# alloc-default and ext4-ref need no setup. alloc-extsize: run-alloc.sh sets the extent size hint
+# on the directory first. alloc-allocsize: run-alloc.sh remounts with allocsize=64m.
+alloc-default|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+alloc-prealloc|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50 --prealloc 1
+alloc-extsize|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+alloc-allocsize|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+ext4-ref|ext4|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
