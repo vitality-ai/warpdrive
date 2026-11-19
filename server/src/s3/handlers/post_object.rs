@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use super::common::*;
 use crate::metadata::Metadata;
 use crate::service::metadata_service::MetadataService;
-use crate::storage::config::StorageConfig;
 use super::tagging::{parse_tag_xml, validate_tags};
 
 type HmacSha1 = Hmac<Sha1>;
@@ -411,7 +410,7 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
     // through `web::block` the same way `object.rs`'s PUT handler does;
     // calling it directly here would block this actix worker's whole
     // event loop for the fsync's duration.
-    let store = StorageConfig::from_env().create_store();
+    let store = crate::storage::object_store();
     let user_id_owned = user_id.clone();
     let bucket_owned = bucket.clone();
     let file_bytes = form.file_bytes.clone();

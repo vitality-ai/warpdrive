@@ -171,6 +171,17 @@ pub(crate) enum RecordOp {
     PutContent(ContentDependentRecord),
     UpdateContent(ContentDependentRecord),
     DeleteContent(DeleteKeyRequest),
+    /// An S3 metadata row (`replicated_metadata`), or its tombstone when
+    /// `record` is `None`.
+    Meta(MetaRowRequest),
+}
+
+/// Body of `/cluster/_internal/meta`: one S3 metadata row write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaRowRequest {
+    pub key: String,
+    pub seq: u64,
+    pub record: Option<super::replicated_metadata::MetaRecord>,
 }
 
 /// How a store answered one record write, without the replaced value.
@@ -201,6 +212,14 @@ impl RecordOp {
             RecordOp::PutContent(r) => content.put(r)?.into(),
             RecordOp::UpdateContent(r) => content.update(r)?.into(),
             RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
+            RecordOp::Meta(m) => {
+                let rows = super::replicated_metadata::rows()
+                    .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
+                match m.record {
+                    Some(r) => rows.put(m.key, r)?.into(),
+                    None => rows.delete(m.key, m.seq)?.into(),
+                }
+            }
         })
     }
 
@@ -212,6 +231,7 @@ impl RecordOp {
             RecordOp::PutContent(_) => "content-location pin",
             RecordOp::UpdateContent(_) => "content-location update",
             RecordOp::DeleteContent(_) => "content-location tombstone",
+            RecordOp::Meta(_) => "metadata row",
         }
     }
 
@@ -224,6 +244,7 @@ impl RecordOp {
             RecordOp::PutContent(r) => client.post(format!("{base}/content_location")).json(r),
             RecordOp::UpdateContent(r) => client.post(format!("{base}/content_location/update")).json(r),
             RecordOp::DeleteContent(d) => client.delete(format!("{base}/content_location")).json(d),
+            RecordOp::Meta(m) => client.post(format!("{base}/meta")).json(m),
         }
     }
 }
@@ -346,6 +367,19 @@ async fn replicate_content_location_update(state: &ClusterState, record: &Conten
 
 fn delete_req(user_id: &str, bucket: &str, key: &str, seq: u64) -> DeleteKeyRequest {
     DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq }
+}
+
+/// Replicates an S3 metadata row write (a tombstone when `record` is
+/// `None`) to every peer. Returns how many stored it.
+pub(crate) async fn replicate_meta_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, record: Option<super::replicated_metadata::MetaRecord>) -> usize {
+    replicate_ordered(state, peers, seq, |seq| {
+        let record = record.clone().map(|mut r| {
+            r.seq = seq;
+            r
+        });
+        RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, record })
+    })
+    .await
 }
 
 /// Replicates a tombstone for `(user_id, bucket, key)` at `seq` to every
@@ -657,7 +691,7 @@ fn inline_bytes(record: &LocationRecord, key: &str) -> Result<Option<Vec<u8>>, E
     }
 }
 
-async fn put_object_plain(
+pub(crate) async fn put_object_plain(
     user_id: &str, bucket: &str, key: &str, body: &[u8], state: &ClusterState, s3_meta: &ObjectS3Metadata,
 ) -> Result<HttpResponse, Error> {
     let bucket = bucket.to_string();
@@ -934,7 +968,7 @@ async fn ensure_local_copy_is_current(state: &ClusterState, record: &LocationRec
 /// going through response-building. Only used for parts stored via
 /// `put_object_plain` (see `cluster_upload_part_inner`), so there's no
 /// content-dependent (packed) case to handle here.
-async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>) -> Result<Vec<u8>, Error> {
+pub(crate) async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state: &web::Data<ClusterState>) -> Result<Vec<u8>, Error> {
     let record = state
         .location_store
         .get(user_id, bucket, key)
@@ -2235,4 +2269,18 @@ mod tests {
             assert_eq!(decoded.key, key, "round-trip mismatch for key {key:?}");
         }
     }
+}
+
+/// Receiving side of S3 metadata row replication.
+pub async fn cluster_internal_meta_row(
+    body: web::Json<MetaRowRequest>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let op = RecordOp::Meta(body.into_inner());
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
+        .map_err(ErrorInternalServerError)?;
+    Ok(outcome_response(outcome))
 }

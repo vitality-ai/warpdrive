@@ -12,7 +12,6 @@ use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_ano
 use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
-use crate::storage::config::StorageConfig;
 
 use super::checksum::{compute_checksum, parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use super::common::*;
@@ -172,7 +171,7 @@ pub async fn s3_put_object_handler(
             if stripped.is_empty() { None } else { Some(stripped.join(", ")) }
         });
 
-    let store = StorageConfig::from_env().create_store();
+    let store = crate::storage::object_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
     let mut body_buf: Vec<u8> = Vec::new();
 
@@ -184,10 +183,16 @@ pub async fn s3_put_object_handler(
         if chunk.is_empty() { continue; }
 
         body_buf.extend_from_slice(&chunk);
+    }
 
+    // One write for the whole body, not one per network chunk. The body is
+    // already buffered for the ETag, so this costs no extra memory, and on
+    // a cluster each write is a full erasure-coded round with its own
+    // replicated record: a 1 MB body used to take 20 or more of them.
+    if !body_buf.is_empty() {
         let ctx = context.clone();
         let store_c = Arc::clone(&store);
-        let buf = chunk.to_vec();
+        let buf = body_buf.clone();
         let pair = web::block(move || {
             store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string())
         }).await
@@ -494,7 +499,7 @@ pub async fn s3_get_object_handler(
     info!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
 
     let slices = Arc::new(slices);
-    let store = StorageConfig::from_env().create_store();
+    let store = crate::storage::object_store();
     let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
     let bucket_log = bucket.clone();
     let key_log = key.clone();

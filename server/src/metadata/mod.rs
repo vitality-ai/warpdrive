@@ -19,7 +19,7 @@ pub struct DataChunk {
 }
 
 /// Full metadata for a stored S3 object
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
     pub chunks: Vec<DataChunk>,
     /// Legacy catch-all properties map (kept for backward compat; prefer typed fields below).

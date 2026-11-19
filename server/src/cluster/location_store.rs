@@ -153,6 +153,8 @@ pub trait LocationStore: Send + Sync {
     fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<LocationRecord>>;
     /// Deletes the key at `seq`, leaving a tombstone.
     fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<LocationRecord>>;
+    /// The live record in `bucket` with the greatest key at most `key`.
+    fn floor(&self, user_id: &str, bucket: &str, key: &str) -> Option<(String, LocationRecord)>;
     /// Keys (with their byte size) in `bucket` whose key starts with
     /// `prefix`, for ListObjects.
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
@@ -214,6 +216,13 @@ impl<E: crate::storage::kv_engine::KvEngine<Entry<LocationRecord>>> LocationStor
 
     fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<LocationRecord>> {
         self.log.delete(record_key(user_id, bucket, key), seq)
+    }
+
+    fn floor(&self, user_id: &str, bucket: &str, key: &str) -> Option<(String, LocationRecord)> {
+        let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
+        self.log
+            .floor_live(&bucket_prefix, &record_key(user_id, bucket, key))
+            .map(|(k, r)| (k[bucket_prefix.len()..].to_string(), r))
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {

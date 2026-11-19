@@ -3,13 +3,20 @@
 use crate::metadata::{MetadataStorage, Metadata, BucketStats, config::MetadataConfig};
 use std::sync::Arc;
 use actix_web::Error;
-use lazy_static::lazy_static;
 
-lazy_static! {
-    static ref METADATA_STORE: Arc<dyn MetadataStorage> = {
-        let config = MetadataConfig::from_env();
-        config.create_store()
-    };
+static METADATA_STORE: std::sync::OnceLock<Arc<dyn MetadataStorage>> = std::sync::OnceLock::new();
+
+/// Sets the store every `MetadataService` uses. Called once at startup: a
+/// cluster node sets the replicated store here, so the same handlers serve
+/// both deployments. Returns false if already set.
+pub fn set_metadata_store(store: Arc<dyn MetadataStorage>) -> bool {
+    METADATA_STORE.set(store).is_ok()
+}
+
+/// The process-wide metadata store. Without `set_metadata_store`, the one
+/// `METADATA_BACKEND` names (SQLite by default).
+pub fn metadata_store() -> Arc<dyn MetadataStorage> {
+    Arc::clone(METADATA_STORE.get_or_init(|| MetadataConfig::from_env().create_store()))
 }
 
 pub struct MetadataService {
@@ -22,7 +29,7 @@ impl MetadataService {
     /// the process-wide `METADATA_STORE` singleton (`SQLiteMetadataStore`
     /// by default, `MockMetadataStore` under `METADATA_BACKEND=mock`).
     pub fn new(user: &str) -> Result<Self, Error> {
-        Ok(Self { user: user.to_string(), store: Arc::clone(&METADATA_STORE) })
+        Ok(Self { user: user.to_string(), store: metadata_store() })
     }
 
     /// Cluster's entry point: the same facade, the same S3-handler-facing

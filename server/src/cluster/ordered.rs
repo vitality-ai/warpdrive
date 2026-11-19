@@ -196,6 +196,11 @@ impl<R: OrderedRecord, E: KvEngine<Entry<R>>> OrderedStore<R, E> {
         self.engine.get(rk)
     }
 
+    /// The live record with the greatest key at most `key` within `prefix`.
+    pub fn floor_live(&self, prefix: &str, key: &str) -> Option<(String, R)> {
+        self.engine.floor(prefix, key).and_then(|(k, e)| e.into_live().map(|r| (k, r)))
+    }
+
     /// `f` over every live record whose key starts with `prefix`.
     pub fn list_live<T>(&self, prefix: &str, mut f: impl FnMut(&str, &R) -> T) -> Vec<T> {
         self.engine.scan_prefix(prefix, |k, e| e.live().map(|r| f(k, r)))
