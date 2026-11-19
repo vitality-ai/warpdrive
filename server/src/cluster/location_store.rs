@@ -17,12 +17,10 @@
 //! actually true, not just asserted.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use parking_lot::RwLock;
-use crate::storage::durable_log::DurableAppendLog;
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
 
 /// Sentinel `user_id` for every request that arrives with no authenticated
 /// identity -- which today is *every* request on the bare, pre-Phase-3
@@ -164,173 +162,60 @@ fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
     format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
 }
 
-/// Append-only log of JSON-lines `(record_key, Option<LocationRecord>)`
-/// pairs; `None` is a tombstone (delete). In-memory index is rebuilt by
-/// replaying the whole log on startup. `BTreeMap`, not `HashMap` (#163):
-/// `record_key` leads with bucket's own length-prefix, so lexicographic
-/// order still groups every bucket's keys contiguously (see `record_key`'s
-/// own doc for why this is also collision-free, unlike a plain `/`
-/// separator), which is what makes `list`'s prefix lookup a bounded range
-/// scan instead of a full-table scan.
-pub struct BitcaskLocationStore {
-    log_path: PathBuf,
-    /// Owns the file, the dup'd sync-only handle, and the group-commit
-    /// batching needed to make an append durable without paying one
-    /// fsync per write -- see `storage::durable_log`'s module doc.
-    log: DurableAppendLog,
-    index: RwLock<BTreeMap<String, LocationRecord>>,
-    /// #155: `log_file` and `index` are two *separate* locks, so without
-    /// this, two concurrent writers (e.g. a replicated PUT and a
-    /// replicated DELETE for the same key, arriving together) could each
-    /// finish their own log-append-then-index-update in a different
-    /// order, leaving the log and the index permanently disagreeing about
-    /// which one happened last -- invisible until the next restart
-    /// replays the log and gets the *other* answer (a deleted object
-    /// "resurrects", or vice versa). Held across the full append-then-
-    /// update sequence in every mutating method (`put`, `delete`,
-    /// `compact`), so the two data structures can never apply writes in
-    /// different orders from each other.
-    write_lock: parking_lot::Mutex<()>,
+/// `LocationStore` on a per-node `KvEngine`. The default engine is
+/// `BitcaskEngine` with a `BTreeMap` index: `record_key` groups each
+/// bucket's keys contiguously, so a prefix listing is a bounded range scan
+/// (#163).
+pub struct BitcaskLocationStore<E = BitcaskEngine<LocationRecord>> {
+    engine: E,
 }
 
 impl BitcaskLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        let log_path = log_path.as_ref().to_path_buf();
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut index = BTreeMap::new();
-        if log_path.exists() {
-            let f = File::open(&log_path)?;
-            let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
-            let last_idx = lines.len().saturating_sub(1);
-            for (i, line) in lines.iter().enumerate() {
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<(String, Option<LocationRecord>)>(line) {
-                    Ok((rk, Some(r))) => {
-                        index.insert(rk, r);
-                    }
-                    Ok((rk, None)) => {
-                        index.remove(&rk);
-                    }
-                    // Same reasoning as `ShardMetaStore::open` (#152): only
-                    // the last line can be a torn write from a crash
-                    // mid-append, so quarantine just that one with a
-                    // warning instead of refusing to start.
-                    Err(e) if i == last_idx => {
-                        log::warn!(
-                            "location log {}: ignoring malformed trailing line, \
-                             likely a torn write from a crash: {e}",
-                            log_path.display()
-                        );
-                    }
-                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                }
-            }
-        }
-
-        let log = DurableAppendLog::open(&log_path)?;
-        Ok(Self {
-            log_path,
-            log,
-            index: RwLock::new(index),
-            write_lock: parking_lot::Mutex::new(()),
-        })
+        Ok(Self { engine: BitcaskEngine::open(log_path, "location")? })
     }
 
     pub fn path(&self) -> &Path {
-        &self.log_path
+        self.engine.path()
     }
 }
 
-impl LocationStore for BitcaskLocationStore {
+impl<E: KvEngine<LocationRecord>> BitcaskLocationStore<E> {
+    /// The store on any engine.
+    pub fn with_engine(engine: E) -> Self {
+        Self { engine }
+    }
+}
+
+impl<E: KvEngine<LocationRecord>> LocationStore for BitcaskLocationStore<E> {
     fn put(&self, record: LocationRecord) -> io::Result<()> {
-        let rk = record_key(&record.user_id, &record.bucket, &record.key);
-        let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // #155: held across both the append and the index update, so a
-        // concurrent put/delete for the same key can never apply to the
-        // log and the index in different orders. Released before the
-        // durability wait below, so it never serializes group commit's
-        // whole point (batching many callers' fsyncs) behind one lock.
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().insert(rk, record);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+        self.engine.put(record_key(&record.user_id, &record.bucket, &record.key), record)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord> {
-        self.index.read().get(&record_key(user_id, bucket, key)).cloned()
+        self.engine.get(&record_key(user_id, bucket, key))
     }
 
     fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
-        let rk = record_key(user_id, bucket, key);
-        let line = serde_json::to_string(&(rk.clone(), Option::<LocationRecord>::None))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().remove(&rk);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+        self.engine.delete(&record_key(user_id, bucket, key))
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
         let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
-        // A BTreeMap range starting *at* the prefix (an O(log n) binary
-        // search, not a linear scan from the beginning) then taken only
-        // while keys still match it: visits exactly the matching keys, in
-        // order, and stops as soon as the first non-matching one is seen.
-        // O(log n + matches), not O(every key in every bucket) like the
-        // old full-iterate-and-filter did (#163).
-        self.index
-            .read()
-            .range(full_prefix.clone()..)
-            .take_while(|(k, _)| k.starts_with(&full_prefix))
-            .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
-            .collect()
+        self.engine.scan_prefix(&full_prefix, |k, r| Some((k[bucket_prefix.len()..].to_string(), r.original_len as u64)))
     }
 
     fn compact(&self) -> io::Result<()> {
-        // #155: same `write_lock` as `put`/`delete`, so compaction can't
-        // interleave with either -- a concurrent put/delete must see
-        // either the pre- or post-compaction state, never a log file
-        // mid-rewrite out from under it, and never a snapshot of the
-        // index that's already out of sync with what made it into the
-        // compacted file.
-        let _write_guard = self.write_lock.lock();
-        let index = self.index.read();
-
-        let tmp_path = self.log_path.with_extension("compact.tmp");
-        {
-            let mut tmp = File::create(&tmp_path)?;
-            for (rk, record) in index.iter() {
-                let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                writeln!(tmp, "{line}")?;
-            }
-            tmp.flush()?;
-        }
-        self.log.replace_with_compacted(&tmp_path, &self.log_path)
+        self.engine.compact()
     }
 }
 
-/// Smallest string greater than every string with byte-prefix `prefix`,
-/// found by incrementing the last byte that isn't already 0xff (dropping
-/// any trailing 0xff bytes first, since they can't be incremented in
-/// place). `None` only if every byte is 0xff.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn sample(bucket: &str, key: &str) -> LocationRecord {
         sample_for("u1", bucket, key)
