@@ -7,7 +7,7 @@ set -u
 TRIAL=$1; CONFIGS=${2:-~/bench/configs.txt}; RFILE=${3:-matrix.jsonl}
 BIN=~/segbench/target/release/segbench
 mkdir -p ~/results/tl
-COMMON="--live-gb 6 --churn-x 3 --warm-x 1 --writers 8 --readers 4 --seed $TRIAL"
+COMMON="--live-gb 6 --churn-x 3 --warm-x 1 --writers 8 --readers 4 --seed $TRIAL ${EXTRA:-}"
 grep -v '^#' "$CONFIGS" | grep . | shuf --random-source=<(yes $TRIAL) > ~/results/order-$TRIAL.txt
 while IFS='|' read -r NAME FS ARGS; do
   sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
