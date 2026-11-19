@@ -30,9 +30,29 @@ RES, OUT = sys.argv[1], sys.argv[2]
 VAL = sys.argv[3] if len(sys.argv) > 3 else None
 os.makedirs(OUT, exist_ok=True)
 
+def device_wa(name, trial, fg):
+    """iostat device writes / customer writes, when the run was monitored."""
+    f = os.path.join(RES, "mon", f"{name}-t{trial}.iostat")
+    if not os.path.exists(f) or fg <= 0:
+        return None
+    hdr, w = None, []
+    for l in open(f):
+        t = l.split()
+        if t and t[0].startswith("Device"):
+            hdr = t
+        elif hdr and t and t[0].startswith("nvme"):
+            w.append(float(dict(zip(hdr, t))["wMB/s"]) * 1.048576)
+    w = w[len(w) // 3:]
+    return statistics.mean(w) / fg if w else None
+
+
 rows = []
 for f in sorted(glob.glob(os.path.join(RES, "matrix-*.jsonl"))):
     rows += [json.loads(l) for l in open(f) if l.strip()]
+for r in rows:
+    d = device_wa(r["name"], r["trial"], r["r"]["fg_mbs"])
+    r["r"]["device_wa"] = d if d is not None else r["r"]["wa"]
+WA_SOURCE = "device" if any(device_wa(r["name"], r["trial"], r["r"]["fg_mbs"]) for r in rows[:3]) else "counted"
 trials = sorted({r["trial"] for r in rows})
 by = defaultdict(dict)  # name -> trial -> summary
 for r in rows:
@@ -61,7 +81,7 @@ def rho(name, t):
 METRICS = {
     "phys_sa": lambda n, t: by[n][t]["phys_sa_mean"],
     "sa": lambda n, t: by[n][t]["sa_mean"],
-    "wa": lambda n, t: by[n][t]["wa"],
+    "wa": lambda n, t: by[n][t]["device_wa"],
     "rho": rho,
     "fg_mbs": lambda n, t: by[n][t]["fg_mbs"],
     "rp99_ms": lambda n, t: by[n][t]["rp99_med_us"] / 1000,
@@ -120,7 +140,9 @@ INK, MUTED, GRID = "#1f2328", "#5b636e", "#e3e6ea"
 plt.rcParams.update({"font.size": 9, "axes.edgecolor": GRID, "axes.labelcolor": MUTED, "xtick.color": MUTED,
                      "ytick.color": MUTED, "axes.grid": True, "grid.color": GRID, "axes.spines.top": False,
                      "axes.spines.right": False, "figure.facecolor": "white"})
-PLOT_M = [("phys_sa", "space amp. (physical)"), ("wa", "write amp."), ("rho", "foreground slowdown (rho)"), ("rp99_ms", "read p99, ms")]
+PLOT_M = [("phys_sa", "space amp. (physical)"), ("wa", f"write amp. ({WA_SOURCE})"), ("wp99_ms", "write p99, ms (median per-second)"), ("rp99_ms", "read p99, ms (median per-second)")]
+# Shared, honest y ranges per metric, so small differences look small.
+YLIM = {"phys_sa": None, "wa": (0.95, None), "wp99_ms": (0, None), "rp99_ms": (0, None)}
 fig, axes = plt.subplots(len(FACTORS), len(PLOT_M), figsize=(13, 2.3 * len(FACTORS)))
 for i, (f, (_, vals, b)) in enumerate(FACTORS.items()):
     labels = [("unlim." if (f == "rate_mbps" and v == 0) else str(v)) for v in vals]
@@ -140,11 +162,18 @@ for i, (f, (_, vals, b)) in enumerate(FACTORS.items()):
         if ys[bi] is not None:
             ax.plot([bi], [ys[bi]], marker="o", ms=10, mfc="none", mec=INK, mew=1.2)
         ax.set_xticks(x, labels)
+        allv = [med(n, m) for n in by if med(n, m) is not None]
+        if m == "phys_sa":
+            ax.set_ylim(0, max(allv) * 1.1)
+        elif m == "wa":
+            ax.set_ylim(0.95, max(1.3, max(allv) * 1.05))
+        else:
+            ax.set_ylim(0, max(allv) * 1.1)
         if i == 0:
             ax.set_title(title, loc="left", color=INK)
         if j == 0:
             ax.set_ylabel(f, color=INK)
-fig.suptitle("One factor at a time around the baseline (circled). Median of 3 VMs, bars = min-max.", x=0.01, ha="left", color=INK)
+fig.suptitle("One factor at a time around the baseline (circled). Median of 3 VMs, bars = min-max. Each metric uses one y range for all rows.", x=0.01, ha="left", color=INK)
 fig.tight_layout(rect=(0, 0, 1, 0.97))
 fig.savefig(os.path.join(OUT, "factors.png"), dpi=150)
 plt.close(fig)
