@@ -1,5 +1,10 @@
 # WarpDrive: Distributed, Erasure-Coded Object Engine with Pluggable Placement
 
+> **Historical.** This is the original plan for the cluster engine, written before
+> any of it existed (October 2026), and it isn't kept up to date. For the code as
+> it is now, see [Technical Architecture](Technical-Architecture.md). For where the
+> design is going, see RFC 5.
+
 ## Context
 
 A read-only codebase survey (`/Users/cj/cj/personal/claude/warpdrive-distributed`, cloned
