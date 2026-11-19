@@ -27,18 +27,18 @@
 
 **Trial spread** (min-max of the 2 trials, PUT ops/s at 4 KB): B0 1,073-1,089, B1 1,081-1,082, B2 1,831-1,839, B3 2,002-2,015
 
-**Resources at 4 KB, concurrency 16, mean per node** (CPU %, network MB/s, disk writes/s, disk flushes/s):
+**Resources at 4 KB, concurrency 16.** Node 0 coordinates every request, so it's shown apart from nodes 1-4 (mean). Each cell is node 0 / nodes 1-4.
 
 | Phase | Variant | CPU % | net MB/s | disk writes/s | disk flushes/s |
 |---|---|---|---|---|---|
-| get | B0 | 35 | 10.7 | 142 | 46 |
-| get | B1 | 34 | 10.6 | 33 | 11 |
-| get | B2 | 18 | 12.6 | 16 | 5 |
-| get | B3 | 18 | 12.7 | 30 | 10 |
-| put | B0 | 64 | 6.6 | 7489 | 2402 |
-| put | B1 | 64 | 6.7 | 7529 | 2414 |
-| put | B2 | 60 | 20.0 | 5056 | 1640 |
-| put | B3 | 65 | 21.7 | 5674 | 1856 |
+| get | B0 | 91 / 20 | 33.4 / 5.0 | 115 / 149 | 36 / 48 |
+| get | B1 | 90 / 20 | 33.2 / 4.9 | 30 / 34 | 10 / 11 |
+| get | B2 | 91 / 0 | 63.1 / 0.0 | 17 / 16 | 5 / 5 |
+| get | B3 | 91 / 0 | 63.2 / 0.1 | 19 / 33 | 5 / 11 |
+| put | B0 | 96 / 56 | 19.3 / 3.4 | 7157 / 7572 | 2309 / 2426 |
+| put | B1 | 97 / 56 | 19.6 / 3.5 | 7076 / 7642 | 2284 / 2446 |
+| put | B2 | 96 / 50 | 56.6 / 10.9 | 5094 / 5047 | 1623 / 1644 |
+| put | B3 | 97 / 58 | 61.1 / 11.9 | 4564 / 5952 | 1464 / 1954 |
 
 **PUT stage means on the coordinator (ms)**:
 

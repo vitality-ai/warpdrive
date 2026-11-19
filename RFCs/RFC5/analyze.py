@@ -131,7 +131,8 @@ def trace_means(runs):
       if not os.path.exists(f):
           continue
       for line in open(f):
-          if "trace put" not in line:
+          # "trace put" in the 2026-11-19 runs, "cluster PUT ... shards_us=" (TRACE level) after.
+          if "trace put" not in line and not ("cluster PUT" in line and "shards_us=" in line):
               continue
           for k in ("shards_us", "local_cleanup_us", "replicate_us", "total_us"):
               m = re.search(rf"{k}=(\d+)", line)
@@ -254,11 +255,13 @@ def resources(run):
             res[phase]["disk_w_s"].append(mean([fnum(s, "w/s") for s in x]))
             res[phase]["disk_flush_s"].append(mean([fnum(s, "f/s") for s in x]))
             res[phase]["disk_util"].append(mean([fnum(s, "%util") for s in x]))
-    return {p: {k: mean(v) for k, v in m.items()} for p, m in res.items()}
+    # Node 0 coordinates every request, so report it apart from the other
+    # four. A mean over all five hides a saturated coordinator.
+    return {p: {k: {"coord": v[0] if v else 0, "others": mean(v[1:])} for k, v in m.items()} for p, m in res.items()}
 
 
-RES_METRICS = [("cpu", "CPU busy %, mean of nodes"), ("net_MBs", "network rx+tx MB/s, mean of nodes"),
-               ("disk_w_s", "disk writes/s, mean of nodes"), ("disk_flush_s", "disk flushes/s, mean of nodes")]
+RES_METRICS = [("cpu", "CPU busy %"), ("net_MBs", "network rx+tx MB/s"),
+               ("disk_w_s", "disk writes/s"), ("disk_flush_s", "disk flushes/s")]
 res_table = {}
 for phase in ("put", "get"):
     fig, axes = plt.subplots(1, 4, figsize=(15, 3.8))
@@ -266,14 +269,21 @@ for phase in ("put", "get"):
         for i, v in enumerate(VARIANTS):
             r = resources(f"{v}_s4096_c16_t{TRIALS[-1]}")
             res_table[(phase, v)] = r[phase]
-            val = r[phase].get(k, 0)
-            ax.bar(i, val, 0.6, color=COLOR[v], edgecolor=SURFACE, linewidth=2)
-            ax.text(i, val, f"{val:.0f}" if val >= 10 else f"{val:.1f}", ha="center", va="bottom", color=INK, fontsize=8)
+            vals = r[phase].get(k, {"coord": 0, "others": 0})
+            for off, which, hatch in ((-0.17, "coord", None), (0.17, "others", "///")):
+                val = vals[which]
+                ax.bar(i + off, val, 0.32, color=COLOR[v], edgecolor=SURFACE, linewidth=2, hatch=hatch,
+                       alpha=1.0 if which == "coord" else 0.55)
+                ax.text(i + off, val, f"{val:.0f}" if val >= 10 else f"{val:.1f}", ha="center", va="bottom", color=INK, fontsize=7)
         ax.set_xticks(range(4), VARIANTS)
+        ax.set_ylim(0, ax.get_ylim()[1] * 1.12)
         ax.set_title(title, loc="left", fontsize=9)
-    fig.suptitle(f"Per-node resources during the {phase.upper()} phase, 4 KB, concurrency 16 "
-                 f"(B0 main, B1 switches off, B2 inline, B3 inline + skip local sync), trial {TRIALS[-1]}", x=0.01, ha="left", color=INK)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT, f"resources_{phase}.png"), dpi=150); plt.close(fig)
+    from matplotlib.patches import Patch
+    fig.legend(handles=[Patch(facecolor="#888888", label="node 0 (coordinator)"),
+                        Patch(facecolor="#888888", alpha=0.55, hatch="///", label="nodes 1-4, mean")],
+               loc="upper right", ncol=2, fontsize=8, frameon=False)
+    fig.suptitle(f"Resources during the {phase.upper()} phase, 4 KB, concurrency 16, trial {TRIALS[-1]}", x=0.01, ha="left", color=INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.savefig(os.path.join(OUT, f"resources_{phase}.png"), dpi=150); plt.close(fig)
 
 # ---------------------------------------------------------------- concurrency
 conc_rows = [r for r in rows if r["payload_bytes"] == 4096 and r["trial"] == 1 and r["variant"] in ("B0", "B3") and not r["run"].endswith("_perf")]
@@ -310,10 +320,13 @@ with open(os.path.join(OUT, "results.md"), "w") as f:
                     f"{fmt(agg('get','p99_us',v,s),1)} | {spp_txt} |\n" if put else "")
     f.write("\n**Trial spread** (min-max of the 2 trials, PUT ops/s at 4 KB): ")
     f.write(", ".join(f"{v} {fmt(spread('put','throughput_ops_s',v,4096)[0])}-{fmt(spread('put','throughput_ops_s',v,4096)[1])}" for v in VARIANTS) + "\n\n")
-    f.write("**Resources at 4 KB, concurrency 16, mean per node** (CPU %, network MB/s, disk writes/s, disk flushes/s):\n\n")
+    f.write("**Resources at 4 KB, concurrency 16.** Node 0 coordinates every request, so it's shown apart from nodes 1-4 (mean). Each cell is node 0 / nodes 1-4.\n\n")
     f.write("| Phase | Variant | CPU % | net MB/s | disk writes/s | disk flushes/s |\n|---|---|---|---|---|---|\n")
+    z = {"coord": 0, "others": 0}
     for (phase, v), r in sorted(res_table.items()):
-        f.write(f"| {phase} | {v} | {r.get('cpu',0):.0f} | {r.get('net_MBs',0):.1f} | {r.get('disk_w_s',0):.0f} | {r.get('disk_flush_s',0):.0f} |\n")
+        c, n, w, fl = (r.get(k, z) for k in ("cpu", "net_MBs", "disk_w_s", "disk_flush_s"))
+        f.write(f"| {phase} | {v} | {c['coord']:.0f} / {c['others']:.0f} | {n['coord']:.1f} / {n['others']:.1f} | "
+                f"{w['coord']:.0f} / {w['others']:.0f} | {fl['coord']:.0f} / {fl['others']:.0f} |\n")
     f.write("\n**PUT stage means on the coordinator (ms)**:\n\n| Size | Variant | shard round | local cleanup | record round | total |\n|---|---|---|---|---|---|\n")
     for (v, s), t in sorted(breakdown.items(), key=lambda x: (x[0][1], x[0][0])):
         f.write(f"| {size_label(s)} | {v} | {t.get('shards_us',0)/1000:.2f} | {t.get('local_cleanup_us',0)/1000:.2f} | {t.get('replicate_us',0)/1000:.2f} | {t.get('total_us',0)/1000:.2f} |\n")

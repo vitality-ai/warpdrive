@@ -47,9 +47,9 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
-/// Number of real syncs issued by every `GroupCommit` in this process. One
-/// sync can cover many writes, so this divided by operations is the
-/// "syncs per write" figure the cluster timing endpoint reports.
+/// Number of syncs issued by every `GroupCommit` in this process. One sync
+/// can cover many writes, so this divided by operations gives syncs per
+/// write. Reported by the cluster timing endpoint.
 static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn sync_count() -> u64 {
@@ -119,10 +119,6 @@ impl GroupCommit {
         // reached the lock above. The sync call below starts strictly
         // after this read, so it's guaranteed to cover all of them.
         let target = self.next_ticket.load(Ordering::Acquire);
-        // `bench-no-fsync` (never a default feature) skips the sync so a
-        // benchmark can separate protocol cost from disk-flush cost. A build
-        // with it enabled is not durable and must never ship.
-        #[cfg(not(feature = "bench-no-fsync"))]
         syncable.sync()?;
         SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
         self.synced_through.fetch_max(target, Ordering::AcqRel);

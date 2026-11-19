@@ -10,6 +10,9 @@
 //! Set S3_BENCH_TRACE=<file> to also write one line per request:
 //!   phase,start_unix_us,latency_us,ok,key
 //!
+//! Credentials come from WARPDRIVE_ADMIN_ACCESS_KEY / WARPDRIVE_ADMIN_SECRET_KEY,
+//! defaulting to the AWS documentation example pair the test clusters use.
+//!
 //! Usage: s3_bench <url> <path_prefix> <bucket> <concurrency> <duration_secs> <payload_bytes>
 //!   path_prefix: "/s3", "/cluster/s3" or "" for the root routes
 //! Example: s3_bench http://127.0.0.1:9710 /s3 bench 32 10 4096
@@ -22,8 +25,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
-const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+fn access_key() -> &'static str {
+    static K: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    K.get_or_init(|| std::env::var("WARPDRIVE_ADMIN_ACCESS_KEY").unwrap_or_else(|_| "AKIAIOSFODNN7EXAMPLE".into()))
+}
+
+fn secret_key() -> &'static str {
+    static K: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    K.get_or_init(|| std::env::var("WARPDRIVE_ADMIN_SECRET_KEY").unwrap_or_else(|_| "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()))
+}
 const REGION: &str = "us-east-1";
 const SERVICE: &str = "s3";
 
@@ -54,13 +64,13 @@ fn sign(method: &str, host: &str, path: &str, body: &[u8]) -> Vec<(String, Strin
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
-    let signature = hex::encode(hmac_bytes(&signing_key(SECRET_KEY, date_stamp), string_to_sign.as_bytes()));
+    let signature = hex::encode(hmac_bytes(&signing_key(secret_key(), date_stamp), string_to_sign.as_bytes()));
     vec![
         ("x-amz-content-sha256".into(), payload_hash),
         ("x-amz-date".into(), amz_date.clone()),
         (
             "Authorization".into(),
-            format!("AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"),
+            format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}", access_key()),
         ),
     ]
 }

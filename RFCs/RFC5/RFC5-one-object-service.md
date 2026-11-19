@@ -1,6 +1,8 @@
 # RFC 5 - One S3 Object Service with Pluggable Components
 
-**Status:** Proposed. Option B chosen. Write/read path techniques T1-T2 prototyped and measured (see *Measured results*).
+**Status:** Proposed. Option B chosen. Write/read path techniques T1 and T2 implemented and measured (see *Measured results*). T2 is on by default. T1 is opt-in (`WARPDRIVE_INLINE_MAX_BYTES`, default 0) until its high-concurrency PUT tail (finding 8) is explained.
+
+This branch changes performance only. It doesn't change any S3 behavior, so the 207-test cluster gap below is still open. Closing it is migration steps 1-4.
 **Branch:** `feat-rfc5-one-object-service`
 
 ---
@@ -99,12 +101,12 @@ So a small PUT costs about 16 syncs across the cluster and two network rounds, w
 
 **What a GET costs today:** one record lookup (local), then k shard fetches over the network, then decode, even for a 1 KB object.
 
-The techniques below each remove a part of that cost. Each has its own switch so it can be measured alone.
+The techniques below each remove a part of that cost.
 
 | | Technique | What it removes | Status |
 |---|---|---|---|
-| T1 | **Inline small objects.** A small object's bytes go inside its `LocationRecord`, which is already replicated to every node with the write quorum. | PUT: the whole shard round. GET: every network hop, since the receiving node serves from its own copy. | Prototyped (`WARPDRIVE_INLINE_MAX_BYTES`) |
-| T2 | **Drop the redundant local cleanup.** | One sync in sequence on every PUT. | Prototyped (`WARPDRIVE_SKIP_LOCAL_CLEANUP`) |
+| T1 | **Inline small objects.** A small object's bytes go inside its `LocationRecord`, which is already replicated to every node with the write quorum. | PUT: the whole shard round. GET: every network hop, since the receiving node serves from its own copy. | Implemented, opt-in: `WARPDRIVE_INLINE_MAX_BYTES` (default 0, capped at 128 KiB) |
+| T2 | **Drop the redundant local cleanup.** | One sync in sequence on every PUT. | Implemented, on by default. Skipped only when this node's `WARPDRIVE_SELF_ADDR` is in the peer list, so the broadcast is known to reach it. |
 | T3 | **One durable append per shard write.** Shard bytes and the shard-index entry go into one log append with one sync. | One of the two sequential syncs on every shard holder. | Next |
 | T4 | **Record rides with the shards.** Shard holders get the record in the same message as their shard, marked pending, and it goes live when write quorum is reached. Nodes that hold no shard get the record in parallel. | The second network round for sharded objects. | Next |
 | T5 | **Local shard short-circuit.** When the coordinator holds a shard itself, read or write it directly instead of over gRPC to itself. Also covers N=1 (single node as RS(1,0)). | One network hop per request on the coordinator's own shard. | Next |
@@ -112,11 +114,16 @@ The techniques below each remove a part of that cost. Each has its own switch so
 
 **Durability stays the same.** T1 writes the record to the same quorum as today's records (3 of 5 nodes for RS(3,2)), each synced, so an acknowledged inline object survives losing any two nodes, like an erasure-coded one. T4 keeps the rule from #151: a record only becomes visible once its shards have reached write quorum.
 
-**The cost T1 trades:** an inline object is stored on every node (5x for a 5-node cluster) instead of 1.67x. That's why the threshold matters: small objects are where per-request cost dominates and storage cost doesn't. The threshold is a tunable, defaulting to off in the prototype. Records also grow the location log, which needs the compaction work in RFC 3.
+**The cost T1 trades:**
+- **Disk.** An inline object is stored on every node (5x for a 5-node cluster) instead of 1.67x, and the copies grow with cluster size.
+- **Memory.** Every node keeps its location records in an in-memory index, so inline bytes are held in RAM on every node: about 1.33x the object size (base64) per inline object, per node.
+- **Log growth.** Records grow the location log, which needs the compaction work in RFC 3.
 
-**Order:** T1 and T2 first (prototyped, measured below). Then T3 and T4 for sharded objects, then T5. T6 once the median is solved.
+That's why the threshold matters, and why it's opt-in with a 128 KiB cap. Small objects are where per-request cost dominates and storage cost doesn't. Keeping inline bytes out of the in-memory index (the index holds a log offset and a GET reads the bytes from the log) would remove the memory cost. That's a follow-up before T1 can be on by default.
 
-## Measured results (2026-11-19, prototypes T1 and T2)
+**Order:** T1 and T2 first (implemented, measured below). Then T3 and T4 for sharded objects, then T5. T6 once the median is solved.
+
+## Measured results (2026-11-19, T1 and T2)
 
 **Setup:** GCP us-central1-a. 5 × `n2-standard-2` nodes, each with its own local NVMe SSD, RS(3,2), plus 1 client VM. Each run starts from empty data, then 10 s of PUTs and 10 s of GETs, concurrency 16, 2 trials. Scripts and raw data: `bench/`, `results/`.
 
@@ -127,15 +134,18 @@ The techniques below each remove a part of that cost. Each has its own switch so
 | B2 | B1 + T1 inline small objects (threshold 64 KB) |
 | B3 | B2 + T2 skip the redundant local sync |
 
+These runs used commit 783501f, where T1 and T2 each had a switch. In the final code T2 has no switch, so B3 is what `WARPDRIVE_INLINE_MAX_BYTES=65536` gives today.
+
 **Findings:**
 
 1. **Tracing is free.** B0 and B1 match within trial spread at every size (4 KB PUT: 1,080 vs 1,081 ops/s).
-2. **Small-object GET: ~4.6x throughput, ~5x lower latency, half the CPU.** At 4 KB, B3 serves 14,545 GET/s at p50 1.07 ms against `main`'s 3,112 at 5.01 ms. Node CPU during GET drops from 35% to 18%. The receiving node answers from its own record, with no shard fetches.
-3. **Small-object PUT: ~1.9x throughput, ~half the latency.** At 4 KB, B3 does 2,007 PUT/s at p50 7.79 ms against 1,080 at 14.45 ms. Syncs per PUT fall from ~16 to ~5.7 across the cluster, and the coordinator's PUT time from 13.6 ms (shard round 6.3 + local sync 1.9 + record round 5.4) to 6.6 ms (record round only).
-4. **T2 alone is worth ~8-9% on small PUTs** (B2 to B3: 1,835 to 2,007 PUT/s at 4 KB), for removing one sync.
-5. **The inline benefit for PUT ends between 16 KB and 64 KB.** At 64 KB, PUT is flat or slightly worse (B1 749, B2 702, B3 745 ops/s): each inline object goes to all 5 nodes in base64 inside a JSON log line, so network per PUT rises ~3x (6.7 to 21 MB/s per node at 4 KB). GET still gains 2.3x at 64 KB. **A PUT-side threshold around 16 KB looks right**, and it could differ from the GET-side benefit.
-6. **Sharded objects are unchanged.** At 256 KB and 1 MB, all four variants match within noise, as expected, since T1 doesn't apply above the threshold.
-7. **Open: B3 PUT under high concurrency.** At concurrency 64 and 4 KB, B3 PUT drops to 1,768 ops/s with p99 260 ms, worse than `main` (1,049 ops/s, p99 115 ms). GET doesn't have this. Something saturates on the inline write path, likely the single location log per node or the all-node record fan-out. Not diagnosed yet. It must be fixed before T1 ships.
+2. **Small-object GET: ~4.6x throughput, ~5x lower latency, ~8x less CPU per GET.** At 4 KB, B3 serves 14,545 GET/s at p50 1.07 ms against `main`'s 3,112 at 5.01 ms. In both, node 0 is at about 90-100% CPU. With `main`, nodes 1-4 also spend ~20% each serving shards. With B3 they sit idle, because the receiving node answers from its own record.
+3. **The limit is node 0's CPU, not the network or disks.** Every request goes through node 0 (2 vCPUs), which runs at 90-100% CPU in every small-object run. The busiest NIC peaked at ~2.5 Gb/s, a quarter of the `n2-standard-2` egress limit ("up to 10 Gb/s"). Spreading clients across all nodes is the next measurement.
+4. **Small-object PUT: ~1.9x throughput, ~half the latency.** At 4 KB, B3 does 2,007 PUT/s at p50 7.79 ms against 1,080 at 14.45 ms. Syncs per PUT fall from ~16 to ~5.7 across the cluster, and the coordinator's PUT time from 13.6 ms (shard round 6.3 + local sync 1.9 + record round 5.4) to 6.6 ms (record round only).
+5. **T2 is worth ~8-9% on small PUTs** (B2 to B3: 1,835 to 2,007 PUT/s at 4 KB), for removing one sync.
+6. **The inline benefit for PUT ends between 16 KB and 64 KB.** At 64 KB, PUT is flat or slightly worse (B1 749, B2 702, B3 745 ops/s): each inline object goes to all 5 nodes in base64 inside a JSON log line, so network per PUT rises ~3x (at 4 KB, node 0 goes from 19 to 61 MB/s and nodes 1-4 from 3.4 to 12 MB/s). GET still gains 2.3x at 64 KB. **A PUT-side threshold around 16 KB looks right**, and it could differ from the GET-side benefit.
+7. **Sharded objects are unchanged.** At 256 KB and 1 MB, all four variants match within noise, as expected, since T1 doesn't apply above the threshold.
+8. **Open: B3 PUT under high concurrency.** At concurrency 64 and 4 KB, B3 PUT drops to 1,768 ops/s with p99 260 ms, worse than `main` (1,049 ops/s, p99 115 ms). GET doesn't have this. Something saturates on the inline write path, likely the single location log per node or the all-node record fan-out. Not diagnosed yet. T1 stays opt-in until this is explained.
 
 Full table: `results/results.md`.
 
@@ -147,9 +157,7 @@ Full table: `results/results.md`.
 ![Resources during GET](results/resources_get.png)
 ![Concurrency](results/concurrency.png)
 
-CPU flamegraphs of the coordinator (4 KB, concurrency 16): `results/flame_B0.svg`, `results/flame_B3.svg`.
-
-**Caveats:** Every variant logged at INFO on every request (access log plus trace lines, written to `logs/application.log`), so absolute numbers include logging cost for all of them, `main` too. Next runs: headline numbers at WARN, traces in separate or sampled runs. 2 trials per point (spread at 4 KB within ~1-2%). One client, all requests coordinated by node 0. Concurrency sweep is 1 trial. B0 has no sync counter, so its syncs/PUT is read from B1, which runs the same path.
+**Caveats:** Every variant logged at INFO on every request (access log plus trace lines, written to `logs/application.log`), so absolute numbers include logging cost for all of them, `main` too. This branch moves its trace lines to TRACE. The access log and the other per-request lines move with the logging fix (#220). Next runs use the default level for headline numbers and collect traces in separate runs. The node-0 `perf` profiles covered the PUT phase only. Their flame graphs are too large to commit and aren't in the repo. 2 trials per point (spread at 4 KB within ~1-2%). One client, all requests coordinated by node 0. Concurrency sweep is 1 trial. B0 has no sync counter, so its syncs/PUT is read from B1, which runs the same path.
 
 ## Performance gates
 
@@ -190,7 +198,7 @@ Work that doesn't wait for this RFC: #206/#207 (partial-write repair, shard rebu
 ## Open questions
 
 1. **Versioning order without a leader.** Version IDs are time-ordered today. Is last-writer-wins by version ID acceptable for concurrent PUTs until a Raft-backed store exists?
-2. **Inline threshold.** What default, and should it be per bucket? Measured below at 64 KB.
+2. **Inline threshold.** What default, and should it be per bucket? Measured at 64 KB. The PUT gain ends between 16 KB and 64 KB.
 3. **Listing at scale.** `LocationStore::list` scans every key (#163). The `MetadataStore` interface should allow an ordered index.
 4. **Configuration.** Name and shape of the setting that picks the metadata backend (replicated store vs SQLite).
 

@@ -9,11 +9,14 @@ mkdir -p ~/results
 SUMMARY=~/results/summary.csv
 [ -f $SUMMARY ] || echo "run,variant,phase,payload_bytes,concurrency,ops,errors,throughput_ops_s,mean_us,p50_us,p90_us,p99_us,syncs_total,trial" > $SUMMARY
 
+# B0 = main. B1 = this branch at its defaults (redundant local sync skipped,
+# no inlining). B2 = B1 + inline objects up to 64 KB.
+# The 2026-11-19 results in ../results used an earlier build with a switch
+# for each technique; see README.md for how those variants map.
 variant_bin() { case $1 in B0) echo wd-main;; *) echo wd-proto;; esac; }
 variant_env() { case $1 in
-  B0|B1) echo "WARPDRIVE_BENCH=1";;
+  B0|B1) echo "";;
   B2) echo "WARPDRIVE_INLINE_MAX_BYTES=65536";;
-  B3) echo "WARPDRIVE_INLINE_MAX_BYTES=65536 WARPDRIVE_SKIP_LOCAL_CLEANUP=1";;
 esac; }
 syncs() { local t=0; for n in "${NODES[@]}"; do v=$($SSH $n '~/node.sh syncs'); t=$((t + ${v:-0})); done; echo $t; }
 
@@ -48,10 +51,10 @@ run() {  # run <variant> <size> <conc> <trial> [perf]
 }
 
 case "${1:-all}" in
-smoke) run B0 4096 16 0; run B3 4096 16 0 ;;
+smoke) run B0 4096 16 0; run B2 4096 16 0 ;;
 all)
-  for TR in 1 2; do for SZ in 1024 4096 16384 65536 262144 1048576; do for V in B0 B1 B2 B3; do run $V $SZ 16 $TR; done; done; done
-  for C in 1 4 16 64; do for V in B0 B3; do run $V 4096 $C 1; done; done
-  for V in B0 B3; do run $V 4096 16 1 perf; done
+  for TR in 1 2; do for SZ in 1024 4096 16384 65536 262144 1048576; do for V in B0 B1 B2; do run $V $SZ 16 $TR; done; done; done
+  for C in 1 4 16 64; do for V in B0 B2; do run $V 4096 $C 1; done; done
+  for V in B0 B2; do run $V 4096 16 1 perf; done
   echo "ALL DONE $(date +%T)" ;;
 esac

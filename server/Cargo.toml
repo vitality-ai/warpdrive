@@ -67,9 +67,6 @@ rand = "0.8"
 # runs on a machine with no libsqlite3 installed. Docker and the .deb keep
 # the default (system libsqlite3), which their base images already provide.
 bundled-sqlite = ["rusqlite/bundled"]
-# Benchmarks only: skips fsync so protocol cost can be measured apart from
-# disk-flush cost. Never enable in a build that serves data.
-bench-no-fsync = []
 
 [build-dependencies]
 tonic-build = "0.11"

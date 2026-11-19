@@ -154,7 +154,7 @@ pub fn store_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize, dat
     SERVER_TIMING.meta_put.record(t0.elapsed());
 
     SERVER_TIMING.total.record(request_start.elapsed());
-    log::info!("trace shard_put key={key} idx={shard_idx} bytes={} storage_write_us={storage_us} meta_put_us={meta_us} total_us={}", data.len(), request_start.elapsed().as_micros());
+    log::trace!("shard_put key={key} idx={shard_idx} bytes={} storage_write_us={storage_us} meta_put_us={meta_us} total_us={}", data.len(), request_start.elapsed().as_micros());
     Ok(())
 }
 
