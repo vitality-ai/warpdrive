@@ -10,14 +10,18 @@
 //! | Key | Holds |
 //! |---|---|
 //! | `bkt/{bucket}` | owner, creation time and every bucket setting |
-//! | `obj/{user}/{bucket}/{key}` | every version of the object, oldest first; the last is the latest |
+//! | `ver/{user}/{bucket}/{key}\0{order}` | one object version; `order` is its creation stamp, so the last row of a key is the latest |
 //! | `upl/{upload_id}` | a multipart upload and its parts |
 //! | `acl/{bucket}/{key}/{version}` | an object version's ACL |
 //! | `lck/{bucket}/{key}/{version}` | an object version's retention and legal hold |
 //!
-//! Each S3 operation changes one row, so it is atomic on its own. Writes
-//! to one row are serialized by a per-key lock on this node. Under the
-//! single-write-node limitation, that serializes them cluster-wide.
+//! A write touches only the rows it changes: a versioned PUT appends one
+//! version row, a tag change rewrites one, so a write's cost doesn't grow
+//! with the key's history. (With all versions in one row, 1,000 versions
+//! of a 4 KB key took 405 MB of log per node, and PUT p50 rose from 28 ms
+//! to 44 ms.) Writes to one object key are serialized by a per-key lock on
+//! this node. Under the single-write-node limitation, that serializes them
+//! cluster-wide.
 //!
 //! **Versions.** A bucket that was never versioned keeps one version per
 //! key, id `""`. With versioning enabled, every PUT appends a version with a
@@ -48,7 +52,8 @@ use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
 pub struct BucketRow {
     pub owner: String,
     pub created_at: String,
-    /// "disabled" (never versioned), "Enabled" or "Suspended".
+    /// "disabled" (never versioned), "enabled" or "suspended", as the
+    /// handlers write it.
     pub versioning: String,
     pub location: String,
     pub lock_enabled: bool,
@@ -61,6 +66,10 @@ pub struct BucketRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VersionEntry {
+    /// Creation stamp (`hlc`): the version's place in its key's history
+    /// and the last part of its row key.
+    #[serde(default)]
+    pub order: u64,
     /// `""` for a bucket that was never versioned, `"null"` for the null
     /// version of a suspended bucket, otherwise a generated id.
     pub version_id: String,
@@ -85,7 +94,9 @@ impl VersionEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// All of one key's versions, oldest first: an in-memory view assembled
+/// from its version rows.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ObjectRow {
     pub versions: Vec<VersionEntry>,
 }
@@ -141,7 +152,7 @@ pub struct LockRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetaValue {
     Bucket(BucketRow),
-    Object(ObjectRow),
+    Version(VersionEntry),
     Upload(UploadRow),
     Acl { owner: String, grants: String },
     Lock(LockRow),
@@ -180,7 +191,7 @@ pub fn open_rows(path: &str) -> std::io::Result<MetaRows> {
 /// node can read them. Called for each row it applies, and at startup.
 pub fn index_record(r: &MetaRecord) {
     match &r.value {
-        MetaValue::Object(o) => o.versions.iter().flat_map(|v| &v.blobs).for_each(index_blob),
+        MetaValue::Version(v) => v.blobs.iter().for_each(index_blob),
         MetaValue::Upload(u) => u.parts.values().flat_map(|p| &p.blobs).for_each(index_blob),
         _ => {}
     }
@@ -195,11 +206,20 @@ fn blobs_for(user: &str, bucket: &str, extents: &[(u64, u64)]) -> Vec<BlobRef> {
 fn bucket_key(bucket: &str) -> String {
     format!("bkt/{bucket}")
 }
-fn object_prefix(user: &str, bucket: &str) -> String {
-    format!("obj/{}:{user}/{}:{bucket}/", user.len(), bucket.len())
+fn bucket_versions_prefix(user: &str, bucket: &str) -> String {
+    format!("ver/{}:{user}/{}:{bucket}/", user.len(), bucket.len())
 }
-fn object_key(user: &str, bucket: &str, key: &str) -> String {
-    format!("{}{key}", object_prefix(user, bucket))
+/// Every version row of one key starts with this. Object keys can't
+/// contain NUL, and NUL sorts first, so key order is preserved.
+fn versions_prefix(user: &str, bucket: &str, key: &str) -> String {
+    format!("{}{key}\0", bucket_versions_prefix(user, bucket))
+}
+fn version_key(user: &str, bucket: &str, key: &str, order: u64) -> String {
+    format!("{}{order:016x}", versions_prefix(user, bucket, key))
+}
+/// After every version row of a key (hex digits sort below 'g').
+fn versions_end(user: &str, bucket: &str, key: &str) -> String {
+    format!("{}g", versions_prefix(user, bucket, key))
 }
 fn upload_key(upload_id: &str) -> String {
     format!("upl/{upload_id}")
@@ -347,26 +367,44 @@ impl ReplicatedMetadataStore {
         Ok(out)
     }
 
+    /// Every version of a key, oldest first. `None` if it has none.
     fn object(&self, user: &str, bucket: &str, key: &str) -> Option<ObjectRow> {
-        match self.get(&object_key(user, bucket, key)) {
-            Some(MetaValue::Object(o)) if !o.versions.is_empty() => Some(o),
+        let versions: Vec<VersionEntry> = self
+            .rows
+            .list_live(&versions_prefix(user, bucket, key), |_, r| match &r.value {
+                MetaValue::Version(v) => Some(v.clone()),
+                _ => None,
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        (!versions.is_empty()).then_some(ObjectRow { versions })
+    }
+
+    /// The latest version of a key, found with one lookup.
+    fn latest(&self, user: &str, bucket: &str, key: &str) -> Option<VersionEntry> {
+        match self.rows.floor_live(&versions_prefix(user, bucket, key), &versions_end(user, bucket, key)) {
+            Some((_, MetaRecord { value: MetaValue::Version(v), .. })) => Some(v),
             _ => None,
         }
     }
 
-    /// Read-modify-write of an object row. An empty row is removed.
+    /// Read-modify-write of a key's versions. Writes only the version rows
+    /// `f` added or changed, and tombstones the ones it removed.
     fn update_object<T>(&self, user: &str, bucket: &str, key: &str, f: impl FnOnce(&mut ObjectRow) -> Result<T, Error>) -> Result<T, Error> {
-        let rk = object_key(user, bucket, key);
-        let _g = self.locks.lock(&rk);
-        let mut row = self.object(user, bucket, key).unwrap_or_default();
-        let before = row.clone();
-        let out = f(&mut row)?;
-        if row != before {
-            if row.versions.is_empty() {
-                self.remove(&rk)?;
-            } else {
-                self.put(&rk, MetaValue::Object(row))?;
+        let _g = self.locks.lock(&versions_prefix(user, bucket, key));
+        let before = self.object(user, bucket, key).unwrap_or_default();
+        let mut after = before.clone();
+        let out = f(&mut after)?;
+        let old: BTreeMap<u64, &VersionEntry> = before.versions.iter().map(|v| (v.order, v)).collect();
+        let new: BTreeMap<u64, &VersionEntry> = after.versions.iter().map(|v| (v.order, v)).collect();
+        for (order, v) in &new {
+            if old.get(order) != Some(v) {
+                self.put(&version_key(user, bucket, key, *order), MetaValue::Version((*v).clone()))?;
             }
+        }
+        for order in old.keys().filter(|o| !new.contains_key(o)) {
+            self.remove(&version_key(user, bucket, key, *order))?;
         }
         Ok(out)
     }
@@ -392,16 +430,30 @@ impl ReplicatedMetadataStore {
         self.bucket(bucket).map(|b| b.versioning).unwrap_or_else(|| "disabled".to_string())
     }
 
-    /// Every object row in a bucket, in key order.
+    /// The bucket's versioning mode, whatever case it was stored in.
+    fn mode(&self, bucket: &str) -> Versioning {
+        match self.versioning(bucket).to_ascii_lowercase().as_str() {
+            "enabled" => Versioning::Enabled,
+            "suspended" => Versioning::Suspended,
+            _ => Versioning::Disabled,
+        }
+    }
+
+    /// Every key in a bucket with its versions, in key order.
     fn objects_in(&self, user: &str, bucket: &str) -> Vec<(String, ObjectRow)> {
-        let prefix = object_prefix(user, bucket);
-        self.rows.list_live(&prefix, |k, r| match &r.value {
-            MetaValue::Object(o) if !o.versions.is_empty() => Some((k[prefix.len()..].to_string(), o.clone())),
+        let prefix = bucket_versions_prefix(user, bucket);
+        let mut out: Vec<(String, ObjectRow)> = Vec::new();
+        let rows = self.rows.list_live(&prefix, |k, r| match &r.value {
+            MetaValue::Version(v) => k[prefix.len()..].rsplit_once('\0').map(|(key, _)| (key.to_string(), v.clone())),
             _ => None,
-        })
-        .into_iter()
-        .flatten()
-        .collect()
+        });
+        for (key, v) in rows.into_iter().flatten() {
+            match out.last_mut() {
+                Some((k, o)) if *k == key => o.versions.push(v),
+                _ => out.push((key, ObjectRow { versions: vec![v] })),
+            }
+        }
+        out
     }
 
     fn lock_row(&self, bucket: &str, key: &str, version_id: &str) -> Option<LockRow> {
@@ -416,6 +468,13 @@ impl ReplicatedMetadataStore {
         self.remove(&version_scoped("acl", bucket, key, version_id))?;
         self.remove(&version_scoped("lck", bucket, key, version_id))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Versioning {
+    Disabled,
+    Enabled,
+    Suspended,
 }
 
 /// Visible size and count of a bucket's latest, non-deleted objects.
@@ -435,14 +494,15 @@ impl MetadataStorage for ReplicatedMetadataStore {
                 return Err(ErrorBadRequest("Key already exists"));
             }
             let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list());
-            o.versions = vec![VersionEntry { version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
+            o.versions = vec![VersionEntry { order: hlc::now(), version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
             Ok(())
         })
     }
 
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
-        self.object(user_id, bucket, object_id)
-            .and_then(|o| o.latest().filter(|v| !v.is_delete_marker).map(|v| v.meta.clone()))
+        self.latest(user_id, bucket, object_id)
+            .filter(|v| !v.is_delete_marker)
+            .map(|v| v.meta)
             .ok_or_else(|| not_found(bucket, object_id))
     }
 
@@ -465,7 +525,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
 
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
-        Ok(self.object(user_id, bucket, object_id).and_then(|o| o.latest().map(|v| !v.is_delete_marker)).unwrap_or(false))
+        Ok(self.latest(user_id, bucket, object_id).is_some_and(|v| !v.is_delete_marker))
     }
 
     fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
@@ -545,13 +605,13 @@ impl MetadataStorage for ReplicatedMetadataStore {
     // ---- S3 PUT path ----
 
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
-        let versioning = self.versioning(bucket);
+        let mode = self.mode(bucket);
         let (vid, replaced) = self.update_object(user_id, bucket, key, |o| {
             let mut meta = metadata.clone();
             meta.is_delete_marker = false;
-            let (vid, replaced) = match versioning.as_str() {
-                "Enabled" => (new_version_id(), None),
-                "Suspended" => {
+            let (vid, replaced) = match mode {
+                Versioning::Enabled => (new_version_id(), None),
+                Versioning::Suspended => {
                     let old = o.find("null").map(|i| o.versions.remove(i));
                     ("null".to_string(), old)
                 }
@@ -559,7 +619,13 @@ impl MetadataStorage for ReplicatedMetadataStore {
             };
             meta.version_id = (!vid.is_empty()).then(|| vid.clone());
             let blobs = blobs_for(user_id, bucket, &meta.to_offset_size_list());
-            o.versions.push(VersionEntry { version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
+            // An unversioned overwrite takes the old version's slot: one row
+            // write, not a new row plus a tombstone.
+            let order = match (mode, &replaced) {
+                (Versioning::Disabled, Some(old)) => old.order,
+                _ => hlc::now(),
+            };
+            o.versions.push(VersionEntry { order, version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
             Ok((vid, replaced))
         })?;
         let old_extents = match replaced {
@@ -619,8 +685,8 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
 
     fn delete_object_v2(&self, user_id: &str, bucket: &str, key: &str) -> Result<VersioningDeleteResult, Error> {
-        let versioning = self.versioning(bucket);
-        if versioning != "Enabled" && versioning != "Suspended" {
+        let mode = self.mode(bucket);
+        if mode == Versioning::Disabled {
             // Not versioned: the caller removes the object.
             return Ok(VersioningDeleteResult::Deleted);
         }
@@ -632,12 +698,12 @@ impl MetadataStorage for ReplicatedMetadataStore {
             m
         };
         let (vid, replaced) = self.update_object(user_id, bucket, key, |o| {
-            let (vid, replaced) = if versioning == "Enabled" {
+            let (vid, replaced) = if mode == Versioning::Enabled {
                 (new_version_id(), None)
             } else {
                 ("null".to_string(), o.find("null").map(|i| o.versions.remove(i)))
             };
-            o.versions.push(VersionEntry { version_id: vid.clone(), is_delete_marker: true, meta: marker_meta(&vid), tags: Vec::new(), parts_manifest: None, blobs: Vec::new() });
+            o.versions.push(VersionEntry { order: hlc::now(), version_id: vid.clone(), is_delete_marker: true, meta: marker_meta(&vid), tags: Vec::new(), parts_manifest: None, blobs: Vec::new() });
             Ok((vid, replaced))
         })?;
         if let Some(v) = replaced {
@@ -667,11 +733,11 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
 
     fn get_latest_last_modified(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        Ok(self.object(user_id, bucket, key).and_then(|o| o.latest().and_then(|v| v.meta.last_modified.clone())))
+        Ok(self.latest(user_id, bucket, key).and_then(|v| v.meta.last_modified))
     }
 
     fn get_latest_version_marker_info(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<(String, bool)>, Error> {
-        Ok(self.object(user_id, bucket, key).and_then(|o| o.latest().map(|v| (v.version_id.clone(), v.is_delete_marker))))
+        Ok(self.latest(user_id, bucket, key).map(|v| (v.version_id, v.is_delete_marker)))
     }
 
     /// Versions in key order, newest first within a key, starting after
@@ -730,10 +796,10 @@ impl MetadataStorage for ReplicatedMetadataStore {
         })
     }
     fn get_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<Vec<(String, String)>, Error> {
-        Ok(self.object(user_id, bucket, key).and_then(|o| o.latest().map(|v| v.tags.clone())).unwrap_or_default())
+        Ok(self.latest(user_id, bucket, key).map(|v| v.tags).unwrap_or_default())
     }
     fn delete_object_tags(&self, user_id: &str, bucket: &str, key: &str) -> Result<(), Error> {
-        if self.object(user_id, bucket, key).is_none() {
+        if self.latest(user_id, bucket, key).is_none() {
             return Ok(());
         }
         self.set_object_tags(user_id, bucket, key, &[])
@@ -907,7 +973,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
 
     fn get_parts_manifest(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {
-        Ok(self.object(user_id, bucket, key).and_then(|o| o.latest().and_then(|v| v.parts_manifest.clone())))
+        Ok(self.latest(user_id, bucket, key).and_then(|v| v.parts_manifest))
     }
 
     fn set_parts_manifest(&self, user_id: &str, bucket: &str, key: &str, manifest: &str) -> Result<(), Error> {
@@ -942,7 +1008,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
                 owner: user_id.to_string(),
                 created_at: now_iso(),
                 // An Object Lock bucket is versioned from creation, as in S3.
-                versioning: if lock_enabled { "Enabled".to_string() } else { "disabled".to_string() },
+                versioning: if lock_enabled { "enabled".to_string() } else { "disabled".to_string() },
                 lock_enabled,
                 ..Default::default()
             }),
@@ -1054,7 +1120,7 @@ mod tests {
         let (_d, s) = store();
         s.create_bucket("u", "b").unwrap();
         s.put_object_v2("u", "b", "k", &meta(1, "pre")).unwrap();
-        s.set_versioning_state("u", "b", "Enabled").unwrap();
+        s.set_versioning_state("u", "b", "enabled").unwrap();
         let (v1, gc1) = s.put_object_v2("u", "b", "k", &meta(2, "v1")).unwrap();
         let (v2, _) = s.put_object_v2("u", "b", "k", &meta(3, "v2")).unwrap();
         assert!(gc1.is_empty() && v1.is_some() && v2.is_some() && v1 != v2);
@@ -1075,9 +1141,9 @@ mod tests {
     fn suspended_versioning_replaces_only_the_null_version() {
         let (_d, s) = store();
         s.create_bucket("u", "b").unwrap();
-        s.set_versioning_state("u", "b", "Enabled").unwrap();
+        s.set_versioning_state("u", "b", "enabled").unwrap();
         let (v1, _) = s.put_object_v2("u", "b", "k", &meta(1, "v1")).unwrap();
-        s.set_versioning_state("u", "b", "Suspended").unwrap();
+        s.set_versioning_state("u", "b", "suspended").unwrap();
         assert_eq!(s.put_object_v2("u", "b", "k", &meta(2, "n1")).unwrap().0.as_deref(), Some("null"));
         assert_eq!(s.put_object_v2("u", "b", "k", &meta(3, "n2")).unwrap(), (Some("null".into()), vec![(1000, 2)]));
         let (rows, ..) = s.list_object_versions_full("u", "b", "", "", "", 1000).unwrap();
@@ -1088,7 +1154,7 @@ mod tests {
     fn version_listing_pages_by_key_and_version_marker() {
         let (_d, s) = store();
         s.create_bucket("u", "b").unwrap();
-        s.set_versioning_state("u", "b", "Enabled").unwrap();
+        s.set_versioning_state("u", "b", "enabled").unwrap();
         for k in ["a", "a", "b"] {
             s.put_object_v2("u", "b", k, &meta(1, k)).unwrap();
         }

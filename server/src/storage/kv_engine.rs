@@ -45,9 +45,9 @@ pub trait KvEngine<V>: Send + Sync {
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
-    /// The entry with the greatest key that is at most `key` and starts
-    /// with `prefix`.
-    fn floor(&self, prefix: &str, key: &str) -> Option<(String, V)>;
+    /// The entry with the greatest key that is at most `key`, starts with
+    /// `prefix`, and whose value `accept` takes.
+    fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(String, V)>;
     /// Every entry, as owned pairs.
     fn snapshot(&self) -> Vec<(String, V)>;
     /// Reclaims space taken by overwritten and deleted entries.
@@ -65,7 +65,7 @@ pub trait Index<V>: Default + Send + Sync {
     fn len(&self) -> usize;
     fn for_each(&self, f: impl FnMut(&String, &V));
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
-    fn floor(&self, prefix: &str, key: &str) -> Option<(&String, &V)>;
+    fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)>;
 }
 
 impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
@@ -92,10 +92,11 @@ impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
             .filter_map(|(k, v)| f(k, v))
             .collect()
     }
-    fn floor(&self, prefix: &str, key: &str) -> Option<(&String, &V)> {
-        self.range::<str, _>((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))
-            .next_back()
-            .filter(|(k, _)| k.starts_with(prefix))
+    fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)> {
+        self.range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Included(key)))
+            .rev()
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .find(|(_, v)| accept(v))
     }
 }
 
@@ -120,8 +121,8 @@ impl<V: Send + Sync> Index<V> for HashMap<String, V> {
         hits.sort_by(|a, b| a.0.cmp(b.0));
         hits.into_iter().filter_map(|(k, v)| f(k, v)).collect()
     }
-    fn floor(&self, prefix: &str, key: &str) -> Option<(&String, &V)> {
-        self.iter().filter(|(k, _)| k.starts_with(prefix) && k.as_str() <= key).max_by(|a, b| a.0.cmp(b.0))
+    fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)> {
+        self.iter().filter(|(k, v)| k.starts_with(prefix) && k.as_str() <= key && accept(v)).max_by(|a, b| a.0.cmp(b.0))
     }
 }
 
@@ -255,8 +256,8 @@ where
         self.index.read().scan_prefix(prefix, f)
     }
 
-    fn floor(&self, prefix: &str, key: &str) -> Option<(String, V)> {
-        self.index.read().floor(prefix, key).map(|(k, v)| (k.clone(), v.clone()))
+    fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(String, V)> {
+        self.index.read().floor(prefix, key, accept).map(|(k, v)| (k.clone(), v.clone()))
     }
 
     fn snapshot(&self) -> Vec<(String, V)> {
@@ -379,11 +380,12 @@ mod tests {
         for (k, v) in [("a/10", 1), ("a/20", 2), ("b/05", 3)] {
             e.put(k.into(), v).unwrap();
         }
-        assert_eq!(e.floor("a/", "a/15"), Some(("a/10".into(), 1)));
-        assert_eq!(e.floor("a/", "a/20"), Some(("a/20".into(), 2)));
-        assert_eq!(e.floor("a/", "a/99"), Some(("a/20".into(), 2)));
-        assert_eq!(e.floor("a/", "a/05"), None);
-        assert_eq!(e.floor("b/", "b/04"), None, "a key in another prefix isn't returned");
+        assert_eq!(e.floor("a/", "a/15", |_| true), Some(("a/10".into(), 1)));
+        assert_eq!(e.floor("a/", "a/20", |_| true), Some(("a/20".into(), 2)));
+        assert_eq!(e.floor("a/", "a/99", |_| true), Some(("a/20".into(), 2)));
+        assert_eq!(e.floor("a/", "a/05", |_| true), None);
+        assert_eq!(e.floor("b/", "b/04", |_| true), None, "a key in another prefix isn't returned");
+        assert_eq!(e.floor("a/", "a/99", |v| *v == 1), Some(("a/10".into(), 1)), "entries accept refuses are skipped");
     }
 
     #[test]

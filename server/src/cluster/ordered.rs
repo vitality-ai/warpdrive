@@ -201,7 +201,8 @@ impl<R: OrderedRecord, E: KvEngine<Entry<R>>> OrderedStore<R, E> {
 
     /// The live record with the greatest key at most `key` within `prefix`.
     pub fn floor_live(&self, prefix: &str, key: &str) -> Option<(String, R)> {
-        self.engine.floor(prefix, key).and_then(|(k, e)| e.into_live().map(|r| (k, r)))
+        // Tombstones are skipped: a deleted entry's predecessor is the answer.
+        self.engine.floor(prefix, key, |e| e.live().is_some()).and_then(|(k, e)| e.into_live().map(|r| (k, r)))
     }
 
     /// `f` over every live record whose key starts with `prefix`.
