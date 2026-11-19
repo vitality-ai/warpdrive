@@ -1,0 +1,13 @@
+# Scale-test subset: same as configs.txt rows, run at 2, 4 and 8 vCPUs
+base|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+nocompact|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50 --compact 0
+layout-A|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout A --copy cfr --rate-mbps 50
+copy-rw|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy rw --rate-mbps 50
+ext4-copy-cfr|ext4|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+ext4-copy-rw|ext4|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy rw --rate-mbps 50
+rate_mbps-0|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 0
+rate_mbps-25|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 25
+umax-0.2|xfs|--segment-mb 256 --umax 0.2 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+umax-0.7|xfs|--segment-mb 256 --umax 0.7 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-32|xfs|--segment-mb 32 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-1024|xfs|--segment-mb 1024 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
