@@ -35,6 +35,7 @@ struct Cfg {
     readers: usize,
     read_rate: f64,  // total reads per second across readers (open loop); 0 = as fast as possible
     direct: bool,    // reads bypass the page cache (O_DIRECT, Linux)
+    prealloc: bool,  // fallocate each segment to its full size when it's created
     compact: bool,
     hot_frac: f64,
     seed: u64,
@@ -45,7 +46,7 @@ fn parse() -> Cfg {
     let mut c = Cfg {
         dir: PathBuf::from("/mnt/nvme/segbench"), segment_mb: 256, umax: 0.5, policy: "costbenefit".into(),
         layout: "C".into(), copy: "cfr".into(), rate_mbps: 50.0, live_gb: 6.0, churn_x: 4.0, warm_x: 2.0,
-        writers: 8, readers: 4, read_rate: 200.0, direct: true, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
+        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
     };
     let a: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -66,6 +67,7 @@ fn parse() -> Cfg {
             "--readers" => c.readers = v.parse().unwrap(),
             "--read-rate" => c.read_rate = v.parse().unwrap(),
             "--direct" => c.direct = v == "1",
+            "--prealloc" => c.prealloc = v == "1",
             "--compact" => c.compact = v == "1",
             "--hot-frac" => c.hot_frac = v.parse().unwrap(),
             "--seed" => c.seed = v.parse().unwrap(),
@@ -135,6 +137,11 @@ fn seg_path(cfg: &Cfg, id: u64, surv: bool) -> PathBuf {
 fn new_segment(sh: &Shared, st: &mut Inner, surv: bool) -> u64 {
     let id = st.next_seg; st.next_seg += 1;
     let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(seg_path(&sh.cfg, id, surv)).unwrap();
+    // Reserve the whole segment up front: one allocation, no speculative preallocation.
+    #[cfg(target_os = "linux")]
+    if sh.cfg.prealloc {
+        unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, sh.seg_size as i64) };
+    }
     let f = Arc::new(f);
     // Readers use their own handle, opened with O_DIRECT so reads always go to the device.
     #[cfg(target_os = "linux")]
