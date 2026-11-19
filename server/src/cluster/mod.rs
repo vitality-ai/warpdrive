@@ -13,6 +13,7 @@ pub mod grpc_peer_client;
 pub mod tcp_peer_client;
 pub mod hlc;
 pub mod bridge;
+pub mod blob_io;
 pub mod blob_store;
 pub mod replicated_metadata;
 pub mod ordered;

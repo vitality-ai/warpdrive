@@ -39,7 +39,8 @@ use crate::metadata::{
     BucketStats, DeleteSpecificResult, DeletionEvent, Metadata, MetadataStorage, MultipartPartRow, MultipartUploadRow,
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
-use crate::storage::kv_engine::BitcaskEngine;
+use super::blob_store::{blob_at, index_blob, BlobRef};
+use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
 
 // ---------------------------------------------------------------- rows
 
@@ -67,6 +68,10 @@ pub struct VersionEntry {
     pub meta: Metadata,
     pub tags: Vec<(String, String)>,
     pub parts_manifest: Option<String>,
+    /// Where this version's bytes are: one entry per stored range. The row
+    /// is the only record of a blob's placement.
+    #[serde(default)]
+    pub blobs: Vec<BlobRef>,
 }
 
 impl VersionEntry {
@@ -102,6 +107,9 @@ pub struct PartRow {
     pub size: u64,
     pub extents_blob: Vec<u8>,
     pub checksum_value: String,
+    /// Where the part's bytes are (see `VersionEntry::blobs`).
+    #[serde(default)]
+    pub blobs: Vec<BlobRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,7 +167,29 @@ impl OrderedRecord for MetaRecord {
 pub type MetaRows = OrderedStore<MetaRecord, BitcaskEngine<Entry<MetaRecord>>>;
 
 pub fn open_rows(path: &str) -> std::io::Result<MetaRows> {
-    Ok(OrderedStore::new(BitcaskEngine::open(path, "s3 metadata")?))
+    let rows: MetaRows = OrderedStore::new(BitcaskEngine::open(path, "s3 metadata")?);
+    for (_, entry) in rows.engine().snapshot() {
+        if let Some(r) = entry.live() {
+            index_record(r);
+        }
+    }
+    Ok(rows)
+}
+
+/// Adds every blob a row references to this node's address index, so this
+/// node can read them. Called for each row it applies, and at startup.
+pub fn index_record(r: &MetaRecord) {
+    match &r.value {
+        MetaValue::Object(o) => o.versions.iter().flat_map(|v| &v.blobs).for_each(index_blob),
+        MetaValue::Upload(u) => u.parts.values().flat_map(|p| &p.blobs).for_each(index_blob),
+        _ => {}
+    }
+}
+
+/// The placements of the blobs starting at `extents`' offsets, as this
+/// node's index knows them (it wrote them, or applied their rows).
+fn blobs_for(user: &str, bucket: &str, extents: &[(u64, u64)]) -> Vec<BlobRef> {
+    extents.iter().filter_map(|(offset, _)| blob_at(user, bucket, *offset)).collect()
 }
 
 fn bucket_key(bucket: &str) -> String {
@@ -225,7 +255,10 @@ pub struct LocalWriter(pub Arc<MetaRows>);
 impl RowWriter for LocalWriter {
     fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String> {
         let res = match record {
-            Some(r) => self.0.put(key.to_string(), r),
+            Some(r) => {
+                index_record(&r);
+                self.0.put(key.to_string(), r)
+            }
             None => self.0.delete(key.to_string(), seq),
         }
         .map_err(|e| e.to_string())?;
@@ -401,7 +434,8 @@ impl MetadataStorage for ReplicatedMetadataStore {
             if o.latest().is_some_and(|v| !v.is_delete_marker) {
                 return Err(ErrorBadRequest("Key already exists"));
             }
-            o.versions = vec![VersionEntry { version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None }];
+            let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list());
+            o.versions = vec![VersionEntry { version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
             Ok(())
         })
     }
@@ -438,6 +472,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
         self.update_object(user_id, bucket, object_id, |o| match o.versions.last_mut() {
             Some(v) if !v.is_delete_marker => {
                 v.meta = metadata.clone();
+                v.blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list());
                 Ok(())
             }
             _ => Err(not_found(bucket, object_id)),
@@ -523,7 +558,8 @@ impl MetadataStorage for ReplicatedMetadataStore {
                 _ => (String::new(), o.versions.drain(..).last()),
             };
             meta.version_id = (!vid.is_empty()).then(|| vid.clone());
-            o.versions.push(VersionEntry { version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None });
+            let blobs = blobs_for(user_id, bucket, &meta.to_offset_size_list());
+            o.versions.push(VersionEntry { version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
             Ok((vid, replaced))
         })?;
         let old_extents = match replaced {
@@ -601,7 +637,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
             } else {
                 ("null".to_string(), o.find("null").map(|i| o.versions.remove(i)))
             };
-            o.versions.push(VersionEntry { version_id: vid.clone(), is_delete_marker: true, meta: marker_meta(&vid), tags: Vec::new(), parts_manifest: None });
+            o.versions.push(VersionEntry { version_id: vid.clone(), is_delete_marker: true, meta: marker_meta(&vid), tags: Vec::new(), parts_manifest: None, blobs: Vec::new() });
             Ok((vid, replaced))
         })?;
         if let Some(v) = replaced {
@@ -841,10 +877,12 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
 
     fn upsert_multipart_part(&self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8], checksum_value: &str) -> Result<(), Error> {
+        let extents = crate::util::serializer::deserialize_offset_size(extents_blob)?;
         self.update_upload(upload_id, |u| {
+            let blobs = blobs_for(&u.user_id, &u.bucket, &extents);
             u.parts.insert(
                 part_number,
-                PartRow { etag: etag.to_string(), size, extents_blob: extents_blob.to_vec(), checksum_value: checksum_value.to_string() },
+                PartRow { etag: etag.to_string(), size, extents_blob: extents_blob.to_vec(), checksum_value: checksum_value.to_string(), blobs },
             );
         })
     }
@@ -1108,9 +1146,10 @@ mod tests {
     fn multipart_uploads_and_parts() {
         let (_d, s) = store();
         s.create_multipart_upload("up1", "u", "b", "k", None, "{}", "t", "", "", "", "", "").unwrap();
-        s.upsert_multipart_part("up1", 2, "e2", 20, b"x", "").unwrap();
-        s.upsert_multipart_part("up1", 1, "e1", 10, b"y", "").unwrap();
-        s.upsert_multipart_part("up1", 1, "e1b", 11, b"z", "").unwrap();
+        let ext = |o: u64, n: u64| crate::util::serializer::serialize_offset_size(&vec![(o, n)]).unwrap();
+        s.upsert_multipart_part("up1", 2, "e2", 20, &ext(100, 20), "").unwrap();
+        s.upsert_multipart_part("up1", 1, "e1", 10, &ext(0, 10), "").unwrap();
+        s.upsert_multipart_part("up1", 1, "e1b", 11, &ext(50, 11), "").unwrap();
         let parts = s.list_multipart_parts("up1").unwrap();
         assert_eq!(parts.iter().map(|p| (p.part_number, p.etag.as_str())).collect::<Vec<_>>(), vec![(1, "e1b"), (2, "e2")]);
         assert_eq!(s.list_bucket_multipart_uploads("b").unwrap().len(), 1);
@@ -1142,9 +1181,14 @@ mod tests {
             let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
             s.create_bucket("u", "b").unwrap();
             s.put_object_v2("u", "b", "k", &meta(4, "e")).unwrap();
+            // An upload's parts are a map keyed by part number.
+            s.create_multipart_upload("up", "u", "b", "k2", None, "{}", "t", "", "", "", "", "").unwrap();
+            let ext = crate::util::serializer::serialize_offset_size(&vec![(0, 10)]).unwrap();
+            s.upsert_multipart_part("up", 3, "e3", 10, &ext, "").unwrap();
         }
         let rows = Arc::new(open_rows(&path).unwrap());
         let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().size, 4);
+        assert_eq!(s.list_multipart_parts("up").unwrap()[0].part_number, 3);
     }
 }

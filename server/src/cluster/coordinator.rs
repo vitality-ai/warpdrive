@@ -216,7 +216,10 @@ impl RecordOp {
                 let rows = super::replicated_metadata::rows()
                     .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
                 match m.record {
-                    Some(r) => rows.put(m.key, r)?.into(),
+                    Some(r) => {
+                        super::replicated_metadata::index_record(&r);
+                        rows.put(m.key, r)?.into()
+                    }
                     None => rows.delete(m.key, m.seq)?.into(),
                 }
             }
@@ -649,7 +652,7 @@ const INLINE_MAX_CAP: usize = 128 * 1024;
 /// shard writes plus the record, and a GET is served from the receiving
 /// node's own copy. The cost: the bytes are held in memory and on disk on
 /// every node, instead of spread as shards.
-fn inline_max_bytes() -> usize {
+pub(crate) fn inline_max_bytes() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         let configured = std::env::var("WARPDRIVE_INLINE_MAX_BYTES").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);

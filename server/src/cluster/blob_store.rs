@@ -5,9 +5,14 @@
 //! arithmetic on them (a Range GET or a copy range slices a stored range).
 //! Single-node mode backs that with one file per bucket. Here, each write
 //! reserves a range of a per-bucket address space and is stored as one
-//! erasure-coded blob, through the cluster's ordinary PUT path, keyed by
-//! the range's start address. A read finds the blob whose range holds the
-//! address and slices it.
+//! erasure-coded blob. A read finds the blob whose range holds the address
+//! and slices it.
+//!
+//! **No record per blob.** A blob's placement travels in the S3 metadata
+//! row of the object that uses it, so a PUT replicates one record. Every
+//! node keeps an in-memory index from address to placement: the writing
+//! node adds a blob when it writes it, and every node adds the blobs of
+//! each object or upload row it applies, and of every row at startup.
 //!
 //! **Addresses are unique without coordination.** The top 8 bits are this
 //! node's slot (its position in `WARPDRIVE_PEERS`, or
@@ -28,8 +33,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 
+use super::blob_io::{read_blob, write_blob, BlobPlacement};
 use super::bridge;
-use super::location_store::ObjectS3Metadata;
 use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
 use crate::storage::Storage;
 
@@ -45,7 +50,7 @@ pub fn blob_bucket(bucket: &str) -> String {
 }
 
 /// Zero-padded hex, so key order is address order.
-fn blob_key(base: u64) -> String {
+pub fn blob_key(base: u64) -> String {
     format!("{base:016x}")
 }
 
@@ -66,6 +71,37 @@ pub fn node_slot() -> Result<u64, String> {
         .map(|i| i as u64)
         .filter(|i| *i < 256)
         .ok_or_else(|| format!("{me} is not in WARPDRIVE_PEERS, so it has no slot (set WARPDRIVE_NODE_SLOT)"))
+}
+
+/// A blob as an object's metadata row carries it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlobRef {
+    pub user_id: String,
+    pub bucket: String,
+    pub base: u64,
+    pub placement: BlobPlacement,
+}
+
+type IndexMap = HashMap<(String, String), std::collections::BTreeMap<u64, BlobPlacement>>;
+
+static INDEX: std::sync::LazyLock<parking_lot::RwLock<IndexMap>> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+/// Adds a blob to this node's address index.
+pub fn index_blob(b: &BlobRef) {
+    INDEX.write().entry((b.user_id.clone(), b.bucket.clone())).or_default().insert(b.base, b.placement.clone());
+}
+
+/// The blob whose range holds `offset`, as `(start address, placement)`.
+fn lookup(user_id: &str, bucket: &str, offset: u64) -> Option<(u64, BlobPlacement)> {
+    let index = INDEX.read();
+    let (base, p) = index.get(&(user_id.to_string(), bucket.to_string()))?.range(..=offset).next_back()?;
+    (offset < base + p.len.max(1)).then(|| (*base, p.clone()))
+}
+
+/// The blob starting at exactly `base`, for attaching to a metadata row.
+pub fn blob_at(user_id: &str, bucket: &str, base: u64) -> Option<BlobRef> {
+    let placement = INDEX.read().get(&(user_id.to_string(), bucket.to_string()))?.get(&base)?.clone();
+    Some(BlobRef { user_id: user_id.to_string(), bucket: bucket.to_string(), base, placement })
 }
 
 /// Hands out address ranges for one node.
@@ -148,27 +184,23 @@ impl ClusterBlobStore {
         let slot = node_slot()?;
         let alloc = Allocator::open(alloc_log, slot).map_err(|e| format!("blob allocator log {alloc_log}: {e}"))?;
         log::info!("cluster blob store: node slot {slot}");
-        Ok(Self { alloc, cache: Mutex::new(BlobCache { budget: 256 << 20, used: 0, entries: VecDeque::new() }) })
+        // Recently read blobs, `WARPDRIVE_BLOB_CACHE_MB` (default 256, 0 disables).
+        let budget_mb: usize = std::env::var("WARPDRIVE_BLOB_CACHE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256);
+        Ok(Self { alloc, cache: Mutex::new(BlobCache { budget: budget_mb << 20, used: 0, entries: VecDeque::new() }) })
     }
 
-    /// The blob holding `offset`, as `(key, start address, bytes)`.
-    fn blob_at(&self, user_id: &str, bucket: &str, offset: u64) -> Result<(u64, Arc<Vec<u8>>), Error> {
-        let state = bridge::state().ok_or_else(|| ErrorInternalServerError("cluster state not installed"))?;
-        let ib = blob_bucket(bucket);
-        let (key, record) = state
-            .location_store
-            .floor(user_id, &ib, &blob_key(offset))
-            .ok_or_else(|| ErrorInternalServerError(format!("no stored range holds offset {offset:#x} in {bucket}")))?;
-        let base = u64::from_str_radix(&key, 16).map_err(|_| ErrorInternalServerError(format!("bad blob key {key:?}")))?;
-        let cache_key = (user_id.to_string(), ib.clone(), format!("{key}@{}", record.version));
+    /// The bytes of the blob holding `offset`, with its start address.
+    fn bytes_at(&self, user_id: &str, bucket: &str, offset: u64) -> Result<(u64, Arc<Vec<u8>>), Error> {
+        let (base, placement) =
+            lookup(user_id, bucket, offset).ok_or_else(|| ErrorInternalServerError(format!("no stored range holds offset {offset:#x} in {bucket}")))?;
+        let cache_key = (user_id.to_string(), bucket.to_string(), format!("{base:x}@{}", placement.wire_key));
         if let Some(bytes) = self.cache.lock().get(&cache_key) {
             return Ok((base, bytes));
         }
-        let (user, k) = (user_id.to_string(), key.clone());
-        let bytes = bridge::run(move || async move {
-            super::coordinator::fetch_plain_object_bytes(&user, &ib, &k, &state).await.map_err(|e| e.to_string())
-        })
-        .map_err(ErrorInternalServerError)?;
+        let state = bridge::state().ok_or_else(|| ErrorInternalServerError("cluster state not installed"))?;
+        let (user, ib) = (user_id.to_string(), blob_bucket(bucket));
+        let bytes = bridge::run(move || async move { read_blob(&state, &user, &ib, &placement).await.map_err(|e| e.to_string()) })
+            .map_err(ErrorInternalServerError)?;
         let bytes = Arc::new(bytes);
         self.cache.lock().insert(cache_key, Arc::clone(&bytes));
         Ok((base, bytes))
@@ -183,13 +215,9 @@ impl Storage for ClusterBlobStore {
         let base = self.alloc.allocate(user_id, bucket, len.max(1)).map_err(ErrorInternalServerError)?;
         let state = bridge::state().ok_or_else(|| ErrorInternalServerError("cluster state not installed"))?;
         let (user, ib, key, body) = (user_id.to_string(), blob_bucket(bucket), blob_key(base), data.to_vec());
-        bridge::run(move || async move {
-            super::coordinator::put_object_plain(&user, &ib, &key, &body, &state, &ObjectS3Metadata::default())
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        })
-        .map_err(ErrorInternalServerError)?;
+        let placement = bridge::run(move || async move { write_blob(&state, &user, &ib, &key, &body).await.map_err(|e| e.to_string()) })
+            .map_err(ErrorInternalServerError)?;
+        index_blob(&BlobRef { user_id: user_id.to_string(), bucket: bucket.to_string(), base, placement });
         Ok((base, len))
     }
 
@@ -197,7 +225,7 @@ impl Storage for ClusterBlobStore {
         if size == 0 {
             return Ok(Vec::new());
         }
-        let (base, bytes) = self.blob_at(user_id, bucket, offset)?;
+        let (base, bytes) = self.bytes_at(user_id, bucket, offset)?;
         let start = (offset - base) as usize;
         let end = start + size as usize;
         if end > bytes.len() {

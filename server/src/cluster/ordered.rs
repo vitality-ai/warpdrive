@@ -43,23 +43,26 @@ pub enum Entry<R> {
 /// is how a record line looked before ordering existed. A bare record
 /// reads as live with its own `seq` (0 if it has none), so any later write
 /// replaces it.
+///
+/// Parsed through `serde_json::Value`, not a serde untagged enum: an
+/// untagged enum can't read a map with numeric keys (a multipart upload's
+/// parts), so a node holding one couldn't replay its own log.
 impl<'de, R: DeserializeOwned> Deserialize<'de> for Entry<R> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        enum Tagged<R> {
-            Live(R),
-            Tombstone { seq: u64 },
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(d)?;
+        if let serde_json::Value::Object(m) = &v {
+            if m.len() == 1 {
+                if let Some(r) = m.get("Live") {
+                    return R::deserialize(r).map(Entry::Live).map_err(D::Error::custom);
+                }
+                if let Some(t) = m.get("Tombstone") {
+                    let seq = t.get("seq").and_then(|s| s.as_u64()).ok_or_else(|| D::Error::custom("tombstone without a seq"))?;
+                    return Ok(Entry::Tombstone { seq });
+                }
+            }
         }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr<R> {
-            Tagged(Tagged<R>),
-            Bare(R),
-        }
-        Ok(match Repr::<R>::deserialize(d)? {
-            Repr::Tagged(Tagged::Live(r)) | Repr::Bare(r) => Entry::Live(r),
-            Repr::Tagged(Tagged::Tombstone { seq }) => Entry::Tombstone { seq },
-        })
+        R::deserialize(&v).map(Entry::Live).map_err(D::Error::custom)
     }
 }
 
