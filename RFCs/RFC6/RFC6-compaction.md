@@ -26,7 +26,7 @@ RFC 3 designed segment files and a compactor for the single-node engine, with of
 
 1. **Space is reclaimed** for deletes, overwrites, failed writes and record logs.
 2. **Compaction never blocks foreground I/O.** No lock is held across a copy. Foreground PUT and GET p99 stay within noise while compaction runs.
-3. **Moving bytes is node-local.** Compacting a segment needs no network traffic and no cluster coordination. Freeing a shard needs one batched check with the other nodes, in the background.
+3. **DELETE is fast, reclamation is local.** DELETE removes the object's record on a quorum and returns. Each node frees the shard bytes on its own, later. Compacting a segment needs no network traffic.
 4. **Durability is unchanged.** A byte is freed only once nothing can still reference it.
 5. **Single node is not special.** RS(1,0) uses the same code.
 
@@ -43,12 +43,18 @@ Two facts about the RFC 5 engine make compaction cheaper than in RFC 3:
 
 So reclamation doesn't depend on a delete message reaching every shard holder. Lost deletes, failed writes and old versions all look the same, an unreferenced shard, and the node that holds it finds it.
 
-**But a node's own copy can be stale.** Records are written to a quorum of nodes, not all of them, so a node can miss a record or a newer version of one. If the node acted on its own copy alone, it could free a shard that another node's record still points to. So the local check only nominates candidates. A shard is freed only after **every node confirms** it doesn't reference it:
-- One batched request per peer, carrying thousands of candidates, in the background.
-- A peer that doesn't answer means "keep". The candidate is retried on the next sweep.
-- A stale record on a node can only make it keep bytes, never free them. A missed delete or newer version leaves the old reference in place.
+**But a node's own copy can be stale.** Records reach a quorum of nodes, not all of them. So a node decides how sure it is by what it has:
 
-Confirmation is rare and batched, so it costs almost nothing. Moving bytes during compaction (below) needs no confirmation, because it doesn't free anything that's referenced.
+| What the node has for the shard's `(bucket, key)` | Meaning | Action |
+|---|---|---|
+| A tombstone, or a record with a newer version | A delete or overwrite happened | Free on its own, after the grace period |
+| A record with this version, naming this node | Referenced | Keep |
+| No record at all | A failed PUT's shard, **or** this node missed a PUT's record | Ask every other node first. Free only if all say they don't reference it. |
+
+- **Tombstone or newer version: no confirmation.** If another node missed that tombstone, it may still try to read the deleted object and fail. That's correct: the client deleted it.
+- **No record: confirm first.** Here the node can't tell "never committed" from "I missed it", and the second case means freeing would drop a shard of a live object. The check is one batched request per peer, in the background. A peer that doesn't answer means "keep", and the candidate is retried on the next sweep. This case is rare: failed writes, and shards left over after a restart.
+
+Moving bytes during compaction (below) needs no confirmation, because it frees nothing that's referenced.
 
 **Grace period.** A shard is written before its record exists, because the record is replicated only after shard quorum (#151). So a shard is only treated as unreferenced once it's older than a grace period `G`, default 10 minutes, which covers any in-flight PUT. The shard index stores each shard's write time for this check.
 
@@ -85,9 +91,10 @@ The liveness rule needs `(bucket, key, version, idx)`. Today these could only be
 
 Each node keeps `live_bytes[segment]` in memory. It's rebuilt from the shard index at startup, like the index itself, so it can't drift.
 
-- A shard is marked as a candidate when it looks unreferenced locally: its record was deleted, it was overwritten by a new version, or it outlived the grace period with no record. Record updates reach the node anyway, so this is an in-memory lookup on each `put` or `delete`.
-- A background **orphan sweep** walks the shard index every few minutes and catches anything the record path missed, such as shards of failed writes. It reads only memory.
-- Candidates are confirmed with every peer in one batch (see above). Only confirmed shards are subtracted from `live_bytes` and removed from the shard index.
+- **On a tombstone or a newer version:** when the node applies it, the old shards it holds are marked dead right away. It's an in-memory lookup, with no I/O and no network.
+- **Orphan sweep:** every few minutes it walks the shard index and finds shards with no record older than the grace period, such as shards of failed writes, and confirms them with every peer in one batch.
+- Dead shards are subtracted from `live_bytes`. Their index entries are removed when their segment is compacted or deleted.
+- After a restart, tombstones already merged out of the log are gone, so their shards show up as "no record" and take the confirmed path. That's slower, but safe.
 
 ### 4. Two write heads: fresh and survivor
 
@@ -154,8 +161,9 @@ A log is merged when its size is more than twice the size of its live entries. M
 
 ### 9. What a delete does
 
-- **Coordinator:** replicates the record tombstone, as today. It doesn't need to send shard deletes.
-- **Every node:** applying the tombstone (or a newer version's record) makes the old shards candidates on the nodes that hold them. The orphan sweep is the backstop. Candidates are freed once every node confirms.
+- **Coordinator:** replicates the record tombstone to every node and returns once a quorum acks, as today. It sends no shard deletes, so DELETE stays one round.
+- **Each node, on applying the tombstone:** marks the shards it holds for that object dead. No confirmation is needed, since a tombstone is proof of a delete.
+- **Nodes that missed the tombstone:** keep their shards until the tombstone reaches them, or until the orphan sweep confirms the shard is unreferenced everywhere.
 - **Bytes on disk:** freed when the segment is compacted, or when the whole segment is dead, by unlinking it with no copy.
 
 ## Cost model
@@ -202,7 +210,7 @@ Step 1 already makes the problem visible: each node reports how much space it co
 
 ## Open questions
 
-1. **Confirmation when a node is down.** Every node must confirm, so a long outage pauses reclamation. Is that acceptable, or should a replaced node's shards be handled by the rebuild in #207?
+1. **Confirmation when a node is down.** Only "no record" shards need every node to confirm, so a long outage pauses only those (failed writes, post-restart leftovers). Deletes and overwrites still reclaim. Is that acceptable?
 2. **Grace period `G`.** 10 minutes covers any PUT today. Should it come from the PUT timeout instead?
 3. **Segment size.** 256 MB keeps a compaction unit small. Is it too many files for buckets with heavy churn?
 4. **Survivor generations.** Should survivors that survive again go into a third stream (LFS-style multiple generations), or are two enough?
