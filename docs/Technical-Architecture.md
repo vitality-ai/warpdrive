@@ -24,9 +24,10 @@ Measured results: [`docs/benchmarks/v1.0.0-results.md`](benchmarks/v1.0.0-result
 
 ## Code modules and how they talk
 
-One `warp_drive` binary (`server/src/`) holds both engines. The router sends
-a request to the single-node engine when the node has no peers, and to the
-cluster engine when it does.
+**Today:** one `warp_drive` binary (`server/src/`) holds both engines, behind
+the same `/s3` URL. The router sends a request to the single-node handlers
+when the node has no peers, and to the cluster handlers when it does. RFC 5
+merges them into one handler set (see [Composable design](#composable-design-rfc-5)).
 
 ![Code modules](diagrams/04-code-modules.svg)
 
@@ -74,9 +75,12 @@ from regressing. Details:
 
 ## Single-node engine
 
-Used when a node starts without `WARPDRIVE_PEERS` or `WARPDRIVE_JOIN_VIA`.
+**Today:** used when a node starts without `WARPDRIVE_PEERS` or
+`WARPDRIVE_JOIN_VIA`, with SQLite metadata (`MetadataBackend::default()`).
 It has the most complete S3 support ([`TEST-COVERAGE.md`](TEST-COVERAGE.md))
-and no redundancy.
+and no redundancy. With RFC 5, a single node runs the cluster engine as a
+one-node cluster, with `LocationStore` metadata by default and SQLite
+optional.
 
 ![Single-node engine](diagrams/07-single-node.svg)
 

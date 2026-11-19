@@ -108,5 +108,5 @@
 <path d="M970.1029169001173,590.2636780313186 L1145.696875904679,589.0143134840492 Q1160.4144407246774,590.614752907872 1159.907513217298,602.9720347950581 L1160.7209138458888,656.5715609134793 Q1159.6065719649023,669.7528307878666 1145.559672875186,671.0563589067453 L967.7970452152305,670.9172847359754 Q955.1396599494983,671.1374745874858 953.7141019001989,656.0056841230393 L954.3965424301637,604.8967071271097 Q956.1476823471863,589.6005352264159 967.9980553664429,591.2006526426205" fill="none" stroke="#0c8599" stroke-width="1.1" stroke-linejoin="round"/>
 <text x="1057.5" y="627.0" font-size="20" text-anchor="middle" fill="#1e1e1e">Peer transport</text>
 <text x="1057.5" y="649.0" font-size="14.5" text-anchor="middle" fill="#495057">gRPC, TCP, HTTP</text>
-<text x="590" y="822" font-size="15" text-anchor="middle" fill="#495057">Single-node engine on the left, cluster engine on the right. Both store bytes through storage/.</text>
+<text x="590" y="822" font-size="15" text-anchor="middle" fill="#495057">Today: same /s3 URL, two handler sets behind it. RFC 5 merges them into one.</text>
 </svg>
