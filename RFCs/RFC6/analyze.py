@@ -11,9 +11,11 @@ Model: every metric M is predicted as M(base) plus the main effect of each
 factor's chosen value, measured one factor at a time and paired within a VM:
     M(x) = M_base + sum_f sum_v x[f,v] * delta[f,v](M)
 The ILP picks exactly one value per factor (binary x[f,v]) to minimize a
-weighted sum of normalized physical space amplification, write amplification
-and foreground slowdown (rho), subject to bounds on read p99 and foreground
-throughput.
+weighted sum of five terms, each normalized by its baseline value:
+    space:        physical space amplification
+    durability of the device: write amplification
+    performance:  foreground slowdown (rho), write p99, read p99
+A weight sweep shows how the pick moves between space and performance.
 """
 import glob, json, os, statistics, sys
 from collections import defaultdict
@@ -80,12 +82,24 @@ def spread(name, m):
     return (min(v), max(v)) if v else (None, None)
 
 
-def delta(f, v, m):
-    """Median over trials of (metric at f=v) - (metric at base), paired per VM."""
+IGNORED = []  # (factor, value, metric, paired diffs): effects the solver treats as zero
+
+
+def delta(f, v, m, record=False):
+    """Median over trials of (metric at f=v) - (metric at base), paired per VM.
+
+    An effect counts only if every VM agrees on its sign. Otherwise it's noise
+    and the solver gets 0 for it."""
     n = run_name(f, v)
     d = [METRICS[m](n, t) - METRICS[m]("base", t) for t in trials
          if t in by[n] and t in by["base"] and METRICS[m](n, t) is not None and METRICS[m]("base", t) is not None]
-    return statistics.median(d) if d else None
+    if not d:
+        return None
+    if not (all(x > 0 for x in d) or all(x < 0 for x in d)):
+        if record:
+            IGNORED.append((f, v, m, d))
+        return 0.0
+    return statistics.median(d)
 
 
 # ------------------------------------------------------------------ table
@@ -137,42 +151,80 @@ plt.close(fig)
 
 # ------------------------------------------------------------------ ILP
 cand = [(f, v) for f, (_, vals, _) in FACTORS.items() for v in vals]
-D = {m: np.array([(delta(f, v, m) if v != FACTORS[f][2] else 0.0) or 0.0 for f, v in cand]) for m in METRICS}
+D = {m: np.array([(delta(f, v, m, record=True) if v != FACTORS[f][2] else 0.0) or 0.0 for f, v in cand]) for m in METRICS}
 B = {m: med("base", m) for m in METRICS}
 
 
-def solve(w_sa, w_wa, w_rho, max_rp99_x=1.5, min_fg_x=0.8):
-    # Normalize each objective term by its baseline value.
-    c = w_sa * D["phys_sa"] / B["phys_sa"] + w_wa * D["wa"] / B["wa"] + w_rho * D["rho"] / B["rho"]
+OBJ = ["phys_sa", "wa", "rho", "wp99_ms", "rp99_ms"]
+
+
+def solve(w, max_rp99_x=None, min_fg_x=None):
+    """w: weights for OBJ, in order. Each term is normalized by its baseline."""
+    c = sum(wi * D[m] / B[m] for wi, m in zip(w, OBJ))
     A, lb, ub = [], [], []
     for f in FACTORS:  # exactly one value per factor
         A.append([1.0 if cf == f else 0.0 for cf, _ in cand]); lb.append(1); ub.append(1)
-    A.append(list(D["rp99_ms"])); lb.append(-np.inf); ub.append(B["rp99_ms"] * max_rp99_x - B["rp99_ms"])
-    A.append(list(D["fg_mbs"])); lb.append(B["fg_mbs"] * min_fg_x - B["fg_mbs"]); ub.append(np.inf)
+    if max_rp99_x:
+        A.append(list(D["rp99_ms"])); lb.append(-np.inf); ub.append(B["rp99_ms"] * max_rp99_x - B["rp99_ms"])
+    if min_fg_x:
+        A.append(list(D["fg_mbs"])); lb.append(B["fg_mbs"] * min_fg_x - B["fg_mbs"]); ub.append(np.inf)
     res = milp(c, constraints=LinearConstraint(np.array(A), lb, ub), integrality=np.ones(len(cand)), bounds=Bounds(0, 1))
     if not res.success:
         return None
     x = np.round(res.x).astype(int)
     pick = {f: v for (f, v), xi in zip(cand, x) if xi}
-    pred = {m: B[m] + float(D[m] @ x) for m in ("phys_sa", "wa", "rho", "fg_mbs", "rp99_ms")}
+    pred = {m: B[m] + float(D[m] @ x) for m in OBJ + ["fg_mbs"]}
     return pick, pred
 
 
-WEIGHTS = [("space-first", 0.6, 0.2, 0.2), ("balanced", 0.34, 0.33, 0.33), ("write-first", 0.2, 0.4, 0.4)]
+# Weights for (space amp, write amp, rho, write p99, read p99).
+WEIGHTS = [("space-first", (0.5, 0.1, 0.15, 0.1, 0.15)),
+           ("balanced", (0.25, 0.15, 0.2, 0.2, 0.2)),
+           ("performance-first", (0.1, 0.1, 0.3, 0.25, 0.25))]
+
+
+def fmt_pick(p):
+    return (f"{p['segment_mb']} | {p['umax']} | {p['policy']} | {p['layout']} | {p['copy']} | {p['rate_mbps'] or 'unlimited'}")
+
+
 picks = []
 with open(os.path.join(OUT, "ilp.md"), "w") as out:
-    out.write("ILP over measured main effects. Constraints: read p99 at most 1.5x base, foreground MB/s at least 0.8x base.\n\n")
-    out.write("| Weights (SA, WA, rho) | segment MB | umax | policy | layout | copy | rate MB/s | pred. phys SA | pred. WA | pred. rho | pred. fg MB/s | pred. read p99 ms |\n")
-    out.write("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
-    for name, a, b, c in WEIGHTS:
-        r = solve(a, b, c)
+    out.write("ILP over measured main effects. Objective terms are normalized by the baseline. "
+              "Performance = foreground slowdown (rho), write p99, read p99.\n\n")
+    out.write("| Profile | weights (SA, WA, rho, w p99, r p99) | segment MB | umax | policy | layout | copy | rate MB/s | "
+              "pred. phys SA | pred. WA | pred. rho | pred. fg MB/s | pred. w p99 ms | pred. r p99 ms |\n")
+    out.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+    for name, w in WEIGHTS:
+        r = solve(w)
         if not r:
-            out.write(f"| {name} | infeasible |\n"); continue
+            out.write(f"| {name} | {w} | infeasible |\n"); continue
         p, pr = r
         picks.append((name, p, pr))
-        out.write(f"| {name} ({a}, {b}, {c}) | {p['segment_mb']} | {p['umax']} | {p['policy']} | {p['layout']} | {p['copy']} | "
-                  f"{p['rate_mbps'] or 'unlimited'} | {pr['phys_sa']:.2f} | {pr['wa']:.2f} | {pr['rho']:.2f} | {pr['fg_mbs']:.0f} | {pr['rp99_ms']:.1f} |\n")
-json.dump([{"weights": n, "pick": p, "pred": pr} for n, p, pr in picks], open(os.path.join(OUT, "ilp.json"), "w"), indent=1)
+        out.write(f"| {name} | {w} | {fmt_pick(p)} | {pr['phys_sa']:.2f} | {pr['wa']:.2f} | {pr['rho']:.2f} | "
+                  f"{pr['fg_mbs']:.0f} | {pr['wp99_ms']:.0f} | {pr['rp99_ms']:.1f} |\n")
+    # Sweep: performance weight p from 0 to 1, split evenly over rho, w p99, r p99;
+    # the rest split 2:1 between space and write amplification.
+    out.write("\n**Weight sweep** (share of weight on performance; the rest goes 2:1 to space amp and write amp):\n\n")
+    out.write("| performance share | segment MB | umax | policy | layout | copy | rate MB/s | pred. phys SA | pred. rho | pred. r p99 ms |\n")
+    out.write("|---|---|---|---|---|---|---|---|---|---|\n")
+    sweep = []
+    for share in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]:
+        rest = 1 - share
+        w = (rest * 2 / 3, rest / 3, share / 3, share / 3, share / 3)
+        r = solve(w)
+        if r:
+            p, pr = r
+            sweep.append((share, p, pr))
+            out.write(f"| {share:.1f} | {fmt_pick(p)} | {pr['phys_sa']:.2f} | {pr['rho']:.2f} | {pr['rp99_ms']:.1f} |\n")
+with open(os.path.join(OUT, "ilp.md"), "a") as out:
+    out.write("\n**Effects treated as zero** (the VMs disagreed on direction):\n\n")
+    out.write("| factor | value | metric | paired differences per VM |\n|---|---|---|---|\n")
+    for f, v, m, d in IGNORED:
+        if m in OBJ:
+            out.write(f"| {f} | {v} | {m} | {', '.join(f'{x:+.3g}' for x in d)} |\n")
+json.dump({"profiles": [{"weights": n, "pick": p, "pred": pr} for n, p, pr in picks],
+           "sweep": [{"perf_share": sh, "pick": p, "pred": pr} for sh, p, pr in sweep]},
+          open(os.path.join(OUT, "ilp.json"), "w"), indent=1)
 
 # ------------------------------------------------------------------ validation
 if VAL and os.path.exists(VAL):

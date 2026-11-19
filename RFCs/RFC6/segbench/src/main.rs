@@ -115,6 +115,9 @@ struct Shared {
     measuring: AtomicBool,
     wlat: Mutex<Vec<u32>>,
     rlat: Mutex<Vec<u32>>,
+    copy_us: AtomicU64,        // time spent inside copy_range
+    freed_bytes: AtomicU64,    // bytes of segment files removed
+    seg_ms: Mutex<Vec<u32>>,   // wall time per compacted segment
     // group commit
     gc: Mutex<(u64, u64)>, // (next_ticket, synced_through)
     gc_cv: Condvar,
@@ -154,6 +157,7 @@ fn reserve(sh: &Shared, st: &mut Inner, len: u64, survivor_stream: bool) -> (u64
 fn remove_segment(sh: &Shared, st: &mut Inner, id: u64) {
     if let Some(s) = st.segs.remove(&id) {
         st.disk_bytes -= s.len;
+        if sh.measuring.load(Relaxed) { sh.freed_bytes.fetch_add(s.len, Relaxed); }
         let _ = std::fs::remove_file(seg_path(&sh.cfg, id, s.survivor));
     }
 }
@@ -380,7 +384,9 @@ fn compactor(sh: Arc<Shared>) {
                 } else { tokens -= len as f64; }
             }
             let (dseg, doff, dst) = { let mut st = sh.st.lock().unwrap(); reserve(&sh, &mut st, len, true) };
+            let tc = Instant::now();
             copy_range(&src, off, &dst, doff, len, &sh.cfg.copy, &mut buf);
+            if sh.measuring.load(Relaxed) { sh.copy_us.fetch_add(tc.elapsed().as_micros() as u64, Relaxed); }
             sh.comp_bytes.fetch_add(len, Relaxed);
             placed.push((id, off, len, dseg, doff));
         }
@@ -400,6 +406,7 @@ fn compactor(sh: Arc<Shared>) {
             remove_segment(&sh, &mut st, v);
         }
         sh.segs_compacted.fetch_add(1, Relaxed);
+        if sh.measuring.load(Relaxed) { sh.seg_ms.lock().unwrap().push(t_start.elapsed().as_millis() as u32); }
         sh.comp_busy_us.fetch_add(t_start.elapsed().as_micros() as u64, Relaxed);
         sh.compacting.store(false, Relaxed);
     }
@@ -413,6 +420,14 @@ fn fs_used(dir: &std::path::Path) -> u64 {
     let mut v: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut v) } != 0 { return 0; }
     (v.f_blocks as u64 - v.f_bfree as u64) * v.f_frsize as u64
+}
+
+/// User + system CPU seconds used by this process so far.
+fn cpu_secs() -> f64 {
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    t(u.ru_utime) + t(u.ru_stime)
 }
 
 fn pct(v: &mut Vec<u32>, p: f64) -> u32 {
@@ -434,6 +449,7 @@ fn main() {
         rd_ops: AtomicU64::new(0), compacting: AtomicBool::new(false), comp_busy_us: AtomicU64::new(0),
         segs_compacted: AtomicU64::new(0), whole_dead: AtomicU64::new(0), stop: AtomicBool::new(false),
         measuring: AtomicBool::new(false), wlat: Mutex::new(Vec::new()), rlat: Mutex::new(Vec::new()),
+        copy_us: AtomicU64::new(0), freed_bytes: AtomicU64::new(0), seg_ms: Mutex::new(Vec::new()),
         gc: Mutex::new((0, 0)), gc_cv: Condvar::new(), gc_leader: Mutex::new(()),
     });
     let fs_base = fs_used(&cfg.dir);
@@ -461,6 +477,8 @@ fn main() {
     // Per-second samples during the measured window: (fg MB/s, compaction active fraction, SA, w p99, r p99)
     let mut samples: Vec<(f64, bool, f64, u32, u32)> = Vec::new();
     let mut phys: Vec<f64> = Vec::new();
+    let (mut all_w, mut all_r): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut cpu0 = 0.0f64;
     let mut idle_tp = Vec::new(); let mut busy_tp = Vec::new();
     let mut max_files = 0usize;
     let mut busy_prev = 0u64;
@@ -470,6 +488,7 @@ fn main() {
         if m_start.is_none() && clock >= warm_until {
             m_start = Some((Instant::now(), sh.fg_bytes.load(Relaxed), sh.comp_bytes.load(Relaxed)));
             sh.measuring.store(true, Relaxed);
+            cpu0 = cpu_secs();
             sh.wlat.lock().unwrap().clear(); sh.rlat.lock().unwrap().clear();
         }
         let (disk, live, files) = { let st = sh.st.lock().unwrap(); (st.disk_bytes, st.live_bytes, st.segs.len()) };
@@ -484,6 +503,7 @@ fn main() {
             let mut wl = std::mem::take(&mut *sh.wlat.lock().unwrap());
             let mut rl = std::mem::take(&mut *sh.rlat.lock().unwrap());
             let (a, b) = (pct(&mut wl, 0.99), pct(&mut rl, 0.99));
+            all_w.extend_from_slice(&wl); all_r.extend_from_slice(&rl);
             (a, b)
         } else { (0, 0) };
         let sa = if live > 0 { disk as f64 / live as f64 } else { 0.0 };
@@ -506,6 +526,9 @@ fn main() {
     for h in hs { h.join().unwrap(); }
     let (ms, fg0, comp0) = m_start.unwrap();
     let secs = ms.elapsed().as_secs_f64();
+    let cpu_pct = (cpu_secs() - cpu0) / secs * 100.0;
+    let mut segms = std::mem::take(&mut *sh.seg_ms.lock().unwrap());
+    let copy_s = sh.copy_us.load(Relaxed) as f64 / 1e6;
     let fgb = (sh.fg_bytes.load(Relaxed) - fg0) as f64;
     let cb = (sh.comp_bytes.load(Relaxed) - comp0) as f64;
     let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
@@ -519,12 +542,17 @@ fn main() {
         "{{\"segment_mb\":{},\"umax\":{},\"policy\":\"{}\",\"layout\":\"{}\",\"copy\":\"{}\",\"rate_mbps\":{},\"compact\":{},\"live_gb\":{},\
 \"secs\":{:.1},\"fg_mbs\":{:.1},\"wa\":{:.3},\"sa_mean\":{:.3},\"sa_max\":{:.3},\"phys_sa_mean\":{:.3},\"wp99_med_us\":{},\"rp99_med_us\":{},\
 \"wp99_max_us\":{},\"rp99_max_us\":{},\"fg_idle_mbs\":{:.1},\"fg_busy_mbs\":{:.1},\"rho\":{:.3},\"busy_frac\":{:.3},\
-\"segs_compacted\":{},\"whole_dead\":{},\"max_files\":{}}}",
+\"segs_compacted\":{},\"whole_dead\":{},\"max_files\":{},\"w_p50_us\":{},\"w_p99_us\":{},\"w_p999_us\":{},\
+\"r_p50_us\":{},\"r_p99_us\":{},\"r_p999_us\":{},\"copy_mbs\":{:.1},\"freed_mbs\":{:.1},\"seg_ms_p50\":{},\"seg_ms_max\":{},\"cpu_pct\":{:.1}}}",
         cfg.segment_mb, cfg.umax, cfg.policy, cfg.layout, cfg.copy, cfg.rate_mbps, cfg.compact, cfg.live_gb,
         secs, fgb / 1e6 / secs, (fgb + cb) / fgb.max(1.0), sa_mean, sa_max, mean(&phys), pct(&mut wps, 0.5), pct(&mut rps, 0.5),
         wps.iter().max().copied().unwrap_or(0), rps.iter().max().copied().unwrap_or(0), it, bt,
         if bt > 0.0 { it / bt } else { 1.0 }, busy_tp.len() as f64 / samples.len().max(1) as f64,
-        sh.segs_compacted.load(Relaxed), sh.whole_dead.load(Relaxed), max_files
+        sh.segs_compacted.load(Relaxed), sh.whole_dead.load(Relaxed), max_files,
+        pct(&mut all_w, 0.5), pct(&mut all_w, 0.99), pct(&mut all_w, 0.999),
+        pct(&mut all_r, 0.5), pct(&mut all_r, 0.99), pct(&mut all_r, 0.999),
+        if copy_s > 0.0 { cb / 1e6 / copy_s } else { 0.0 }, sh.freed_bytes.load(Relaxed) as f64 / 1e6 / secs,
+        pct(&mut segms, 0.5), segms.iter().max().copied().unwrap_or(0), cpu_pct
     );
     let _ = std::fs::remove_dir_all(&cfg.dir);
 }
