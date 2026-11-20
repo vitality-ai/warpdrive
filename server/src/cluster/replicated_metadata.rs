@@ -789,7 +789,11 @@ impl MetadataStorage for ReplicatedMetadataStore {
     fn set_object_tags(&self, user_id: &str, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<(), Error> {
         self.update_object(user_id, bucket, key, |o| match o.versions.last_mut() {
             Some(v) => {
-                v.tags = tags.to_vec();
+                // Kept sorted by key: GetObjectTagging returns them in key
+                // order whatever order the PUT sent them in.
+                let mut sorted = tags.to_vec();
+                sorted.sort();
+                v.tags = sorted;
                 Ok(())
             }
             None => Err(not_found(bucket, key)),
@@ -808,7 +812,10 @@ impl MetadataStorage for ReplicatedMetadataStore {
         Ok(self.get_object_tags(user_id, bucket, key)?.len() as i64)
     }
     fn set_bucket_tags(&self, bucket: &str, tags: &[(String, String)]) -> Result<(), Error> {
-        self.update_bucket(bucket, |b| b.tags = tags.to_vec())
+        self.update_bucket(bucket, |b| {
+            b.tags = tags.to_vec();
+            b.tags.sort();
+        })
     }
     fn get_bucket_tags(&self, bucket: &str) -> Result<Vec<(String, String)>, Error> {
         Ok(self.bucket(bucket).map(|b| b.tags).unwrap_or_default())
