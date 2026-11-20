@@ -4,35 +4,35 @@ Hash: SHA512
 Origin: Vitality AI
 Label: Warpdrive
 Codename: stable
-Date: Wed, 18 Nov 2026 22:31:45 UTC
+Date: Fri, 20 Nov 2026 20:56:27 UTC
 Architectures: amd64
 Components: main
 Description: Warpdrive S3-compatible object storage
 MD5Sum:
- 74c2f4c61284e6f86358a6aa9aaf21be 666 main/binary-amd64/Packages
- 8b655ac17461270d7b33ee41bcff2a74 464 main/binary-amd64/Packages.gz
+ 09487fcf9d80f149549dede1e722d04d 666 main/binary-amd64/Packages
+ c1679caaa4185b68a5217761f9f0d65a 463 main/binary-amd64/Packages.gz
  8a8edf0111dc1c9cd4fbc68e920b77b5 125 main/binary-amd64/Release
 SHA1:
- 59a41ea635fa60aeb803297a4aa0efb4ca134aa7 666 main/binary-amd64/Packages
- 09c34dc61010aeb0d21224a0079a8d82a942c1ed 464 main/binary-amd64/Packages.gz
+ 7582e1ef324794f095a4e62217da764c1195f489 666 main/binary-amd64/Packages
+ 78aec339652b49ce753d482522d969345aec2603 463 main/binary-amd64/Packages.gz
  9570c7e6ef6f79a794b03a214c42013fe689cf93 125 main/binary-amd64/Release
 SHA256:
- 385169844a9fb858926b1e6d449e4f9508e2c822817e62ecf6e190bcdaf6632d 666 main/binary-amd64/Packages
- a42e7e2a9aa6146777709deba90a8eaa03bada2e95aa2e93133927066fc90d96 464 main/binary-amd64/Packages.gz
+ 9d93985ce31846deb7aa50dfc60c132431b546cb61d04187ec4031aa1e9a2cbf 666 main/binary-amd64/Packages
+ 270eda0ed467a81904680ae0fd2f25598459850fe0a228270ad2eeaad8c2f34b 463 main/binary-amd64/Packages.gz
  909e609b6e4e1c5967de217c6b02b8e3d8b019d42569891d5945992d19600fa3 125 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEElhZS/fgQiDCzK9/jdpdMKgmnN7AFAmr+J1EACgkQdpdMKgmn
-N7Ckcw/7BbmYmxQfvHk7BnSx1fBD75cTO5GAG/yCy6gI5Au5Wj4gcp3ZpAz6XKQT
-Uph5eE4tmEBnXjQecxuaFkeWvTwXnTJ2VdB8C5cBZm6u/t2/cyhvwZRoRFqy0xK8
-6LwBSX6A1asugsCKsVF9gbBRhyZaRHcy1I7WzuMf5Qnka7mzBQ03u4dZWic3b8mt
-E44lMmf4suHG+gjBL+AXCD2efKdXTtM9lhDJQMvJ9ML1H+I6IfkhaP0RK+7L07MN
-i2dQmz1xnc/rCHsOkIx7ox5XxMoiCMdN2E68jieOUPTKtTSMpAn6/eMyQIpIUYWI
-Z7gYDA8NOADHk2kiCle1sQQt1rfEr3adrsg7qV1pdCgFumsISA8cdAmwMNYYov4H
-rWW7kOprtRHo1wPydErPizWXTFdQxz3KDB+kd4MS2w7H+M4waB0s3wMfbenEoXx4
-AbDFMJPyL2O3hYnPU77eOSrpqjKHZyvWoeZRbgFazVeT5FgPiRBbyETeSh1C18Gm
-f/Ce9bZQx4Y7AK+LUdfLrd/7OtZpjEhSaZUPxUnUEiZzJsWe82P9i7QWmjT/g0cP
-9bp5zCB5uhA3Rr9QD1HQll4UOUxq1PncLBHlO/+ZpXVP7pl3m4TnU+hp1TTaYMkJ
-62it5nmzr2eHwnpbcG49290VvMw3QKODjuhUEOYM/sKAWV2mXwI=
-=q+e9
+iQIzBAEBCgAdFiEElhZS/fgQiDCzK9/jdpdMKgmnN7AFAmsAs/sACgkQdpdMKgmn
+N7Cb8w/8CBrG6nvuirrGj4I9ifrLss/hbHImZ8PHCghiZ8RoeWnD+N18KBVDnsHc
+HbbxuiRzz8wK8tsCn+qtliVwJPpLZWXiO2Jr4Be+/8T3pLpjSs+Djsg3HI9ymSRp
+plx5z38cLebsZjIIqWPLc5i2Fk4ntT5ieUWea5VtqDw+CbIlYvqlpJjZKIPetjLw
+G5OKhq6PQ91TCUc9ZfgES4sfJTgdhAw0bnjbcn0NSJQ9yVYAUSWU/tFL3qh2UEUz
+HQISH2virhqnKhclXWv6GXcJStGwjuQdX4L8kQymsj63eXWgY4qvEmS+LpRXnIU0
+EZlnTSdG1vbNHqwDcc09A/kL8+dJkqC8JJ4X8kB+imuUbXSKWhtwNDEdBeYYKQ4k
+d1VSgnlLkH3089xBE0ft3pcjseowqpnfktwZ9bx4ifR3zZvRBjz2k/lCC+UiZlWF
+YwHKXcgf/oO3a+mRfPOXVSEO8Xe/f6hBp0wQ323daAoQ3buHsXpZ2fZCiLBSA2VO
+H9zeSvU+uCNa1OyZTOfoAuz/qOpGctXM/UgTi9ALprW4zcsYFzuUtRDknaNxzf3y
+1S1kcoG92I3LrRqpk41SineHFb5KUY9Nr+QSgMG4opFIzdZZ0LoeWkVUu9c5KzV9
+HbrmY8dXuyN3yOeyp40GSjVafa2GqioJtUp2iN2Qoxn5A+SblJY=
+=DoH5
 -----END PGP SIGNATURE-----
