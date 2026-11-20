@@ -636,12 +636,21 @@ fn parse_presigned_v4(query: &HashMap<String, String>) -> Result<ParsedPresigned
 }
 
 fn check_presigned_expiry(amz_date: &str, expires: u64) -> Result<(), Error> {
-    let dt = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
-        .map_err(|_| ErrorUnauthorized("Invalid X-Amz-Date format"))?;
-    let issued_at = dt.and_utc().timestamp() as u64;
-    let expires_at = issued_at + expires;
-    let now = chrono::Utc::now().timestamp() as u64;
-    if now >= expires_at {
+    check_presigned_time(amz_date, expires, chrono::Utc::now().timestamp())
+}
+
+/// A presigned URL is valid from X-Amz-Date (less the skew allowance) until
+/// X-Amz-Date + X-Amz-Expires. Without the lower bound, a URL dated in the
+/// future stays valid past the 7-day X-Amz-Expires limit.
+fn check_presigned_time(amz_date: &str, expires: u64, now: i64) -> Result<(), Error> {
+    let issued_at = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| ErrorUnauthorized("Invalid X-Amz-Date format"))?
+        .and_utc()
+        .timestamp();
+    if issued_at - now > MAX_REQUEST_SKEW_SECS {
+        return Err(s3_access_denied("Request is not valid yet"));
+    }
+    if now >= issued_at + expires as i64 {
         return Err(s3_access_denied("Request has expired"));
     }
     Ok(())
@@ -1311,7 +1320,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn presigned_v4_rejects_an_expired_url_and_accepts_one_in_time() {
+    async fn presigned_v4_enforces_its_validity_window() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:1");
         std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-service-secret");
@@ -1330,6 +1339,12 @@ mod tests {
             let at = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
             sign_test_get(access_key, secret_key, "/s3/bucket-a/k", "localhost:9710", at, &at.format("%Y%m%d").to_string(), SigLocation::Query { expires_secs: 900 }).0
         };
+
+        let not_yet_valid = sign(-60);
+        assert!(authenticate_presigned_v4(&not_yet_valid, &parse_query_map(&not_yet_valid)).await.is_err(), "a URL dated 1 hour ahead must be rejected");
+        let small_skew = sign(-5);
+        let result = authenticate_presigned_v4(&small_skew, &parse_query_map(&small_skew)).await;
+        assert!(result.is_ok(), "a URL dated 5 min ahead is within the skew allowance: {:?}", result.err());
 
         let expired = sign(20);
         assert!(authenticate_presigned_v4(&expired, &parse_query_map(&expired)).await.is_err(), "a URL signed 20 min ago with a 15 min expiry must be rejected");
