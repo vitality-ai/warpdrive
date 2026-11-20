@@ -1159,69 +1159,96 @@ mod tests {
         assert!(err.is_err());
     }
 
-    /// Builds a presigned-V4 GET request for `canonical_uri`, signed with
-    /// `secret_key`, using the identical canonical-request/signing steps
-    /// `verify_sigv4_presigned` checks against -- so a test can exercise
-    /// `authenticate_presigned_v4` with a signature that actually verifies,
-    /// instead of only ever hitting the signature-mismatch error path.
-    fn build_presigned_get_request(access_key: &str, secret_key: &str, canonical_uri: &str, host: &str) -> HttpRequest {
+    /// Where `sign_test_get` puts the signature.
+    enum SigLocation {
+        /// `Authorization` header, as an SDK sends a normal request.
+        Header,
+        /// `X-Amz-*` query parameters, as in a presigned URL.
+        Query { expires_secs: u64 },
+    }
+
+    /// Builds a GET for `uri`, signed with SigV4 at `signed_at` with credential
+    /// scope day `scope_date`. The signing steps match what `verify_sigv4` and
+    /// `verify_sigv4_presigned` check, so a test can exercise a signature that
+    /// verifies, and choose the signing time to cover clock skew and expiry.
+    /// Returns the parsed `Authorization` header for `SigLocation::Header`.
+    fn sign_test_get(
+        access_key: &str,
+        secret_key: &str,
+        uri: &str,
+        host: &str,
+        signed_at: chrono::DateTime<chrono::Utc>,
+        scope_date: &str,
+        location: SigLocation,
+    ) -> (HttpRequest, Option<ParsedAuthHeader>) {
         use hmac::{Hmac, Mac};
         use sha2::{Digest, Sha256};
         type HmacSha256 = Hmac<Sha256>;
+        let hmac = |key: &[u8], msg: &[u8]| {
+            let mut m = HmacSha256::new_from_slice(key).unwrap();
+            m.update(msg);
+            m.finalize().into_bytes().to_vec()
+        };
 
+        let amz_date = signed_at.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope = format!("{scope_date}/us-east-1/s3/aws4_request");
+
+        // The parts of the canonical request that depend on where the
+        // signature goes: query string, signed headers, payload hash.
+        let (canonical_query, canonical_headers, signed_headers, payload_hash) = match location {
+            SigLocation::Header => (
+                String::new(),
+                format!("host:{host}\nx-amz-content-sha256:{EMPTY_PAYLOAD_HASH}\nx-amz-date:{amz_date}"),
+                "host;x-amz-content-sha256;x-amz-date",
+                EMPTY_PAYLOAD_HASH,
+            ),
+            SigLocation::Query { expires_secs } => {
+                let mut pairs = vec![
+                    ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+                    ("X-Amz-Credential".to_string(), format!("{access_key}/{scope}")),
+                    ("X-Amz-Date".to_string(), amz_date.clone()),
+                    ("X-Amz-Expires".to_string(), expires_secs.to_string()),
+                    ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+                ];
+                pairs.sort_by(|a, b| percent_encode_uri(&a.0).cmp(&percent_encode_uri(&b.0)));
+                let query = pairs.iter().map(|(k, v)| format!("{}={}", percent_encode_uri(k), percent_encode_uri(v))).collect::<Vec<_>>().join("&");
+                (query, format!("host:{host}"), "host", "UNSIGNED-PAYLOAD")
+            }
+        };
+        let canonical_request = format!("GET\n{uri}\n{canonical_query}\n{canonical_headers}\n\n{signed_headers}\n{payload_hash}");
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", hex::encode(Sha256::digest(canonical_request.as_bytes())));
+        let k = hmac(format!("AWS4{secret_key}").as_bytes(), scope_date.as_bytes());
+        let k = hmac(&k, b"us-east-1");
+        let k = hmac(&k, b"s3");
+        let k = hmac(&k, b"aws4_request");
+        let signature = hex::encode(hmac(&k, string_to_sign.as_bytes()));
+
+        match location {
+            SigLocation::Header => {
+                let auth = format!("AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}");
+                let req = test::TestRequest::get()
+                    .uri(uri)
+                    .insert_header(("host", host))
+                    .insert_header(("x-amz-content-sha256", EMPTY_PAYLOAD_HASH))
+                    .insert_header(("x-amz-date", amz_date))
+                    .insert_header(("Authorization", auth.clone()))
+                    .to_http_request();
+                (req, Some(parse_authorization_header_full(&auth).unwrap()))
+            }
+            SigLocation::Query { .. } => {
+                let req = test::TestRequest::get()
+                    .uri(&format!("{uri}?{canonical_query}&X-Amz-Signature={signature}"))
+                    .insert_header(("host", host))
+                    .to_http_request();
+                (req, None)
+            }
+        }
+    }
+
+    /// A presigned GET signed now, valid for 15 minutes.
+    fn presigned_get_now(access_key: &str, secret_key: &str, uri: &str) -> HttpRequest {
         let now = chrono::Utc::now();
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
-        let region = "us-east-1";
-        let service = "s3";
-        let credential = format!("{access_key}/{date}/{region}/{service}/aws4_request");
-        let signed_headers = "host";
-
-        let mut pairs = vec![
-            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
-            ("X-Amz-Credential".to_string(), credential),
-            ("X-Amz-Date".to_string(), amz_date.clone()),
-            ("X-Amz-Expires".to_string(), "900".to_string()),
-            ("X-Amz-SignedHeaders".to_string(), signed_headers.to_string()),
-        ];
-        pairs.sort_by(|a, b| percent_encode_uri(&a.0).cmp(&percent_encode_uri(&b.0)));
-        let canonical_query_string = pairs.iter()
-            .map(|(k, v)| format!("{}={}", percent_encode_uri(k), percent_encode_uri(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        let canonical_headers = format!("host:{host}");
-        let canonical_request =
-            format!("GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers}\nUNSIGNED-PAYLOAD");
-
-        let mut hasher = Sha256::new();
-        hasher.update(canonical_request.as_bytes());
-        let canonical_request_hash = hex::encode(hasher.finalize());
-        let credential_scope = format!("{date}/{region}/{service}/aws4_request");
-        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
-
-        let k_secret = format!("AWS4{secret_key}");
-        let mut mac = HmacSha256::new_from_slice(k_secret.as_bytes()).unwrap();
-        mac.update(date.as_bytes());
-        let k_date = mac.finalize().into_bytes();
-        let mut mac = HmacSha256::new_from_slice(&k_date).unwrap();
-        mac.update(region.as_bytes());
-        let k_region = mac.finalize().into_bytes();
-        let mut mac = HmacSha256::new_from_slice(&k_region).unwrap();
-        mac.update(service.as_bytes());
-        let k_service = mac.finalize().into_bytes();
-        let mut mac = HmacSha256::new_from_slice(&k_service).unwrap();
-        mac.update(b"aws4_request");
-        let k_signing = mac.finalize().into_bytes();
-        let mut mac = HmacSha256::new_from_slice(&k_signing).unwrap();
-        mac.update(string_to_sign.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
-
-        let full_query = format!("{canonical_query_string}&X-Amz-Signature={signature}");
-        test::TestRequest::get()
-            .uri(&format!("{canonical_uri}?{full_query}"))
-            .insert_header(("host", host))
-            .to_http_request()
+        sign_test_get(access_key, secret_key, uri, "localhost:9710", now, &now.format("%Y%m%d").to_string(), SigLocation::Query { expires_secs: 900 }).0
     }
 
     #[actix_web::test]
@@ -1245,7 +1272,7 @@ mod tests {
         // allowed_buckets -- this is the cross-tenant-bucket bypass the fix
         // closes. Before the fix, this request was accepted because the
         // presigned path never checked allowed_buckets at all.
-        let req = build_presigned_get_request(access_key, secret_key, "/s3/bucket-b/some-key", "localhost:9710");
+        let req = presigned_get_now(access_key, secret_key, "/s3/bucket-b/some-key");
         let query_map = parse_query_map(&req);
         let result = authenticate_presigned_v4(&req, &query_map).await;
         assert!(result.is_err(), "presigned URL for a bucket outside the access key's allowed set must be rejected");
@@ -1272,7 +1299,7 @@ mod tests {
             });
         }
 
-        let req = build_presigned_get_request(access_key, secret_key, "/s3/bucket-a/some-key", "localhost:9710");
+        let req = presigned_get_now(access_key, secret_key, "/s3/bucket-a/some-key");
         let query_map = parse_query_map(&req);
         let result = authenticate_presigned_v4(&req, &query_map).await;
         assert!(result.is_ok(), "presigned URL for a bucket the access key IS registered for must still succeed: {:?}", result.err());
@@ -1283,42 +1310,42 @@ mod tests {
         std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
     }
 
-    /// Header-signed GET for `/s3/b/k`, signed at `signed_at` with scope day `scope_date`.
-    fn build_header_signed_get(secret_key: &str, signed_at: chrono::DateTime<chrono::Utc>, scope_date: &str) -> (HttpRequest, ParsedAuthHeader) {
-        use hmac::{Hmac, Mac};
-        use sha2::{Digest, Sha256};
-        type HmacSha256 = Hmac<Sha256>;
-        let hmac = |key: &[u8], msg: &[u8]| {
-            let mut m = HmacSha256::new_from_slice(key).unwrap();
-            m.update(msg);
-            m.finalize().into_bytes().to_vec()
+    #[actix_web::test]
+    async fn presigned_v4_rejects_an_expired_url_and_accepts_one_in_time() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::set_var("VITALITY_CONSOLE_URL", "http://127.0.0.1:1");
+        std::env::set_var("WARPDRIVE_SERVICE_SECRET", "test-service-secret");
+        let access_key = "AKIAPRESIGNEXPIRY";
+        let secret_key = "presign-expiry-secret";
+        {
+            let mut cache = CREDENTIAL_CACHE.write();
+            cache.insert(access_key.to_string(), CachedCredential {
+                secret_key: secret_key.to_string(),
+                owner_id: "owner-presign-expiry".to_string(),
+                allowed_buckets: ["bucket-a".to_string()].into_iter().collect(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(300),
+            });
+        }
+        let sign = |minutes_ago: i64| {
+            let at = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+            sign_test_get(access_key, secret_key, "/s3/bucket-a/k", "localhost:9710", at, &at.format("%Y%m%d").to_string(), SigLocation::Query { expires_secs: 900 }).0
         };
 
-        let amz_date = signed_at.format("%Y%m%dT%H%M%SZ").to_string();
-        let canonical_request = format!(
-            "GET\n/s3/b/k\n\nhost:localhost\nx-amz-content-sha256:{EMPTY_PAYLOAD_HASH}\nx-amz-date:{amz_date}\n\nhost;x-amz-content-sha256;x-amz-date\n{EMPTY_PAYLOAD_HASH}"
-        );
-        let scope = format!("{scope_date}/us-east-1/s3/aws4_request");
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            hex::encode(Sha256::digest(canonical_request.as_bytes()))
-        );
-        let k = hmac(format!("AWS4{secret_key}").as_bytes(), scope_date.as_bytes());
-        let k = hmac(&k, b"us-east-1");
-        let k = hmac(&k, b"s3");
-        let k = hmac(&k, b"aws4_request");
-        let signature = hex::encode(hmac(&k, string_to_sign.as_bytes()));
+        let expired = sign(20);
+        assert!(authenticate_presigned_v4(&expired, &parse_query_map(&expired)).await.is_err(), "a URL signed 20 min ago with a 15 min expiry must be rejected");
+        let in_time = sign(10);
+        let result = authenticate_presigned_v4(&in_time, &parse_query_map(&in_time)).await;
+        assert!(result.is_ok(), "a URL signed 10 min ago with a 15 min expiry must still verify: {:?}", result.err());
 
-        let auth = format!("AWS4-HMAC-SHA256 Credential=AKIA/{scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}");
-        let req = test::TestRequest::default()
-            .method(actix_web::http::Method::GET)
-            .uri("/s3/b/k")
-            .insert_header(("host", "localhost"))
-            .insert_header(("x-amz-content-sha256", EMPTY_PAYLOAD_HASH))
-            .insert_header(("x-amz-date", amz_date))
-            .insert_header(("Authorization", auth.clone()))
-            .to_http_request();
-        (req, parse_authorization_header_full(&auth).unwrap())
+        invalidate_s3_credential_cache(access_key);
+        std::env::remove_var("VITALITY_CONSOLE_URL");
+        std::env::remove_var("WARPDRIVE_SERVICE_SECRET");
+    }
+
+    /// Header-signed GET for `/s3/b/k`, signed at `signed_at` with scope day `scope_date`.
+    fn header_signed_get(secret_key: &str, signed_at: chrono::DateTime<chrono::Utc>, scope_date: &str) -> (HttpRequest, ParsedAuthHeader) {
+        let (req, parsed) = sign_test_get("AKIA", secret_key, "/s3/b/k", "localhost", signed_at, scope_date, SigLocation::Header);
+        (req, parsed.unwrap())
     }
 
     fn error_code(e: Error) -> (u16, String) {
@@ -1332,7 +1359,7 @@ mod tests {
     #[actix_web::test]
     async fn header_signed_request_within_window_verifies() {
         let now = chrono::Utc::now();
-        let (req, parsed) = build_header_signed_get("s3cret", now, &now.format("%Y%m%d").to_string());
+        let (req, parsed) = header_signed_get("s3cret", now, &now.format("%Y%m%d").to_string());
         assert!(verify_sigv4(&req, "s3cret", &parsed).is_ok());
     }
 
@@ -1340,7 +1367,7 @@ mod tests {
     async fn header_signed_request_outside_window_is_too_skewed() {
         for offset_min in [-16i64, 16, -60 * 24 * 365 * 6] {
             let at = chrono::Utc::now() + chrono::Duration::minutes(offset_min);
-            let (req, parsed) = build_header_signed_get("s3cret", at, &at.format("%Y%m%d").to_string());
+            let (req, parsed) = header_signed_get("s3cret", at, &at.format("%Y%m%d").to_string());
             let (status, body) = error_code(verify_sigv4(&req, "s3cret", &parsed).unwrap_err());
             assert_eq!(status, 403, "offset {offset_min} min");
             assert!(body.contains("RequestTimeTooSkewed"), "offset {offset_min} min: {body}");
@@ -1351,7 +1378,7 @@ mod tests {
     async fn header_signed_request_with_mismatched_scope_date_is_rejected() {
         let now = chrono::Utc::now();
         let other_day = (now - chrono::Duration::days(2)).format("%Y%m%d").to_string();
-        let (req, parsed) = build_header_signed_get("s3cret", now, &other_day);
+        let (req, parsed) = header_signed_get("s3cret", now, &other_day);
         let (status, body) = error_code(verify_sigv4(&req, "s3cret", &parsed).unwrap_err());
         assert_eq!(status, 403);
         assert!(body.contains("AccessDenied"), "{body}");
