@@ -29,7 +29,7 @@
 use actix_web::error::ErrorInternalServerError;
 use actix_web::Error;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -160,32 +160,47 @@ impl Allocator {
 }
 
 /// Recently read blobs, so a GET streaming one object in slices fetches the
-/// blob once, not once per slice.
+/// blob once, not once per slice. A hash map for lookup plus an LRU order
+/// for eviction, both O(1) per access: a linear scan over a full cache of
+/// 4 KB blobs (~65,000 entries) took over half of a node's CPU on GCP.
 struct BlobCache {
     budget: usize,
     used: usize,
-    entries: VecDeque<((String, String, String), Arc<Vec<u8>>)>,
+    tick: u64,
+    entries: HashMap<(String, String, String), (Arc<Vec<u8>>, u64)>,
+    /// Last-use tick -> key, oldest first.
+    order: std::collections::BTreeMap<u64, (String, String, String)>,
 }
 
 impl BlobCache {
+    fn new(budget: usize) -> Self {
+        Self { budget, used: 0, tick: 0, entries: HashMap::new(), order: std::collections::BTreeMap::new() }
+    }
+
     fn get(&mut self, k: &(String, String, String)) -> Option<Arc<Vec<u8>>> {
-        let pos = self.entries.iter().position(|(key, _)| key == k)?;
-        let entry = self.entries.remove(pos)?;
-        let bytes = Arc::clone(&entry.1);
-        self.entries.push_back(entry);
+        self.tick += 1;
+        let tick = self.tick;
+        let (bytes, last) = self.entries.get_mut(k)?;
+        let old = std::mem::replace(last, tick);
+        let bytes = Arc::clone(bytes);
+        if let Some(key) = self.order.remove(&old) {
+            self.order.insert(tick, key);
+        }
         Some(bytes)
     }
 
     fn insert(&mut self, k: (String, String, String), v: Arc<Vec<u8>>) {
-        if v.len() > self.budget {
+        if v.len() > self.budget || self.entries.contains_key(&k) {
             return;
         }
+        self.tick += 1;
         self.used += v.len();
-        self.entries.push_back((k, v));
+        self.order.insert(self.tick, k.clone());
+        self.entries.insert(k, (v, self.tick));
         while self.used > self.budget {
-            match self.entries.pop_front() {
-                Some((_, old)) => self.used -= old.len(),
-                None => break,
+            let Some((_, oldest)) = self.order.pop_first() else { break };
+            if let Some((bytes, _)) = self.entries.remove(&oldest) {
+                self.used -= bytes.len();
             }
         }
     }
@@ -204,7 +219,7 @@ impl ClusterBlobStore {
         log::info!("cluster blob store: node slot {slot}");
         // Recently read blobs, `WARPDRIVE_BLOB_CACHE_MB` (default 256, 0 disables).
         let budget_mb: usize = std::env::var("WARPDRIVE_BLOB_CACHE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256);
-        Ok(Self { alloc, cache: Mutex::new(BlobCache { budget: budget_mb << 20, used: 0, entries: VecDeque::new() }) })
+        Ok(Self { alloc, cache: Mutex::new(BlobCache::new(budget_mb << 20)) })
     }
 
     /// The bytes of the blob holding `offset`, with its start address.
@@ -311,6 +326,22 @@ mod tests {
         let local = ["http://127.0.0.1:9710", "http://127.0.0.1:9711", "http://127.0.0.1:9712"];
         assert_eq!(slot_in(&local, None, Some("9712")), Ok(2));
         assert!(slot_in(&local, Some("http://127.0.0.1:9999"), None).is_err());
+    }
+
+    #[test]
+    fn the_cache_evicts_least_recently_used_first_and_stays_within_budget() {
+        let k = |n: &str| ("u".to_string(), "b".to_string(), n.to_string());
+        let mut c = BlobCache::new(30);
+        c.insert(k("a"), Arc::new(vec![0; 10]));
+        c.insert(k("b"), Arc::new(vec![0; 10]));
+        c.insert(k("c"), Arc::new(vec![0; 10]));
+        assert!(c.get(&k("a")).is_some(), "touching a makes b the oldest");
+        c.insert(k("d"), Arc::new(vec![0; 10]));
+        assert!(c.get(&k("b")).is_none(), "b was evicted");
+        assert!(c.get(&k("a")).is_some() && c.get(&k("c")).is_some() && c.get(&k("d")).is_some());
+        assert_eq!(c.used, 30);
+        c.insert(k("huge"), Arc::new(vec![0; 31]));
+        assert!(c.get(&k("huge")).is_none(), "a blob over the budget isn't cached");
     }
 
     #[test]
