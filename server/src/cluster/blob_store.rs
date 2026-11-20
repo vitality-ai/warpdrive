@@ -55,22 +55,40 @@ pub fn blob_key(base: u64) -> String {
 }
 
 /// This node's slot: `WARPDRIVE_NODE_SLOT`, else its position in
-/// `WARPDRIVE_PEERS` (matched against `WARPDRIVE_SELF_ADDR`).
+/// `WARPDRIVE_PEERS`, found by `WARPDRIVE_SELF_ADDR` or, when that isn't
+/// set, by the one peer whose port is this node's `WARPDRIVE_PORT` (every
+/// node of a single-host cluster has its own port).
 pub fn node_slot() -> Result<u64, String> {
     if let Ok(v) = std::env::var("WARPDRIVE_NODE_SLOT") {
         return v.trim().parse::<u64>().ok().filter(|s| *s < 256).ok_or_else(|| format!("WARPDRIVE_NODE_SLOT must be 0-255, got {v:?}"));
     }
-    let me = std::env::var("WARPDRIVE_SELF_ADDR").map_err(|_| "WARPDRIVE_SELF_ADDR is required to pick this node's slot".to_string())?;
-    let me = me.trim().trim_end_matches('/');
     let peers = std::env::var("WARPDRIVE_PEERS").unwrap_or_default();
-    peers
-        .split(',')
-        .map(|p| p.trim().trim_end_matches('/'))
-        .filter(|p| !p.is_empty())
-        .position(|p| p == me)
-        .map(|i| i as u64)
-        .filter(|i| *i < 256)
-        .ok_or_else(|| format!("{me} is not in WARPDRIVE_PEERS, so it has no slot (set WARPDRIVE_NODE_SLOT)"))
+    let peers: Vec<&str> = peers.split(',').map(|p| p.trim().trim_end_matches('/')).filter(|p| !p.is_empty()).collect();
+    slot_in(&peers, std::env::var("WARPDRIVE_SELF_ADDR").ok().as_deref(), std::env::var("WARPDRIVE_PORT").ok().as_deref())
+}
+
+fn slot_in(peers: &[&str], self_addr: Option<&str>, port: Option<&str>) -> Result<u64, String> {
+    let found = match self_addr.map(|a| a.trim().trim_end_matches('/')) {
+        Some(me) => peers.iter().position(|p| *p == me).ok_or_else(|| format!("{me} is not in WARPDRIVE_PEERS, so it has no slot (set WARPDRIVE_NODE_SLOT)"))?,
+        None => {
+            let port = port.unwrap_or("9710").trim();
+            let suffix = format!(":{port}");
+            let matches: Vec<usize> = peers.iter().enumerate().filter(|(_, p)| p.ends_with(&suffix)).map(|(i, _)| i).collect();
+            match matches.as_slice() {
+                [i] => *i,
+                _ => {
+                    return Err(format!(
+                        "can't tell which of WARPDRIVE_PEERS is this node ({} peers use port {port}): set WARPDRIVE_SELF_ADDR or WARPDRIVE_NODE_SLOT",
+                        matches.len()
+                    ))
+                }
+            }
+        }
+    };
+    if found >= 256 {
+        return Err(format!("this node is peer #{found}, above the 256 slots: set WARPDRIVE_NODE_SLOT"));
+    }
+    Ok(found as u64)
 }
 
 /// A blob as an object's metadata row carries it.
@@ -283,6 +301,16 @@ mod tests {
         assert_eq!(a.allocate("u", "b1", 10).unwrap(), 0);
         assert_eq!(a.allocate("u", "b2", 10).unwrap(), 0, "each bucket has its own address space");
         assert_eq!(b.allocate("u", "b1", 10).unwrap(), 1 << SLOT_SHIFT, "another node's slot never collides");
+    }
+
+    #[test]
+    fn the_slot_comes_from_the_self_address_or_a_unique_port() {
+        let peers = ["http://10.0.0.1:9710", "http://10.0.0.2:9710", "http://10.0.0.3:9710"];
+        assert_eq!(slot_in(&peers, Some("http://10.0.0.2:9710/"), None), Ok(1));
+        assert!(slot_in(&peers, None, Some("9710")).is_err(), "three peers share the port, so it's ambiguous");
+        let local = ["http://127.0.0.1:9710", "http://127.0.0.1:9711", "http://127.0.0.1:9712"];
+        assert_eq!(slot_in(&local, None, Some("9712")), Ok(2));
+        assert!(slot_in(&local, Some("http://127.0.0.1:9999"), None).is_err());
     }
 
     #[test]
