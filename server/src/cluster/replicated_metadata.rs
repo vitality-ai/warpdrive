@@ -516,12 +516,33 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
 
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error> {
-        Ok(self
-            .objects_in(user_id, bucket)
-            .into_iter()
-            .filter(|(_, o)| o.latest().is_some_and(|v| !v.is_delete_marker))
-            .map(|(k, _)| k)
-            .collect())
+        self.list_objects_with_prefix(user_id, bucket, "")
+    }
+
+    /// A range scan over the prefix's version rows that carries only each
+    /// key and whether its latest version is a delete marker.
+    fn list_objects_with_prefix(&self, user_id: &str, bucket: &str, prefix: &str) -> Result<Vec<ObjectId>, Error> {
+        let base = bucket_versions_prefix(user_id, bucket);
+        let rows = self.rows.list_live(&format!("{base}{prefix}"), |k, r| match &r.value {
+            MetaValue::Version(v) => k[base.len()..].rsplit_once('\0').map(|(key, _)| (key.to_string(), v.is_delete_marker)),
+            _ => None,
+        });
+        // Rows come in key order, oldest version first: a key's last row is
+        // its latest version.
+        let mut out: Vec<ObjectId> = Vec::new();
+        let mut current: Option<(String, bool)> = None;
+        for (key, marker) in rows.into_iter().flatten() {
+            if let Some((k, m)) = current.take() {
+                if k != key && !m {
+                    out.push(k);
+                }
+            }
+            current = Some((key, marker));
+        }
+        if let Some((k, false)) = current {
+            out.push(k);
+        }
+        Ok(out)
     }
 
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error> {
@@ -1170,6 +1191,20 @@ mod tests {
         let (page2, truncated, ..) = s.list_object_versions_full("u", "b", "", &nk, &nv, 2).unwrap();
         assert!(!truncated);
         assert_eq!(page2.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn prefix_listing_shows_each_live_key_once_and_hides_deleted_ones() {
+        let (_d, s) = store();
+        s.create_bucket("u", "b").unwrap();
+        s.set_versioning_state("u", "b", "enabled").unwrap();
+        for k in ["a", "ab", "ab", "ab/c", "b"] {
+            s.put_object_v2("u", "b", k, &meta(1, k)).unwrap();
+        }
+        s.delete_object_v2("u", "b", "ab/c").unwrap();
+        assert_eq!(s.list_objects_with_prefix("u", "b", "a").unwrap(), vec!["a".to_string(), "ab".to_string()]);
+        assert_eq!(s.list_objects_with_prefix("u", "b", "ab").unwrap(), vec!["ab".to_string()], "ab/c's latest is a delete marker");
+        assert_eq!(s.list_objects("u", "b").unwrap(), vec!["a".to_string(), "ab".to_string(), "b".to_string()]);
     }
 
     #[test]

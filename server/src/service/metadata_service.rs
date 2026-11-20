@@ -114,6 +114,10 @@ impl MetadataService {
         self.store.list_objects(&self.user, bucket)
     }
 
+    pub fn list_objects_with_prefix(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, Error> {
+        self.store.list_objects_with_prefix(&self.user, bucket, prefix)
+    }
+
     // --- Bucket management ---
 
     pub fn create_bucket(&self, bucket: &str) -> Result<(), Error> {
