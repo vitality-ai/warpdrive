@@ -1,0 +1,8 @@
+# Validation of the solver's pick at the fixed 225 MB/s load. name|fs|args
+v-pick|xfs|--segment-mb 32 --umax 0.4 --policy greedy --layout C --copy cfr --rate-mbps 0
+v-rate0-only|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 0
+v-pick-costbenefit|xfs|--segment-mb 32 --umax 0.4 --policy costbenefit --layout C --copy cfr --rate-mbps 0
+v-pick-64mb|xfs|--segment-mb 64 --umax 0.4 --policy greedy --layout C --copy cfr --rate-mbps 0
+v-base-1|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+v-base-2|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+v-nocompact|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50 --compact 0
