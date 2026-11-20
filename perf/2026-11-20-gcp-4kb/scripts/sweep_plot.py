@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 D, OUT = sys.argv[1], sys.argv[2]
-LABEL = {"217": "#217", "par": "this PR (32 HTTP workers)", "par_w256": "this PR, 256 HTTP workers"}
+LABEL = {"217": "#217", "par": "#226 (32 HTTP workers)", "par_w256": "#226, 256 HTTP workers"}
 COLOR = {"217": "#8a8f98", "par": "#2a78d6", "par_w256": "#eb6834"}
 INK, MUTED, GRID = "#1f2328", "#5b636e", "#e3e6ea"
 plt.rcParams.update({"font.size": 9, "axes.edgecolor": GRID, "axes.labelcolor": MUTED, "xtick.color": MUTED, "ytick.color": MUTED,
