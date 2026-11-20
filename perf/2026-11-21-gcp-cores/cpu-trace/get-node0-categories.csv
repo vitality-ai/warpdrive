@@ -1,0 +1,17 @@
+category,share_pct
+"malloc, free, copies",18.0
+"gRPC to peers (tonic, h2, hyper, prost)",15.4
+"kernel: network (TCP, virtio)",15.3
+"kernel: scheduler, futex, wakeups",13.0
+"HTTP routing (actix router, regex)",9.4
+"async runtime and locks (tokio, parking_lot)",7.6
+HTTP/1 parsing and responses (actix-http),6.2
+other user space,3.8
+WarpDrive code,3.8
+kernel: other,2.6
+"hashing: SHA-256, MD5, checksums",2.1
+tracing spans (no output at WARN),1.0
+"kernel: storage (ext4, NVMe, sync)",0.9
+clock reads,0.5
+erasure coding,0.3
+"kernel: memory (page faults, mmap)",0.2

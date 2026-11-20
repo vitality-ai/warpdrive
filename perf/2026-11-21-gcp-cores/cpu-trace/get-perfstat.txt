@@ -1,0 +1,10 @@
+
+ Performance counter stats for process id '15478':
+
+          19354.03 msec task-clock                       #    1.934 CPUs utilized             
+            449762      context-switches                 #   23.239 K/sec                     
+             31958      cpu-migrations                   #    1.651 K/sec                     
+               353      page-faults                      #   18.239 /sec                      
+
+      10.007684921 seconds time elapsed
+

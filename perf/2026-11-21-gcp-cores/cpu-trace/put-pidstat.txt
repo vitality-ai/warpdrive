@@ -1,0 +1,4 @@
+Linux 6.8.0-1073-gcp (wln-0) 	11/20/26 	_x86_64_	(4 CPU)
+
+# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU   cswch/s nvcswch/s  Command
+22:31:28     1001     15478  121.10   73.60    0.00   72.90  194.70     1    352.30    985.30  wd-par

@@ -1,0 +1,17 @@
+phase,theme,share_pct,us_per_request
+put,Talking to other nodes (gRPC + kernel TCP),26.2,253
+put,"Thread hand-offs (scheduler, futex, runtime, locks)",24.9,241
+put,"malloc, free, copies",13.7,132
+put,S3 front end (HTTP parsing + routing),9.9,96
+put,"Hashing (SigV4, SHA-256, MD5, checksum)",4.0,39
+put,"Disk (ext4, NVMe, fdatasync)",5.5,53
+put,"WarpDrive logic, JSON, erasure coding",5.9,57
+put,"Other (tracing, clock, page faults, misc)",9.9,96
+get,Talking to other nodes (gRPC + kernel TCP),30.7,190
+get,"Thread hand-offs (scheduler, futex, runtime, locks)",20.6,127
+get,"malloc, free, copies",18.0,111
+get,S3 front end (HTTP parsing + routing),15.6,97
+get,"Hashing (SigV4, SHA-256, MD5, checksum)",2.1,13
+get,"Disk (ext4, NVMe, fdatasync)",0.9,6
+get,"WarpDrive logic, JSON, erasure coding",4.1,25
+get,"Other (tracing, clock, page faults, misc)",8.1,50

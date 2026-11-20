@@ -1,0 +1,16 @@
+category,share_pct
+"kernel: scheduler, futex, wakeups",18.3
+"kernel: storage (ext4, NVMe, sync)",13.3
+"malloc, free, copies",12.0
+other user space,9.5
+"gRPC to peers (tonic, h2, hyper, prost)",9.5
+"kernel: network (TCP, virtio)",9.2
+HTTP/1 parsing and responses (actix-http),7.1
+"async runtime and locks (tokio, parking_lot)",5.1
+JSON (serde_json),5.1
+kernel: other,4.6
+WarpDrive code,3.1
+"kernel: memory (page faults, mmap)",1.8
+"HTTP routing (actix router, regex)",0.6
+tracing spans (no output at WARN),0.6
+clock reads,0.3

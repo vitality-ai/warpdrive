@@ -1,0 +1,13 @@
+category,share_pct
+"gRPC to peers (tonic, h2, hyper, prost)",25.7
+"kernel: network (TCP, virtio)",16.2
+"malloc, free, copies",14.0
+"kernel: scheduler, futex, wakeups",10.5
+other user space,9.0
+"kernel: storage (ext4, NVMe, sync)",6.2
+"async runtime and locks (tokio, parking_lot)",5.7
+kernel: other,5.0
+HTTP/1 parsing and responses (actix-http),4.4
+tracing spans (no output at WARN),1.3
+clock reads,1.1
+WarpDrive code,0.9
