@@ -44,6 +44,7 @@ start_node() {
   # inherited from the environment, so per-run failpoint config reaches nodes.
   ( cd "$d" && exec env \
     WARPDRIVE_PORT="$((BASE_PORT+i))" \
+    WARPDRIVE_SELF_ADDR="http://127.0.0.1:$((BASE_PORT+i))" \
     WARPDRIVE_PEERS="$(peers)" \
     WARPDRIVE_RS_K=3 WARPDRIVE_RS_M=2 \
     WARPDRIVE_LOCATION_LOG="$d/location.log" \

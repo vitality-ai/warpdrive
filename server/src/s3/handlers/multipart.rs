@@ -13,7 +13,6 @@ use crate::s3::auth::authenticate_s3_request;
 use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::{StorageService, StorageMode};
 use crate::service::user_context::UserContext;
-use crate::storage::config::StorageConfig;
 use crate::util::serializer::deserialize_offset_size;
 use crate::metadata::Metadata;
 
@@ -954,7 +953,7 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
             let part_size = part.sz;
 
             let slices = Arc::new(stream_slices(&extents));
-            let store = StorageConfig::from_env().create_store();
+            let store = crate::storage::object_store();
             let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
             let byte_stream = stream::try_unfold(0usize, move |idx| {
                 let slices = Arc::clone(&slices);
@@ -1002,7 +1001,7 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
     let total_size = meta.size;
     let extents = meta.to_offset_size_list();
     let slices = Arc::new(stream_slices(&extents));
-    let store = StorageConfig::from_env().create_store();
+    let store = crate::storage::object_store();
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let byte_stream = stream::try_unfold(0usize, move |idx| {
         let slices = Arc::clone(&slices);

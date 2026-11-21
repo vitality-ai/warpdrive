@@ -145,8 +145,7 @@ pub async fn s3_cors_not_configured_handler(req: HttpRequest) -> Result<HttpResp
         .unwrap_or_default();
     let req_header_refs: Vec<&str> = request_headers.iter().map(|s| s.as_str()).collect();
 
-    use crate::metadata::sqlite_store::SQLiteMetadataStore;
-    let cors_xml = SQLiteMetadataStore::new().get_bucket_cors(bucket)?;
+    let cors_xml = crate::service::metadata_service::metadata_store().get_bucket_cors(bucket)?;
 
     let cors_xml = match cors_xml {
         None => return Ok(s3_error(StatusCode::BAD_REQUEST, "CORSNotEnabled",

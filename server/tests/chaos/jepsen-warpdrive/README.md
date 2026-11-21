@@ -25,6 +25,15 @@ without iproute2), so they are per-node isolation, not a clean two-sided
 split-brain. That is still strictly more than a process kill. Documented, not
 hidden.
 
+## Ordering
+
+`lein run ordering` races several clients on a few keys through node0 with no
+faults, then reads every key from every node. All nodes must return the same
+value. The main `test` run can't catch this: Elle sees only node0's answers,
+so a disagreement on the other nodes never enters its history. It runs
+without faults because a node that missed a write is allowed to lag until
+repair exists.
+
 ## Why the results are trustworthy
 
 `lein run selftest` is a **negative control**: it feeds Elle a history with a
@@ -42,6 +51,7 @@ cd server/tests/chaos/jepsen-warpdrive
 
 lein run selftest                 # negative control: Elle must catch a planted G1a
 lein run validate                 # SigV4 S3 client smoke test against a running node:9710
+lein run ordering --duration-sec 20 --concurrency 8   # concurrent writes: every node must agree
 lein run durability --m 200       # power-loss: write 200 acked keys, SIGKILL all, recover, assert survival
 lein run test --seed 42 --duration-sec 60 --concurrency 8   # seeded Jepsen+Elle consistency run
 ```

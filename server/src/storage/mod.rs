@@ -6,9 +6,11 @@ pub mod local_store;
 pub mod mock_store;
 pub mod config;
 pub mod group_commit;
+pub mod kv_engine;
 pub mod durable_log;
 
 use actix_web::Error;
+use std::sync::{Arc, OnceLock};
 
 /// Trait defining the minimal binary storage interface
 pub trait Storage: Send + Sync {
@@ -23,4 +25,20 @@ pub trait Storage: Send + Sync {
 
     /// Verify data integrity for the specified range
     fn verify(&self, user_id: &str, bucket: &str, offset: u64, size: u64, checksum: &[u8]) -> Result<bool, Error>;
+}
+static OBJECT_STORE: OnceLock<Arc<dyn Storage>> = OnceLock::new();
+
+/// Sets the store the S3 handlers keep object bytes in. Called once at
+/// startup: a cluster node sets the cluster store here, so the same
+/// handlers serve both deployments. Returns false if already set.
+pub fn set_object_store(store: Arc<dyn Storage>) -> bool {
+    OBJECT_STORE.set(store).is_ok()
+}
+
+/// The store the S3 handlers keep object bytes in. Without
+/// `set_object_store`, the one `STORAGE_BACKEND` names (local disk by
+/// default). The cluster's own shard bytes don't go through this: each node
+/// stores its shards on its local disk (`cluster::shard_storage`).
+pub fn object_store() -> Arc<dyn Storage> {
+    Arc::clone(OBJECT_STORE.get_or_init(|| config::StorageConfig::from_env().create_store()))
 }

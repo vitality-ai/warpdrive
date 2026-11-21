@@ -3,7 +3,6 @@
 use actix_web::Error;
 use actix_web::error::ErrorBadRequest;
 use flatbuffers::{root, FlatBufferBuilder};
-use crate::storage::config::StorageConfig;
 use crate::service::user_context::UserContext;
 use crate::service::metadata_service::MetadataService;
 use crate::util::serializer::deserialize_offset_size;
@@ -18,7 +17,7 @@ impl StorageService {
     pub fn new() -> Self { Self }
 
     fn store(&self) -> std::sync::Arc<dyn crate::storage::Storage> {
-        StorageConfig::from_env().create_store()
+        crate::storage::object_store()
     }
 
     // Unified write: handles Native (FlatBuffers) and S3 (raw bytes)

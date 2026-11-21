@@ -139,6 +139,14 @@ WARPDRIVE_SELF_ADDR=http://node6:9710 \
 - `WARPDRIVE_PEERS` — the seed peer list (self included), comma-separated.
 - `WARPDRIVE_PEER_TRANSPORT` — `grpc` (default), `http`, or `tcp`, for the
   peer-to-peer shard transport.
+- `WARPDRIVE_INLINE_MAX_BYTES` — objects up to this size are stored inside
+  their location record instead of as erasure-coded shards. Default `0`
+  (off), maximum 131072 (128 KiB). An inline object needs one replicated write
+  instead of a shard round plus that write, and any node serves a GET from its
+  own copy: on a 5-node cluster, 4 KB objects measured ~1.9x PUT and ~4.6x GET
+  throughput (RFC 5). The cost: every node keeps a copy on disk and in memory
+  (about 1.33x the object size each), so size it against your object count.
+  Set the same value on every node.
 
 ### Basic PUT/GET/DELETE
 

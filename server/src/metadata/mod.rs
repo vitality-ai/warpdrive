@@ -19,7 +19,7 @@ pub struct DataChunk {
 }
 
 /// Full metadata for a stored S3 object
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
     pub chunks: Vec<DataChunk>,
     /// Legacy catch-all properties map (kept for backward compat; prefer typed fields below).
@@ -181,6 +181,11 @@ pub trait MetadataStorage: Send + Sync {
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error>;
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error>;
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error>;
+    /// Keys starting with `prefix`, in key order. Backends that can range
+    /// scan should override this. The default filters `list_objects`.
+    fn list_objects_with_prefix(&self, user_id: &str, bucket: &str, prefix: &str) -> Result<Vec<ObjectId>, Error> {
+        Ok(self.list_objects(user_id, bucket)?.into_iter().filter(|k| k.starts_with(prefix)).collect())
+    }
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error>;
     fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error>;
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error>;

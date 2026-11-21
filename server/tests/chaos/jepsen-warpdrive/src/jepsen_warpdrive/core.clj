@@ -218,6 +218,61 @@
                    "FAIL: acked writes did NOT survive power loss -> ack-before-durable violation"))
         ok))))
 
+(defn ordering-test
+  "Replica convergence under concurrent writes to the same keys. C clients
+   race PUTs on K keys through node0 (the single write node) for D seconds,
+   with no faults. Once they stop, every key is read from every node, and
+   every node must return the same value.
+
+   Elle can't see this: the main run reads only through node0, so a
+   disagreement on other nodes never shows up in its history. A node that
+   missed a write during faults is allowed to lag (there is no repair yet),
+   which is why this runs without a nemesis: every node receives every
+   write, so any disagreement is an ordering bug."
+  [{:keys [duration-sec concurrency keys-n n] :or {duration-sec 20 concurrency 8 keys-n 4 n 5}}]
+  (println (format "=== WarpDrive ordering test: %d clients racing on %d keys for %ds, %d nodes ==="
+                   concurrency keys-n duration-sec n))
+  (cluster-stop) (cluster-start)
+  (let [conn    (s3/conn "127.0.0.1:9710" access-key secret-key)
+        _       (println "create-bucket ->" (:status (s3/create-bucket conn bucket)))
+        stop?   (atom false)
+        counter (atom 0)
+        acked   (atom 0)
+        workers (mapv (fn [pid]
+                        (Thread. ^Runnable
+                         (fn []
+                           (let [rng (Random. (long pid))]
+                             (while (not @stop?)
+                               (let [k (str "race-" (.nextInt rng (int keys-n)))
+                                     v (str (swap! counter inc))]
+                                 (try
+                                   (when (= 200 (:status (s3/put-object conn bucket k (.getBytes v))))
+                                     (swap! acked inc))
+                                   (catch Exception _ nil))))))))
+                      (range concurrency))]
+    (doseq [^Thread t workers] (.start t))
+    (Thread/sleep (long (* 1000 duration-sec)))
+    (reset! stop? true)
+    (doseq [^Thread t workers] (.join t 10000))
+    (Thread/sleep 1000)
+    (let [nodes   (mapv #(s3/conn (str "127.0.0.1:" (+ 9710 %)) access-key secret-key) (range n))
+          read-at (fn [c k] (let [r (s3/get-object c bucket k)]
+                              (if (= 200 (:status r)) (String. ^bytes (:body r)) (str "HTTP " (:status r)))))
+          split   (for [i (range keys-n)
+                        :let [k (str "race-" i)
+                              vals (mapv #(read-at % k) nodes)]
+                        :when (apply not= vals)]
+                    [k vals])]
+      (println "\n=== ORDERING RESULT ===")
+      (println "acked writes       :" @acked)
+      (println "keys disagreeing   :" (count split) "of" keys-n)
+      (doseq [[k vals] split] (println "  " k "->" vals))
+      (let [ok (and (pos? @acked) (empty? split))]
+        (println (if ok
+                   "PASS: every node returns the same value for every key"
+                   "FAIL: nodes disagree on a key's value after concurrent writes"))
+        ok))))
+
 (defn- parse-args [args]
   (into {} (map (fn [[k v]]
                   [(keyword (str/replace k #"^--" ""))
@@ -254,9 +309,11 @@
   (case (first args)
     "validate" (validate)
     "selftest" (System/exit (if (selftest) 0 1))
+    "ordering" (let [ok (ordering-test (parse-args (rest args)))]
+                 (shutdown-agents) (System/exit (if ok 0 1)))
     "durability" (let [ok (durability-test (parse-args (rest args)))]
                    (shutdown-agents) (System/exit (if ok 0 1)))
     "test"     (let [ok (run-test (parse-args (rest args)))]
                  (shutdown-agents)
                  (System/exit (if (false? ok) 1 0)))
-    (println "usage: lein run validate | lein run test [--seed N --duration-sec S --concurrency C --n NODES --keys-n K]")))
+    (println "usage: lein run validate | selftest | durability [--m M] | ordering [--duration-sec S --concurrency C --keys-n K] | test [--seed N --duration-sec S --concurrency C --n NODES --keys-n K]")))

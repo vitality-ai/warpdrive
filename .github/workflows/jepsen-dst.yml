@@ -96,6 +96,9 @@ jobs:
         working-directory: server/tests/chaos/jepsen-warpdrive
         run: lein run selftest
 
+      - name: Ordering (concurrent writes to the same keys, every node must agree)
+        working-directory: server/tests/chaos/jepsen-warpdrive
+        run: lein run ordering --duration-sec 20 --concurrency 8 --keys-n 4
       - name: Power-loss durability (acked writes must survive full-cluster SIGKILL)
         working-directory: server/tests/chaos/jepsen-warpdrive
         run: lein run durability --m 200

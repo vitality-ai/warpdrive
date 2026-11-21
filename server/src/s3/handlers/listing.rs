@@ -125,7 +125,7 @@ pub async fn s3_list_objects_handler(
     info!("S3 ListObjects{}: bucket={} prefix={:?} delim={:?} max_keys={} marker={:?}",
           if is_v2 { "V2" } else { "V1" }, bucket, prefix, delimiter, max_keys, effective_marker);
 
-    let all_keys = db.list_objects(&bucket)?;
+    let all_keys = db.list_objects_with_prefix(&bucket, prefix)?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
 
     let mut contents_xml   = String::new();
