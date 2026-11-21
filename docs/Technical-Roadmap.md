@@ -49,11 +49,13 @@ Ongoing project work that still needs design input.
 | Area | Status |
 |------|--------|
 | Storage: Key/Value, Files, and Blobs | Core, in active development |
-| Fault tolerance: erasure coding for data replication | Seeking design contribution ([discussion](https://github.com/cia-labs/Storage-service/issues/72)) |
-| User access management | [Vitality Console](https://github.com/vitality-ai/Vitality-console) |
+| Composable engine: one object service with pluggable components | Proposed in RFC 5 (PR #217) |
+| Fault tolerance: erasure coding | Shipped in the cluster engine, RS(k,m). Open: repairing partial writes (#206), rebuilding a replaced node (#207) |
+| Space reclamation | Open: no reclamation in the cluster engine, and single-node deletes don't free space (#218) |
+| User access management | SigV4 admin keys, STS federation with any OIDC provider, [Vitality Console](https://github.com/vitality-ai/Vitality-console) |
 | Search | Seeking design contribution ([discussion](https://github.com/cia-labs/Storage-service/issues/35)) |
-| Availability | Seeking design contribution, no discussion thread open yet |
-| Client library | S3-compatible / custom client currently Python-only ([python-sdk](https://github.com/vitality-ai/python-sdk)) |
+| Availability | Health endpoints (#208), metrics (#209) |
+| Client library | Any S3 client. The custom Python SDK is deprecated. |
 | Compute and storage infrastructure research | [NexCSAD](https://github.com/vitality-ai/NexCSAD) |
 
 ### References
