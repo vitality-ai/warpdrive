@@ -17,11 +17,9 @@
 //! cluster-only store, same as `location_store.rs`.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use parking_lot::RwLock;
-use crate::storage::durable_log::DurableAppendLog;
+use std::io;
+use std::path::Path;
+use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
 
 pub trait ShardMetaStore: Send + Sync {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()>;
@@ -43,142 +41,46 @@ pub trait ShardMetaStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
-/// Append-only log of JSON-lines `(shard_key, Option<(offset, size)>)`
-/// pairs; `None` is a tombstone (delete). In-memory index rebuilt by
-/// replaying the log on startup.
-///
-/// Previously raw CSV (`"{shard_key},{offset},{size}"`, split on `,`
-/// with no escaping). Since `shard_key` embeds the user's bucket and
-/// object key verbatim, a key containing a literal `,` or `\n` corrupted
-/// the log: on the next restart, `open()` either misparsed the line into
-/// the wrong fields (an `offset`/`size` that fails to parse as a number)
-/// or produced an extra line, and since `open()`'s only caller is a
-/// `lazy_static` that `.expect()`s the result, that turned into a panic
-/// on the first shard read/write after restart -- the node could no
-/// longer serve or store any shard at all (#152). JSON-lines, the same
-/// format `location_store.rs` already uses, escapes arbitrary byte
-/// content in `shard_key` as a matter of course.
-pub struct BitcaskShardMetaStore {
-    log_path: PathBuf,
-    /// Owns the file, the dup'd sync-only handle, and the group-commit
-    /// batching needed to make an append durable without paying one
-    /// fsync per write -- see `storage::durable_log`'s module doc.
-    log: DurableAppendLog,
-    index: RwLock<HashMap<String, (u64, u64)>>,
-    /// #155 — see `location_store.rs`'s matching field doc: without one
-    /// lock held across both the log append and the index update, a
-    /// concurrent put/delete for the same shard key can apply to the log
-    /// and the index in different orders, so a restart (log replay only)
-    /// can disagree with what the live index had.
-    write_lock: parking_lot::Mutex<()>,
+/// `ShardMetaStore` on a per-node `KvEngine`. The default engine uses a
+/// `HashMap` index: this store only does point lookups, on the shard write
+/// and read path. JSON lines (#152): shard keys embed user-supplied bucket
+/// and object keys, which may contain any byte.
+pub struct BitcaskShardMetaStore<E = BitcaskEngine<(u64, u64), HashMap<String, (u64, u64)>>> {
+    engine: E,
 }
 
 impl BitcaskShardMetaStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        let log_path = log_path.as_ref().to_path_buf();
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut index = HashMap::new();
-        if log_path.exists() {
-            let f = File::open(&log_path)?;
-            let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
-            let last_idx = lines.len().saturating_sub(1);
-            for (i, line) in lines.iter().enumerate() {
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<(String, Option<(u64, u64)>)>(line) {
-                    Ok((key, Some(record))) => {
-                        index.insert(key, record);
-                    }
-                    Ok((key, None)) => {
-                        index.remove(&key);
-                    }
-                    // Only the *last* line can be a torn write from a crash
-                    // mid-append (appends are sequential, so nothing before
-                    // it can be torn this way) -- quarantine just that one
-                    // line with a warning instead of refusing to start, per
-                    // #152's suggested fix. A malformed line anywhere else
-                    // is real corruption, not a crash artifact, and still a
-                    // hard error.
-                    Err(e) if i == last_idx => {
-                        log::warn!(
-                            "shard meta log {}: ignoring malformed trailing line, \
-                             likely a torn write from a crash: {e}",
-                            log_path.display()
-                        );
-                    }
-                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                }
-            }
-        }
-
-        let log = DurableAppendLog::open(&log_path)?;
-        Ok(Self {
-            log_path,
-            log,
-            index: RwLock::new(index),
-            write_lock: parking_lot::Mutex::new(()),
-        })
+        Ok(Self { engine: BitcaskEngine::open(log_path, "shard meta")? })
     }
 
     pub fn path(&self) -> &Path {
-        &self.log_path
+        self.engine.path()
     }
 }
 
-impl ShardMetaStore for BitcaskShardMetaStore {
+impl<E: KvEngine<(u64, u64)>> BitcaskShardMetaStore<E> {
+    /// The store on any engine.
+    pub fn with_engine(engine: E) -> Self {
+        Self { engine }
+    }
+}
+
+impl<E: KvEngine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()> {
-        let line = serde_json::to_string(&(shard_key, Some((offset, size))))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // #155: held across both the append and the index update, so a
-        // concurrent put/delete for the same shard key can never apply to
-        // the log and the index in different orders. Released before the
-        // durability wait below -- see `location_store.rs::put`'s
-        // matching comment for why that matters for group commit.
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().insert(shard_key.to_string(), (offset, size));
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+        self.engine.put(shard_key.to_string(), (offset, size))
     }
 
     fn get(&self, shard_key: &str) -> Option<(u64, u64)> {
-        self.index.read().get(shard_key).copied()
+        self.engine.get(shard_key)
     }
 
     fn delete(&self, shard_key: &str) -> io::Result<()> {
-        let line = serde_json::to_string(&(shard_key, Option::<(u64, u64)>::None))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().remove(shard_key);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+        self.engine.delete(shard_key)
     }
 
     fn compact(&self) -> io::Result<()> {
-        // #155: same `write_lock` as `put`/`delete`, so compaction can't
-        // interleave with either.
-        let _write_guard = self.write_lock.lock();
-        let index = self.index.read();
-        let tmp_path = self.log_path.with_extension("compact.tmp");
-        {
-            let mut tmp = File::create(&tmp_path)?;
-            for (key, &(offset, size)) in index.iter() {
-                let line = serde_json::to_string(&(key, Some((offset, size))))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                writeln!(tmp, "{line}")?;
-            }
-            tmp.flush()?;
-        }
-        self.log.replace_with_compacted(&tmp_path, &self.log_path)
+        self.engine.compact()
     }
 }
 
@@ -186,6 +88,7 @@ impl ShardMetaStore for BitcaskShardMetaStore {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Write;
 
     #[test]
     fn put_then_get_round_trips() {
