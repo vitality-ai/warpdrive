@@ -1,0 +1,9 @@
+run,arm,node0_cores,put_per_s,get_per_s,put_p99_ms,get_p99_ms,errors,put_cpu_us_per_req,get_cpu_us_per_req,put_ctx_switches_per_req,get_ctx_switches_per_req
+1,bridge pool (baseline),2,2035.8,3233.1,113.395,58.816,0,947,607,30.4,11.4
+2,direct (WARPDRIVE_BRIDGE_DIRECT=1),2,2166.2,3470.1,110.44,73.433,0,886,569,29.5,11.0
+3,bridge pool (baseline),4,3059.0,5143.4,76.696,34.159,0,1138,739,33.3,12.7
+4,direct (WARPDRIVE_BRIDGE_DIRECT=1),4,3057.0,4715.8,78.11,41.202,0,1123,801,31.9,11.6
+5,direct (WARPDRIVE_BRIDGE_DIRECT=1),2,2075.1,3498.1,115.569,72.909,0,929,563,29.3,11.2
+6,bridge pool (baseline),2,2206.5,3587.6,105.139,53.3,0,875,549,30.5,11.4
+7,direct (WARPDRIVE_BRIDGE_DIRECT=1),4,3035.2,5248.5,83.424,36.649,0,1114,726,32.2,11.8
+8,bridge pool (baseline),4,3085.4,4993.8,75.637,35.77,0,1100,757,33.0,12.5
