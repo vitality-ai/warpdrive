@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bucket_config::{BucketConfigStore, BucketPlacementConfig};
+use super::bucket_registry::{BucketRegistry, ClaimResult};
 use super::content_location_store::{ContentDependentRecord, ContentLocationStore, UnitMeta};
 use super::ec::ErasureCoder;
 use super::location_store::{LocationRecord, LocationStore, ObjectS3Metadata, UNAUTHENTICATED_USER};
@@ -58,6 +59,10 @@ pub struct ClusterState {
     /// Per-bucket placement policy choice + overhead-threshold fallback
     /// config (see `bucket_config.rs`). Missing bucket -> `default_bucket_config`.
     pub bucket_config_store: Arc<dyn BucketConfigStore>,
+    /// Who owns each bucket, cluster-wide, independent of whoever's asking
+    /// (see `bucket_registry.rs`) — the RFC2.13 bucket-policy prerequisite.
+    /// Missing bucket -> no recorded owner yet (nothing to protect).
+    pub bucket_registry: Arc<dyn BucketRegistry>,
     /// Pushdown's column-decoding registry (see `pushdown.rs`), keyed by
     /// the codec name a unit was tagged with at PUT time.
     pub column_codecs: HashMap<String, Arc<dyn ColumnCodec>>,
@@ -1663,6 +1668,211 @@ pub async fn cluster_internal_put_bucket_config(
         .put(body.into_inner())
         .map_err(|e| ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::Ok().finish())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimBucketRequest {
+    pub bucket: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimBucketResponse {
+    /// Whatever this one peer's local `claim_if_absent` resolved to —
+    /// might equal the request's own `user_id` (won the race, or already
+    /// owned it) or a different, pre-existing owner. The coordinating
+    /// side (`cluster_claim_bucket`) is what checks whether *every* peer
+    /// agrees this is the same owner.
+    pub owner_user_id: String,
+}
+
+/// Why a bucket claim failed, distinguished so the caller (an S3 PUT
+/// handler) can map each to the right HTTP status: a different owner is
+/// a 403, an unreachable peer is a 503 — conflating them would turn a
+/// transient infra blip into a permanent-looking access denial.
+pub enum ClaimError {
+    OwnedBySomeoneElse(String),
+    Infra(String),
+}
+
+/// Claims `bucket` for `user_id` cluster-wide, or confirms they already
+/// own it. Same all-peer-required bar as `cluster_put_bucket_config`
+/// above (not quorum) — a bucket's owner is at least as
+/// consistency-critical as its placement config, and unlike that
+/// function's plain ack-counting, success here specifically requires
+/// every peer's *local claim* to resolve to this exact `user_id`, not
+/// just "request received": a peer can receive the request but still
+/// lose a concurrent race to a different owner locally, and an ack that
+/// only meant "processed" would hide that.
+pub(crate) async fn cluster_claim_bucket(state: &ClusterState, bucket: &str, user_id: &str) -> Result<(), ClaimError> {
+    let peers = state.membership.peers();
+    if peers.is_empty() {
+        return Err(ClaimError::Infra(
+            "no peers configured (set WARPDRIVE_PEERS or join the cluster first)".to_string(),
+        ));
+    }
+
+    let body = ClaimBucketRequest { bucket: bucket.to_string(), user_id: user_id.to_string() };
+    let requests = peers.iter().map(|peer| {
+        let client = state.location_http.clone();
+        let url = format!("{}/cluster/_internal/bucket_registry/claim", peer.trim_end_matches('/'));
+        let body = body.clone();
+        async move {
+            let resp = client.post(&url).json(&body).send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json::<ClaimBucketResponse>().await.ok()
+        }
+    });
+    let results: Vec<Option<ClaimBucketResponse>> = join_all(requests).await;
+    let acked = results.iter().filter(|r| r.is_some()).count();
+    if acked < peers.len() {
+        return Err(ClaimError::Infra(format!(
+            "bucket claim requires every peer to respond: {acked}/{} responded",
+            peers.len()
+        )));
+    }
+
+    let mut other_owner: Option<String> = None;
+    for owner in results.into_iter().flatten().map(|r| r.owner_user_id) {
+        if owner != user_id {
+            other_owner = Some(owner);
+        }
+    }
+    match other_owner {
+        None => Ok(()),
+        Some(owner) => Err(ClaimError::OwnedBySomeoneElse(owner)),
+    }
+}
+
+/// Receiving side of a bucket claim: resolves this one node's local
+/// `claim_if_absent` and reports whatever the resulting owner is —
+/// whether this request won, lost to a concurrent claim, or the bucket
+/// was already owned from before.
+pub async fn cluster_internal_claim_bucket(
+    body: web::Json<ClaimBucketRequest>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let owner_user_id = match state.bucket_registry.claim_if_absent(&body.bucket, &body.user_id) {
+        ClaimResult::Claimed => body.user_id.clone(),
+        ClaimResult::AlreadyOwnedBy(existing) => existing,
+    };
+    Ok(HttpResponse::Ok().json(ClaimBucketResponse { owner_user_id }))
+}
+
+/// Raw policy JSON storage only — no `Effect`/`Principal`/`Action`
+/// evaluation anywhere here or anywhere else in the codebase yet. This is
+/// deliberately inert plumbing: RFC2.13's evaluator is a pure addition on
+/// top, with somewhere to read from and write to already in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalPutBucketPolicyRequest {
+    bucket: String,
+    policy_json: Option<String>,
+}
+
+/// Owner-only (checked here, before any peer is contacted — a non-owner's
+/// request never even gets broadcast) bucket-policy write. Same
+/// all-peer-required replication as `cluster_put_bucket_config`: a
+/// policy is exactly the kind of small, infrequent, correctness-critical
+/// config where every node agreeing matters more than availability
+/// during a partition.
+pub async fn cluster_put_bucket_policy(
+    path: web::Path<String>,
+    body: web::Bytes,
+    req: actix_web::HttpRequest,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    let bucket = path.into_inner();
+    let auth_result = crate::s3::auth::authenticate_s3_request(&req).await?;
+    check_bucket_ownership_readonly(&state, &bucket, &auth_result.user_id, auth_result.allow_all_buckets)?;
+
+    let peers = state.membership.peers();
+    if peers.is_empty() {
+        return Err(ErrorInternalServerError(
+            "no peers configured (set WARPDRIVE_PEERS or join the cluster first)",
+        ));
+    }
+    // The policy JSON document is the raw request body, not wrapped in
+    // any WarpDrive-internal envelope -- this is what an AWS SDK's
+    // PutBucketPolicy sends on the wire.
+    let policy_text = String::from_utf8(body.to_vec())
+        .map_err(|_| s3_err(StatusCode::BAD_REQUEST, "MalformedPolicy", "Policy document is not valid UTF-8", &format!("/{bucket}")))?;
+    let policy_json = if policy_text.trim().is_empty() { None } else { Some(policy_text) };
+    let puts = peers.iter().cloned().map(|peer| {
+        let client = state.location_http.clone();
+        let bucket = bucket.clone();
+        let policy_json = policy_json.clone();
+        async move {
+            let url = format!("{}/cluster/_internal/bucket_registry/policy", peer.trim_end_matches('/'));
+            client
+                .post(&url)
+                .json(&InternalPutBucketPolicyRequest { bucket, policy_json })
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        }
+    });
+    let results = join_all(puts).await;
+    let acked = results.iter().filter(|ok| **ok).count();
+    if acked < peers.len() {
+        return Err(ErrorInternalServerError(format!(
+            "bucket policy requires every peer to ack: {acked}/{} acknowledged",
+            peers.len()
+        )));
+    }
+    Ok(HttpResponse::Ok().finish())
+}
+
+/// Receiving side of bucket-policy replication.
+pub async fn cluster_internal_put_bucket_policy(
+    body: web::Json<InternalPutBucketPolicyRequest>,
+    state: web::Data<ClusterState>,
+) -> Result<HttpResponse, Error> {
+    state
+        .bucket_registry
+        .put_policy(&body.bucket, body.policy_json.clone())
+        .map_err(|e| ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::Ok().finish())
+}
+
+/// Read-side ownership gate for GET/HEAD/DELETE/LIST and the non-claiming
+/// parts of PUT (tagging/retention/etc. sub-dispatch): denies only when
+/// the bucket *is* recorded as owned by someone else. A bucket with no
+/// recorded owner at all is let through unchanged — there's nothing to
+/// protect yet, and the object/key lookup below will 404 on its own for
+/// a name nobody has ever written to. Admin (`allow_all_buckets`)
+/// bypasses this entirely, same as every other bucket-scope check in this
+/// project.
+pub(crate) fn check_bucket_ownership_readonly(state: &ClusterState, bucket: &str, user_id: &str, allow_all_buckets: bool) -> Result<(), Error> {
+    if allow_all_buckets {
+        return Ok(());
+    }
+    match state.bucket_registry.get(bucket) {
+        Some(ownership) if ownership.owner_user_id != user_id => {
+            Err(s3_err(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", &format!("/{bucket}")))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Write-side ownership gate for PUT: claims the bucket for `user_id` if
+/// nobody owns it yet (first-writer-owns, matching S3's own
+/// globally-unique-bucket-name semantics — unlike this project's own
+/// per-user-namespaced buckets everywhere else), or confirms they already
+/// do. Admin bypasses this entirely, same as the read-side gate.
+pub(crate) async fn check_or_claim_bucket_ownership(state: &ClusterState, bucket: &str, user_id: &str, allow_all_buckets: bool) -> Result<(), Error> {
+    if allow_all_buckets {
+        return Ok(());
+    }
+    match cluster_claim_bucket(state, bucket, user_id).await {
+        Ok(()) => Ok(()),
+        Err(ClaimError::OwnedBySomeoneElse(_)) => {
+            Err(s3_err(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied", &format!("/{bucket}")))
+        }
+        Err(ClaimError::Infra(msg)) => Err(ErrorInternalServerError(msg)),
+    }
 }
 
 /// Receiving side of content-dependent location-pin replication — the
