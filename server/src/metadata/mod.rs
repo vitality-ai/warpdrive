@@ -224,6 +224,15 @@ pub trait MetadataStorage: Send + Sync {
         None
     }
 
+    /// `upsert_multipart_part` as a future that can run on another thread.
+    /// The error carries its HTTP status. `None`: no async path.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_multipart_part_async(
+        self: std::sync::Arc<Self>, _upload_id: String, _part_number: i32, _etag: String, _size: u64, _extents_blob: Vec<u8>, _checksum_value: String,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), (u16, String)>>> {
+        None
+    }
+
     // --- Deletion WAL ---
     fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error>;

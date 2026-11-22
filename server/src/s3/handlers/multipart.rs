@@ -190,19 +190,11 @@ pub async fn s3_upload_part_handler(
     }
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    // web::block: `Storage::write` now does a real (group-committed) fsync
-    // -- see `storage::group_commit`'s module doc -- so this has to go
-    // through `web::block` the same way `object.rs`'s PUT handler does;
-    // calling it directly here would block this actix worker's whole
-    // event loop for the fsync's duration.
-    let context_c = context.clone();
-    let body_c = body.clone();
-    let offset_size_list = web::block(move || {
-        StorageService::new().write_object(&context_c, &body_c, StorageMode::S3).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    // Awaited, never blocking this worker: over the network on a cluster,
+    // on the blocking pool for a local store (its write fsyncs).
+    let offset_size_list = vec![crate::storage::write_any(crate::storage::object_store(), context.user_id.clone(), context.bucket.clone(), body.to_vec())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?];
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
@@ -233,7 +225,7 @@ pub async fn s3_upload_part_handler(
         String::new()
     };
 
-    db.upsert_multipart_part(&upload_id, part_number, &etag, body.len() as u64, &extents_blob, &part_checksum_value)?;
+    db.upsert_multipart_part_awaited(&upload_id, part_number, &etag, body.len() as u64, &extents_blob, &part_checksum_value).await?;
 
     info!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
     let mut part_resp = HttpResponse::Ok();
@@ -962,9 +954,8 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
                 async move {
                     if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
                     let (off, sz) = slices[idx];
-                    let chunk = web::block(move || store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string()))
-                        .await.map_err(actix_web::error::ErrorInternalServerError)?
-                        .map_err(actix_web::error::ErrorInternalServerError)?;
+                    let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz)
+                        .await.map_err(actix_web::error::ErrorInternalServerError)?;
                     Ok(Some((Bytes::from(chunk), idx + 1)))
                 }
             });
@@ -1010,9 +1001,8 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
         async move {
             if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
             let (off, sz) = slices[idx];
-            let chunk = web::block(move || store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string()))
-                .await.map_err(actix_web::error::ErrorInternalServerError)?
-                .map_err(actix_web::error::ErrorInternalServerError)?;
+            let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz)
+                .await.map_err(actix_web::error::ErrorInternalServerError)?;
             Ok(Some((Bytes::from(chunk), idx + 1)))
         }
     });

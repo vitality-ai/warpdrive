@@ -97,6 +97,26 @@ impl MetadataService {
         })
     }
 
+    /// `upsert_multipart_part`, awaited without blocking the caller's thread
+    /// when the store has an async path.
+    pub async fn upsert_multipart_part_awaited(
+        &self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8], checksum_value: &str,
+    ) -> Result<(), Error> {
+        let fut = Arc::clone(&self.store).upsert_multipart_part_async(
+            upload_id.to_string(), part_number, etag.to_string(), size, extents_blob.to_vec(), checksum_value.to_string(),
+        );
+        match fut {
+            Some(fut) => crate::cluster::bridge::spawn(fut)
+                .await
+                .map_err(|e| actix_web::error::ErrorInternalServerError(format!("metadata write task failed: {e}")))?
+                .map_err(|(status, msg)| {
+                    let status = actix_web::http::StatusCode::from_u16(status).unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+                    Error::from(actix_web::error::InternalError::new(msg, status))
+                }),
+            None => self.store.upsert_multipart_part(upload_id, part_number, etag, size, extents_blob, checksum_value),
+        }
+    }
+
     /// Read a fully-populated Metadata object (S3 GET / HEAD path).
     pub fn get_object_full(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         self.store.get_metadata(&self.user, bucket, key)

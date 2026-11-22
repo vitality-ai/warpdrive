@@ -529,6 +529,17 @@ impl ReplicatedMetadataStore {
         Ok(VersioningDeleteResult::Marker { version_id: vid })
     }
 
+    /// `update_upload` awaited: the same lock, read and row write.
+    async fn update_upload_async(&self, upload_id: &str, f: impl FnOnce(&mut UploadRow)) -> Result<(), (u16, String)> {
+        let key = upload_key(upload_id);
+        let _g = self.locks.lock_async(&key).await;
+        let Some(mut row) = self.upload(upload_id) else {
+            return Err((404, format!("no multipart upload {upload_id}")));
+        };
+        f(&mut row);
+        self.put_async(key, MetaValue::Upload(row)).await.map_err(|e| (500, e))
+    }
+
     fn upload(&self, upload_id: &str) -> Option<UploadRow> {
         match self.get(&upload_key(upload_id)) {
             Some(MetaValue::Upload(u)) => Some(u),
@@ -650,6 +661,19 @@ fn stats(objects: &[(String, ObjectRow)]) -> (u64, u64) {
 impl MetadataStorage for ReplicatedMetadataStore {
     fn put_object_v2_async(self: Arc<Self>, user_id: String, bucket: String, key: String, metadata: Metadata) -> Result<BoxFuture<'static, Result<(Option<String>, Vec<(u64, u64)>), String>>, Metadata> {
         Ok(Box::pin(self.put_object_v2_owned(user_id, bucket, key, metadata)))
+    }
+
+    fn upsert_multipart_part_async(
+        self: Arc<Self>, upload_id: String, part_number: i32, etag: String, size: u64, extents_blob: Vec<u8>, checksum_value: String,
+    ) -> Option<BoxFuture<'static, Result<(), (u16, String)>>> {
+        Some(Box::pin(async move {
+            let extents = crate::util::serializer::deserialize_offset_size(&extents_blob).map_err(|e| (400, e.to_string()))?;
+            self.update_upload_async(&upload_id, |u| {
+                let blobs = blobs_for(&u.user_id, &u.bucket, &extents);
+                u.parts.insert(part_number, PartRow { etag, size, extents_blob, checksum_value, blobs });
+            })
+            .await
+        }))
     }
 
     fn delete_object_async(self: Arc<Self>, user_id: String, bucket: String, key: String) -> Option<BoxFuture<'static, Result<VersioningDeleteResult, String>>> {

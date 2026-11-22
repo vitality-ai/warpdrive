@@ -55,3 +55,25 @@ pub fn set_object_store(store: Arc<dyn Storage>) -> bool {
 pub fn object_store() -> Arc<dyn Storage> {
     Arc::clone(OBJECT_STORE.get_or_init(|| config::StorageConfig::from_env().create_store()))
 }
+
+/// Reads through the store's async path when it has one (the cluster: the
+/// read is awaited on this worker), else on the blocking pool.
+pub async fn read_any(store: Arc<dyn Storage>, user_id: String, bucket: String, offset: u64, size: u64) -> Result<Vec<u8>, String> {
+    if let Some(fut) = store.read_async(&user_id, &bucket, offset, size) {
+        return fut.await;
+    }
+    actix_web::web::block(move || store.read(&user_id, &bucket, offset, size).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("blocking read task failed: {e}"))?
+}
+
+/// Writes through the store's async path when it has one, else on the
+/// blocking pool. Returns once the bytes are durable.
+pub async fn write_any(store: Arc<dyn Storage>, user_id: String, bucket: String, data: Vec<u8>) -> Result<(u64, u64), String> {
+    if let Some(fut) = store.write_async(&user_id, &bucket, data.clone()) {
+        return fut.await;
+    }
+    actix_web::web::block(move || store.write(&user_id, &bucket, &data).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("blocking write task failed: {e}"))?
+}
