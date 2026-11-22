@@ -1,0 +1,194 @@
+run,size,arm,minute,disk_gb,live_gb,put_ops_s,put_p99_ms,cpu_pct
+comp,1 MB,"Sweep v1, punch + copy_file_range",0,7.087,0.524,225.2,328.3,39.7
+comp,1 MB,"Sweep v1, punch + copy_file_range",1,14.364,0.524,229.9,248.6,41.8
+comp,1 MB,"Sweep v1, punch + copy_file_range",2,21.622,0.524,229.2,248.4,41.8
+comp,1 MB,"Sweep v1, punch + copy_file_range",3,28.847,0.524,228.2,246.4,41.8
+comp,1 MB,"Sweep v1, punch + copy_file_range",4,36.047,0.524,226.8,253.2,42.2
+comp,1 MB,"Sweep v1, punch + copy_file_range",5,36.05,0.524,225.3,273.7,42.7
+comp,1 MB,"Sweep v1, punch + copy_file_range",6,35.967,0.524,226.6,283.4,42.6
+comp,1 MB,"Sweep v1, punch + copy_file_range",7,35.025,0.524,226.2,269.8,42.3
+comp,1 MB,"Sweep v1, punch + copy_file_range",8,33.841,0.524,226.9,251.2,41.5
+comp,1 MB,"Sweep v1, punch + copy_file_range",9,32.663,0.524,226.7,248.9,43.1
+comp,1 MB,"Sweep v1, punch + copy_file_range",10,27.548,0.524,3.4,217.3,15.3
+comp,1 MB,"Sweep v1, punch + copy_file_range",11,19.401,0.524,,,14.7
+comp,1 MB,"Sweep v1, punch + copy_file_range",12,13.904,0.524,,,14.2
+comp,1 MB,"Sweep v1, punch + copy_file_range",13,5.855,0.524,,,14.5
+comp,1 MB,"Sweep v1, punch + copy_file_range",14,0.984,0.524,,,13.8
+comp,1 MB,"Sweep v1, punch + copy_file_range",15,0.592,0.524,,,13.0
+comp,1 MB,"Sweep v1, punch + copy_file_range",16,0.525,0.524,,,13.1
+comp,1 MB,"Sweep v1, punch + copy_file_range",17,0.525,0.524,,,13
+comp,1 MB,"Sweep v1, punch + copy_file_range",18,0.525,0.524,,,13.1
+comp,1 MB,"Sweep v1, punch + copy_file_range",19,0.525,0.524,,,12.9
+comp,1 MB,"Sweep v1, punch + copy_file_range",20,0.525,0.524,,,1.2
+comp,1 MB,Compactor off (sweep still runs),0,7.068,0.524,226.0,346.0,40.4
+comp,1 MB,Compactor off (sweep still runs),1,14.291,0.524,228.1,235.5,42.7
+comp,1 MB,Compactor off (sweep still runs),2,21.508,0.524,228.0,247.3,42.4
+comp,1 MB,Compactor off (sweep still runs),3,28.749,0.524,228.7,240.6,42.7
+comp,1 MB,Compactor off (sweep still runs),4,35.979,0.524,228.2,251.0,42.5
+comp,1 MB,Compactor off (sweep still runs),5,43.206,0.524,228.3,247.7,42.6
+comp,1 MB,Compactor off (sweep still runs),6,50.187,0.524,226.5,263.8,42.8
+comp,1 MB,Compactor off (sweep still runs),7,57.387,0.524,227.3,274.2,42.6
+comp,1 MB,Compactor off (sweep still runs),8,63.378,0.524,231.5,231.8,42.4
+comp,1 MB,Compactor off (sweep still runs),9,64.014,0.524,354.5,228.2,29.2
+comp,1 MB,Compactor off (sweep still runs),10,64.015,0.524,3.8,104.1,12.4
+comp,1 MB,Compactor off (sweep still runs),11,64.015,0.524,,,13.4
+comp,1 MB,Compactor off (sweep still runs),12,64.015,0.524,,,13.5
+comp,1 MB,Compactor off (sweep still runs),13,64.015,0.524,,,13.5
+comp,1 MB,Compactor off (sweep still runs),14,64.015,0.524,,,13.7
+comp,1 MB,Compactor off (sweep still runs),15,64.015,0.524,,,13.6
+comp,1 MB,Compactor off (sweep still runs),16,64.015,0.524,,,13.4
+comp,1 MB,Compactor off (sweep still runs),17,64.015,0.524,,,13.5
+comp,1 MB,Compactor off (sweep still runs),18,64.015,0.524,,,13.4
+comp,1 MB,Compactor off (sweep still runs),19,64.015,0.524,,,13.3
+comp,1 MB,Compactor off (sweep still runs),20,64.015,0.524,,,1.3
+comp,1 MB,Compactor off (sweep still runs),21,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),22,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),23,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),24,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),25,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),26,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),27,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),28,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),29,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),30,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),31,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),32,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),33,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),34,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),35,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),36,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),37,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),38,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),39,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),40,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),41,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),42,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),43,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),44,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),45,64.015,0.524,,,0.1
+comp,1 MB,Compactor off (sweep still runs),46,64.015,0.524,,,0.2
+comp,1 MB,Compactor off (sweep still runs),47,64.015,0.524,,,1.3
+comp,1 MB,"Sweep v1, compaction only",0,7.993,0.524,255.2,319.3,45.6
+comp,1 MB,"Sweep v1, compaction only",1,16.199,0.524,259.1,207.7,47.1
+comp,1 MB,"Sweep v1, compaction only",2,24.423,0.524,259.6,215.4,47.5
+comp,1 MB,"Sweep v1, compaction only",3,32.596,0.524,258.1,204.6,47.3
+comp,1 MB,"Sweep v1, compaction only",4,40.806,0.524,258.1,215.0,47.8
+comp,1 MB,"Sweep v1, compaction only",5,40.877,0.524,250.5,289.0,47.2
+comp,1 MB,"Sweep v1, compaction only",6,40.606,0.524,257.1,208.4,49.1
+comp,1 MB,"Sweep v1, compaction only",7,39.408,0.524,257.2,211.6,48.6
+comp,1 MB,"Sweep v1, compaction only",8,37.912,0.524,258.1,209.9,47.5
+comp,1 MB,"Sweep v1, compaction only",9,39.538,0.524,256.6,229.4,50.5
+comp,1 MB,"Sweep v1, compaction only",10,30.373,0.524,2.6,197.3,15.2
+comp,1 MB,"Sweep v1, compaction only",11,27.106,0.524,,,14.0
+comp,1 MB,"Sweep v1, compaction only",12,17.477,0.524,,,14.4
+comp,1 MB,"Sweep v1, compaction only",13,8.298,0.524,,,14.4
+comp,1 MB,"Sweep v1, compaction only",14,0.625,0.524,,,13.4
+comp,1 MB,"Sweep v1, compaction only",15,0.628,0.524,,,12.9
+comp,1 MB,"Sweep v1, compaction only",16,0.584,0.524,,,12.8
+comp,1 MB,"Sweep v1, compaction only",17,0.584,0.524,,,12.6
+comp,1 MB,"Sweep v1, compaction only",18,0.584,0.524,,,12.7
+comp,1 MB,"Sweep v1, compaction only",19,0.584,0.524,,,13.0
+comp,1 MB,"Sweep v1, compaction only",20,0.584,0.524,,,0
+comp,4 KB,"Sweep v1, punch + copy_file_range",0,0.456,0.205,3696.2,418.8,76.9
+comp,4 KB,"Sweep v1, punch + copy_file_range",1,0.906,0.205,3639.1,402.5,77.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",2,1.317,0.205,3318.9,745.3,73.4
+comp,4 KB,"Sweep v1, punch + copy_file_range",3,1.381,0.205,584.0,1268.7,47.8
+comp,4 KB,"Sweep v1, punch + copy_file_range",4,1.428,0.205,382.1,1339.3,47.5
+comp,4 KB,"Sweep v1, punch + copy_file_range",5,1.476,0.205,393.6,1300.5,48.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",6,1.801,0.205,2717.3,816.4,67.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",7,1.908,0.205,861.0,1264.2,47.8
+comp,4 KB,"Sweep v1, punch + copy_file_range",8,1.959,0.205,410.4,1266.8,48.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",9,2.016,0.205,471.2,1170.7,49.6
+comp,4 KB,"Sweep v1, punch + copy_file_range",10,2.017,0.205,4.8,978.0,63.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",11,2.017,0.205,,,64.5
+comp,4 KB,"Sweep v1, punch + copy_file_range",12,2.017,0.205,,,65.0
+comp,4 KB,"Sweep v1, punch + copy_file_range",13,2.017,0.205,,,65.1
+comp,4 KB,"Sweep v1, punch + copy_file_range",14,2.017,0.205,,,66.1
+comp,4 KB,"Sweep v1, punch + copy_file_range",15,2.017,0.205,,,65.5
+comp,4 KB,"Sweep v1, punch + copy_file_range",16,2.017,0.205,,,54.1
+comp,4 KB,"Sweep v1, punch + copy_file_range",17,2.017,0.205,,,49.9
+comp,4 KB,"Sweep v1, punch + copy_file_range",18,2.019,0.205,,,54.0
+comp,4 KB,"Sweep v1, punch + copy_file_range",19,2.032,0.205,,,67.8
+comp,4 KB,"Sweep v1, punch + copy_file_range",20,2.042,0.205,,,30.1
+comp,4 KB,"Sweep v1, punch + copy_file_range",21,2.047,0.205,,,40.8
+comp,4 KB,"Sweep v1, punch + copy_file_range",22,2.047,0.205,,,54.4
+comp,4 KB,"Sweep v1, punch + copy_file_range",23,2.047,0.205,,,53.8
+comp,4 KB,"Sweep v1, punch + copy_file_range",24,2.047,0.205,,,55.9
+comp,4 KB,"Sweep v1, punch + copy_file_range",25,2.047,0.205,,,54.6
+comp,4 KB,"Sweep v1, punch + copy_file_range",26,2.047,0.205,,,54.1
+comp,4 KB,"Sweep v1, punch + copy_file_range",27,1.89,0.205,,,47.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",28,1.518,0.205,,,37.5
+comp,4 KB,"Sweep v1, punch + copy_file_range",29,1.518,0.205,,,37.5
+comp,4 KB,"Sweep v1, punch + copy_file_range",30,1.514,0.205,,,35.5
+comp,4 KB,"Sweep v1, punch + copy_file_range",31,1.517,0.205,,,40.2
+comp,4 KB,"Sweep v1, punch + copy_file_range",32,1.226,0.205,,,87
+comp,4 KB,Compactor off (sweep still runs),0,0.452,0.205,3693.1,403.5,76.0
+comp,4 KB,Compactor off (sweep still runs),1,0.896,0.205,3597.4,451.2,75.4
+comp,4 KB,Compactor off (sweep still runs),2,1.308,0.205,3338.0,561.0,73.2
+comp,4 KB,Compactor off (sweep still runs),3,1.373,0.205,547.5,1185.3,47.9
+comp,4 KB,Compactor off (sweep still runs),4,1.421,0.205,389.7,1284.3,47.1
+comp,4 KB,Compactor off (sweep still runs),5,1.481,0.205,482.1,1302.1,46.7
+comp,4 KB,Compactor off (sweep still runs),6,1.854,0.205,3061.3,632.0,70.5
+comp,4 KB,Compactor off (sweep still runs),7,1.907,0.205,414.6,1176.4,46.1
+comp,4 KB,Compactor off (sweep still runs),8,1.958,0.205,421.8,1219.9,48.1
+comp,4 KB,Compactor off (sweep still runs),9,2.011,0.205,417.9,1479.6,48.0
+comp,4 KB,Compactor off (sweep still runs),10,2.011,0.205,0.0,493.1,66.4
+comp,4 KB,Compactor off (sweep still runs),11,2.011,0.205,,,68.9
+comp,4 KB,Compactor off (sweep still runs),12,2.011,0.205,,,68.5
+comp,4 KB,Compactor off (sweep still runs),13,2.011,0.205,,,69.0
+comp,4 KB,Compactor off (sweep still runs),14,2.011,0.205,,,68.2
+comp,4 KB,Compactor off (sweep still runs),15,2.011,0.205,,,66.9
+comp,4 KB,Compactor off (sweep still runs),16,2.011,0.205,,,56.3
+comp,4 KB,Compactor off (sweep still runs),17,2.011,0.205,,,60
+comp,4 KB,Compactor off (sweep still runs),18,2.011,0.205,,,66.1
+comp,4 KB,Compactor off (sweep still runs),19,2.011,0.205,,,67.1
+comp,4 KB,Compactor off (sweep still runs),20,2.011,0.205,,,45.5
+comp,4 KB,Compactor off (sweep still runs),21,2.011,0.205,,,53.4
+comp,4 KB,Compactor off (sweep still runs),22,2.011,0.205,,,52.3
+comp,4 KB,Compactor off (sweep still runs),23,2.011,0.205,,,53.6
+comp,4 KB,Compactor off (sweep still runs),24,2.011,0.205,,,53.1
+comp,4 KB,Compactor off (sweep still runs),25,2.011,0.205,,,54.1
+comp,4 KB,Compactor off (sweep still runs),26,2.011,0.205,,,52.5
+comp,4 KB,Compactor off (sweep still runs),27,2.011,0.205,,,51.4
+comp,4 KB,Compactor off (sweep still runs),28,2.011,0.205,,,47.6
+comp,4 KB,Compactor off (sweep still runs),29,2.011,0.205,,,29.1
+comp,4 KB,Compactor off (sweep still runs),30,2.011,0.205,,,46.9
+comp,4 KB,Compactor off (sweep still runs),31,2.011,0.205,,,52.6
+comp,4 KB,Compactor off (sweep still runs),32,2.011,0.205,,,64.0
+comp,4 KB,Compactor off (sweep still runs),33,2.011,0.205,,,72.4
+comp,4 KB,Compactor off (sweep still runs),34,2.011,0.205,,,73.8
+comp,4 KB,Compactor off (sweep still runs),35,2.011,0.205,,,73.8
+comp,4 KB,Compactor off (sweep still runs),36,2.011,0.205,,,73.8
+comp,4 KB,Compactor off (sweep still runs),37,2.011,0.205,,,45.9
+comp,4 KB,"Sweep v1, compaction only",0,0.457,0.205,3708.6,383.8,76.9
+comp,4 KB,"Sweep v1, compaction only",1,0.91,0.205,3672.6,434.6,77.8
+comp,4 KB,"Sweep v1, compaction only",2,1.325,0.205,3345.2,654.2,73.8
+comp,4 KB,"Sweep v1, compaction only",3,1.397,0.205,638.1,1109.3,48.4
+comp,4 KB,"Sweep v1, compaction only",4,1.446,0.205,395.2,1420.1,47.4
+comp,4 KB,"Sweep v1, compaction only",5,1.502,0.205,440.1,1221.2,47.9
+comp,4 KB,"Sweep v1, compaction only",6,1.872,0.205,3038.0,333.9,70.3
+comp,4 KB,"Sweep v1, compaction only",7,1.958,0.205,689.1,1175.4,47.8
+comp,4 KB,"Sweep v1, compaction only",8,2.009,0.205,415.3,1340.0,47.6
+comp,4 KB,"Sweep v1, compaction only",9,2.057,0.205,393.4,1272.3,47.7
+comp,4 KB,"Sweep v1, compaction only",10,2.057,0.205,3.7,776.3,67.6
+comp,4 KB,"Sweep v1, compaction only",11,2.057,0.205,,,71.4
+comp,4 KB,"Sweep v1, compaction only",12,2.057,0.205,,,71.5
+comp,4 KB,"Sweep v1, compaction only",13,2.057,0.205,,,72.2
+comp,4 KB,"Sweep v1, compaction only",14,2.057,0.205,,,71.9
+comp,4 KB,"Sweep v1, compaction only",15,2.057,0.205,,,72.1
+comp,4 KB,"Sweep v1, compaction only",16,2.057,0.205,,,63.4
+comp,4 KB,"Sweep v1, compaction only",17,2.07,0.205,,,57.1
+comp,4 KB,"Sweep v1, compaction only",18,2.072,0.205,,,50.1
+comp,4 KB,"Sweep v1, compaction only",19,2.072,0.205,,,62.3
+comp,4 KB,"Sweep v1, compaction only",20,2.072,0.205,,,45.2
+comp,4 KB,"Sweep v1, compaction only",21,2.072,0.205,,,54.2
+comp,4 KB,"Sweep v1, compaction only",22,2.072,0.205,,,53.4
+comp,4 KB,"Sweep v1, compaction only",23,2.072,0.205,,,53.4
+comp,4 KB,"Sweep v1, compaction only",24,2.072,0.205,,,52
+comp,4 KB,"Sweep v1, compaction only",25,2.072,0.205,,,52.9
+comp,4 KB,"Sweep v1, compaction only",26,1.893,0.205,,,48.2
+comp,4 KB,"Sweep v1, compaction only",27,1.893,0.205,,,42.1
+comp,4 KB,"Sweep v1, compaction only",28,1.558,0.205,,,38.9
+comp,4 KB,"Sweep v1, compaction only",29,1.56,0.205,,,22.9
+comp,4 KB,"Sweep v1, compaction only",30,1.57,0.205,,,43.3
+comp,4 KB,"Sweep v1, compaction only",31,1.257,0.205,,,36.2

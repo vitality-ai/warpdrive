@@ -1,0 +1,5 @@
+put error sample: PUT status=500 Internal Server Error body=metadata write did not reach quorum: 1/2 nodes stored the row
+put error sample: PUT status=500 Internal Server Error body=metadata write did not reach quorum: 1/2 nodes stored the row
+put error sample: PUT status=500 Internal Server Error body=metadata write did not reach quorum: 1/2 nodes stored the row
+put error sample: PUT status=500 Internal Server Error body=write quorum not met: 1/2 nodes stored a shard (RS(2,1))
+put error sample: PUT status=500 Internal Server Error body=metadata write did not reach quorum: 1/2 nodes stored the row

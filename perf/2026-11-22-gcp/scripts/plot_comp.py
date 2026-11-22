@@ -8,6 +8,9 @@ COL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 rows = [r for r in csv.DictReader(open(src)) if r["run"] == run]
 for size in dict.fromkeys(r["size"] for r in rows):
     sr = [r for r in rows if r["size"] == size]; arms = list(dict.fromkeys(r["arm"] for r in sr))
+    # Same window for every arm: an arm whose collection hung has samples past the run.
+    end = min(max(int(r["minute"]) for r in sr if r["arm"] == a) for a in arms)
+    sr = [r for r in sr if int(r["minute"]) <= end]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), dpi=130)
     for ax, (field, label, put_only) in zip(axes, [("disk_gb", "Disk per node, GB (mean of nodes)", False), ("put_ops_s", "PUT ops/s, overwrite phase", True)]):
         for i, a in enumerate(arms):

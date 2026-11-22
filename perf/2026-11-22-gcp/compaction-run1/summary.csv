@@ -1,0 +1,7 @@
+run,size,arm,put_ops_s,put_p50_ms,put_p99_ms,put_errors,get_ops_s,get_p99_ms,get_errors,live_gb_per_node,disk_gb_end_of_writes,disk_gb_peak,disk_gb_end,space_amp_end_of_writes,space_amp_end,cpu_pct_writes,dead_entries_dropped,bytes_copied,bytes_punched,bytes_freed
+comp,1 MB,"Sweep v1, punch + copy_file_range",227.4,131.025,220.229,0,1177.4,61.272,0,0.524,32.934,39.642,0.525,62.82,1.0,41.8,406386,1212678144,253755392,214077276160
+comp,1 MB,Compactor off (sweep still runs),207.9,130.42,218.504,19892,1177.9,51.315,0,0.524,64.014,65.463,64.015,122.1,122.1,40.9,0,0,0,0
+comp,1 MB,"Sweep v1, compaction only",257.2,113.562,187.45,0,1177.6,61.926,0,0.524,39.798,45.709,0.584,75.91,1.11,47.6,460011,1330118656,0,242330107904
+comp,4 KB,"Sweep v1, punch + copy_file_range",1647.9,35.935,597.463,0,6971.3,120.318,0,0.205,2.017,2.06,1.226,9.85,5.99,58.4,662132,6322176,20189184,1409286144
+comp,4 KB,Compactor off (sweep still runs),1636.3,36.16,633.193,0,7386.0,98.016,0,0.205,2.011,2.011,2.011,9.82,9.82,57.9,0,0,0,0
+comp,4 KB,"Sweep v1, compaction only",1673.9,35.748,619.102,0,8658.5,74.774,0,0.205,2.057,2.097,1.257,10.04,6.14,58.5,1414716,83161088,0,2013265920
