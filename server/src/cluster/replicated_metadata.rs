@@ -44,7 +44,8 @@ use crate::metadata::{
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
 use super::blob_store::{blob_at, index_blob, BlobRef};
-use warp_meta_store::{BitcaskEngine, Engine};
+use super::meta_engine::{AnyEngine, MetaEngineKind};
+use warp_meta_store::Engine;
 
 // ---------------------------------------------------------------- rows
 
@@ -174,11 +175,12 @@ impl Record for MetaRecord {
     }
 }
 
-/// This node's copy of the rows.
-pub type MetaRows = WarpMetaStore<MetaRecord, BitcaskEngine<Entry<MetaRecord>>>;
+/// This node's copy of the rows, on the engine picked at startup
+/// (`WARPDRIVE_META_ENGINE`, see `meta_engine`).
+pub type MetaRows = WarpMetaStore<MetaRecord, AnyEngine<Entry<MetaRecord>>>;
 
-pub fn open_rows(path: &str) -> std::io::Result<MetaRows> {
-    let rows: MetaRows = WarpMetaStore::new(BitcaskEngine::open(path, "s3 metadata")?);
+pub fn open_rows(kind: MetaEngineKind, path: &str) -> std::io::Result<MetaRows> {
+    let rows: MetaRows = WarpMetaStore::new(AnyEngine::open(kind, path, "s3 metadata")?);
     for (_, entry) in rows.engine().snapshot() {
         if let Some(r) = entry.live() {
             index_record(r);
@@ -1301,13 +1303,18 @@ fn upload_view(upload_id: &str, u: &UploadRow) -> MultipartUploadRow {
     }
 }
 
+/// The metadata store's tests, run once per engine: the same rows, locks
+/// and restarts must behave the same on the KV and the SQL engine.
 #[cfg(test)]
-mod tests {
-    use super::*;
+macro_rules! metadata_store_tests {
+    ($name:ident, $kind:expr) => {
+        mod $name {
+            use super::*;
+            const KIND: MetaEngineKind = $kind;
 
     fn store() -> (tempfile::TempDir, ReplicatedMetadataStore) {
         let dir = tempfile::tempdir().unwrap();
-        let rows = Arc::new(open_rows(&dir.path().join("m.log").to_string_lossy()).unwrap());
+        let rows = Arc::new(open_rows(KIND, &dir.path().join("m.log").to_string_lossy()).unwrap());
         let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
         (dir, s)
     }
@@ -1472,7 +1479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.log").to_string_lossy().into_owned();
         {
-            let rows = Arc::new(open_rows(&path).unwrap());
+            let rows = Arc::new(open_rows(KIND, &path).unwrap());
             let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
             s.create_bucket("u", "b").unwrap();
             s.put_object_v2("u", "b", "k", &meta(4, "e")).unwrap();
@@ -1481,9 +1488,16 @@ mod tests {
             let ext = crate::util::serializer::serialize_offset_size(&vec![(0, 10)]).unwrap();
             s.upsert_multipart_part("up", 3, "e3", 10, &ext, "").unwrap();
         }
-        let rows = Arc::new(open_rows(&path).unwrap());
+        let rows = Arc::new(open_rows(KIND, &path).unwrap());
         let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().size, 4);
         assert_eq!(s.list_multipart_parts("up").unwrap()[0].part_number, 3);
     }
+        }
+    };
 }
+
+#[cfg(test)]
+metadata_store_tests!(tests_bitcask, MetaEngineKind::Bitcask);
+#[cfg(test)]
+metadata_store_tests!(tests_sqlite, MetaEngineKind::Sqlite);

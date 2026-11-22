@@ -5,6 +5,7 @@ pub mod ec;
 pub mod packing;
 pub mod placement;
 pub mod membership;
+pub mod meta_engine;
 pub mod shard_meta_store;
 pub mod timing_stats;
 pub mod shard_storage;

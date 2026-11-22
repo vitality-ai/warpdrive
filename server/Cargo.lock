@@ -3227,6 +3227,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp-meta-store-sqlite"
+version = "0.1.0"
+dependencies = [
+ "parking_lot 0.12.5",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "warp-meta-store",
+]
+
+[[package]]
 name = "warp_drive"
 version = "1.0.0-beta"
 dependencies = [
@@ -3270,6 +3281,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "warp-meta-store",
+ "warp-meta-store-sqlite",
 ]
 
 [[package]]
