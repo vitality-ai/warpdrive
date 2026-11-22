@@ -1,0 +1,4 @@
+# name|fs|args: 2 KiB objects (a 4 KB object's shard on RS(2,1)), 2 GB live. Buffered reads in every arm (O_DIRECT needs 4 KiB alignment).
+small-nocompact|xfs|--obj-kb 2 --live-gb 2 --direct 0 --segment-mb 64 --compact 0
+small-punch|xfs|--obj-kb 2 --live-gb 2 --direct 0 --segment-mb 1048576 --compact 0 --punch 1
+small-seg64|xfs|--obj-kb 2 --live-gb 2 --direct 0 --segment-mb 64 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50

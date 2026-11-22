@@ -43,6 +43,8 @@ struct Cfg {
     onefile: bool,
     /// Punch each dead object's range out of its file on delete (no copying).
     punch: bool,
+    /// Every object this size in KiB (0: the 64 KiB / 1 MiB / 4 MiB mix).
+    obj_kb: u64,
     hot_frac: f64,
     seed: u64,
     timeline: Option<PathBuf>,
@@ -52,7 +54,7 @@ fn parse() -> Cfg {
     let mut c = Cfg {
         dir: PathBuf::from("/mnt/nvme/segbench"), segment_mb: 256, umax: 0.5, policy: "costbenefit".into(),
         layout: "C".into(), copy: "cfr".into(), rate_mbps: 50.0, live_gb: 6.0, churn_x: 4.0, warm_x: 2.0,
-        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, write_rate: 0.0, compact: true, onefile: false, punch: false, hot_frac: 0.9, seed: 1, timeline: None,
+        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, write_rate: 0.0, compact: true, onefile: false, punch: false, obj_kb: 0, hot_frac: 0.9, seed: 1, timeline: None,
     };
     let a: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -78,6 +80,7 @@ fn parse() -> Cfg {
             "--compact" => c.compact = v == "1",
             "--onefile" => c.onefile = v == "1",
             "--punch" => c.punch = v == "1",
+            "--obj-kb" => c.obj_kb = v.parse().unwrap(),
             "--hot-frac" => c.hot_frac = v.parse().unwrap(),
             "--seed" => c.seed = v.parse().unwrap(),
             "--timeline" => c.timeline = Some(v.into()),
@@ -236,7 +239,8 @@ fn sync(f: &File) {
 }
 
 // ------------------------------------------------------------------ workload
-fn obj_size(r: &mut Rng) -> u64 {
+fn obj_size(r: &mut Rng, cfg: &Cfg) -> u64 {
+    if cfg.obj_kb > 0 { return cfg.obj_kb << 10; }
     let x = r.f();
     if x < 0.6 { 64 << 10 } else if x < 0.9 { 1 << 20 } else { 4 << 20 }
 }
@@ -264,7 +268,7 @@ fn prefill(sh: &Shared) {
     loop {
         let mut st = sh.st.lock().unwrap();
         if st.live_bytes >= target { break; }
-        let len = obj_size(&mut r);
+        let len = obj_size(&mut r, &sh.cfg);
         let (seg, off, f) = reserve(sh, &mut st, len, false);
         f.write_all_at(&buf[..len as usize], off).unwrap();
         let life = if r.f() < p_cold { r.exp(cold_mean) } else { r.exp(hot_mean) } as u64;
@@ -290,7 +294,7 @@ fn writer(sh: Arc<Shared>, wid: u64) {
     let per_writer = sh.cfg.write_rate * 1e6 / sh.cfg.writers as f64;
     let mut next = Instant::now() + Duration::from_millis(wid * 7);
     while !sh.stop.load(Relaxed) {
-        let len = obj_size(&mut r);
+        let len = obj_size(&mut r, &sh.cfg);
         let t0 = if per_writer > 0.0 {
             let now = Instant::now();
             if next > now { std::thread::sleep(next - now); }
@@ -622,12 +626,12 @@ fn main() {
     let mut rps: Vec<u32> = samples.iter().map(|s| s.4).collect();
     let (it, bt) = (mean(&idle_tp), mean(&busy_tp));
     println!(
-        "{{\"segment_mb\":{},\"umax\":{},\"policy\":\"{}\",\"layout\":\"{}\",\"copy\":\"{}\",\"rate_mbps\":{},\"compact\":{},\"onefile\":{},\"punch\":{},\"live_gb\":{},\
+        "{{\"segment_mb\":{},\"umax\":{},\"policy\":\"{}\",\"layout\":\"{}\",\"copy\":\"{}\",\"rate_mbps\":{},\"compact\":{},\"onefile\":{},\"punch\":{},\"obj_kb\":{},\"live_gb\":{},\
 \"secs\":{:.1},\"fg_mbs\":{:.1},\"wa\":{:.3},\"sa_mean\":{:.3},\"sa_max\":{:.3},\"phys_sa_mean\":{:.3},\"wp99_med_us\":{},\"rp99_med_us\":{},\
 \"wp99_max_us\":{},\"rp99_max_us\":{},\"fg_idle_mbs\":{:.1},\"fg_busy_mbs\":{:.1},\"rho\":{:.3},\"busy_frac\":{:.3},\
 \"segs_compacted\":{},\"whole_dead\":{},\"max_files\":{},\"w_p50_us\":{},\"w_p99_us\":{},\"w_p999_us\":{},\
 \"r_p50_us\":{},\"r_p99_us\":{},\"r_p999_us\":{},\"copy_mbs\":{:.1},\"freed_mbs\":{:.1},\"seg_ms_p50\":{},\"seg_ms_max\":{},\"cpu_pct\":{:.1}}}",
-        cfg.segment_mb, cfg.umax, cfg.policy, cfg.layout, cfg.copy, cfg.rate_mbps, cfg.compact, cfg.onefile, cfg.punch, cfg.live_gb,
+        cfg.segment_mb, cfg.umax, cfg.policy, cfg.layout, cfg.copy, cfg.rate_mbps, cfg.compact, cfg.onefile, cfg.punch, cfg.obj_kb, cfg.live_gb,
         secs, fgb / 1e6 / secs, (fgb + cb) / fgb.max(1.0), sa_mean, sa_max, mean(&phys), pct(&mut wps, 0.5), pct(&mut rps, 0.5),
         wps.iter().max().copied().unwrap_or(0), rps.iter().max().copied().unwrap_or(0), it, bt,
         if bt > 0.0 { it / bt } else { 1.0 }, busy_tp.len() as f64 / samples.len().max(1) as f64,
