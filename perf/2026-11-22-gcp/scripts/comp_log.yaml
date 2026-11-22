@@ -1,0 +1,15 @@
+appenders:
+  file:
+    kind: file
+    path: "logs/application.log"
+    encoder:
+      pattern: "{d} - {l} - {M} - {m}{n}"
+root:
+  level: warn
+  appenders:
+    - file
+loggers:
+  warp_drive::cluster::compactor:
+    level: info
+  warp_drive::cluster::reclaim:
+    level: info
