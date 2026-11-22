@@ -38,6 +38,11 @@ struct Cfg {
     prealloc: bool,  // fallocate each segment to its full size when it's created
     write_rate: f64, // total customer write MB/s (open loop); 0 = as fast as possible
     compact: bool,
+    /// One file: the compactor may take the active file too, rotating new
+    /// writes to a fresh one (whole-file rewrite). Use with a huge segment size.
+    onefile: bool,
+    /// Punch each dead object's range out of its file on delete (no copying).
+    punch: bool,
     hot_frac: f64,
     seed: u64,
     timeline: Option<PathBuf>,
@@ -47,7 +52,7 @@ fn parse() -> Cfg {
     let mut c = Cfg {
         dir: PathBuf::from("/mnt/nvme/segbench"), segment_mb: 256, umax: 0.5, policy: "costbenefit".into(),
         layout: "C".into(), copy: "cfr".into(), rate_mbps: 50.0, live_gb: 6.0, churn_x: 4.0, warm_x: 2.0,
-        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, write_rate: 0.0, compact: true, hot_frac: 0.9, seed: 1, timeline: None,
+        writers: 8, readers: 4, read_rate: 200.0, direct: true, prealloc: false, write_rate: 0.0, compact: true, onefile: false, punch: false, hot_frac: 0.9, seed: 1, timeline: None,
     };
     let a: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -71,6 +76,8 @@ fn parse() -> Cfg {
             "--prealloc" => c.prealloc = v == "1",
             "--write-rate" => c.write_rate = v.parse().unwrap(),
             "--compact" => c.compact = v == "1",
+            "--onefile" => c.onefile = v == "1",
+            "--punch" => c.punch = v == "1",
             "--hot-frac" => c.hot_frac = v.parse().unwrap(),
             "--seed" => c.seed = v.parse().unwrap(),
             "--timeline" => c.timeline = Some(v.into()),
@@ -91,7 +98,9 @@ impl Rng {
 
 // ------------------------------------------------------------------ state
 struct Obj { seg: u64, off: u64, len: u64, pos: usize }
-struct Seg { file: Arc<File>, rfile: Arc<File>, len: u64, live: u64, sealed: bool, survivor: bool, newest: Instant }
+/// `inflight`: reservations whose object isn't registered yet. The compactor
+/// waits for it to reach zero, so it never copies a file a write is still landing in.
+struct Seg { file: Arc<File>, rfile: Arc<File>, len: u64, live: u64, sealed: bool, survivor: bool, newest: Instant, inflight: u64 }
 
 struct Inner {
     objs: HashMap<u64, Obj>,
@@ -153,7 +162,7 @@ fn new_segment(sh: &Shared, st: &mut Inner, surv: bool) -> u64 {
     } else { Arc::clone(&f) };
     #[cfg(not(target_os = "linux"))]
     let rf = Arc::clone(&f);
-    st.segs.insert(id, Seg { file: f, rfile: rf, len: 0, live: 0, sealed: false, survivor: surv, newest: Instant::now() });
+    st.segs.insert(id, Seg { file: f, rfile: rf, len: 0, live: 0, sealed: false, survivor: surv, newest: Instant::now(), inflight: 0 });
     id
 }
 
@@ -171,6 +180,7 @@ fn reserve(sh: &Shared, st: &mut Inner, len: u64, survivor_stream: bool) -> (u64
     let s = st.segs.get_mut(&id).unwrap();
     let off = s.len;
     s.len += len;
+    s.inflight += 1;
     s.newest = Instant::now();
     st.disk_bytes += len;
     (id, off, Arc::clone(&s.file))
@@ -262,7 +272,7 @@ fn prefill(sh: &Shared) {
         let pos = st.ids.len();
         st.ids.push(id);
         st.objs.insert(id, Obj { seg, off, len, pos });
-        st.segs.get_mut(&seg).unwrap().live += len;
+        { let s = st.segs.get_mut(&seg).unwrap(); s.live += len; s.inflight -= 1; }
         st.live_bytes += len;
         st.deaths.push(Reverse((life, id)));
         if !segs.contains(&seg) { segs.push(seg); }
@@ -299,7 +309,7 @@ fn writer(sh: Arc<Shared>, wid: u64) {
             let pos = st.ids.len();
             st.ids.push(id);
             st.objs.insert(id, Obj { seg, off, len, pos });
-            if let Some(s) = st.segs.get_mut(&seg) { s.live += len; }
+            if let Some(s) = st.segs.get_mut(&seg) { s.live += len; s.inflight -= 1; }
             st.live_bytes += len;
             st.deaths.push(Reverse((born + life, id)));
             // Expire everything whose lifetime has passed.
@@ -322,6 +332,9 @@ fn delete(sh: &Shared, st: &mut Inner, id: u64) {
         st.ids.swap_remove(o.pos);
         if last != id { st.objs.get_mut(&last).unwrap().pos = o.pos; }
         st.live_bytes -= o.len;
+        if sh.cfg.punch {
+            if let Some(s) = st.segs.get(&o.seg) { punch(&s.file, o.off, o.len); }
+        }
         let whole_dead = match st.segs.get_mut(&o.seg) {
             Some(s) => { s.live -= o.len; s.sealed && s.live == 0 }
             None => false,
@@ -329,6 +342,17 @@ fn delete(sh: &Shared, st: &mut Inner, id: u64) {
         // A sealed segment with nothing live is freed by unlinking it, no copy.
         if whole_dead { remove_segment(sh, st, o.seg); sh.whole_dead.fetch_add(1, Relaxed); }
     }
+}
+
+/// Deallocates the whole 4 KiB blocks of `[off, off + len)`, keeping the file size.
+fn punch(f: &File, off: u64, len: u64) {
+    let a = off.div_ceil(4096) * 4096;
+    let b = (off + len) / 4096 * 4096;
+    if b <= a { return; }
+    #[cfg(target_os = "linux")]
+    unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, a as i64, (b - a) as i64) };
+    #[cfg(not(target_os = "linux"))]
+    let _ = (f, a, b);
 }
 
 fn reader(sh: Arc<Shared>, rid: u64) {
@@ -369,7 +393,8 @@ fn pick_victim(sh: &Shared, st: &Inner) -> Option<u64> {
     let now = Instant::now();
     let mut best: Option<(f64, u64)> = None;
     for (&id, s) in &st.segs {
-        if !s.sealed || s.len == 0 { continue; }
+        let active_file = sh.cfg.onefile && id == st.active && !s.survivor;
+        if (!s.sealed && !active_file) || s.len == 0 { continue; }
         let u = s.live as f64 / s.len as f64;
         if u >= sh.cfg.umax { continue; }
         let score = match sh.cfg.policy.as_str() {
@@ -409,6 +434,18 @@ fn compactor(sh: Arc<Shared>) {
     while !sh.stop.load(Relaxed) {
         let victim = { let st = sh.st.lock().unwrap(); pick_victim(&sh, &st) };
         let Some(v) = victim else { std::thread::sleep(Duration::from_millis(20)); continue };
+        if sh.cfg.onefile {
+            let mut st = sh.st.lock().unwrap();
+            if st.active == v {
+                st.segs.get_mut(&v).unwrap().sealed = true;
+                let n = new_segment(&sh, &mut st, false);
+                st.active = n;
+            }
+        }
+        // Writes reserved into the victim before it was picked finish first.
+        while sh.st.lock().unwrap().segs.get(&v).map(|s| s.inflight > 0).unwrap_or(false) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let t_start = Instant::now();
         sh.compacting.store(true, Relaxed);
         let (src, moves) = {
@@ -440,6 +477,7 @@ fn compactor(sh: Arc<Shared>) {
         {
             let mut st = sh.st.lock().unwrap();
             for (id, off, len, dseg, doff) in placed {
+                if let Some(s) = st.segs.get_mut(&dseg) { s.inflight -= 1; }
                 let still_here = st.objs.get(&id).map(|o| o.seg == v && o.off == off).unwrap_or(false);
                 if still_here {
                     let o = st.objs.get_mut(&id).unwrap();
@@ -584,12 +622,12 @@ fn main() {
     let mut rps: Vec<u32> = samples.iter().map(|s| s.4).collect();
     let (it, bt) = (mean(&idle_tp), mean(&busy_tp));
     println!(
-        "{{\"segment_mb\":{},\"umax\":{},\"policy\":\"{}\",\"layout\":\"{}\",\"copy\":\"{}\",\"rate_mbps\":{},\"compact\":{},\"live_gb\":{},\
+        "{{\"segment_mb\":{},\"umax\":{},\"policy\":\"{}\",\"layout\":\"{}\",\"copy\":\"{}\",\"rate_mbps\":{},\"compact\":{},\"onefile\":{},\"punch\":{},\"live_gb\":{},\
 \"secs\":{:.1},\"fg_mbs\":{:.1},\"wa\":{:.3},\"sa_mean\":{:.3},\"sa_max\":{:.3},\"phys_sa_mean\":{:.3},\"wp99_med_us\":{},\"rp99_med_us\":{},\
 \"wp99_max_us\":{},\"rp99_max_us\":{},\"fg_idle_mbs\":{:.1},\"fg_busy_mbs\":{:.1},\"rho\":{:.3},\"busy_frac\":{:.3},\
 \"segs_compacted\":{},\"whole_dead\":{},\"max_files\":{},\"w_p50_us\":{},\"w_p99_us\":{},\"w_p999_us\":{},\
 \"r_p50_us\":{},\"r_p99_us\":{},\"r_p999_us\":{},\"copy_mbs\":{:.1},\"freed_mbs\":{:.1},\"seg_ms_p50\":{},\"seg_ms_max\":{},\"cpu_pct\":{:.1}}}",
-        cfg.segment_mb, cfg.umax, cfg.policy, cfg.layout, cfg.copy, cfg.rate_mbps, cfg.compact, cfg.live_gb,
+        cfg.segment_mb, cfg.umax, cfg.policy, cfg.layout, cfg.copy, cfg.rate_mbps, cfg.compact, cfg.onefile, cfg.punch, cfg.live_gb,
         secs, fgb / 1e6 / secs, (fgb + cb) / fgb.max(1.0), sa_mean, sa_max, mean(&phys), pct(&mut wps, 0.5), pct(&mut rps, 0.5),
         wps.iter().max().copied().unwrap_or(0), rps.iter().max().copied().unwrap_or(0), it, bt,
         if bt > 0.0 { it / bt } else { 1.0 }, busy_tp.len() as f64 / samples.len().max(1) as f64,
