@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use super::shard_storage::{delete_shard_if, move_shard_if, parse_shard_key, shard_entries};
+use super::shard_storage::{delete_shards_if, move_shard_if, parse_shard_key, shard_entries};
 use crate::storage::local_store::{get_storage_directory, segment_of, LocalXFSBinaryStore, SegmentInfo};
 
 #[derive(Debug, Clone, Copy)]
@@ -179,12 +179,10 @@ pub fn run_pass(dead: &[(String, u64, u64)]) -> CompactStats {
     let store = LocalXFSBinaryStore::new();
     retire_due(&store, &cfg, &mut stats);
 
-    for (sk, offset, size) in dead {
-        match delete_shard_if(sk, (*offset, *size)) {
-            Ok(true) => stats.dead_entries_dropped += 1,
-            Ok(false) => {}
-            Err(e) => log::warn!("compactor: dropping the entry of {sk:?} failed: {e}"),
-        }
+    let dead: Vec<(String, (u64, u64))> = dead.iter().map(|(sk, o, n)| (sk.clone(), (*o, *n))).collect();
+    match delete_shards_if(&dead) {
+        Ok(n) => stats.dead_entries_dropped += n,
+        Err(e) => log::warn!("compactor: dropping dead entries failed: {e}"),
     }
 
     // Segments first, then the index: a write that finished after the

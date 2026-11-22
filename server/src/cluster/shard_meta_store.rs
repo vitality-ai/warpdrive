@@ -42,6 +42,9 @@ pub trait ShardMetaStore: Send + Sync {
     /// Removes `shard_key` only if it still points at `at`. Returns whether
     /// it removed it.
     fn delete_if_at(&self, shard_key: &str, at: (u64, u64)) -> io::Result<bool>;
+    /// `delete_if_at` for many shards, durable on return with one sync.
+    /// Returns how many it removed.
+    fn delete_many_if_at(&self, shards: &[(String, (u64, u64))]) -> io::Result<usize>;
     /// Every shard key with its `(offset, size)`, for the space reclaimer.
     fn entries(&self) -> Vec<(String, (u64, u64))>;
     /// See `LocationStore::compact` — same reasoning and same mechanism
@@ -100,6 +103,12 @@ impl<E: Engine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
 
     fn delete_if_at(&self, shard_key: &str, at: (u64, u64)) -> io::Result<bool> {
         self.engine.delete_if(shard_key, |cur| *cur != at)
+    }
+
+    fn delete_many_if_at(&self, shards: &[(String, (u64, u64))]) -> io::Result<usize> {
+        let at: HashMap<&str, (u64, u64)> = shards.iter().map(|(k, a)| (k.as_str(), *a)).collect();
+        let keys: Vec<String> = shards.iter().map(|(k, _)| k.clone()).collect();
+        self.engine.delete_many_if(&keys, |k, cur| at.get(k) != Some(cur))
     }
 
     fn entries(&self) -> Vec<(String, (u64, u64))> {

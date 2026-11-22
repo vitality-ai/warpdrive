@@ -168,6 +168,25 @@ where
         Ok(true)
     }
 
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
+        let mut removed = 0;
+        for key in keys {
+            let current: Option<V> = tx
+                .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(io_err)?
+                .and_then(|b| decode(&b));
+            if matches!(current, Some(v) if !keep(key, &v)) {
+                tx.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
+                removed += 1;
+            }
+        }
+        tx.commit().map_err(io_err)?;
+        Ok(removed)
+    }
+
     fn scan_prefix<T>(&self, prefix: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         let mut out = Vec::new();
         self.walk(prefix, None, false, |k, v| {

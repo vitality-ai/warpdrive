@@ -125,6 +125,9 @@ where
     fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
         forward!(self, e => e.delete_if(key, keep))
     }
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        forward!(self, e => e.delete_many_if(keys, keep))
+    }
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         forward!(self, e => e.scan_prefix(prefix, f))
     }

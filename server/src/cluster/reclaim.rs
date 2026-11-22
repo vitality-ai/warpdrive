@@ -58,8 +58,10 @@ use super::shard_storage::{parse_shard_key, shard_entries, ShardId};
 
 /// Prefix of the internal bucket S3 blob shards are stored under.
 const BLOB_NS: &str = "\u{1}blobs\u{1}";
-/// Shards per confirmation request.
-const CHECK_BATCH: usize = 1000;
+/// Shards per confirmation request. A peer reads all of its records once
+/// per request to answer, so few large requests: about 2.5 MB of JSON
+/// each, against hundreds of thousands of candidates on a busy node.
+const CHECK_BATCH: usize = 20_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {

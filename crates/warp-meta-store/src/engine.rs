@@ -47,6 +47,16 @@ pub trait Engine<V>: Send + Sync {
     /// value, atomically with respect to every other write. Returns whether
     /// it removed anything. A missing key is left alone.
     fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool>;
+    /// `delete_if` for many keys, durable on return. An engine can make the
+    /// whole batch durable at once instead of one key at a time. Returns
+    /// how many it removed.
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        let mut removed = 0;
+        for k in keys {
+            removed += self.delete_if(k, |v| keep(k, v))? as usize;
+        }
+        Ok(removed)
+    }
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
@@ -300,6 +310,31 @@ where
         };
         self.log.sync_ticket(ticket)?;
         Ok(true)
+    }
+
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        // Appended in chunks under the write lock, so writers wait at most
+        // one chunk, then made durable by one sync: a sync covers every
+        // line appended before its ticket.
+        let mut removed = 0;
+        let mut last = None;
+        for chunk in keys.chunks(4096) {
+            let _write_guard = self.write_lock.lock();
+            for key in chunk {
+                match self.index.read().get(key) {
+                    Some(v) if !keep(key, v) => {}
+                    _ => continue,
+                }
+                last = Some(self.log.append_line(&Self::line(key, None)?)?);
+                self.lines.fetch_add(1, Ordering::Relaxed);
+                self.index.write().remove(key);
+                removed += 1;
+            }
+        }
+        if let Some(ticket) = last {
+            self.log.sync_ticket(ticket)?;
+        }
+        Ok(removed)
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
@@ -566,6 +601,24 @@ mod tests {
         assert!(e.delete_if("k", |v| *v != 5).unwrap());
         assert_eq!(e.get("k"), None);
         assert_eq!(open(&dir).get("k"), None, "the delete is in the log");
+    }
+
+    #[test]
+    fn delete_many_if_removes_only_the_unchanged_and_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for i in 0..10_000u64 {
+            e.put(format!("k{i}"), i).unwrap();
+        }
+        e.put("k5".into(), 999).unwrap(); // changed since the caller looked
+        let keys: Vec<String> = (0..10_000).map(|i| format!("k{i}")).chain(["missing".to_string()]).collect();
+        let removed = e.delete_many_if(&keys, |k, v| *v != k[1..].parse::<u64>().unwrap()).unwrap();
+        assert_eq!(removed, 9_999);
+        assert_eq!(e.get("k5"), Some(999));
+        let replayed = open(&dir);
+        assert_eq!(replayed.get("k5"), Some(999));
+        assert_eq!(replayed.get("k6"), None);
+        assert_eq!(replayed.snapshot().len(), 1);
     }
 
     #[test]
