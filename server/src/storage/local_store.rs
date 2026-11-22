@@ -10,96 +10,155 @@ use std::env;
 use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
 use log::{debug, trace, warn};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use lazy_static::lazy_static;
 use warp_meta_store::group_commit::GroupCommit;
 
-// Per-(user, bucket) next-write-offset, so concurrent writes to DIFFERENT
-// buckets never block each other, and concurrent writes to the SAME bucket
-// stay correct via fetch_add rather than a shared lock held for the whole
-// write. Previously one global `Mutex<()>` serialized every write in the
-// process regardless of bucket — confirmed (via a load test) to be the
-// dominant bottleneck for the cluster's concurrent shard writes, now fixed
-// at the source rather than worked around above this trait. The mutex here
-// is only taken once per (user, bucket), to initialize its counter from the
-// file's current size — not on every write.
-lazy_static! {
-    static ref NEXT_OFFSET: Mutex<HashMap<String, Arc<AtomicU64>>> = Mutex::new(HashMap::new());
-}
-
-fn offset_counter(user_id: &str, bucket: &str, file_path: &PathBuf) -> Arc<AtomicU64> {
-    let key = format!("{user_id}/{bucket}");
-    {
-        let map = NEXT_OFFSET.lock();
-        if let Some(c) = map.get(&key) {
-            return Arc::clone(c);
-        }
-    }
-    let initial = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-    let mut map = NEXT_OFFSET.lock();
-    Arc::clone(
-        map.entry(key)
-            .or_insert_with(|| Arc::new(AtomicU64::new(initial))),
-    )
-}
-
-// Same pattern, same reasoning, one layer up: every `write`/`read` was
-// calling `OpenOptions::open` (a real `open(2)` syscall, plus the kernel
-// work to resolve the path and allocate a file descriptor) on *every
-// single shard operation*, having never cached the handle from the last
-// one. Under real concurrent shard throughput this is pure avoidable
-// syscall overhead competing with the actual I/O for the same descriptor
-// table lock inside the kernel -- exactly the kind of thing that caps
-// throughput below what the hardware can actually do. Cached here,
-// opened once per (user, bucket), reused via positional `_at` calls
-// (`write_all_at`/`read_exact_at`) so a shared `Arc<File>` needs no
-// synchronization for the I/O itself -- pread/pwrite don't touch the
-// file's shared cursor, matching `offset_counter`'s own existing
-// "no lock needed for the write itself" invariant.
+// Each (user, bucket) stores its bytes in segment files under
+// `{storage}/{user}/{bucket}/`, named `{id:010}.seg` (RFC 6, step 3). Writes
+// append to the active segment. When the next write would take it past the
+// segment size, the next segment becomes active. A write larger than a
+// segment gets one to itself. Sealed segments are never written again, so
+// the compactor can copy their live bytes out and delete them whole.
 //
-// Opened with the write-mode flags (create + read + write) regardless of
-// whether the first caller is a read or a write, so either access pattern
-// populates a handle the other can reuse. The one edge case this
-// produces: a read on a bucket that was never written returns
-// `UnexpectedEof` (empty file, just created) instead of `NotFound` (file
-// never existed) -- a different error *type* for a case that shouldn't
-// happen with correct callers (every real `(offset, size)` pair comes
-// from a prior successful write), not a different error *outcome*.
-lazy_static! {
-    static ref OPEN_FILES: Mutex<HashMap<String, Arc<File>>> = Mutex::new(HashMap::new());
+// The offset this store hands out is global: the segment id in the top
+// 24 bits and the offset inside the segment in the low 40. The shard index
+// keeps storing one (offset, size) pair, and a read finds its segment
+// without a lookup.
+const LOCAL_BITS: u32 = 40;
+const LOCAL_MASK: u64 = (1 << LOCAL_BITS) - 1;
+
+/// The segment a global offset points into.
+pub fn segment_of(offset: u64) -> u64 {
+    offset >> LOCAL_BITS
 }
 
-fn cached_file(user_id: &str, bucket: &str, file_path: &PathBuf) -> io::Result<Arc<File>> {
-    let key = format!("{user_id}/{bucket}");
-    {
-        let map = OPEN_FILES.lock();
-        if let Some(f) = map.get(&key) {
-            return Ok(Arc::clone(f));
+fn local_of(offset: u64) -> u64 {
+    offset & LOCAL_MASK
+}
+
+/// Bytes after which a segment is sealed. `WARPDRIVE_SEGMENT_MB`, default
+/// 64: the RFC 6 matrix freed the most space on small objects at 64 MB, and
+/// 64 to 128 MB kept the compaction unit small at no cost in write p99.
+fn default_segment_bytes() -> u64 {
+    static BYTES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        env::var("WARPDRIVE_SEGMENT_MB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or(64) << 20
+    });
+    *BYTES
+}
+
+/// One segment file and the group commit that batches its fsyncs. An fsync
+/// covers one file, so each segment has its own batching domain.
+struct Segment {
+    file: File,
+    commit: GroupCommit,
+}
+
+/// Where the next write in a bucket goes.
+struct Head {
+    seg: u64,
+    next: u64,
+}
+
+struct BucketFiles {
+    dir: PathBuf,
+    segment_bytes: u64,
+    head: Mutex<Head>,
+    // Every segment opened so far stays open: reads are pread on a shared
+    // handle. 64 MB segments mean about 16 descriptors per GB stored.
+    open: Mutex<HashMap<u64, Arc<Segment>>>,
+}
+
+fn segment_name(seg: u64) -> String {
+    format!("{seg:010}.seg")
+}
+
+/// fsync a directory, so an entry just created in it survives a crash.
+fn sync_dir(dir: &std::path::Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+impl BucketFiles {
+    /// Opens a bucket's directory, or creates it when `create`. The active
+    /// segment is the highest-numbered one, and writes continue at its
+    /// current length.
+    fn open(dir: PathBuf, segment_bytes: u64, create: bool) -> io::Result<Self> {
+        if !dir.is_dir() {
+            if !create {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("no segments at {}", dir.display())));
+            }
+            std::fs::create_dir_all(&dir)?;
+            // The new directory's entry must survive a crash along with the
+            // first segment written into it.
+            if let Some(parent) = dir.parent() {
+                sync_dir(parent)?;
+                if let Some(root) = parent.parent() {
+                    sync_dir(root)?;
+                }
+            }
         }
+        let mut head = Head { seg: 0, next: 0 };
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".seg")).and_then(|n| n.parse::<u64>().ok()) else { continue };
+            if id >= head.seg {
+                head = Head { seg: id, next: entry.metadata()?.len() };
+            }
+        }
+        Ok(Self { dir, segment_bytes, head: Mutex::new(head), open: Mutex::new(HashMap::new()) })
     }
-    let file = OpenOptions::new().create(true).read(true).write(true).open(file_path)?;
-    let mut map = OPEN_FILES.lock();
-    Ok(Arc::clone(
-        map.entry(key).or_insert_with(|| Arc::new(file)),
-    ))
+
+    /// Reserves `size` bytes: the segment and the offset inside it. Never
+    /// splits a write across segments.
+    fn reserve(&self, size: u64) -> (u64, u64) {
+        let mut h = self.head.lock();
+        if h.next > 0 && h.next + size > self.segment_bytes {
+            h.seg += 1;
+            h.next = 0;
+        }
+        let at = (h.seg, h.next);
+        h.next += size;
+        at
+    }
+
+    /// The open segment `seg`. Creating it (on a write) also syncs the
+    /// directory before anyone can acknowledge a write into it.
+    fn segment(&self, seg: u64, create: bool) -> io::Result<Arc<Segment>> {
+        let mut open = self.open.lock();
+        if let Some(s) = open.get(&seg) {
+            return Ok(Arc::clone(s));
+        }
+        let path = self.dir.join(segment_name(seg));
+        let file = if create {
+            let existed = path.exists();
+            let f = OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+            if !existed {
+                sync_dir(&self.dir)?;
+            }
+            f
+        } else {
+            OpenOptions::new().read(true).write(true).open(&path)?
+        };
+        let s = Arc::new(Segment { file, commit: GroupCommit::new() });
+        open.insert(seg, Arc::clone(&s));
+        Ok(s)
+    }
 }
 
-// One `GroupCommit` per (user, bucket) -- a fsync on one bucket's file
-// says nothing about another bucket's durability, so each needs its own
-// batching domain, same granularity as `NEXT_OFFSET`/`OPEN_FILES` above.
-// See `warp_meta_store::group_commit`'s module doc for why this batches many
-// concurrent writers' fsyncs into far fewer real syscalls without ever
-// acknowledging a write before it's actually durable.
 lazy_static! {
-    static ref GROUP_COMMITS: Mutex<HashMap<String, Arc<GroupCommit>>> = Mutex::new(HashMap::new());
+    static ref BUCKETS: Mutex<HashMap<PathBuf, Arc<BucketFiles>>> = Mutex::new(HashMap::new());
 }
 
-fn group_commit_for(user_id: &str, bucket: &str) -> Arc<GroupCommit> {
-    let key = format!("{user_id}/{bucket}");
-    let mut map = GROUP_COMMITS.lock();
-    Arc::clone(map.entry(key).or_insert_with(|| Arc::new(GroupCommit::new())))
+fn bucket_files(dir: PathBuf, segment_bytes: u64, create: bool) -> io::Result<Arc<BucketFiles>> {
+    if let Some(b) = BUCKETS.lock().get(&dir) {
+        return Ok(Arc::clone(b));
+    }
+    // Opened outside the map lock: scanning a directory is I/O. Two racing
+    // openers build the same state and the first insert wins.
+    let fresh = Arc::new(BucketFiles::open(dir.clone(), segment_bytes, create)?);
+    Ok(Arc::clone(BUCKETS.lock().entry(dir).or_insert(fresh)))
 }
 
 fn get_storage_directory() -> PathBuf {
@@ -124,99 +183,69 @@ fn get_storage_directory() -> PathBuf {
 }
 
 /// Local XFS binary storage implementation
-pub struct LocalXFSBinaryStore;
+pub struct LocalXFSBinaryStore {
+    segment_bytes: u64,
+}
 
 impl LocalXFSBinaryStore {
-    pub fn new() -> Self { Self }
-    
-    /// Get the file path for a user's bucket binary file
-    fn get_bucket_file_path(&self, user_id: &str, bucket: &str) -> PathBuf {
-        let storage_dir = get_storage_directory();
-        let user_dir = storage_dir.join(user_id);
-        
-        // Create user directory if it doesn't exist
-        if !user_dir.exists() {
-            std::fs::create_dir_all(&user_dir)
-                .expect("Failed to create user directory");
-        }
-        
-        // Return path as user/bucket-name.bin
-        user_dir.join(format!("{}.bin", bucket))
+    pub fn new() -> Self {
+        Self { segment_bytes: default_segment_bytes() }
+    }
+
+    /// A store whose buckets seal segments at `segment_bytes`. The size is
+    /// fixed when a bucket is first opened in this process.
+    pub fn with_segment_bytes(segment_bytes: u64) -> Self {
+        Self { segment_bytes: segment_bytes.clamp(1, LOCAL_MASK) }
+    }
+
+    /// The directory holding a bucket's segments: `{storage}/{user}/{bucket}/`.
+    fn bucket_dir(&self, user_id: &str, bucket: &str) -> PathBuf {
+        get_storage_directory().join(user_id).join(bucket)
+    }
+
+    fn bucket(&self, user_id: &str, bucket: &str, create: bool) -> Result<Arc<BucketFiles>, Error> {
+        bucket_files(self.bucket_dir(user_id, bucket), self.segment_bytes, create).map_err(ErrorInternalServerError)
     }
 }
 
 impl Storage for LocalXFSBinaryStore {
     fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
-        let file_path = self.get_bucket_file_path(user_id, bucket);
-        let counter = offset_counter(user_id, bucket, &file_path);
-
+        let files = self.bucket(user_id, bucket, true)?;
         let size = data.len() as u64;
-        // Reserve a non-overlapping byte range atomically, so concurrent
-        // writers (including to the same bucket) never race on where they
-        // write — no lock needed for the write itself.
-        let offset = counter.fetch_add(size, Ordering::SeqCst);
+        if size > LOCAL_MASK {
+            return Err(ErrorInternalServerError(format!("a {size}-byte write is larger than a segment can address")));
+        }
+        // Reserves a range no other writer gets. The lock covers only the
+        // reservation, never the I/O.
+        let (seg, local) = files.reserve(size);
+        let segment = files.segment(seg, true).map_err(ErrorInternalServerError)?;
 
-        let file = cached_file(user_id, bucket, &file_path)
-            .map_err(ErrorInternalServerError)?;
+        // `write_all_at`, not `write_at`: one pwrite may write fewer bytes
+        // than asked (signals, ENOSPC, the ~2 GiB cap), and a short write
+        // must not be recorded as a full one.
+        segment.file.write_all_at(data, local).map_err(ErrorInternalServerError)?;
 
-        // Positioned write (pwrite): writes at `offset` regardless of this
-        // file handle's own cursor, so concurrently-opened handles to the
-        // same file never interfere with each other. `write_all_at`, not
-        // `write_at`: a single `pwrite` can legitimately write fewer bytes
-        // than requested (Linux caps a single pwrite at ~2 GiB regardless
-        // of the buffer size; signals and ENOSPC partway through can also
-        // produce a short write), and `write_at`'s return value (how many
-        // bytes actually landed) was being discarded here, so a short
-        // write was silently recorded as if `size` full bytes were
-        // written -- real data truncation with no error anywhere.
-        // `write_all_at` loops until every byte lands or a real error
-        // occurs, matching what the caller already assumes happened.
-        file.write_all_at(data, offset)
-            .map_err(ErrorInternalServerError)?;
+        // Acknowledged only once durable. The group commit batches the
+        // fsyncs of concurrent writers to this segment into fewer real
+        // ones (see `warp_meta_store::group_commit`).
+        let ticket = segment.commit.ticket();
+        segment.commit.wait_for_durable(ticket, &segment.file).map_err(ErrorInternalServerError)?;
 
-        // Durability (see docs/PERF-JOURNAL.md, 2026-10-21): without this,
-        // a write was only as durable as the OS page cache -- acknowledged
-        // to the client with no guarantee it would survive a crash before
-        // an unrelated future writeback happened to flush it. A naive
-        // `file.sync_data()` here was measured to cost 82-89% of
-        // throughput under load, enough to fall below the very baseline
-        // (MinIO) this project is being compared against -- the wrong
-        // tradeoff. `group_commit_for` batches many concurrent writers
-        // (even to different offsets in the *same* bucket file, which
-        // this trait's whole design supports lock-free) behind far fewer
-        // real fsync calls; see `warp_meta_store::group_commit`'s module doc for
-        // why this never acknowledges a write before it is actually
-        // durable, unlike a fixed-interval timer-based flush would.
-        let group_commit = group_commit_for(user_id, bucket);
-        let ticket = group_commit.ticket();
-        group_commit
-            .wait_for_durable(ticket, &*file)
-            .map_err(ErrorInternalServerError)?;
-
-        debug!("Wrote data for user {} bucket {} at offset {} with size {}",
-              user_id, bucket, offset, size);
-
+        let offset = (seg << LOCAL_BITS) | local;
+        debug!("Wrote data for user {} bucket {} at segment {} offset {} with size {}", user_id, bucket, seg, local, size);
         Ok((offset, size))
     }
-    
+
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
-        // Positional read (pread, via read_exact_at): no seek, no shared
-        // cursor, safe to use on a handle cached and shared across
-        // concurrent callers (see `cached_file`'s doc).
-        let file_path = self.get_bucket_file_path(user_id, bucket);
-        let file = cached_file(user_id, bucket, &file_path)
-            .map_err(ErrorInternalServerError)?;
-
+        let files = self.bucket(user_id, bucket, false)?;
+        let segment = files.segment(segment_of(offset), false).map_err(ErrorInternalServerError)?;
         let mut buffer = vec![0u8; size as usize];
-        file.read_exact_at(&mut buffer, offset)
-            .map_err(ErrorInternalServerError)?;
-
-        trace!("Read data for user {} bucket {} from offset {} with size {}",
-              user_id, bucket, offset, size);
-
+        // pread on the shared handle: no seek, no shared cursor.
+        segment.file.read_exact_at(&mut buffer, local_of(offset)).map_err(ErrorInternalServerError)?;
+        trace!("Read data for user {} bucket {} from offset {} with size {}", user_id, bucket, offset, size);
         Ok(buffer)
     }
-    
+
     fn delete(&self, user_id: &str, bucket: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         // Queue deletion event in SQLite for background worker to process
         use crate::metadata::sqlite_store::SQLiteMetadataStore;
@@ -339,5 +368,66 @@ mod tests {
         }
 
         assert_eq!(all_extents.len(), threads * writes_per_thread);
+    }
+
+    /// Drops a bucket's in-memory state, as a restart would.
+    fn restart(store: &LocalXFSBinaryStore, user_id: &str, bucket: &str) {
+        BUCKETS.lock().remove(&store.bucket_dir(user_id, bucket));
+    }
+
+    #[test]
+    fn writes_roll_to_a_new_segment_and_never_straddle_one() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(100);
+        let (u, b) = ("test_user_seg", "seg_roll_bucket");
+        let mut got = Vec::new();
+        for i in 0..10u8 {
+            let data = vec![i; 37];
+            got.push((store.write(u, b, &data).unwrap(), data));
+        }
+        // 37-byte writes into 100-byte segments: two per segment.
+        let segs: Vec<u64> = got.iter().map(|((o, _), _)| segment_of(*o)).collect();
+        assert_eq!(segs, vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4]);
+        for ((o, n), data) in &got {
+            assert!(local_of(*o) + n <= 100, "write at {o:#x} straddles its segment");
+            assert_eq!(&store.read(u, b, *o, *n).unwrap(), data);
+        }
+        let dir = store.bucket_dir(u, b);
+        assert!(dir.join(segment_name(4)).is_file());
+    }
+
+    #[test]
+    fn a_write_larger_than_a_segment_gets_one_to_itself() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(100);
+        let (u, b) = ("test_user_seg", "seg_big_bucket");
+        let (o1, _) = store.write(u, b, &[1; 10]).unwrap();
+        let big = vec![7u8; 250];
+        let (o2, n2) = store.write(u, b, &big).unwrap();
+        let (o3, _) = store.write(u, b, &[3; 10]).unwrap();
+        assert_eq!((segment_of(o1), segment_of(o2), segment_of(o3)), (0, 1, 2));
+        assert_eq!(local_of(o2), 0);
+        assert_eq!(store.read(u, b, o2, n2).unwrap(), big);
+    }
+
+    #[test]
+    fn after_a_restart_writes_continue_where_the_active_segment_ends() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(100);
+        let (u, b) = ("test_user_seg", "seg_restart_bucket");
+        let before: Vec<_> = (0..5u8).map(|i| { let d = vec![i; 30]; (store.write(u, b, &d).unwrap(), d) }).collect();
+        restart(&store, u, b);
+        let (o, n) = store.write(u, b, &[9; 30]).unwrap();
+        // 5 x 30 bytes: segment 0 holds 3 (90 bytes), segment 1 holds 2 (60).
+        assert_eq!((segment_of(o), local_of(o)), (1, 60));
+        for ((o, n), d) in &before {
+            assert_eq!(&store.read(u, b, *o, *n).unwrap(), d, "a write before the restart was overwritten");
+        }
+        assert_eq!(store.read(u, b, o, n).unwrap(), vec![9; 30]);
+    }
+
+    #[test]
+    fn reading_a_bucket_never_written_creates_nothing() {
+        let store = LocalXFSBinaryStore::new();
+        let (u, b) = ("test_user_seg", "seg_never_written");
+        assert!(store.read(u, b, 0, 1).is_err());
+        assert!(!store.bucket_dir(u, b).exists());
     }
 }

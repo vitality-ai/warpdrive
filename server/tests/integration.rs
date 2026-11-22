@@ -635,14 +635,14 @@ async fn test_bucket_feature() {
     println!("PUT with bucket Status: {:?}", put_resp.status());
     assert_eq!(put_resp.status(), StatusCode::OK);
 
-    // 2. Verify the bucket file was created
-    let expected_bucket_file = format!("storage/{}/{}.bin", test_user, test_bucket);
+    // 2. Verify the bucket's first segment was created
+    let expected_bucket_file = format!("storage/{}/{}/0000000000.seg", test_user, test_bucket);
     println!("Checking for bucket file: {}", expected_bucket_file);
     
     // Check if the bucket file exists
     let bucket_file_exists = std::path::Path::new(&expected_bucket_file).exists();
     println!("Bucket file exists: {}", bucket_file_exists);
-    assert!(bucket_file_exists, "Bucket file should be created at: {}", expected_bucket_file);
+    assert!(bucket_file_exists, "Bucket segment should be created at: {}", expected_bucket_file);
 
     // 3. GET data with bucket header
     let get_req = test::TestRequest::get()
@@ -675,12 +675,12 @@ async fn test_bucket_feature() {
     assert_eq!(put_default_resp.status(), StatusCode::OK);
 
     // 5. Verify default bucket file was created
-    let expected_default_file = format!("storage/{}/default.bin", test_user);
+    let expected_default_file = format!("storage/{}/default/0000000000.seg", test_user);
     println!("Checking for default bucket file: {}", expected_default_file);
     
     let default_file_exists = std::path::Path::new(&expected_default_file).exists();
     println!("Default bucket file exists: {}", default_file_exists);
-    assert!(default_file_exists, "Default bucket file should be created at: {}", expected_default_file);
+    assert!(default_file_exists, "Default bucket segment should be created at: {}", expected_default_file);
 
     // 6. Test bucket isolation - same key in different buckets
     let isolated_key = format!("isolated_key_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
@@ -714,8 +714,8 @@ async fn test_bucket_feature() {
     assert_eq!(put_bucket2_resp.status(), StatusCode::OK);
 
     // 7. Verify both bucket files exist
-    let bucket1_file = format!("storage/{}/{}.bin", test_user, bucket1);
-    let bucket2_file = format!("storage/{}/{}.bin", test_user, bucket2);
+    let bucket1_file = format!("storage/{}/{}/0000000000.seg", test_user, bucket1);
+    let bucket2_file = format!("storage/{}/{}/0000000000.seg", test_user, bucket2);
     
     assert!(std::path::Path::new(&bucket1_file).exists(), "Bucket1 file should exist: {}", bucket1_file);
     assert!(std::path::Path::new(&bucket2_file).exists(), "Bucket2 file should exist: {}", bucket2_file);
