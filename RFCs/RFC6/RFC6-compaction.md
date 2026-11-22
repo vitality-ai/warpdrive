@@ -226,6 +226,41 @@ A log is due when it has at least 10,000 lines and more than twice as many lines
 
 **Acceptance:** crate tests run 4 writers putting and deleting during a compaction of a 40,000-line log: the slowest write took under half the compaction's time, and the compacted log replays to the final index. On a local 3-node cluster (`acceptance/step2.sh`), 15,000 overwrites of 50 keys left the metadata log at about 2,800 lines: the maintenance thread had compacted it while the writes ran. After a restart, all 50 keys hold their latest version.
 
+### Step 3: segment files
+
+`LocalXFSBinaryStore` keeps each bucket's shards in `{storage}/{user}/{bucket}/{id:010}.seg` instead of one `{bucket}.bin`. A write never straddles segments. When it would cross `WARPDRIVE_SEGMENT_MB` (default 64), the next segment becomes active, and a write larger than a segment gets one to itself.
+
+- **Offsets:** the store still hands out one `u64`. The segment id is in the top 24 bits and the offset inside it in the low 40, so the shard index format is unchanged and a read finds its segment without a lookup. RFC 3's `offset / SEGMENT_SIZE` would have needed every segment to be the same size.
+- **Durability:** a new segment's directory entry is fsynced before any write in it is acknowledged. Each segment has its own group commit.
+- **Restart:** writes continue at the end of the highest-numbered segment.
+- **Beta:** data in the old `{bucket}.bin` files is not read.
+
+**Acceptance:** `acceptance/step1.sh` and `step2.sh` give the same results as before. Throughput is A/B tested on GCP against the commit before it.
+
+### Step 4: the compactor
+
+`cluster/compactor.rs` runs after each reclaim sweep on every node, on its own:
+
+1. **Two sweeps.** A shard is freed only if it was reclaimable in two sweeps at least `WARPDRIVE_RECLAIM_CONFIRM_SECS` apart (60). A shard never becomes referenced again, so it has been dead that long, and a GET that read a version's record just before an overwrite is done with its shards.
+2. **Drop dead entries** from the shard index with `delete_if_at`: only if the entry still points where the sweep saw it.
+3. **Measure.** Segments are listed first, then the shard index is read, so a write that finished after the listing counts as live. A segment is sealed once it stopped taking writes and has been idle `WARPDRIVE_COMPACT_SEAL_SECS` (the reclaim grace, 600 s), so no write reserved before the roll is still in flight.
+4. **Pick** sealed segments under `WARPDRIVE_COMPACT_UMAX` (0.65) by cost-benefit, `(1 - u) * age / (1 + u)`.
+5. **Copy** survivors to the survivor head (segment ids from 2^23) at `WARPDRIVE_COMPACT_MBPS` (50). Each copy is durable before its entry moves, and `move_if` moves it only if it still points at the old copy. A pass starts no new segment after 5 minutes.
+6. **Delete** a segment once nothing points into it, after `WARPDRIVE_COMPACT_UNLINK_SECS` (30), so a read that looked up the old offset just before the move still finds the file. It's checked against a fresh index read first.
+
+A crash at any point leaves every live shard readable. The old segment stays until its entries have moved, and a copy whose entry never moved is dead bytes in a survivor segment, freed by a later pass. `WARPDRIVE_COMPACT=off` keeps sweeps report-only. `POST /cluster/_internal/reclaim/run` sweeps and compacts now.
+
+**Acceptance** (`acceptance/step4.sh`, 3 local nodes, RS(2,1), 1 MB segments): 400 objects of 4 KB to 300 KB, 250 overwritten and 80 deleted. A writer and 4 readers ran through three passes:
+
+| | Disk per node | Segments |
+|---|---|---|
+| Before | 27.9 MB | 28 |
+| After | 17.6 MB, the live data | 18 |
+
+The first pass freed nothing (one sweep). The second dropped 330 dead entries per node and moved 15 survivors. The third deleted 15 segments. There were 0 errors during compaction, and all 607 objects read back exactly, also after restarting every node.
+
+**Not yet:** hole punching of dead whole-block ranges inside sealed segments, for large objects without a copy (the next step, with the `copy_file_range` benchmark). Single-node mode (no peers) stores into segments too but has no sweep, so it reclaims nothing, as before.
+
 ### Segments or one file per bucket
 
 Today each node keeps one append-only file per bucket. Two one-file designs were run against segments on the same 3 VMs (`n2`, local NVMe, XFS with reflink), with `bench/configs-onefile.txt` and `bench/configs-small.txt`. Medians, physical SA with the range across VMs:
