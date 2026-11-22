@@ -3217,6 +3217,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp-meta-store"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "parking_lot 0.12.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "warp_drive"
 version = "1.0.0-beta"
 dependencies = [
@@ -3259,6 +3269,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
+ "warp-meta-store",
 ]
 
 [[package]]

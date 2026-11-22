@@ -330,8 +330,8 @@ async fn replicate_ordered(state: &ClusterState, peers: &[String], mut seq: u64,
         match newest {
             None => return acked,
             Some(newest) if round + 1 < ORDERED_WRITE_ROUNDS => {
-                super::hlc::observe(newest);
-                seq = super::hlc::now();
+                warp_meta_store::hlc::observe(newest);
+                seq = warp_meta_store::hlc::now();
                 log::debug!("{}: a peer holds a newer write (seq {newest}), resending at seq {seq}", make(seq).label());
             }
             Some(_) => {}
@@ -812,7 +812,7 @@ pub(crate) async fn put_object_plain(
         m,
         original_len: body.len(),
         version,
-        seq: super::hlc::now(),
+        seq: warp_meta_store::hlc::now(),
         retention_mode: None,
         retain_until: None,
         legal_hold: false,
@@ -863,7 +863,7 @@ pub(crate) async fn put_object_plain(
     // on the last; now the latter two overlap).
     {
         // web::block: this store's `delete` now does a real group-commit
-        // fsync (see `storage::group_commit`'s module doc) -- calling it
+        // fsync (see `warp_meta_store::group_commit`'s module doc) -- calling it
         // directly here would block this actix worker's whole event loop
         // for the fsync's duration, same hazard `cluster_internal_delete_*`
         // were fixed for. Best-effort local cleanup (the actual durability
@@ -1208,7 +1208,7 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
 async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, bucket: &str, upload_id: &str, keys: &[String]) {
     let peers = state.membership.peers();
     let required = required_write_acks(state.ec.k(), state.ec.m());
-    let seq = super::hlc::now();
+    let seq = warp_meta_store::hlc::now();
     let acks = join_all(keys.iter().map(|k| replicate_location_delete(state, user_id, bucket, k, seq, &peers))).await;
     let missed = acks.iter().filter(|a| **a < required).count();
     if missed > 0 {
@@ -1221,7 +1221,7 @@ async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, b
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
-    let body = format!("{}sync_count={}\n", state.timing.summary(), crate::storage::group_commit::sync_count());
+    let body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
@@ -1652,7 +1652,7 @@ pub(crate) async fn cluster_delete_object_inner(
         .unwrap_or_else(|| (state.ec.k(), state.ec.m()));
     let required_acks = required_write_acks(k, m);
 
-    let seq = super::hlc::now();
+    let seq = warp_meta_store::hlc::now();
     let (plain_acked, packed_acked) = tokio::join!(
         replicate_location_delete(state, user_id, &bucket, &key, seq, &peers),
         replicate_content_location_delete(state, user_id, &bucket, &key, seq, &peers),
@@ -1723,7 +1723,7 @@ pub async fn cluster_put_retention(
     // cluster_put_bucket_config just above: this is a fact every
     // coordinator must agree on, not a write quorum is enough for.
     let peers = state.membership.peers();
-    record.seq = super::hlc::now();
+    record.seq = warp_meta_store::hlc::now();
     let acked = replicate_location_update(&state, &record, &peers).await;
     if acked < peers.len() {
         return Err(ErrorInternalServerError(format!(
@@ -1753,7 +1753,7 @@ pub(crate) async fn cluster_put_object_tagging_inner(
 
     if let Some(mut record) = state.content_location_store.get(user_id, bucket, key) {
         record.tags = tags;
-        record.seq = super::hlc::now();
+        record.seq = warp_meta_store::hlc::now();
         let acked = replicate_content_location_update(state, &record, &peers).await;
         if acked < peers.len() {
             return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
@@ -1765,7 +1765,7 @@ pub(crate) async fn cluster_put_object_tagging_inner(
 
     if let Some(mut record) = state.location_store.get(user_id, bucket, key) {
         record.tags = tags;
-        record.seq = super::hlc::now();
+        record.seq = warp_meta_store::hlc::now();
         let acked = replicate_location_update(state, &record, &peers).await;
         if acked < peers.len() {
             return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
@@ -1840,7 +1840,7 @@ pub(crate) async fn cluster_put_object_retention_inner(
     record.retention_mode = Some(mode.to_string());
     record.retain_until = Some(retain_until.to_string());
 
-    record.seq = super::hlc::now();
+    record.seq = warp_meta_store::hlc::now();
     let peers = state.membership.peers();
     let acked = replicate_location_update(state, &record, &peers).await;
     if acked < peers.len() {
@@ -1867,7 +1867,7 @@ pub(crate) async fn cluster_put_object_legal_hold_inner(
         .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
     record.legal_hold = legal_hold;
 
-    record.seq = super::hlc::now();
+    record.seq = warp_meta_store::hlc::now();
     let peers = state.membership.peers();
     let acked = replicate_location_update(state, &record, &peers).await;
     if acked < peers.len() {

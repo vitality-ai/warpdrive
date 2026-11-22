@@ -37,14 +37,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::hlc;
-use super::ordered::{Applied, Entry, OrderedRecord, OrderedStore};
+use warp_meta_store::hlc;
+use warp_meta_store::{Applied, Entry, Record, WarpMetaStore};
 use crate::metadata::{
     BucketStats, DeleteSpecificResult, DeletionEvent, Metadata, MetadataStorage, MultipartPartRow, MultipartUploadRow,
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
 use super::blob_store::{blob_at, index_blob, BlobRef};
-use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
+use warp_meta_store::{BitcaskEngine, Engine};
 
 // ---------------------------------------------------------------- rows
 
@@ -165,7 +165,7 @@ pub struct MetaRecord {
     pub value: MetaValue,
 }
 
-impl OrderedRecord for MetaRecord {
+impl Record for MetaRecord {
     fn seq(&self) -> u64 {
         self.seq
     }
@@ -175,10 +175,10 @@ impl OrderedRecord for MetaRecord {
 }
 
 /// This node's copy of the rows.
-pub type MetaRows = OrderedStore<MetaRecord, BitcaskEngine<Entry<MetaRecord>>>;
+pub type MetaRows = WarpMetaStore<MetaRecord, BitcaskEngine<Entry<MetaRecord>>>;
 
 pub fn open_rows(path: &str) -> std::io::Result<MetaRows> {
-    let rows: MetaRows = OrderedStore::new(BitcaskEngine::open(path, "s3 metadata")?);
+    let rows: MetaRows = WarpMetaStore::new(BitcaskEngine::open(path, "s3 metadata")?);
     for (_, entry) in rows.engine().snapshot() {
         if let Some(r) = entry.live() {
             index_record(r);

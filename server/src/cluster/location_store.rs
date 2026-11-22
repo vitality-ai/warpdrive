@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use super::ordered::{OrderedRecord, OrderedStore};
-pub use super::ordered::{Applied, Entry};
+use warp_meta_store::{Record, WarpMetaStore};
+pub use warp_meta_store::{Applied, Entry};
 
 /// Length-prefixes `user_id` and `bucket` so their exact boundaries are
 /// always recoverable regardless of what bytes any of the three fields
@@ -29,7 +29,7 @@ pub use super::ordered::{Applied, Entry};
 pub fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
     format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
 }
-use crate::storage::kv_engine::BitcaskEngine;
+use warp_meta_store::BitcaskEngine;
 
 /// Sentinel `user_id` for every request that arrives with no authenticated
 /// identity -- which today is *every* request on the bare, pre-Phase-3
@@ -164,7 +164,7 @@ pub trait LocationStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
-impl OrderedRecord for LocationRecord {
+impl Record for LocationRecord {
     fn seq(&self) -> u64 {
         self.seq
     }
@@ -173,16 +173,16 @@ impl OrderedRecord for LocationRecord {
     }
 }
 
-/// `LocationStore` on ordered records (`ordered`) over a per-node `KvEngine`.
+/// `LocationStore` on ordered records (`ordered`) over a per-node `Engine`.
 /// The default engine keeps a `BTreeMap` index: `record_key` groups each
 /// bucket's keys contiguously, so a prefix listing is a bounded range scan.
 pub struct BitcaskLocationStore<E = BitcaskEngine<Entry<LocationRecord>>> {
-    log: OrderedStore<LocationRecord, E>,
+    log: WarpMetaStore<LocationRecord, E>,
 }
 
 impl BitcaskLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self { log: OrderedStore::new(BitcaskEngine::open(log_path, "location")?) })
+        Ok(Self { log: WarpMetaStore::new(BitcaskEngine::open(log_path, "location")?) })
     }
 
     pub fn path(&self) -> &Path {
@@ -190,14 +190,14 @@ impl BitcaskLocationStore {
     }
 }
 
-impl<E: crate::storage::kv_engine::KvEngine<Entry<LocationRecord>>> BitcaskLocationStore<E> {
+impl<E: warp_meta_store::Engine<Entry<LocationRecord>>> BitcaskLocationStore<E> {
     /// The store on any engine.
     pub fn with_engine(engine: E) -> Self {
-        Self { log: OrderedStore::new(engine) }
+        Self { log: WarpMetaStore::new(engine) }
     }
 }
 
-impl<E: crate::storage::kv_engine::KvEngine<Entry<LocationRecord>>> LocationStore for BitcaskLocationStore<E> {
+impl<E: warp_meta_store::Engine<Entry<LocationRecord>>> LocationStore for BitcaskLocationStore<E> {
     fn put(&self, record: LocationRecord) -> io::Result<Applied<LocationRecord>> {
         self.log.put(record_key(&record.user_id, &record.bucket, &record.key), record)
     }

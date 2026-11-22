@@ -1,0 +1,15 @@
+[package]
+name = "warp-meta-store"
+version = "0.1.0"
+edition = "2021"
+description = "WarpDrive's metadata store: ordered, last-writer-wins records over pluggable engines (Bitcask by default)"
+publish = false
+
+[dependencies]
+log = "0.4.22"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.128"
+
+[dev-dependencies]
+tempfile = "3"

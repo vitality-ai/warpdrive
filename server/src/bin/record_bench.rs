@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use warp_drive::cluster::hlc;
+use warp_meta_store::hlc;
 use warp_drive::cluster::location_store::{BitcaskLocationStore, LocationRecord, LocationStore};
 
 fn record(key: &str, seq: u64) -> LocationRecord {
@@ -57,7 +57,7 @@ fn main() {
         let path = format!("{dir}/loc-{threads}.log");
         let store = Arc::new(BitcaskLocationStore::open(&path).unwrap());
         let per = records / threads;
-        let syncs0 = warp_drive::storage::group_commit::sync_count();
+        let syncs0 = warp_meta_store::group_commit::sync_count();
         let t0 = Instant::now();
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -74,7 +74,7 @@ fn main() {
             h.join().unwrap();
         }
         let secs = t0.elapsed().as_secs_f64();
-        let syncs = warp_drive::storage::group_commit::sync_count() - syncs0;
+        let syncs = warp_meta_store::group_commit::sync_count() - syncs0;
         println!(
             "{{\"test\":\"put\",\"threads\":{threads},\"ops\":{},\"ops_per_sec\":{:.0},\"writes_per_sync\":{:.1},\"ms_per_sync\":{:.2}}}",
             per * threads,

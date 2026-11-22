@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use lazy_static::lazy_static;
-use crate::storage::group_commit::GroupCommit;
+use warp_meta_store::group_commit::GroupCommit;
 
 // Per-(user, bucket) next-write-offset, so concurrent writes to DIFFERENT
 // buckets never block each other, and concurrent writes to the SAME bucket
@@ -89,7 +89,7 @@ fn cached_file(user_id: &str, bucket: &str, file_path: &PathBuf) -> io::Result<A
 // One `GroupCommit` per (user, bucket) -- a fsync on one bucket's file
 // says nothing about another bucket's durability, so each needs its own
 // batching domain, same granularity as `NEXT_OFFSET`/`OPEN_FILES` above.
-// See `storage::group_commit`'s module doc for why this batches many
+// See `warp_meta_store::group_commit`'s module doc for why this batches many
 // concurrent writers' fsyncs into far fewer real syscalls without ever
 // acknowledging a write before it's actually durable.
 lazy_static! {
@@ -184,7 +184,7 @@ impl Storage for LocalXFSBinaryStore {
         // tradeoff. `group_commit_for` batches many concurrent writers
         // (even to different offsets in the *same* bucket file, which
         // this trait's whole design supports lock-free) behind far fewer
-        // real fsync calls; see `storage::group_commit`'s module doc for
+        // real fsync calls; see `warp_meta_store::group_commit`'s module doc for
         // why this never acknowledges a write before it is actually
         // durable, unlike a fixed-interval timer-based flush would.
         let group_commit = group_commit_for(user_id, bucket);

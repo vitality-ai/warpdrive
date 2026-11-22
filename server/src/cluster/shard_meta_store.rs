@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
+use warp_meta_store::{BitcaskEngine, Engine};
 
 pub trait ShardMetaStore: Send + Sync {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()>;
@@ -41,7 +41,7 @@ pub trait ShardMetaStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
-/// `ShardMetaStore` on a per-node `KvEngine`. The default engine uses a
+/// `ShardMetaStore` on a per-node `Engine`. The default engine uses a
 /// `HashMap` index: this store only does point lookups, on the shard write
 /// and read path. JSON lines (#152): shard keys embed user-supplied bucket
 /// and object keys, which may contain any byte.
@@ -59,14 +59,14 @@ impl BitcaskShardMetaStore {
     }
 }
 
-impl<E: KvEngine<(u64, u64)>> BitcaskShardMetaStore<E> {
+impl<E: Engine<(u64, u64)>> BitcaskShardMetaStore<E> {
     /// The store on any engine.
     pub fn with_engine(engine: E) -> Self {
         Self { engine }
     }
 }
 
-impl<E: KvEngine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
+impl<E: Engine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
     fn put(&self, shard_key: &str, offset: u64, size: u64) -> io::Result<()> {
         self.engine.put(shard_key.to_string(), (offset, size))
     }
