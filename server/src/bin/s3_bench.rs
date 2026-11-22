@@ -7,6 +7,9 @@
 //! Prints one CSV line per phase:
 //!   phase,payload_bytes,concurrency,ops,errors,throughput_ops_s,mean_us,p50_us,p90_us,p99_us
 //!
+//! Set S3_BENCH_KEYS=<n> to overwrite a fixed set of n keys instead of
+//! writing new ones: a steady overwrite load, for compaction runs.
+//!
 //! Set S3_BENCH_TRACE=<file> to also write one line per request:
 //!   phase,start_unix_us,latency_us,ok,key
 //!
@@ -103,7 +106,10 @@ async fn run_phase(
             let mut i: usize = 0;
             while Instant::now() < stop_at {
                 let key = if write_keys {
-                    format!("b-{run_id}-{worker}-{i}")
+                    match overwrite_keys() {
+                        Some(n) => format!("k-{}", (worker + i * concurrency) % n),
+                        None => format!("b-{run_id}-{worker}-{i}"),
+                    }
                 } else {
                     if keys.is_empty() { break; }
                     keys[(worker + i * concurrency) % keys.len()].clone()
@@ -192,6 +198,12 @@ fn report(phase: &str, payload: usize, concurrency: usize, duration: Duration, m
             writeln!(f, "{phase},{start},{lat},{ok},{key}").unwrap();
         }
     }
+}
+
+/// `S3_BENCH_KEYS`: the number of keys PUTs cycle over, if set.
+fn overwrite_keys() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("S3_BENCH_KEYS").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0))
 }
 
 #[tokio::main]
