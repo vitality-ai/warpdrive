@@ -37,4 +37,5 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `get-cpu-profile` | Where does #226's GET CPU go, against main? |
 | `async-io-ab` | With every request path awaiting its I/O, does #226 match main? |
 | `segments-ab` | Do segment files cost throughput, against one file per bucket? |
+| `oversize-ab` | What happens when a shard is as large as a segment or larger? |
 | `compaction-run1` | Does the first, sweep-driven compactor keep disk near live data, and at what cost? |
