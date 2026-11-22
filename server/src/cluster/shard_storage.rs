@@ -177,6 +177,11 @@ pub fn move_shard_if(shard_key: &str, from: (u64, u64), to: (u64, u64)) -> std::
     SHARD_META_STORE.move_if(shard_key, from, to)
 }
 
+/// Where a shard is on this node, if it holds it.
+pub fn shard_location(shard_key: &str) -> Option<(u64, u64)> {
+    SHARD_META_STORE.get(shard_key)
+}
+
 /// `delete_shard_if` for many shards, with one sync for all of them.
 pub fn delete_shards_if(shards: &[(String, (u64, u64))]) -> std::io::Result<usize> {
     SHARD_META_STORE.delete_many_if_at(shards)

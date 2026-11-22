@@ -78,7 +78,9 @@ pub fn config() -> Config {
     Config {
         enabled: !matches!(std::env::var("WARPDRIVE_RECLAIM").as_deref().map(str::trim), Ok("off") | Ok("0") | Ok("false")),
         grace: env_secs("WARPDRIVE_RECLAIM_GRACE_SECS", 600),
-        interval: env_secs("WARPDRIVE_RECLAIM_INTERVAL_SECS", 300),
+        // A daily audit: `gc/` rows free what overwrites and deletes kill
+        // (gc.rs). The sweep finds what no row names.
+        interval: env_secs("WARPDRIVE_RECLAIM_INTERVAL_SECS", 86_400),
     }
 }
 
@@ -406,6 +408,10 @@ pub fn start(state: web::Data<ClusterState>) {
                 let compacted = compact_due_logs(&state);
                 if !compacted.is_empty() {
                     log::info!("compacted record logs: {}", compacted.join(", "));
+                }
+                let gc = super::gc::run();
+                if gc.rows > 0 || gc.compact != Default::default() {
+                    log::info!("gc: {gc:?}");
                 }
                 since_sweep += LOG_CHECK;
                 if cfg.enabled && since_sweep >= cfg.interval {
