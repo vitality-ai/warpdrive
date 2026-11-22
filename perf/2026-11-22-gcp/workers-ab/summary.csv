@@ -1,0 +1,13 @@
+experiment,run,setup,arm,clients,put_ops_s,put_p99_ms,get_ops_s,get_p99_ms,errors
+workers,1,Single node 4 KB,main,128,1165.9,192.0,5456.3,28.5,0
+workers,2,Single node 4 KB,"#226, 32 workers",128,1107.5,229.3,5096.6,61.3,0
+workers,3,Single node 4 KB,"#226, 4 workers",128,1166.5,194.5,5465.8,28.4,0
+workers,4,Single node 4 KB,"#226, 4 workers",128,1145.1,204.7,5482.8,28.2,0
+workers,5,Single node 4 KB,"#226, 32 workers",128,1119.6,229.2,5095.8,60.7,0
+workers,6,Single node 4 KB,main,128,1150.2,196.7,5471.1,28.1,0
+workers,7,"RS(2,1) 4 KB",main,128,2573.5,80.2,6676.8,30.7,30
+workers,8,"RS(2,1) 4 KB","#226, 32 workers",128,2896.8,83.2,5302.4,37.2,0
+workers,9,"RS(2,1) 4 KB","#226, 4 workers",128,1795.7,147.3,6638.5,36.5,0
+workers,10,"RS(2,1) 4 KB","#226, 4 workers",128,1802.4,144.1,6679.3,36.3,0
+workers,11,"RS(2,1) 4 KB","#226, 32 workers",128,2864.2,84.3,5297.6,37.2,0
+workers,12,"RS(2,1) 4 KB",main,128,2542.3,81.2,6637.1,31.0,27

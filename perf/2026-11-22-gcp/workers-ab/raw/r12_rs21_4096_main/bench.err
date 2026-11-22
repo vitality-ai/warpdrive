@@ -1,0 +1,45 @@
+put error sample: PUT status=500 Internal Server Error body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>InternalError</Code>
+<Message>location pin quorum not met: 0/2 peers stored the placement record (shard dat
+put error sample: PUT status=500 Internal Server Error body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>InternalError</Code>
+<Message>location pin quorum not met: 1/2 peers stored the placement record (shard dat
+put error sample: PUT status=500 Internal Server Error body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>InternalError</Code>
+<Message>location pin quorum not met: 1/2 peers stored the placement record (shard dat
+put error sample: PUT status=500 Internal Server Error body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>InternalError</Code>
+<Message>wrote the new object, but could not confirm the stale packed pin was cleared 
+put error sample: PUT status=500 Internal Server Error body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>InternalError</Code>
+<Message>location pin quorum not met: 0/2 peers stored the placement record (shard dat
+get error sample: GET status=404 Not Found body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>NoSuchKey</Code>
+<Message>The specified key does not exist.</Message>
+<Resource>b-1795362230490968936-21-24
+get error sample: GET status=404 Not Found body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>NoSuchKey</Code>
+<Message>The specified key does not exist.</Message>
+<Resource>b-1795362230490968936-98-24
+get error sample: GET status=404 Not Found body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>NoSuchKey</Code>
+<Message>The specified key does not exist.</Message>
+<Resource>b-1795362230490968936-21-24
+get error sample: GET status=404 Not Found body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>NoSuchKey</Code>
+<Message>The specified key does not exist.</Message>
+<Resource>b-1795362230490968936-98-24
+get error sample: GET status=404 Not Found body=<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+<Code>NoSuchKey</Code>
+<Message>The specified key does not exist.</Message>
+<Resource>b-1795362230490968936-21-24
