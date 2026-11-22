@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 S=${S:?set S to a scratch dir holding wt-rfc6, s3venv and server_log.yaml}
 BIN=$S/wt-rfc6/server/target/release/warp_drive; R=$S/step2-cluster; rm -rf $R
-PEERS="http://127.0.0.1:21910,http://127.0.0.1:21911,http://127.0.0.1:21912"
+# Layout: N nodes, RS(K,M). Default RS(3,2) on 5 nodes, the layout deployments use.
+export N=${N:-5} K=${K:-3} M=${M:-2}
+PEERS=$(for i in $(seq 0 $((N-1))); do printf "http://127.0.0.1:2191%d," $i; done); PEERS=${PEERS%,}
 start() { i=$1; mkdir -p $R/n$i; cp $S/server_log.yaml $R/n$i/
-  (cd $R/n$i && WARPDRIVE_PORT=2191$i WARPDRIVE_SELF_ADDR=http://127.0.0.1:2191$i WARPDRIVE_PEERS=$PEERS WARPDRIVE_RS_K=2 WARPDRIVE_RS_M=1 WARPDRIVE_ADMIN_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE WARPDRIVE_ADMIN_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY nohup $BIN >> node.out 2>&1 &)
+  (cd $R/n$i && WARPDRIVE_PORT=2191$i WARPDRIVE_SELF_ADDR=http://127.0.0.1:2191$i WARPDRIVE_PEERS=$PEERS WARPDRIVE_RS_K=$K WARPDRIVE_RS_M=$M WARPDRIVE_ADMIN_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE WARPDRIVE_ADMIN_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY nohup $BIN >> node.out 2>&1 &)
   for k in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:2191$i/ && break; sleep 0.5; done; }
 stop() { i=$1; for d in 0 1000 2000; do lsof -ti tcp:$((21910+i+d)) -sTCP:LISTEN | xargs kill 2>/dev/null; done
   for k in $(seq 1 30); do busy=0; for d in 0 1000 2000; do lsof -ti tcp:$((21910+i+d)) -sTCP:LISTEN >/dev/null && busy=1; done; [ $busy = 0 ] && break; sleep 0.5; done; }
-for i in 0 1 2; do start $i; done; sleep 2
+for i in $(seq 0 $((N-1))); do start $i; done; sleep 2
 $S/s3venv/bin/python - <<'PY'
 import boto3, threading
 from botocore.config import Config
@@ -51,4 +53,4 @@ ok=sum(cc.get_object(Bucket="logs",Key=f"k{k}")["Body"].read()==f"{k}-{last}".en
 n=len([o for p in cc.get_paginator("list_objects_v2").paginate(Bucket="logs") for o in p.get("Contents",[])])
 print(f"after restart on the compacted log: {ok}/50 keys hold their latest version, {n} objects listed")
 PY
-for i in 0 1 2; do stop $i; done; grep -h "panicked\|ERROR" $R/*/node.out | head -3; rm -rf $R
+for i in $(seq 0 $((N-1))); do stop $i; done; grep -h "panicked\|ERROR" $R/*/node.out | head -3; rm -rf $R
