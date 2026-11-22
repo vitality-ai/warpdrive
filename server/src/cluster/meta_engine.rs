@@ -122,6 +122,9 @@ where
     fn put_if<T>(&self, key: String, value: V, check: impl FnOnce(Option<&V>) -> Result<(), T>) -> io::Result<Result<Option<V>, T>> {
         forward!(self, e => e.put_if(key, value, check))
     }
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
+        forward!(self, e => e.delete_if(key, keep))
+    }
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         forward!(self, e => e.scan_prefix(prefix, f))
     }

@@ -38,6 +38,23 @@ fn local_of(offset: u64) -> u64 {
     offset & LOCAL_MASK
 }
 
+/// Segment ids from here up hold survivors: live bytes the compactor copied
+/// out of older segments (RFC 6, step 4). Keeping them apart from fresh
+/// writes groups long-lived data, so survivor segments rarely need copying
+/// again.
+pub const SURVIVOR_BASE: u64 = 1 << 23;
+
+/// One segment as the compactor sees it.
+#[derive(Debug, Clone)]
+pub struct SegmentInfo {
+    pub id: u64,
+    pub len: u64,
+    /// Time since the segment was last written.
+    pub idle: std::time::Duration,
+    /// Still taking writes (one of the two heads): never compacted.
+    pub active: bool,
+}
+
 /// Bytes after which a segment is sealed. `WARPDRIVE_SEGMENT_MB`, default
 /// 64: the RFC 6 matrix freed the most space on small objects at 64 MB, and
 /// 64 to 128 MB kept the compaction unit small at no cost in write p99.
@@ -65,6 +82,7 @@ struct BucketFiles {
     dir: PathBuf,
     segment_bytes: u64,
     head: Mutex<Head>,
+    survivor: Mutex<Head>,
     // Every segment opened so far stays open: reads are pread on a shared
     // handle. 64 MB segments mean about 16 descriptors per GB stored.
     open: Mutex<HashMap<u64, Arc<Segment>>>,
@@ -99,21 +117,26 @@ impl BucketFiles {
             }
         }
         let mut head = Head { seg: 0, next: 0 };
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".seg")).and_then(|n| n.parse::<u64>().ok()) else { continue };
-            if id >= head.seg {
-                head = Head { seg: id, next: entry.metadata()?.len() };
+        let mut survivor = Head { seg: SURVIVOR_BASE, next: 0 };
+        for (id, len, _) in list_segments(&dir)? {
+            let h = if id >= SURVIVOR_BASE { &mut survivor } else { &mut head };
+            if id >= h.seg {
+                *h = Head { seg: id, next: len };
             }
         }
-        Ok(Self { dir, segment_bytes, head: Mutex::new(head), open: Mutex::new(HashMap::new()) })
+        Ok(Self { dir, segment_bytes, head: Mutex::new(head), survivor: Mutex::new(survivor), open: Mutex::new(HashMap::new()) })
     }
 
-    /// Reserves `size` bytes: the segment and the offset inside it. Never
-    /// splits a write across segments.
-    fn reserve(&self, size: u64) -> (u64, u64) {
-        let mut h = self.head.lock();
+    /// The two segments still taking writes.
+    fn heads(&self) -> (u64, u64) {
+        (self.head.lock().seg, self.survivor.lock().seg)
+    }
+
+    /// Reserves `size` bytes at the fresh head, or the survivor head: the
+    /// segment and the offset inside it. Never splits a write across
+    /// segments.
+    fn reserve(&self, size: u64, survivor: bool) -> (u64, u64) {
+        let mut h = if survivor { self.survivor.lock() } else { self.head.lock() };
         if h.next > 0 && h.next + size > self.segment_bytes {
             h.seg += 1;
             h.next = 0;
@@ -147,6 +170,20 @@ impl BucketFiles {
     }
 }
 
+/// The segment files in `dir`: id, length and last-write time.
+fn list_segments(dir: &std::path::Path) -> io::Result<Vec<(u64, u64, std::time::SystemTime)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".seg")).and_then(|n| n.parse::<u64>().ok()) else { continue };
+        let meta = entry.metadata()?;
+        out.push((id, meta.len(), meta.modified()?));
+    }
+    out.sort_by_key(|(id, _, _)| *id);
+    Ok(out)
+}
+
 lazy_static! {
     static ref BUCKETS: Mutex<HashMap<PathBuf, Arc<BucketFiles>>> = Mutex::new(HashMap::new());
 }
@@ -161,7 +198,8 @@ fn bucket_files(dir: PathBuf, segment_bytes: u64, create: bool) -> io::Result<Ar
     Ok(Arc::clone(BUCKETS.lock().entry(dir).or_insert(fresh)))
 }
 
-fn get_storage_directory() -> PathBuf {
+/// The root every user's bucket directories live under.
+pub fn get_storage_directory() -> PathBuf {
     // Try to get the storage directory from environment variable
     match env::var("STORAGE_DIRECTORY") {
         Ok(dir) => {
@@ -206,10 +244,10 @@ impl LocalXFSBinaryStore {
     fn bucket(&self, user_id: &str, bucket: &str, create: bool) -> Result<Arc<BucketFiles>, Error> {
         bucket_files(self.bucket_dir(user_id, bucket), self.segment_bytes, create).map_err(ErrorInternalServerError)
     }
-}
 
-impl Storage for LocalXFSBinaryStore {
-    fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+    /// Appends `data` at the fresh or the survivor head and returns once
+    /// it's durable.
+    fn append(&self, user_id: &str, bucket: &str, data: &[u8], survivor: bool) -> Result<(u64, u64), Error> {
         let files = self.bucket(user_id, bucket, true)?;
         let size = data.len() as u64;
         if size > LOCAL_MASK {
@@ -217,7 +255,7 @@ impl Storage for LocalXFSBinaryStore {
         }
         // Reserves a range no other writer gets. The lock covers only the
         // reservation, never the I/O.
-        let (seg, local) = files.reserve(size);
+        let (seg, local) = files.reserve(size, survivor);
         let segment = files.segment(seg, true).map_err(ErrorInternalServerError)?;
 
         // `write_all_at`, not `write_at`: one pwrite may write fewer bytes
@@ -230,10 +268,60 @@ impl Storage for LocalXFSBinaryStore {
         // ones (see `warp_meta_store::group_commit`).
         let ticket = segment.commit.ticket();
         segment.commit.wait_for_durable(ticket, &segment.file).map_err(ErrorInternalServerError)?;
-
-        let offset = (seg << LOCAL_BITS) | local;
         debug!("Wrote data for user {} bucket {} at segment {} offset {} with size {}", user_id, bucket, seg, local, size);
-        Ok((offset, size))
+        Ok(((seg << LOCAL_BITS) | local, size))
+    }
+
+    /// Copies a survivor out of a segment being compacted: written at the
+    /// survivor head, durable on return.
+    pub fn write_survivor(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+        self.append(user_id, bucket, data, true)
+    }
+
+    /// Every segment of a bucket, oldest id first. Empty if the bucket has
+    /// none.
+    pub fn segments(&self, user_id: &str, bucket: &str) -> io::Result<Vec<SegmentInfo>> {
+        let dir = self.bucket_dir(user_id, bucket);
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let files = bucket_files(dir.clone(), self.segment_bytes, false)?;
+        let (fresh, survivor) = files.heads();
+        let now = std::time::SystemTime::now();
+        Ok(list_segments(&dir)?
+            .into_iter()
+            .map(|(id, len, modified)| SegmentInfo {
+                id,
+                len,
+                idle: now.duration_since(modified).unwrap_or_default(),
+                // A head may not have its file yet: the highest id in each
+                // range counts as active too, so it's never retired.
+                active: id >= fresh && id < SURVIVOR_BASE || id >= survivor,
+            })
+            .collect())
+    }
+
+    /// Deletes a sealed segment once nothing points into it. Refuses a
+    /// segment still taking writes.
+    pub fn retire(&self, user_id: &str, bucket: &str, seg: u64) -> io::Result<()> {
+        let files = bucket_files(self.bucket_dir(user_id, bucket), self.segment_bytes, false)?;
+        let (fresh, survivor) = files.heads();
+        if (seg >= fresh && seg < SURVIVOR_BASE) || seg >= survivor {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("segment {seg} is still taking writes")));
+        }
+        // Readers already holding the handle keep reading the unlinked file.
+        files.open.lock().remove(&seg);
+        match std::fs::remove_file(files.dir.join(segment_name(seg))) {
+            Ok(()) => sync_dir(&files.dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Storage for LocalXFSBinaryStore {
+    fn write(&self, user_id: &str, bucket: &str, data: &[u8]) -> Result<(u64, u64), Error> {
+        self.append(user_id, bucket, data, false)
     }
 
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
@@ -421,6 +509,30 @@ mod tests {
             assert_eq!(&store.read(u, b, *o, *n).unwrap(), d, "a write before the restart was overwritten");
         }
         assert_eq!(store.read(u, b, o, n).unwrap(), vec![9; 30]);
+    }
+
+    #[test]
+    fn survivors_go_to_their_own_segments_and_heads_are_never_retired() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(100);
+        let (u, b) = ("test_user_seg", "seg_survivor_bucket");
+        let fresh: Vec<_> = (0..3u8).map(|i| store.write(u, b, &[i; 60]).unwrap()).collect();
+        let (so, sn) = store.write_survivor(u, b, &[42; 60]).unwrap();
+        assert_eq!(segment_of(so), SURVIVOR_BASE);
+        assert_eq!(store.read(u, b, so, sn).unwrap(), vec![42; 60]);
+        let segs = store.segments(u, b).unwrap();
+        let active: Vec<u64> = segs.iter().filter(|s| s.active).map(|s| s.id).collect();
+        assert_eq!(active, vec![2, SURVIVOR_BASE]);
+        assert!(store.retire(u, b, 2).is_err(), "the fresh head is refused");
+        assert!(store.retire(u, b, SURVIVOR_BASE).is_err(), "the survivor head is refused");
+        store.retire(u, b, 0).unwrap();
+        assert!(store.read(u, b, fresh[0].0, fresh[0].1).is_err(), "a retired segment is gone");
+        assert_eq!(store.read(u, b, fresh[1].0, fresh[1].1).unwrap(), vec![1; 60]);
+        // After a restart both heads continue where they were.
+        restart(&store, u, b);
+        let (o, _) = store.write_survivor(u, b, &[7; 30]).unwrap();
+        assert_eq!((segment_of(o), local_of(o)), (SURVIVOR_BASE, 60));
+        let (o, _) = store.write(u, b, &[8; 30]).unwrap();
+        assert_eq!((segment_of(o), local_of(o)), (2, 60));
     }
 
     #[test]

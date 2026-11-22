@@ -171,6 +171,17 @@ pub fn compact_shard_index() -> std::io::Result<()> {
     SHARD_META_STORE.compact()
 }
 
+/// Points a shard at its new copy, only if it still points at `from`
+/// (RFC 6 step 4: the compactor moving a survivor).
+pub fn move_shard_if(shard_key: &str, from: (u64, u64), to: (u64, u64)) -> std::io::Result<bool> {
+    SHARD_META_STORE.move_if(shard_key, from, to)
+}
+
+/// Drops a dead shard's index entry, only if it still points at `at`.
+pub fn delete_shard_if(shard_key: &str, at: (u64, u64)) -> std::io::Result<bool> {
+    SHARD_META_STORE.delete_if_at(shard_key, at)
+}
+
 /// Every shard this node holds: `(shard key, offset, size)`.
 pub fn shard_entries() -> Vec<(String, u64, u64)> {
     SHARD_META_STORE.entries().into_iter().map(|(k, (o, s))| (k, o, s)).collect()

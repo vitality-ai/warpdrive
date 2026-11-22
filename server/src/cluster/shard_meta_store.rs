@@ -34,6 +34,14 @@ pub trait ShardMetaStore: Send + Sync {
     /// deleted everywhere it was placed still has to call this on every
     /// peer that holds it (not wired up yet — see #163's follow-up note).
     fn delete(&self, shard_key: &str) -> io::Result<()>;
+    /// Points `shard_key` at `to` only if it still points at `from`, as one
+    /// atomic step. The compactor moves a shard this way, so a shard that
+    /// was rewritten or deleted meanwhile is never pointed back at stale
+    /// bytes. Returns whether it moved.
+    fn move_if(&self, shard_key: &str, from: (u64, u64), to: (u64, u64)) -> io::Result<bool>;
+    /// Removes `shard_key` only if it still points at `at`. Returns whether
+    /// it removed it.
+    fn delete_if_at(&self, shard_key: &str, at: (u64, u64)) -> io::Result<bool>;
     /// Every shard key with its `(offset, size)`, for the space reclaimer.
     fn entries(&self) -> Vec<(String, (u64, u64))>;
     /// See `LocationStore::compact` — same reasoning and same mechanism
@@ -84,6 +92,14 @@ impl<E: Engine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
 
     fn delete(&self, shard_key: &str) -> io::Result<()> {
         self.engine.delete(shard_key)
+    }
+
+    fn move_if(&self, shard_key: &str, from: (u64, u64), to: (u64, u64)) -> io::Result<bool> {
+        Ok(self.engine.put_if(shard_key.to_string(), to, |cur| if cur == Some(&from) { Ok(()) } else { Err(()) })?.is_ok())
+    }
+
+    fn delete_if_at(&self, shard_key: &str, at: (u64, u64)) -> io::Result<bool> {
+        self.engine.delete_if(shard_key, |cur| *cur != at)
     }
 
     fn entries(&self) -> Vec<(String, (u64, u64))> {
@@ -181,6 +197,21 @@ mod tests {
             writeln!(f, "{}", serde_json::to_string(&("k1", Some((0u64, 100u64)))).unwrap()).unwrap();
         }
         assert!(BitcaskShardMetaStore::open(&log_path).is_err());
+    }
+
+    #[test]
+    fn move_if_and_delete_if_at_act_only_on_the_expected_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = BitcaskShardMetaStore::open(dir.path().join("shard_meta.log")).unwrap();
+        s.put("k", 10, 4).unwrap();
+        assert!(!s.move_if("k", (11, 4), (100, 4)).unwrap(), "stale source: not moved");
+        assert!(!s.move_if("gone", (10, 4), (100, 4)).unwrap(), "a missing key is never created");
+        assert_eq!(s.get("gone"), None);
+        assert!(s.move_if("k", (10, 4), (100, 4)).unwrap());
+        assert_eq!(s.get("k"), Some((100, 4)));
+        assert!(!s.delete_if_at("k", (10, 4)).unwrap(), "old location: kept");
+        assert!(s.delete_if_at("k", (100, 4)).unwrap());
+        assert_eq!(BitcaskShardMetaStore::open(dir.path().join("shard_meta.log")).unwrap().get("k"), None);
     }
 
     #[test]

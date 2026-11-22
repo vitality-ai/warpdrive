@@ -151,6 +151,23 @@ where
         Ok(Ok(current))
     }
 
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
+        let current: Option<V> = tx
+            .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+            .optional()
+            .map_err(io_err)?
+            .and_then(|b| decode(&b));
+        match current {
+            Some(v) if !keep(&v) => {}
+            _ => return Ok(false),
+        }
+        tx.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
+        tx.commit().map_err(io_err)?;
+        Ok(true)
+    }
+
     fn scan_prefix<T>(&self, prefix: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         let mut out = Vec::new();
         self.walk(prefix, None, false, |k, v| {
@@ -232,6 +249,18 @@ mod tests {
         assert_eq!(e.get("k"), Some(5));
         assert_eq!(e.put_if("k".into(), 7, |cur| if cur == Some(&5) { Ok(()) } else { Err("changed") }).unwrap(), Ok(Some(5)));
         assert_eq!(e.get("k"), Some(7));
+    }
+
+    #[test]
+    fn delete_if_removes_only_when_keep_says_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = SqliteEngine::<u64>::open(dir.path().join("kv.db")).unwrap();
+        e.put("k".into(), 5).unwrap();
+        assert!(!e.delete_if("k", |v| *v != 4).unwrap());
+        assert!(!e.delete_if("missing", |_| false).unwrap());
+        assert_eq!(e.get("k"), Some(5));
+        assert!(e.delete_if("k", |v| *v != 5).unwrap());
+        assert_eq!(e.get("k"), None);
     }
 
     #[test]

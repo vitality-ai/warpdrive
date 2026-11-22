@@ -1,4 +1,5 @@
-//! Which shards could be reclaimed (RFC 6, step 1: report only).
+//! Which shards can be reclaimed (RFC 6, step 1), and handing them to the
+//! compactor (step 4).
 //!
 //! Each node works out, on its own, which of the shards it holds nothing
 //! references any more: those of deleted and overwritten objects, of
@@ -28,9 +29,20 @@
 //!   means keep. A blob shard always takes this path, because a node that
 //!   missed a row can't tell it from a deleted one.
 //!
-//! A sweep runs every `WARPDRIVE_RECLAIM_INTERVAL_SECS` (default 300) and
-//! logs what it found. `WARPDRIVE_RECLAIM=off` turns it off.
-//! `POST /cluster/_internal/reclaim/report` runs one now and returns it.
+//! A sweep runs every `WARPDRIVE_RECLAIM_INTERVAL_SECS` (default 300).
+//! `WARPDRIVE_RECLAIM=off` turns it off.
+//!
+//! **Two sweeps before freeing.** A shard is handed to the compactor only
+//! if it was reclaimable in two sweeps at least
+//! `WARPDRIVE_RECLAIM_CONFIRM_SECS` apart (default 60). A shard stays
+//! unreferenced once it is, so it has been dead for that long: a GET that
+//! read a version's record just before an overwrite has finished with its
+//! shards by then.
+//!
+//! - `POST /cluster/_internal/reclaim/report` sweeps now and reports, frees
+//!   nothing.
+//! - `POST /cluster/_internal/reclaim/run` sweeps and runs a compaction
+//!   pass now, as the background thread does.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -240,6 +252,14 @@ fn now_nanos() -> u64 {
 
 /// One pass over this node's shards: what could be reclaimed now.
 pub async fn sweep(state: &ClusterState) -> SweepStats {
+    sweep_detail(state).await.0
+}
+
+/// A shard the sweep found reclaimable: (shard key, offset, size).
+pub type Dead = (String, u64, u64);
+
+/// `sweep`, with the reclaimable shards themselves.
+pub async fn sweep_detail(state: &ClusterState) -> (SweepStats, Vec<Dead>) {
     let cfg = config();
     let refs = row_references();
     let now = now_nanos();
@@ -288,9 +308,54 @@ pub async fn sweep(state: &ClusterState) -> SweepStats {
 
     stats.bytes_reclaimable = reclaimable.iter().map(|(_, _, _, size)| size).sum();
     if !reclaimable.is_empty() {
-        log::info!("reclaim (report only): {stats:?}");
+        log::info!("reclaim: {stats:?}");
     }
-    stats
+    (stats, reclaimable.into_iter().map(|(sk, _, offset, size)| (sk, offset, size)).collect())
+}
+
+/// The last sweep that counts as the first of two: when, and what it found.
+static FIRST_SWEEP: parking_lot::Mutex<Option<(std::time::Instant, HashSet<Dead>)>> = parking_lot::Mutex::new(None);
+
+/// The shards reclaimable now that were also reclaimable in a sweep at
+/// least `gap` ago. Records `now_dead` as the next first sweep once the
+/// gap has passed.
+fn confirmed(now_dead: Vec<Dead>, gap: Duration) -> Vec<Dead> {
+    let mut first = FIRST_SWEEP.lock();
+    let out = match first.as_ref() {
+        Some((at, seen)) if at.elapsed() >= gap => now_dead.iter().filter(|d| seen.contains(*d)).cloned().collect(),
+        Some(_) => return Vec::new(),
+        None => Vec::new(),
+    };
+    *first = Some((std::time::Instant::now(), now_dead.into_iter().collect()));
+    out
+}
+
+/// What one reclaim run found and freed.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunStats {
+    pub sweep: SweepStats,
+    /// Reclaimable in this sweep and in one at least the confirm gap ago.
+    pub confirmed_dead: usize,
+    pub compact: super::compactor::CompactStats,
+}
+
+/// A sweep, then a compaction pass on what two sweeps agree is dead.
+/// Blocks: call it off the async workers.
+pub fn run(state: web::Data<ClusterState>) -> RunStats {
+    let (sweep, dead) = super::bridge::run(move || async move { sweep_detail(&state).await });
+    let dead = confirmed(dead, env_secs("WARPDRIVE_RECLAIM_CONFIRM_SECS", 60));
+    let compact = super::compactor::run_pass(&dead);
+    if compact != Default::default() {
+        log::info!("compactor: {compact:?}");
+    }
+    RunStats { sweep, confirmed_dead: dead.len(), compact }
+}
+
+pub async fn cluster_internal_reclaim_run(state: web::Data<ClusterState>) -> HttpResponse {
+    match web::block(move || run(state)).await {
+        Ok(stats) => HttpResponse::Ok().json(stats),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
 }
 
 /// How often the record logs are checked for compaction (RFC 6 step 2).
@@ -326,7 +391,7 @@ pub fn start(state: web::Data<ClusterState>) {
     let cfg = config();
     log::info!("record logs: compacted when due, checked every {LOG_CHECK:?}");
     if cfg.enabled {
-        log::info!("reclaim (report only): sweeping every {:?}, grace {:?}", cfg.interval, cfg.grace);
+        log::info!("reclaim: sweeping every {:?}, grace {:?}, compactor {:?}", cfg.interval, cfg.grace, super::compactor::config());
     } else {
         log::info!("reclaim: sweep off (WARPDRIVE_RECLAIM)");
     }
@@ -343,8 +408,7 @@ pub fn start(state: web::Data<ClusterState>) {
                 since_sweep += LOG_CHECK;
                 if cfg.enabled && since_sweep >= cfg.interval {
                     since_sweep = Duration::ZERO;
-                    let s = web::Data::clone(&state);
-                    super::bridge::run(move || async move { sweep(&s).await });
+                    run(web::Data::clone(&state));
                 }
             }
         })

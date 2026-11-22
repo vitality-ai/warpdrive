@@ -43,6 +43,10 @@ pub trait Engine<V>: Send + Sync {
     /// to every other write to the engine. Returns the value it replaced,
     /// or `check`'s error without writing anything.
     fn put_if<T>(&self, key: String, value: V, check: impl FnOnce(Option<&V>) -> Result<(), T>) -> io::Result<Result<Option<V>, T>>;
+    /// Durably removes `key` only if `keep` returns false for its current
+    /// value, atomically with respect to every other write. Returns whether
+    /// it removed anything. A missing key is left alone.
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool>;
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
@@ -279,6 +283,23 @@ where
         };
         self.log.sync_ticket(ticket)?;
         Ok(Ok(previous))
+    }
+
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
+        let line = Self::line(key, None)?;
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            match self.index.read().get(key) {
+                Some(v) if !keep(v) => {}
+                _ => return Ok(false),
+            }
+            let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
+            self.index.write().remove(key);
+            ticket
+        };
+        self.log.sync_ticket(ticket)?;
+        Ok(true)
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
@@ -532,6 +553,19 @@ mod tests {
         assert_eq!(e.put_if("k".into(), 6, |cur| if cur.is_none() { Ok(()) } else { Err("exists") }).unwrap(), Err("exists"));
         assert_eq!(e.put_if("k".into(), 7, |cur| if cur == Some(&5) { Ok(()) } else { Err("changed") }).unwrap(), Ok(Some(5)));
         assert_eq!(open(&dir).get("k"), Some(7), "a refused write left nothing in the log");
+    }
+
+    #[test]
+    fn delete_if_removes_only_when_keep_says_no_and_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        e.put("k".into(), 5).unwrap();
+        assert!(!e.delete_if("k", |v| *v != 4).unwrap(), "the value moved on: kept");
+        assert!(!e.delete_if("missing", |_| false).unwrap());
+        assert_eq!(e.get("k"), Some(5));
+        assert!(e.delete_if("k", |v| *v != 5).unwrap());
+        assert_eq!(e.get("k"), None);
+        assert_eq!(open(&dir).get("k"), None, "the delete is in the log");
     }
 
     #[test]
