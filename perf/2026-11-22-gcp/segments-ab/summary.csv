@@ -1,0 +1,17 @@
+experiment,run,setup,arm,clients,put_ops_s,put_p99_ms,get_ops_s,get_p99_ms,errors
+segments,1,"RS(2,1) 4 KB",One file,128,3825.2,58.6,6480.9,31.8,0
+segments,2,"RS(2,1) 4 KB",Segments,128,3879.6,57.5,6498.5,31.3,0
+segments,3,"RS(2,1) 4 KB",Segments,128,3864.8,57.9,6475.5,32.0,0
+segments,4,"RS(2,1) 4 KB",One file,128,3813.2,58.1,6473.7,31.8,0
+segments,5,"RS(2,1) 1 MB",One file,32,229.7,219.9,490.1,115.2,0
+segments,6,"RS(2,1) 1 MB",Segments,32,229.6,216.9,488.1,115.0,0
+segments,7,"RS(2,1) 1 MB",Segments,32,259.4,186.3,566.5,100.5,0
+segments,8,"RS(2,1) 1 MB",One file,32,231.8,216.9,491.2,117.0,0
+segments,9,Single node 4 KB,One file,128,1764.8,104.0,5491.4,28.3,0
+segments,10,Single node 4 KB,Segments,128,1781.8,102.8,5521.2,28.5,0
+segments,11,Single node 4 KB,Segments,128,1763.7,103.7,5529.8,28.1,0
+segments,12,Single node 4 KB,One file,128,1761.8,104.6,5548.5,27.9,0
+segments,13,Single node 1 MB,One file,32,290.3,167.4,1148.0,104.3,0
+segments,14,Single node 1 MB,Segments,32,291.5,168.5,1152.3,100.7,0
+segments,15,Single node 1 MB,Segments,32,287.6,169.3,1149.4,108.8,0
+segments,16,Single node 1 MB,One file,32,290.1,163.0,1146.6,111.5,0
