@@ -1,6 +1,6 @@
 # RFC 6 - Compaction and Space Reclamation on the RFC 5 Engine
 
-**Status:** Proposed
+**Status:** Step 1 implemented (report only). Steps 2 to 5 to do.
 **Builds on:** RFC 5 (one object service, single node as RS(1,0)), RFC 3 (segment files)
 **Branch:** `feat-rfc6-compaction`
 
@@ -195,6 +195,39 @@ On the RFC 5 GCP setup (5 × `n2-standard-2`, local NVMe), with logging at the d
 | Record-log merge | 10M records, PUT p99 during a merge | No stall |
 
 ## Implementation steps
+
+### Step 1 on the current layout
+
+Since this RFC was written, S3 objects moved to blob addresses whose placement lives in the version and multipart-part rows (the S3 parity work), and every node holds a copy of those rows. The liveness rule is the same, applied to three kinds of shard:
+
+| Shard | Referenced if | Unreferenced, past the grace period |
+|---|---|---|
+| S3 blob (internal bucket `\u{1}blobs\u{1}…`) | a live version or multipart-part row holds a blob with this `wire_key` | confirm with every peer |
+| Location (plain key) | the key's live location record has this version | reclaimable if this node holds a newer record or tombstone, else confirm |
+| Packed stripe (`\0cdstripe:…`) | the key's live content record has this version | as location |
+
+- **No new shard index field.** A shard's `wire_key` ends in its version, `{nanos:x}-{seq:x}`, which is the write time. That is `written_at`.
+- **Blob shards always confirm.** A node that missed a row can't tell it from a deleted one, so the tombstone shortcut applies only to location and packed shards.
+- **Report only.** `POST /cluster/_internal/reclaim/report` and a background sweep (`WARPDRIVE_RECLAIM_INTERVAL_SECS`, default 300) report what could be reclaimed. Nothing is freed until the compactor (steps 3 and 4).
+
+**Acceptance** (`step1/acceptance.sh`, local 3-node RS(2,1)): 20 objects, 5 overwrites, 4 deletes, one aborted and one completed 2-part multipart upload. Every node reports 11 reclaimable shards and 5,453,120 bytes, the independent count. A node restarted with its metadata log wiped keeps all 18 live shards (peers confirm them) and still finds the 11. With a peer down, nothing is reported reclaimable.
+
+### When to compact: what the matrix measured
+
+Medians over 3 VMs (`n2-standard-2`, local NVMe, XFS unless noted) from the segment benchmark:
+
+| Setting | Physical SA | WA | Write p99 |
+|---|---|---|---|
+| No compaction | 5.55 | 1.00 | 88 ms |
+| Baseline (256 MB, `umax` 0.5, 50 MB/s, C, `copy_file_range`) | 2.34 | 1.40 | 112 ms |
+| `umax` 0.7 | 2.07 | 1.40 | 112 ms |
+| `umax` 0.2 | 2.60 | 1.19 | 97 ms |
+| 25 MB/s | 2.87 | 1.19 | 110 ms |
+| 100 MB/s | 2.11 | 1.76 | 112 ms |
+| 64 MB segments | 2.20 | 1.41 | 114 ms |
+| read/write copy | 2.76 | 1.36 | 178 ms |
+
+Each node compacts on its own, continuously in the background: a sealed segment once its live fraction is under `umax` (0.6 to 0.7 frees more at no extra write cost), at 50 MB/s or more (25 MB/s falls behind), with 64 to 128 MB segments and `copy_file_range`. Step 4 starts from these and is validated against them.
 
 Each step is a PR that keeps the Ceph enabled list green and the RFC 5 performance gates.
 

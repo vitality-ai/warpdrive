@@ -668,7 +668,7 @@ pub(crate) fn inline_max_bytes() -> usize {
 }
 
 /// This node's own address (`WARPDRIVE_SELF_ADDR`), if configured.
-fn self_addr() -> Option<&'static str> {
+pub(crate) fn self_addr() -> Option<&'static str> {
     static ADDR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ADDR.get_or_init(|| std::env::var("WARPDRIVE_SELF_ADDR").ok().map(|a| a.trim().trim_end_matches('/').to_string()).filter(|a| !a.is_empty()))
         .as_deref()

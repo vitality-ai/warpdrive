@@ -137,6 +137,35 @@ pub fn shard_key(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> St
     format!("{}:{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key, shard_idx)
 }
 
+/// One shard this node holds, as named by its shard key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardId {
+    pub user_id: String,
+    pub bucket: String,
+    pub wire_key: String,
+    pub idx: usize,
+}
+
+/// Inverts `shard_key`. `None` for a key it didn't produce.
+pub fn parse_shard_key(sk: &str) -> Option<ShardId> {
+    fn take_prefixed(s: &str) -> Option<(&str, &str)> {
+        let (len, rest) = s.split_once(':')?;
+        let len: usize = len.parse().ok()?;
+        let field = rest.get(..len)?;
+        let rest = rest.get(len..)?.strip_prefix(':')?;
+        Some((field, rest))
+    }
+    let (user_id, rest) = take_prefixed(sk)?;
+    let (bucket, rest) = take_prefixed(rest)?;
+    let (wire_key, idx) = rest.rsplit_once(':')?;
+    Some(ShardId { user_id: user_id.to_string(), bucket: bucket.to_string(), wire_key: wire_key.to_string(), idx: idx.parse().ok()? })
+}
+
+/// Every shard this node holds: `(shard key, offset, size)`.
+pub fn shard_entries() -> Vec<(String, u64, u64)> {
+    SHARD_META_STORE.entries().into_iter().map(|(k, (o, s))| (k, o, s)).collect()
+}
+
 pub fn store_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), Error> {
     let request_start = Instant::now();
     let sk = shard_key(user_id, bucket, key, shard_idx);
@@ -169,6 +198,16 @@ pub fn load_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_shard_key_inverts_shard_key() {
+        for (u, b, k, i) in [("u", "b", "k:v1", 0), ("", "\u{1}blobs\u{1}bkt", "00000000000000ff:18a-0", 2), ("a:b", "c", "x:y:z", 11)] {
+            let sk = shard_key(u, b, k, i);
+            assert_eq!(parse_shard_key(&sk), Some(ShardId { user_id: u.into(), bucket: b.into(), wire_key: k.into(), idx: i }), "{sk:?}");
+        }
+        assert_eq!(parse_shard_key("not a shard key"), None);
+        assert_eq!(parse_shard_key("5:ab:1:b:k:0"), None);
+    }
 
     #[test]
     fn store_then_load_round_trips() {

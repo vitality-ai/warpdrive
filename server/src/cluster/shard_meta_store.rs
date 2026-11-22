@@ -34,6 +34,8 @@ pub trait ShardMetaStore: Send + Sync {
     /// deleted everywhere it was placed still has to call this on every
     /// peer that holds it (not wired up yet — see #163's follow-up note).
     fn delete(&self, shard_key: &str) -> io::Result<()>;
+    /// Every shard key with its `(offset, size)`, for the space reclaimer.
+    fn entries(&self) -> Vec<(String, (u64, u64))>;
     /// See `LocationStore::compact` — same reasoning and same mechanism
     /// (#163): rewrite only the live entries to a fresh file, then atomic
     /// rename over the log, so dead (overwritten or deleted) entries stop
@@ -77,6 +79,10 @@ impl<E: Engine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
 
     fn delete(&self, shard_key: &str) -> io::Result<()> {
         self.engine.delete(shard_key)
+    }
+
+    fn entries(&self) -> Vec<(String, (u64, u64))> {
+        self.engine.snapshot()
     }
 
     fn compact(&self) -> io::Result<()> {
