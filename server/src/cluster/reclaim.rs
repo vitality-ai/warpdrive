@@ -118,15 +118,26 @@ fn parse_stripe_key(s: &str) -> Option<(String, usize)> {
 }
 
 /// Every `(user, shard bucket, wire_key)` a live S3 row references.
+/// Every blob a live record references.
+///
+/// The scan isn't a snapshot (`Engine::scan_prefix`), and a reference moves
+/// in one case: CompleteMultipartUpload moves part blobs from the upload row
+/// into a version row, writing the version row before it clears the upload.
+/// So upload rows are scanned first, then everything: a moved blob is seen
+/// in the upload row, or else its version row was already written.
 fn row_references() -> HashSet<(String, String, String)> {
     let Some(rows) = rows() else { return HashSet::new() };
     let mut refs = HashSet::new();
-    let blobs = rows.list_live("", |_, r| match &r.value {
-        MetaValue::Version(v) => v.blobs.clone(),
+    let uploads = rows.list_live("upl/", |_, r| match &r.value {
         MetaValue::Upload(u) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
         _ => Vec::new(),
     });
-    for b in blobs.into_iter().flatten() {
+    let blobs = uploads.into_iter().chain(rows.list_live("", |_, r| match &r.value {
+        MetaValue::Version(v) => v.blobs.clone(),
+        MetaValue::Upload(u) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
+        _ => Vec::new(),
+    }));
+    for b in blobs.flatten() {
         if b.placement.inline.is_none() && !b.placement.wire_key.is_empty() {
             refs.insert((b.user_id.clone(), blob_bucket(&b.bucket), b.placement.wire_key.clone()));
         }

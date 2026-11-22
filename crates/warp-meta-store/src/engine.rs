@@ -59,6 +59,10 @@ pub trait Engine<V>: Send + Sync {
     }
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
+    ///
+    /// Not a snapshot: writers aren't held off for the whole scan, so an
+    /// entry written during it may be seen before or after the write, and
+    /// one that moves to a key already scanned is missed.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
     /// The entry with the greatest key that is at most `key`, starts with
     /// `prefix`, and whose value `accept` takes.
@@ -78,6 +82,8 @@ pub trait Engine<V>: Send + Sync {
 /// scans a bounded range walk. `HashMap` is faster for stores that only
 /// do point lookups.
 pub trait Index<V>: Default + Send + Sync {
+    /// Keys iterate in order, so a scan can resume after a key.
+    const ORDERED: bool;
     fn get(&self, key: &str) -> Option<&V>;
     /// Returns the value it replaced.
     fn insert(&mut self, key: String, value: V) -> Option<V>;
@@ -86,9 +92,33 @@ pub trait Index<V>: Default + Send + Sync {
     fn for_each(&self, f: impl FnMut(&String, &V));
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)>;
+    /// `f` over up to `limit` entries starting with `prefix` and after
+    /// `after`, in key order. Returns the last key visited if it visited
+    /// `limit`, so the scan can resume after it. Only for an `ORDERED`
+    /// index.
+    fn scan_chunk<T>(&self, _prefix: &str, _after: Option<&str>, _limit: usize, _f: &mut impl FnMut(&str, &V) -> Option<T>, _out: &mut Vec<T>) -> Option<String> {
+        None
+    }
 }
 
 impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
+    const ORDERED: bool = true;
+    fn scan_chunk<T>(&self, prefix: &str, after: Option<&str>, limit: usize, f: &mut impl FnMut(&str, &V) -> Option<T>, out: &mut Vec<T>) -> Option<String> {
+        let start = match after {
+            Some(a) => std::ops::Bound::Excluded(a),
+            None => std::ops::Bound::Included(prefix),
+        };
+        let mut n = 0;
+        let mut last = None;
+        for (k, v) in self.range::<str, _>((start, std::ops::Bound::Unbounded)).take_while(|(k, _)| k.starts_with(prefix)).take(limit) {
+            if let Some(t) = f(k, v) {
+                out.push(t);
+            }
+            n += 1;
+            last = Some(k);
+        }
+        (n == limit).then(|| last.cloned()).flatten()
+    }
     fn get(&self, key: &str) -> Option<&V> {
         BTreeMap::get(self, key)
     }
@@ -136,6 +166,7 @@ impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
 }
 
 impl<V: Send + Sync> Index<V> for HashMap<String, V> {
+    const ORDERED: bool = false;
     fn get(&self, key: &str) -> Option<&V> {
         HashMap::get(self, key)
     }
@@ -186,6 +217,8 @@ const COMPACT_RATIO: u64 = 2;
 const COMPACT_MIN_LINES: u64 = 10_000;
 /// Entries copied per read-lock hold while compacting.
 const COMPACT_CHUNK: usize = 4096;
+/// Entries a scan visits per read lock.
+const SCAN_CHUNK: usize = 4096;
 
 impl<V, I> BitcaskEngine<V, I>
 where
@@ -349,8 +382,23 @@ where
         self.log.sync_ticket(ticket)
     }
 
-    fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
-        self.index.read().scan_prefix(prefix, f)
+    fn scan_prefix<T>(&self, prefix: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
+        // An ordered index is scanned in chunks, each under its own brief
+        // read lock, so writers get in between them. One long scan under
+        // the lock held off every writer, and the readers queued behind
+        // them: on GCP a full scan per reclaim request cut PUTs from
+        // 3,700/s to 400/s.
+        if !I::ORDERED {
+            return self.index.read().scan_prefix(prefix, f);
+        }
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            match self.index.read().scan_chunk(prefix, after.as_deref(), SCAN_CHUNK, &mut f, &mut out) {
+                Some(last) => after = Some(last),
+                None => return out,
+            }
+        }
     }
 
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(String, V)> {
@@ -619,6 +667,36 @@ mod tests {
         assert_eq!(replayed.get("k5"), Some(999));
         assert_eq!(replayed.get("k6"), None);
         assert_eq!(replayed.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn a_chunked_scan_sees_every_entry_in_order_and_lets_writers_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = std::sync::Arc::new(open(&dir));
+        for i in 0..20_000u64 {
+            e.put(format!("a/{i:06}"), i).unwrap();
+        }
+        e.put("b/x".into(), 1).unwrap();
+        let got = e.scan_prefix("a/", |k, v| Some((k.to_string(), *v)));
+        assert_eq!(got.len(), 20_000);
+        assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(got[12_345], ("a/012345".to_string(), 12_345));
+        // A writer gets in while a slow scan is running.
+        let (e2, done) = (std::sync::Arc::clone(&e), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let d2 = std::sync::Arc::clone(&done);
+        let w = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            e2.put("a/zzz".into(), 7).unwrap();
+            d2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut wrote_during_scan = false;
+        e.scan_prefix("a/", |_, _| {
+            std::thread::sleep(std::time::Duration::from_micros(10));
+            wrote_during_scan |= done.load(std::sync::atomic::Ordering::SeqCst);
+            None::<()>
+        });
+        w.join().unwrap();
+        assert!(wrote_during_scan, "a write waited for the whole scan");
     }
 
     #[test]
