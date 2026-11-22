@@ -226,6 +226,25 @@ A log is due when it has at least 10,000 lines and more than twice as many lines
 
 **Acceptance:** crate tests run 4 writers putting and deleting during a compaction of a 40,000-line log: the slowest write took under half the compaction's time, and the compacted log replays to the final index. On a local 3-node cluster (`acceptance/step2.sh`), 15,000 overwrites of 50 keys left the metadata log at about 2,800 lines: the maintenance thread had compacted it while the writes ran. After a restart, all 50 keys hold their latest version.
 
+### Segments or one file per bucket
+
+Today each node keeps one append-only file per bucket. Two one-file designs were run against segments on the same 3 VMs (`n2`, local NVMe, XFS with reflink), with `bench/configs-onefile.txt` and `bench/configs-small.txt`. Medians, physical SA with the range across VMs:
+
+| Design | 64 KiB to 4 MiB objects: SA | WA | MB/s | 2 KiB objects: SA | WA | MB/s |
+|---|---|---|---|---|---|---|
+| No compaction | 5.73 [5.69-5.83] | 1.00 | 325 | 5.74 [5.34-5.92] | 1.00 | 22.2 |
+| One file, whole-file rewrite | 4.88 [3.59-4.92] | 1.32 | 153 | | | |
+| One file, hole punching | **1.01** [1.01-1.01] | 1.00 | 320 | 4.67 [4.66-4.71] | 1.00 | 22.2 |
+| Segments 64 MB | 3.13 [3.12-3.15] | 1.15 | 322 | **2.80** [2.76-2.91] | 1.88 | 20.7 |
+| Segments 256 MB | 2.98 [2.95-3.06] | 1.15 | 323 | | | |
+
+- **Whole-file rewrite is out:** it halves foreground throughput and still uses 4 to 5 times the disk.
+- **Hole punching is best for large objects** (disk equal to live data, no copying) and **nearly useless for small ones**: a 2 KiB shard shares its 4 KiB block with neighbours, so a block is freed only when all of them die.
+- **Segments are best for small objects**, the 4 KB workload that dominates, at the cost of copying (WA 1.88) and about 7% foreground throughput.
+- Not measured: fragmentation from punching over hours (runs are 60 s for large objects, 290 s for small).
+
+So neither alone covers both sizes. The data points to segments with the compactor (steps 3 and 4), plus hole punching inside sealed segments for dead ranges of whole blocks, which frees large objects at once without a copy. That was this RFC's original hint; the large-object numbers now say it's worth doing.
+
 ### When to compact: what the matrix measured
 
 Medians over 3 VMs (`n2-standard-2`, local NVMe, XFS unless noted) from the segment benchmark:
