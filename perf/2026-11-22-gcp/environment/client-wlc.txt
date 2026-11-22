@@ -91,6 +91,7 @@ src-par.tgz no-COMMIT-file
 src-seg.tgz 823f04d6fea1e0beb32605e22d57d51dd8d004d1
 src-segbase.tgz b5897db964e252837a8e9e87922552ed58d96a99
 ## release profile (workspace Cargo.toml at 9985702)
+No [profile] section in either Cargo.toml: Cargo defaults (opt-level 3, debug off, no LTO, codegen-units 16, panic unwind).
 ## tarballs without a COMMIT file (made before pack.sh), from the 2026-11-22 verification
 src-main.tgz 0326637 (main)
 src-226.tgz b62e763 (#226 head then, plus leftover local test data dirs, unused at run time)
