@@ -436,7 +436,7 @@ pub async fn s3_delete_objects_handler(
                     db.queue_deletion(&bucket, key, &extents).ok();
                 }
             }
-            match db.delete_specific_version(&bucket, key, vid) {
+            match db.delete_specific_version_awaited(&bucket, key, vid).await {
                 Ok(result) => {
                     if result.was_delete_marker {
                         deleted_xml.push_str(&format!(
@@ -517,6 +517,21 @@ pub async fn s3_delete_objects_handler(
         }
 
         use crate::metadata::sqlite_store::VersioningDeleteResult;
+        // The cluster store does the whole delete, marker or removal, as an
+        // awaited task.
+        if let Some(fut) = db.delete_object_async(&bucket, key) {
+            match fut.await {
+                Ok(VersioningDeleteResult::Marker { version_id }) => deleted_xml.push_str(&format!(
+                    "    <Deleted><Key>{k}</Key><DeleteMarker>true</DeleteMarker>\
+                     <DeleteMarkerVersionId>{v}</DeleteMarkerVersionId></Deleted>\n",
+                    k = xml_escape(key), v = xml_escape(&version_id),
+                )),
+                Ok(VersioningDeleteResult::Deleted) | Err(_) => deleted_xml.push_str(&format!(
+                    "    <Deleted><Key>{}</Key></Deleted>\n", xml_escape(key),
+                )),
+            }
+            continue;
+        }
         match db.delete_object_v2(&bucket, key) {
             Ok(VersioningDeleteResult::Marker { version_id }) => {
                 deleted_xml.push_str(&format!(

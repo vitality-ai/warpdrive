@@ -293,7 +293,7 @@ pub async fn s3_put_object_handler(
         let resource = format!("/{}/{}", bucket, key);
         let tags = parse_url_tags(tagging_str);
         if let Err(resp) = validate_tags(&tags, &resource) { return Ok(resp); }
-        db.set_object_tags(&bucket, &key, &tags)?;
+        db.set_object_tags_awaited(&bucket, &key, &tags).await?;
     }
 
     // Apply object lock — from per-object headers or bucket default retention
@@ -320,11 +320,11 @@ pub async fn s3_put_object_handler(
     }
 
     if lock_mode.is_some() || obj_legal_hold.is_some() {
-        let _ = db.put_object_lock(
+        let _ = db.put_object_lock_awaited(
             &bucket, &key, effective_vid,
             lock_mode.as_deref(), lock_until.as_deref(),
             obj_legal_hold.as_deref(),
-        );
+        ).await;
     }
 
     // Only store an ACL row when the request actually specifies one — otherwise the
@@ -335,7 +335,7 @@ pub async fn s3_put_object_handler(
     if has_acl_header {
         let owner_display = if owner_id == ADMIN_USER_ID { crate::s3::auth::admin_display_name() } else { auth_result.owner_display_name.clone() };
         match resolve_effective_grants(&req, None, &owner_id, &owner_display) {
-            Ok(grants) => db.set_object_acl(&bucket, &key, effective_vid, &owner_id, &grants_to_json(&grants))?,
+            Ok(grants) => db.set_object_acl_awaited(&bucket, &key, effective_vid, &owner_id, &grants_to_json(&grants)).await?,
             Err(resp) => return Ok(resp),
         }
     }

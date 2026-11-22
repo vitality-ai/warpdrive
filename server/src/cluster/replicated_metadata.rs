@@ -676,6 +676,20 @@ impl MetadataStorage for ReplicatedMetadataStore {
         }))
     }
 
+    fn delete_specific_version_async(self: Arc<Self>, user_id: String, bucket: String, key: String, version_id: String) -> Option<BoxFuture<'static, Result<DeleteSpecificResult, String>>> {
+        Some(Box::pin(async move {
+            let vid = version_id.clone();
+            let removed = self.update_object_async(&user_id, &bucket, &key, move |o| o.find(&vid).map(|i| o.versions.remove(i))).await?;
+            match removed {
+                Some(v) => {
+                    self.forget_version_async(&bucket, &key, &v.version_id).await?;
+                    Ok(DeleteSpecificResult { found: true, was_delete_marker: v.is_delete_marker, version_id: v.shown_id() })
+                }
+                None => Ok(DeleteSpecificResult { found: false, was_delete_marker: false, version_id }),
+            }
+        }))
+    }
+
     fn delete_object_async(self: Arc<Self>, user_id: String, bucket: String, key: String) -> Option<BoxFuture<'static, Result<VersioningDeleteResult, String>>> {
         Some(Box::pin(self.delete_object_owned(user_id, bucket, key)))
     }

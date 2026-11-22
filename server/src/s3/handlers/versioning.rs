@@ -24,7 +24,7 @@ pub(super) async fn s3_put_bucket_versioning_inner(bucket: &str, body: &[u8], re
         return Ok(s3_error(StatusCode::CONFLICT, "InvalidBucketState",
                            "Cannot suspend versioning on a bucket with object lock enabled", bucket));
     }
-    db.set_versioning_state(bucket, state)?;
+    db.set_versioning_state_awaited(bucket, state).await?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -77,7 +77,7 @@ pub(super) async fn s3_delete_specific_version_handler(bucket: &str, key: &str, 
         }
     }
 
-    let result = db.delete_specific_version(bucket, key, version_id)?;
+    let result = db.delete_specific_version_awaited(bucket, key, version_id).await?;
 
     let mut resp = HttpResponse::NoContent();
     if result.was_delete_marker {
@@ -90,7 +90,6 @@ pub(super) async fn s3_delete_specific_version_handler(bucket: &str, key: &str, 
 pub(super) async fn s3_get_object_version_handler(bucket: &str, key: &str, version_id: &str, req: &HttpRequest) -> Result<HttpResponse, Error> {
     use crate::s3::auth::authenticate_s3_request;
     use crate::service::metadata_service::MetadataService;
-    use crate::service::storage_service::{StorageService, StorageMode};
     use crate::service::user_context::UserContext;
 
     let resource = format!("/{}/{}", bucket, key);
@@ -129,13 +128,9 @@ pub(super) async fn s3_get_object_version_handler(bucket: &str, key: &str, versi
     let context = UserContext::with_bucket(
         auth_result.user_id.clone(), auth_result.bucket.clone()
     );
-    let body = web::block(move || {
-        StorageService::new()
-            .read_object(&context, &extents, StorageMode::S3)
-            .map_err(|e| e.to_string())
-    }).await
-    .map_err(actix_web::error::ErrorInternalServerError)?
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    let body = crate::storage::read_extents_any(crate::storage::object_store(), &context.user_id, &context.bucket, &extents)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
 
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("Content-Type", content_type));

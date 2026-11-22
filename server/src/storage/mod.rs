@@ -77,3 +77,12 @@ pub async fn write_any(store: Arc<dyn Storage>, user_id: String, bucket: String,
         .await
         .map_err(|e| format!("blocking write task failed: {e}"))?
 }
+
+/// An object's bytes from its extents, each read through `read_any`.
+pub async fn read_extents_any(store: Arc<dyn Storage>, user_id: &str, bucket: &str, extents: &[(u64, u64)]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(extents.iter().map(|(_, n)| *n as usize).sum());
+    for &(offset, size) in extents {
+        out.extend(read_any(Arc::clone(&store), user_id.to_string(), bucket.to_string(), offset, size).await?);
+    }
+    Ok(out)
+}

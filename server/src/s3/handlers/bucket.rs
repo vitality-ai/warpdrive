@@ -155,7 +155,7 @@ pub async fn s3_create_bucket_handler(
         let auth_result = authenticate_s3_request(&req).await?;
         let db = MetadataService::new(&auth_result.user_id)?;
         if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
-        db.set_bucket_cors(&bucket, body.trim())?;
+        db.set_bucket_cors_awaited(&bucket, body.trim()).await?;
         info!("S3 PutBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::Ok()
             .insert_header(("Content-Length", "0"))
@@ -171,13 +171,13 @@ pub async fn s3_create_bucket_handler(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    db.create_bucket_with_lock(&bucket, lock_enabled)?;
+    db.create_bucket_with_lock_awaited(&bucket, lock_enabled).await?;
 
     let location = extract_xml_tag(&body, "LocationConstraint")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !location.is_empty() {
-        db.set_bucket_location(&bucket, &location)?;
+        db.set_bucket_location_awaited(&bucket, &location).await?;
     }
 
     // Only store an ACL row when the request actually specifies one — otherwise the
@@ -187,7 +187,7 @@ pub async fn s3_create_bucket_handler(
             .iter().any(|h| req.headers().contains_key(*h));
     if has_acl_header {
         match resolve_effective_grants(&req, None, &auth_result.user_id, &auth_result.owner_display_name) {
-            Ok(grants) => db.set_bucket_acl(&bucket, &auth_result.user_id, &grants_to_json(&grants))?,
+            Ok(grants) => db.set_bucket_acl_awaited(&bucket, &auth_result.user_id, &grants_to_json(&grants)).await?,
             Err(resp) => return Ok(resp),
         }
     }
@@ -216,7 +216,7 @@ pub async fn s3_delete_bucket_handler(
         let auth_result = authenticate_s3_request(&req).await?;
         let db = MetadataService::new(&auth_result.user_id)?;
         if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
-        db.delete_bucket_cors(&bucket)?;
+        db.delete_bucket_cors_awaited(&bucket).await?;
         info!("S3 DeleteBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
     }
@@ -240,7 +240,7 @@ pub async fn s3_delete_bucket_handler(
                            "The bucket you tried to delete is not empty", &bucket));
     }
 
-    db.delete_bucket(&bucket)?;
+    db.delete_bucket_awaited(&bucket).await?;
     info!("S3 DeleteBucket: bucket={} user={}", bucket, auth_result.user_id);
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }

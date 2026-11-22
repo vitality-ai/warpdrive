@@ -233,6 +233,14 @@ pub trait MetadataStorage: Send + Sync {
         None
     }
 
+    /// `delete_specific_version` as a future that can run on another
+    /// thread. `None`: no async path.
+    fn delete_specific_version_async(
+        self: std::sync::Arc<Self>, _user_id: String, _bucket: String, _key: String, _version_id: String,
+    ) -> Option<futures::future::BoxFuture<'static, Result<DeleteSpecificResult, String>>> {
+        None
+    }
+
     // --- Deletion WAL ---
     fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error>;

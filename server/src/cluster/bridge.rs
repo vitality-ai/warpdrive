@@ -76,6 +76,18 @@ pub fn state() -> Option<web::Data<ClusterState>> {
     STATE.get().cloned()
 }
 
+/// An HTTP worker blocked here can't serve anything else until the cluster
+/// answers. Every request path awaits its cluster I/O instead, so this logs
+/// (once, with where it came from) if one still doesn't.
+static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_if_on_http_worker() {
+    use std::sync::atomic::Ordering;
+    if std::thread::current().name().is_some_and(|n| n.starts_with("actix-server worker") || n.starts_with("actix-rt")) && !WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!("bridge: a cluster call blocked an HTTP worker:\n{}", std::backtrace::Backtrace::force_capture());
+    }
+}
+
 /// Runs the future `make` builds, on a bridge thread, and waits for its
 /// output. Must not be called from a bridge thread itself.
 pub fn run<T, Fut>(make: impl FnOnce() -> Fut + Send + 'static) -> T
@@ -83,6 +95,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = T> + 'static,
 {
+    warn_if_on_http_worker();
     let (tx, rx) = mpsc::sync_channel(1);
     POOL.send(Box::new(move |rt: &tokio::runtime::Runtime| {
         let _ = tx.send(rt.block_on(make()));
@@ -103,6 +116,18 @@ mod tests {
             *local + 1
         });
         assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn a_call_on_an_http_worker_thread_is_flagged() {
+        let out = std::thread::Builder::new()
+            .name("actix-server worker 9".into())
+            .spawn(|| run(|| async { 7 }))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out, 7);
+        assert!(WARNED.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
