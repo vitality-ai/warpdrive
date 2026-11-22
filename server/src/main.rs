@@ -1,6 +1,6 @@
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
 use futures::StreamExt;
-use log::info;
+use log::{info, warn};
 use log4rs;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -370,6 +370,12 @@ fn build_cluster_state() -> web::Data<ClusterState> {
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
+    // Segment files take descriptors; a default soft limit of 1,024 would cap
+    // how much a node can store (#229).
+    match warp_drive::storage::local_store::raise_open_file_limit() {
+        Ok((soft, hard)) => info!("open-file limit {soft} (hard {hard})"),
+        Err(e) => warn!("could not raise the open-file limit: {e}"),
+    }
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
     // Informational only -- the real per-request decision (`distributed_mode`,
     // below) is made from live membership, not this startup snapshot. A

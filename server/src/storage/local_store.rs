@@ -10,6 +10,7 @@ use std::env;
 use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
 use log::{debug, trace, warn};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use lazy_static::lazy_static;
@@ -124,6 +125,87 @@ fn default_segment_bytes() -> u64 {
 struct Segment {
     file: File,
     commit: GroupCommit,
+    /// `TICK` at the last use, for evicting the least recently used.
+    used: AtomicU64,
+}
+
+// Open segment handles are capped, so descriptors don't grow with the data
+// a node stores (about 16 per GB at 64 MB segments). Past the cap the least
+// recently used sealed segments leave the cache. A reader or writer still
+// holding one keeps using it, and the file closes when the last one drops
+// it. The two write heads are never evicted. A cold segment's next read
+// opens it again: one open(2).
+static OPEN: AtomicUsize = AtomicUsize::new(0);
+static TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Segment handles kept open: 4,096, or half the open-file limit if that's
+/// lower. `raise_open_file_limit` runs first at startup.
+fn open_cap() -> usize {
+    static CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let soft = open_file_limit().unwrap_or(1024) as usize;
+        (soft / 2).clamp(64, 4096)
+    });
+    *CAP
+}
+
+fn open_file_limit() -> Option<u64> {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0).then_some(lim.rlim_cur as u64)
+}
+
+/// Raises the soft open-file limit to the hard one, as the Go runtime does,
+/// and returns `(soft, hard)` afterwards. A service started by systemd or
+/// over SSH gets a soft limit of 1,024 otherwise.
+pub fn raise_open_file_limit() -> io::Result<(u64, u64)> {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // macOS refuses a soft limit above OPEN_MAX (10,240) even when the hard
+    // limit is unlimited.
+    #[cfg(target_os = "macos")]
+    let want = lim.rlim_max.min(10_240);
+    #[cfg(not(target_os = "macos"))]
+    let want = lim.rlim_max;
+    if lim.rlim_cur < want {
+        let raised = libc::rlimit { rlim_cur: want, rlim_max: lim.rlim_max };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        lim.rlim_cur = want;
+    }
+    Ok((lim.rlim_cur as u64, lim.rlim_max as u64))
+}
+
+/// Drops the least recently used sealed segments from every bucket's cache
+/// until at most 90% of the cap is left.
+fn evict_cold_segments() {
+    let cap = open_cap();
+    if OPEN.load(Ordering::Relaxed) <= cap {
+        return;
+    }
+    let buckets: Vec<Arc<BucketFiles>> = BUCKETS.lock().values().cloned().collect();
+    let mut cold: Vec<(u64, usize, u64)> = Vec::new();
+    for (bi, b) in buckets.iter().enumerate() {
+        let (fresh, survivor) = b.heads();
+        for (&id, s) in b.open.lock().iter() {
+            if id != fresh && id != survivor {
+                cold.push((s.used.load(Ordering::Relaxed), bi, id));
+            }
+        }
+    }
+    cold.sort_unstable();
+    let excess = OPEN.load(Ordering::Relaxed).saturating_sub(cap * 9 / 10);
+    for (_, bi, id) in cold.into_iter().take(excess) {
+        if buckets[bi].open.lock().remove(&id).is_some() {
+            OPEN.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Segment handles open now, for tests and metrics.
+pub fn open_segments() -> usize {
+    OPEN.load(Ordering::Relaxed)
 }
 
 /// Where the next write in a bucket goes.
@@ -203,8 +285,10 @@ impl BucketFiles {
     /// The open segment `seg`. Creating it (on a write) also syncs the
     /// directory before anyone can acknowledge a write into it.
     fn segment(&self, seg: u64, create: bool) -> io::Result<Arc<Segment>> {
+        let tick = TICK.fetch_add(1, Ordering::Relaxed);
         let mut open = self.open.lock();
         if let Some(s) = open.get(&seg) {
+            s.used.store(tick, Ordering::Relaxed);
             return Ok(Arc::clone(s));
         }
         let path = self.dir.join(segment_name(seg));
@@ -218,8 +302,14 @@ impl BucketFiles {
         } else {
             OpenOptions::new().read(true).write(true).open(&path)?
         };
-        let s = Arc::new(Segment { file, commit: GroupCommit::new() });
+        let s = Arc::new(Segment { file, commit: GroupCommit::new(), used: AtomicU64::new(tick) });
         open.insert(seg, Arc::clone(&s));
+        drop(open);
+        // After this bucket's lock is released: eviction takes every
+        // bucket's lock in turn, this one too.
+        if OPEN.fetch_add(1, Ordering::Relaxed) + 1 > open_cap() {
+            evict_cold_segments();
+        }
         Ok(s)
     }
 }
@@ -402,7 +492,9 @@ impl LocalXFSBinaryStore {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("segment {seg} is still taking writes")));
         }
         // Readers already holding the handle keep reading the unlinked file.
-        files.open.lock().remove(&seg);
+        if files.open.lock().remove(&seg).is_some() {
+            OPEN.fetch_sub(1, Ordering::Relaxed);
+        }
         match std::fs::remove_file(files.dir.join(segment_name(seg))) {
             Ok(()) => sync_dir(&files.dir),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -667,6 +759,27 @@ mod tests {
         assert_eq!(store.read(u, b, c, cn).unwrap(), data);
         restart(&store, u, b);
         assert_eq!(store.read(u, b, c, cn).unwrap(), data, "readable after a restart");
+    }
+
+    #[test]
+    fn open_handles_stay_under_the_cap_and_evicted_segments_read_back() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(64);
+        let (u, b) = ("test_user_seg", "seg_lru_bucket");
+        let cap = open_cap();
+        // Twice the cap in one-write segments.
+        let written: Vec<_> = (0..(2 * cap) as u32).map(|i| { let d = i.to_le_bytes().repeat(16); (store.write(u, b, &d).unwrap(), d) }).collect();
+        assert!(open_segments() <= cap, "{} handles open, cap {cap}", open_segments());
+        // Every segment, evicted ones included, reads back exactly.
+        for ((o, n), d) in &written {
+            assert_eq!(&store.read(u, b, *o, *n).unwrap(), d);
+        }
+        assert!(open_segments() <= cap);
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised_to_the_hard_limit() {
+        let (soft, hard) = raise_open_file_limit().unwrap();
+        assert!(soft >= 1024 && soft <= hard);
     }
 
     #[test]
