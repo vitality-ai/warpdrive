@@ -36,6 +36,10 @@ jobs:
       working-directory: crates/warp-meta-store
       run: cargo test
 
+    - name: Run WarpMetaStore SQLite engine tests
+      working-directory: crates/warp-meta-store-sqlite
+      run: cargo test
+
     - name: Lint with Clippy (Errors Only)
       working-directory: server
       run: |

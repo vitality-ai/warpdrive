@@ -93,6 +93,21 @@ impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
             .collect()
     }
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)> {
+        // No key is both at least `prefix` and at most a smaller `key`.
+        // `range` panics on that empty range, so answer it here.
+        if key < prefix {
+            return None;
+        }
+        // Keys starting with `prefix` form one run that begins at `prefix`.
+        // When `key` is past that run, every key in it is below `key`: take
+        // the last accepted one. Otherwise walk back from `key`.
+        if !key.starts_with(prefix) {
+            return self
+                .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .filter(|(_, v)| accept(v))
+                .last();
+        }
         self.range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Included(key)))
             .rev()
             .take_while(|(k, _)| k.starts_with(prefix))
@@ -303,6 +318,26 @@ mod tests {
 
     fn open(dir: &tempfile::TempDir) -> TestEngine {
         TestEngine::open(dir.path().join("e.log"), "test").unwrap()
+    }
+
+    #[test]
+    fn floor_with_a_key_before_the_prefix_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        e.put("b/1".into(), 1).unwrap();
+        assert_eq!(e.floor("b/", "a", |_| true), None);
+        assert_eq!(e.floor("b/", "b/9", |_| true), Some(("b/1".to_string(), 1)));
+    }
+
+    #[test]
+    fn floor_with_a_key_past_the_prefix_finds_the_last_prefixed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for (k, v) in [("a/1", 1), ("a/2", 2), ("b", 3), ("c", 4)] {
+            e.put(k.into(), v).unwrap();
+        }
+        assert_eq!(e.floor("a/", "c", |_| true), Some(("a/2".to_string(), 2)));
+        assert_eq!(e.floor("a/", "c", |v| *v == 1), Some(("a/1".to_string(), 1)));
     }
 
     #[test]

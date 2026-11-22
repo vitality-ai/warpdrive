@@ -1,0 +1,20 @@
+[package]
+name = "warp-meta-store-sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite engine for WarpMetaStore: the same ordered records, stored in a SQLite table"
+publish = false
+
+[dependencies]
+warp-meta-store = { path = "../warp-meta-store" }
+parking_lot = "0.12"
+rusqlite = "0.32.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.128"
+
+[features]
+# Compile SQLite in instead of linking the system libsqlite3 (as the server's bundled-sqlite).
+bundled = ["rusqlite/bundled"]
+
+[dev-dependencies]
+tempfile = "3"
