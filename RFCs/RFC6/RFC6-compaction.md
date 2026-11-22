@@ -1,6 +1,6 @@
 # RFC 6 - Compaction and Space Reclamation on the RFC 5 Engine
 
-**Status:** Step 1 implemented (report only). Steps 2 to 5 to do.
+**Status:** Steps 1 (report only) and 2 implemented. Steps 3 to 5 to do.
 **Builds on:** RFC 5 (one object service, single node as RS(1,0)), RFC 3 (segment files)
 **Branch:** `feat-rfc6-compaction`
 
@@ -210,7 +210,21 @@ Since this RFC was written, S3 objects moved to blob addresses whose placement l
 - **Blob shards always confirm.** A node that missed a row can't tell it from a deleted one, so the tombstone shortcut applies only to location and packed shards.
 - **Report only.** `POST /cluster/_internal/reclaim/report` and a background sweep (`WARPDRIVE_RECLAIM_INTERVAL_SECS`, default 300) report what could be reclaimed. Nothing is freed until the compactor (steps 3 and 4).
 
-**Acceptance** (`step1/acceptance.sh`, local 3-node RS(2,1)): 20 objects, 5 overwrites, 4 deletes, one aborted and one completed 2-part multipart upload. Every node reports 11 reclaimable shards and 5,453,120 bytes, the independent count. A node restarted with its metadata log wiped keeps all 18 live shards (peers confirm them) and still finds the 11. With a peer down, nothing is reported reclaimable.
+**Acceptance** (`acceptance/step1.sh`, local 3-node RS(2,1)): 20 objects, 5 overwrites, 4 deletes, one aborted and one completed 2-part multipart upload. Every node reports 11 reclaimable shards and 5,453,120 bytes, the independent count. A node restarted with its metadata log wiped keeps all 18 live shards (peers confirm them) and still finds the 11. With a peer down, nothing is reported reclaimable.
+
+### Step 2: record logs compacted without stalling writers
+
+`BitcaskEngine::compact` no longer holds the write lock for the rewrite. A single log file keeps the design simple:
+
+1. **Cut**, under the write lock for an instant: note the log's length. Every line before it is in the index.
+2. **Snapshot**, without the write lock: the live entries, copied out of the index 4,096 at a time under brief read locks, to a temp file, synced.
+3. **Tail and swap**, under the write lock: append the lines written since the cut, sync, rename over the log.
+
+Replaying the result gives the index: a key changed after the cut is in the tail and wins. A writer waiting on its group-commit sync at the swap is covered, because its line is in the temp file and the temp file is synced before the rename.
+
+A log is due when it has at least 10,000 lines and more than twice as many lines as live entries. A maintenance thread checks every 60 s and compacts the S3 metadata rows, the shard index, and the location and content-location logs when due. `POST /cluster/_internal/compact_logs` runs the check now.
+
+**Acceptance:** crate tests run 4 writers putting and deleting during a compaction of a 40,000-line log: the slowest write took under half the compaction's time, and the compacted log replays to the final index. On a local 3-node cluster (`acceptance/step2.sh`), 15,000 overwrites of 50 keys left the metadata log at about 2,800 lines: the maintenance thread had compacted it while the writes ran. After a restart, all 50 keys hold their latest version.
 
 ### When to compact: what the matrix measured
 

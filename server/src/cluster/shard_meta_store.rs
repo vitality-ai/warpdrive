@@ -41,6 +41,11 @@ pub trait ShardMetaStore: Send + Sync {
     /// rename over the log, so dead (overwritten or deleted) entries stop
     /// costing replay time and disk space on every restart.
     fn compact(&self) -> io::Result<()>;
+    /// Whether the log has built up enough dead lines to compact (RFC 6
+    /// step 2: more than twice its live entries).
+    fn compaction_due(&self) -> bool {
+        false
+    }
 }
 
 /// `ShardMetaStore` on a per-node `Engine`. The default engine uses a
@@ -87,6 +92,10 @@ impl<E: Engine<(u64, u64)>> ShardMetaStore for BitcaskShardMetaStore<E> {
 
     fn compact(&self) -> io::Result<()> {
         self.engine.compact()
+    }
+
+    fn compaction_due(&self) -> bool {
+        self.engine.compaction_due()
     }
 }
 

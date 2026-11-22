@@ -293,22 +293,70 @@ pub async fn sweep(state: &ClusterState) -> SweepStats {
     stats
 }
 
-/// Starts the background sweep on its own thread, if enabled.
+/// How often the record logs are checked for compaction (RFC 6 step 2).
+const LOG_CHECK: Duration = Duration::from_secs(60);
+
+/// Compacts every record log that has built up enough dead lines: the S3
+/// metadata rows, the shard index, and the location and content-location
+/// logs. Writers aren't stalled while one runs. Returns the logs compacted.
+pub fn compact_due_logs(state: &ClusterState) -> Vec<&'static str> {
+    let mut done = Vec::new();
+    let mut run = |name: &'static str, due: bool, compact: &dyn Fn() -> std::io::Result<()>| {
+        if due {
+            match compact() {
+                Ok(()) => done.push(name),
+                Err(e) => log::warn!("compaction of the {name} log failed: {e}"),
+            }
+        }
+    };
+    if let Some(rows) = rows() {
+        use warp_meta_store::Engine;
+        run("s3 metadata", rows.engine().compaction_due(), &|| rows.engine().compact());
+    }
+    run("shard index", super::shard_storage::shard_index_compaction_due(), &super::shard_storage::compact_shard_index);
+    run("location", state.location_store.compaction_due(), &|| state.location_store.compact());
+    run("content location", state.content_location_store.compaction_due(), &|| state.content_location_store.compact());
+    done
+}
+
+/// Starts the background thread: record-log compaction every minute, and
+/// the reclaimable-shard sweep every `WARPDRIVE_RECLAIM_INTERVAL_SECS`.
+/// `WARPDRIVE_RECLAIM=off` turns off the sweep. Log compaction always runs.
 pub fn start(state: web::Data<ClusterState>) {
     let cfg = config();
-    if !cfg.enabled {
-        log::info!("reclaim: off (WARPDRIVE_RECLAIM)");
-        return;
+    log::info!("record logs: compacted when due, checked every {LOG_CHECK:?}");
+    if cfg.enabled {
+        log::info!("reclaim (report only): sweeping every {:?}, grace {:?}", cfg.interval, cfg.grace);
+    } else {
+        log::info!("reclaim: sweep off (WARPDRIVE_RECLAIM)");
     }
-    log::info!("reclaim: sweeping every {:?}, grace {:?}", cfg.interval, cfg.grace);
     std::thread::Builder::new()
-        .name("wd-reclaim".into())
-        .spawn(move || loop {
-            std::thread::sleep(cfg.interval);
-            let s = web::Data::clone(&state);
-            super::bridge::run(move || async move { sweep(&s).await });
+        .name("wd-maintenance".into())
+        .spawn(move || {
+            let mut since_sweep = Duration::ZERO;
+            loop {
+                std::thread::sleep(LOG_CHECK);
+                let compacted = compact_due_logs(&state);
+                if !compacted.is_empty() {
+                    log::info!("compacted record logs: {}", compacted.join(", "));
+                }
+                since_sweep += LOG_CHECK;
+                if cfg.enabled && since_sweep >= cfg.interval {
+                    since_sweep = Duration::ZERO;
+                    let s = web::Data::clone(&state);
+                    super::bridge::run(move || async move { sweep(&s).await });
+                }
+            }
         })
-        .expect("failed to start the reclaim thread");
+        .expect("failed to start the maintenance thread");
+}
+
+pub async fn cluster_internal_compact_logs(state: web::Data<ClusterState>) -> HttpResponse {
+    let state = state.into_inner();
+    match web::block(move || compact_due_logs(&state)).await {
+        Ok(done) => HttpResponse::Ok().json(done),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
 }
 
 #[cfg(test)]

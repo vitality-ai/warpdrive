@@ -134,6 +134,9 @@ where
     fn compact(&self) -> io::Result<()> {
         forward!(self, e => e.compact())
     }
+    fn compaction_due(&self) -> bool {
+        forward!(self, e => e.compaction_due())
+    }
 }
 
 #[cfg(test)]

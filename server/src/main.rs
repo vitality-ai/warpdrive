@@ -465,6 +465,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/meta", web::post().to(cluster_internal_meta_row))
             .route("/cluster/_internal/reclaim/check", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_check))
             .route("/cluster/_internal/reclaim/report", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_report))
+            .route("/cluster/_internal/compact_logs", web::post().to(warp_drive::cluster::reclaim::cluster_internal_compact_logs))
             .route("/cluster/_internal/location/update", web::post().to(cluster_internal_update_location))
             .route("/cluster/_internal/content_location/update", web::post().to(cluster_internal_update_content_location))
             .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))

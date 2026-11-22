@@ -161,6 +161,16 @@ pub fn parse_shard_key(sk: &str) -> Option<ShardId> {
     Some(ShardId { user_id: user_id.to_string(), bucket: bucket.to_string(), wire_key: wire_key.to_string(), idx: idx.parse().ok()? })
 }
 
+/// Whether the shard index log is due for compaction (RFC 6 step 2).
+pub fn shard_index_compaction_due() -> bool {
+    SHARD_META_STORE.compaction_due()
+}
+
+/// Compacts the shard index log. Writers aren't stalled while it runs.
+pub fn compact_shard_index() -> std::io::Result<()> {
+    SHARD_META_STORE.compact()
+}
+
 /// Every shard this node holds: `(shard key, offset, size)`.
 pub fn shard_entries() -> Vec<(String, u64, u64)> {
     SHARD_META_STORE.entries().into_iter().map(|(k, (o, s))| (k, o, s)).collect()

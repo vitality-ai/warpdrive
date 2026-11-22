@@ -18,6 +18,7 @@
 //! log at startup.
 
 use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -52,6 +53,11 @@ pub trait Engine<V>: Send + Sync {
     fn snapshot(&self) -> Vec<(String, V)>;
     /// Reclaims space taken by overwritten and deleted entries.
     fn compact(&self) -> io::Result<()>;
+    /// Whether enough space has built up that `compact` is worth running.
+    /// Engines that reclaim on their own answer `false`.
+    fn compaction_due(&self) -> bool {
+        false
+    }
 }
 
 /// The in-memory index a `BitcaskEngine` keeps. `BTreeMap` makes prefix
@@ -150,9 +156,22 @@ pub struct BitcaskEngine<V, I = BTreeMap<String, V>> {
     /// and the index always apply writes in the same order. Released before
     /// the durability wait, so group commit can batch many writers' syncs.
     write_lock: Mutex<()>,
+    /// Lines in the log file, live or not. With the index size, tells when
+    /// the log is worth compacting.
+    lines: AtomicU64,
+    /// One compaction at a time.
+    compacting: Mutex<()>,
     label: &'static str,
     _value: std::marker::PhantomData<fn() -> V>,
 }
+
+/// A log is compacted once it holds more than this many lines per live
+/// entry (RFC 6: "more than twice the size of its live entries").
+const COMPACT_RATIO: u64 = 2;
+/// ...and at least this many lines, so small logs aren't rewritten often.
+const COMPACT_MIN_LINES: u64 = 10_000;
+/// Entries copied per read-lock hold while compacting.
+const COMPACT_CHUNK: usize = 4096;
 
 impl<V, I> BitcaskEngine<V, I>
 where
@@ -168,6 +187,7 @@ where
         }
 
         let mut index = I::default();
+        let mut lines_read = 0u64;
         if log_path.exists() {
             let f = File::open(&log_path)?;
             let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
@@ -176,6 +196,7 @@ where
                 if line.is_empty() {
                     continue;
                 }
+                lines_read += 1;
                 match serde_json::from_str::<(String, Option<V>)>(line) {
                     Ok((key, Some(v))) => {
                         index.insert(key, v);
@@ -201,6 +222,8 @@ where
             log,
             index: RwLock::new(index),
             write_lock: Mutex::new(()),
+            lines: AtomicU64::new(lines_read),
+            compacting: Mutex::new(()),
             label,
             _value: std::marker::PhantomData,
         })
@@ -231,6 +254,7 @@ where
         let ticket = {
             let _write_guard = self.write_lock.lock();
             let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
             self.index.write().insert(key, value);
             ticket
         };
@@ -249,6 +273,7 @@ where
                 return Ok(Err(e));
             }
             let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
             let previous = self.index.write().insert(key, value);
             (ticket, previous)
         };
@@ -261,6 +286,7 @@ where
         let ticket = {
             let _write_guard = self.write_lock.lock();
             let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
             self.index.write().remove(key);
             ticket
         };
@@ -282,29 +308,67 @@ where
         out
     }
 
-    /// Rewrites the log to one line per live entry, then atomically
-    /// replaces it (#163). Holds the write lock for the rewrite.
+    /// Rewrites the log to one line per live entry and atomically replaces
+    /// it (#163), without stalling writers (RFC 6, section 8):
+    ///
+    /// 1. **Cut**, under the write lock for an instant: note the log's
+    ///    length. Every line before it is already in the index.
+    /// 2. **Snapshot**, without the write lock: every live entry, copied out
+    ///    of the index in chunks under brief read locks, to a temp file,
+    ///    synced. Writers keep appending past the cut meanwhile.
+    /// 3. **Tail and swap**, under the write lock: append the lines written
+    ///    since the cut, sync, and rename the temp file over the log.
+    ///
+    /// Replaying the result gives the index: a key changed after the cut is
+    /// in the tail, which replays after the snapshot and wins. A write
+    /// waiting on its sync at the swap is in the temp file, which is synced
+    /// before the rename.
     fn compact(&self) -> io::Result<()> {
-        let _write_guard = self.write_lock.lock();
-        let index = self.index.read();
+        let Some(_one_at_a_time) = self.compacting.try_lock() else { return Ok(()) };
+        let cut = {
+            let _write_guard = self.write_lock.lock();
+            std::fs::metadata(&self.log_path)?.len()
+        };
+
         let tmp_path = self.log_path.with_extension("compact.tmp");
-        {
-            let mut tmp = io::BufWriter::new(File::create(&tmp_path)?);
-            let mut err = None;
-            index.for_each(|k, v| {
-                if err.is_none() {
-                    if let Err(e) = Self::line(k, Some(v)).and_then(|l| writeln!(tmp, "{l}")) {
-                        err = Some(e);
-                    }
-                }
-            });
-            if let Some(e) = err {
-                return Err(e);
+        let mut tmp = io::BufWriter::new(File::create(&tmp_path)?);
+        let mut keys = Vec::new();
+        self.index.read().for_each(|k, _| keys.push(k.clone()));
+        let mut written = 0u64;
+        for chunk in keys.chunks(COMPACT_CHUNK) {
+            let lines: Vec<String> = {
+                let index = self.index.read();
+                chunk.iter().filter_map(|k| index.get(k).map(|v| Self::line(k, Some(v)))).collect::<io::Result<_>>()?
+            };
+            for l in &lines {
+                writeln!(tmp, "{l}")?;
             }
-            tmp.flush()?;
+            written += lines.len() as u64;
         }
-        log::debug!("{} log {} compacted to {} entries", self.label, self.log_path.display(), index.len());
-        self.log.replace_with_compacted(&tmp_path, &self.log_path)
+        tmp.flush()?;
+        tmp.get_ref().sync_data()?;
+
+        let _write_guard = self.write_lock.lock();
+        let mut tail = Vec::new();
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = File::open(&self.log_path)?;
+            f.seek(SeekFrom::Start(cut))?;
+            f.read_to_end(&mut tail)?;
+        }
+        let tail_lines = tail.iter().filter(|b| **b == b'\n').count() as u64;
+        tmp.write_all(&tail)?;
+        tmp.flush()?;
+        drop(tmp);
+        self.log.replace_with_compacted(&tmp_path, &self.log_path)?;
+        self.lines.store(written + tail_lines, Ordering::Relaxed);
+        log::debug!("{} log {} compacted: {written} live entries, {tail_lines} lines written during the compaction", self.label, self.log_path.display());
+        Ok(())
+    }
+
+    fn compaction_due(&self) -> bool {
+        let lines = self.lines.load(Ordering::Relaxed);
+        lines >= COMPACT_MIN_LINES && lines > COMPACT_RATIO * self.index.read().len() as u64
     }
 }
 
@@ -318,6 +382,68 @@ mod tests {
 
     fn open(dir: &tempfile::TempDir) -> TestEngine {
         TestEngine::open(dir.path().join("e.log"), "test").unwrap()
+    }
+
+    #[test]
+    fn compaction_is_due_only_when_the_log_is_mostly_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for i in 0..COMPACT_MIN_LINES {
+            e.put("k".into(), i).unwrap();
+        }
+        assert!(e.compaction_due(), "10k lines for 1 live entry");
+        e.compact().unwrap();
+        assert!(!e.compaction_due(), "one line after compacting");
+        let fresh = TestEngine::open(dir.path().join("e.log"), "test").unwrap();
+        assert_eq!(fresh.get("k"), Some(COMPACT_MIN_LINES - 1));
+        assert!(!fresh.compaction_due(), "the line count is rebuilt on open");
+    }
+
+    /// Writers run during a compaction: none waits for the snapshot, and
+    /// the compacted log replays to exactly the index's final state.
+    #[test]
+    fn compaction_does_not_stall_writers_and_keeps_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = std::sync::Arc::new(open(&dir));
+        // Prefilled from 8 threads so group commit batches the syncs.
+        std::thread::scope(|sc| {
+            for t in 0..8u64 {
+                let e = &e;
+                sc.spawn(move || {
+                    for i in (t..40_000u64).step_by(8) {
+                        e.put(format!("k{}", i % 20_000), i).unwrap();
+                    }
+                });
+            }
+        });
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let (e, done) = (e.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut worst = std::time::Duration::ZERO;
+                    let mut n = 0u64;
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) || n < 200 {
+                        let t0 = std::time::Instant::now();
+                        let key = format!("k{}", (t * 7919 + n) % 25_000);
+                        if n % 5 == 0 { e.delete(&key).unwrap() } else { e.put(key, 1_000_000 + n).unwrap() }
+                        worst = worst.max(t0.elapsed());
+                        n += 1;
+                    }
+                    worst
+                })
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        e.compact().unwrap();
+        let compact_time = t0.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worst = writers.into_iter().map(|w| w.join().unwrap()).max().unwrap();
+        assert!(worst < compact_time / 2, "a writer waited {worst:?}, the compaction took {compact_time:?}");
+        let expected = e.snapshot();
+        drop(e);
+        let reopened = TestEngine::open(dir.path().join("e.log"), "test").unwrap();
+        assert_eq!(reopened.snapshot(), expected, "the compacted log replays to the final index");
     }
 
     #[test]
