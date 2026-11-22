@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# RFC 6 step 4 acceptance on a local 3-node RS(2,1) cluster: the compactor frees dead shards' space,
+# RFC 6 step 4 acceptance on a local 3-node RS(2,1) cluster: the compactor frees dead shards' space
+# (disk = blocks allocated, so punched holes count as freed),
 # and every live object still reads back exactly, during compaction, after it, and after a restart.
 S=${S:?set S to a scratch dir holding wt-rfc6, s3venv and server_log.yaml}
 BIN=$S/wt-rfc6/server/target/release/warp_drive; R=$S/step4-cluster; rm -rf $R
@@ -22,7 +23,7 @@ def disk():
         n=0; segs=0
         for root,_,files in os.walk(f"{R}/n{i}/storage"):
             for f in files:
-                if f.endswith(".seg"): n+=os.path.getsize(os.path.join(root,f)); segs+=1
+                if f.endswith(".seg"): n+=os.stat(os.path.join(root,f)).st_blocks*512; segs+=1
         out.append((n,segs))
     return out
 def run(i): return json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:2191{i}/cluster/_internal/reclaim/run",method="POST"),timeout=600).read())

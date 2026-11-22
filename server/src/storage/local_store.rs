@@ -53,6 +53,60 @@ pub struct SegmentInfo {
     pub idle: std::time::Duration,
     /// Still taking writes (one of the two heads): never compacted.
     pub active: bool,
+    /// Bytes the file takes on disk: `len` less any punched holes.
+    pub physical: u64,
+}
+
+/// The filesystem block size holes are punched in.
+const BLOCK: u64 = 4096;
+
+/// Frees the disk blocks of `[offset, offset + len)`, keeping the file's
+/// length. Reads of the range return zeros afterwards.
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset as libc::off_t, len as libc::off_t) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(target_os = "macos")]
+fn punch_hole(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let arg = libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: offset as libc::off_t, fp_length: len as libc::off_t };
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &arg) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn punch_hole(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "hole punching"))
+}
+
+/// Copies `len` bytes from `src` at `from` to `dst` at `to` inside the
+/// kernel: no copy through user space, and on XFS with reflink the blocks
+/// are shared, not copied. Fails rather than copy fewer bytes.
+#[cfg(target_os = "linux")]
+fn copy_range(src: &File, from: u64, dst: &File, to: u64, len: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let (mut i, mut o, mut left) = (from as libc::loff_t, to as libc::loff_t, len as usize);
+    while left > 0 {
+        let n = unsafe { libc::copy_file_range(src.as_raw_fd(), &mut i, dst.as_raw_fd(), &mut o, left, 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("copy_file_range stopped with {left} bytes left")));
+        }
+        left -= n as usize;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_range(src: &File, from: u64, dst: &File, to: u64, len: u64) -> io::Result<()> {
+    let mut buf = vec![0u8; len as usize];
+    src.read_exact_at(&mut buf, from)?;
+    dst.write_all_at(&buf, to)
 }
 
 /// Bytes after which a segment is sealed. `WARPDRIVE_SEGMENT_MB`, default
@@ -118,7 +172,7 @@ impl BucketFiles {
         }
         let mut head = Head { seg: 0, next: 0 };
         let mut survivor = Head { seg: SURVIVOR_BASE, next: 0 };
-        for (id, len, _) in list_segments(&dir)? {
+        for (id, len, _, _) in list_segments(&dir)? {
             let h = if id >= SURVIVOR_BASE { &mut survivor } else { &mut head };
             if id >= h.seg {
                 *h = Head { seg: id, next: len };
@@ -170,17 +224,18 @@ impl BucketFiles {
     }
 }
 
-/// The segment files in `dir`: id, length and last-write time.
-fn list_segments(dir: &std::path::Path) -> io::Result<Vec<(u64, u64, std::time::SystemTime)>> {
+/// The segment files in `dir`: id, length, last-write time and bytes on disk.
+fn list_segments(dir: &std::path::Path) -> io::Result<Vec<(u64, u64, std::time::SystemTime, u64)>> {
+    use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".seg")).and_then(|n| n.parse::<u64>().ok()) else { continue };
         let meta = entry.metadata()?;
-        out.push((id, meta.len(), meta.modified()?));
+        out.push((id, meta.len(), meta.modified()?, meta.blocks() * 512));
     }
-    out.sort_by_key(|(id, _, _)| *id);
+    out.sort_by_key(|(id, _, _, _)| *id);
     Ok(out)
 }
 
@@ -290,15 +345,52 @@ impl LocalXFSBinaryStore {
         let now = std::time::SystemTime::now();
         Ok(list_segments(&dir)?
             .into_iter()
-            .map(|(id, len, modified)| SegmentInfo {
+            .map(|(id, len, modified, physical)| SegmentInfo {
                 id,
                 len,
+                physical,
                 idle: now.duration_since(modified).unwrap_or_default(),
                 // A head may not have its file yet: the highest id in each
                 // range counts as active too, so it's never retired.
                 active: id >= fresh && id < SURVIVOR_BASE || id >= survivor,
             })
             .collect())
+    }
+
+    /// Copies a survivor's bytes to the survivor head inside the kernel
+    /// (`copy_file_range` on Linux), durable on return.
+    pub fn copy_to_survivor(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<(u64, u64), Error> {
+        let files = self.bucket(user_id, bucket, false)?;
+        let src = files.segment(segment_of(offset), false).map_err(ErrorInternalServerError)?;
+        let (seg, local) = files.reserve(size, true);
+        let dst = files.segment(seg, true).map_err(ErrorInternalServerError)?;
+        copy_range(&src.file, local_of(offset), &dst.file, local, size).map_err(ErrorInternalServerError)?;
+        let ticket = dst.commit.ticket();
+        dst.commit.wait_for_durable(ticket, &dst.file).map_err(ErrorInternalServerError)?;
+        Ok(((seg << LOCAL_BITS) | local, size))
+    }
+
+    /// Frees the whole disk blocks inside each `(offset, len)` range of a
+    /// sealed segment, offsets inside the segment. Partial blocks at either
+    /// end are kept, so bytes outside the ranges are never touched. The
+    /// caller passes only ranges nothing points into: they read back as
+    /// zeros. Returns the bytes freed.
+    pub fn punch(&self, user_id: &str, bucket: &str, seg: u64, ranges: &[(u64, u64)]) -> io::Result<u64> {
+        let files = bucket_files(self.bucket_dir(user_id, bucket), self.segment_bytes, false)?;
+        let (fresh, survivor) = files.heads();
+        if (seg >= fresh && seg < SURVIVOR_BASE) || seg >= survivor {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("segment {seg} is still taking writes")));
+        }
+        let segment = files.segment(seg, false)?;
+        let mut freed = 0;
+        for &(start, len) in ranges {
+            let (a, b) = (start.div_ceil(BLOCK) * BLOCK, (start + len) / BLOCK * BLOCK);
+            if b > a {
+                punch_hole(&segment.file, a, b - a)?;
+                freed += b - a;
+            }
+        }
+        Ok(freed)
     }
 
     /// Deletes a sealed segment once nothing points into it. Refuses a
@@ -533,6 +625,48 @@ mod tests {
         assert_eq!((segment_of(o), local_of(o)), (SURVIVOR_BASE, 60));
         let (o, _) = store.write(u, b, &[8; 30]).unwrap();
         assert_eq!((segment_of(o), local_of(o)), (2, 60));
+    }
+
+    #[test]
+    fn punching_frees_whole_dead_blocks_and_never_touches_live_bytes() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(1 << 20);
+        let (u, b) = ("test_user_seg", "seg_punch_bucket");
+        // live 5000 bytes, dead 70000, live 3000, dead 50000, then a big write
+        // that seals segment 0.
+        let live1 = vec![1u8; 5000];
+        let (o1, n1) = store.write(u, b, &live1).unwrap();
+        let (od, nd) = store.write(u, b, &vec![2u8; 70_000]).unwrap();
+        let live2 = vec![3u8; 3000];
+        let (o2, n2) = store.write(u, b, &live2).unwrap();
+        let (ot, nt) = store.write(u, b, &vec![4u8; 50_000]).unwrap();
+        store.write(u, b, &vec![5u8; 1 << 20]).unwrap();
+        let before = store.segments(u, b).unwrap()[0].physical;
+        // The dead ranges as the compactor computes them: the gaps between
+        // live entries, up to the segment's end.
+        let gaps = [(local_of(od), nd), (local_of(ot), nt)];
+        let freed = store.punch(u, b, 0, &gaps).unwrap();
+        // Rounded inward to whole blocks: [5000, 75000) frees [8192, 73728),
+        // [78000, 128000) frees [81920, 126976).
+        assert_eq!(freed, (73728 - 8192) + (126976 - 81920));
+        assert_eq!(store.read(u, b, o1, n1).unwrap(), live1);
+        assert_eq!(store.read(u, b, o2, n2).unwrap(), live2);
+        let after = store.segments(u, b).unwrap()[0].physical;
+        assert!(after < before, "physical size {before} -> {after}");
+        assert!(store.punch(u, b, 1, &gaps).is_err(), "the active segment is refused");
+    }
+
+    #[test]
+    fn copy_to_survivor_copies_exactly_and_durably() {
+        let store = LocalXFSBinaryStore::with_segment_bytes(100);
+        let (u, b) = ("test_user_seg", "seg_copy_bucket");
+        let data: Vec<u8> = (0..90u8).collect();
+        let (o, n) = store.write(u, b, &data).unwrap();
+        store.write(u, b, &[9; 50]).unwrap();
+        let (c, cn) = store.copy_to_survivor(u, b, o, n).unwrap();
+        assert_eq!(segment_of(c), SURVIVOR_BASE);
+        assert_eq!(store.read(u, b, c, cn).unwrap(), data);
+        restart(&store, u, b);
+        assert_eq!(store.read(u, b, c, cn).unwrap(), data, "readable after a restart");
     }
 
     #[test]

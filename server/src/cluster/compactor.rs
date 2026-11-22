@@ -22,6 +22,15 @@
 //!    `WARPDRIVE_COMPACT_UNLINK_SECS` (default 30), so a read that looked up
 //!    the old offset just before the move still finds the file.
 //!
+//! 6. **Punch holes** in the other sealed segments: the whole disk blocks
+//!    between live entries are freed in place. Large dead objects free at once, without waiting for the
+//!    segment to fall under `umax` and without copying. Holes are rounded
+//!    inward to whole blocks, so no live byte is touched, and a segment that
+//!    had shards moved out within the unlink grace is skipped.
+//!
+//! Survivors are copied inside the kernel with `copy_file_range` (read and
+//! write where it doesn't exist).
+//!
 //! A crash at any point leaves every live shard readable: the old segment
 //! stays until its entries have moved, and a copy whose entry never moved
 //! is dead bytes in a survivor segment, freed by a later pass.
@@ -35,8 +44,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::shard_storage::{delete_shard_if, move_shard_if, parse_shard_key, shard_entries};
-use crate::storage::local_store::{get_storage_directory, segment_of, LocalXFSBinaryStore};
-use crate::storage::Storage;
+use crate::storage::local_store::{get_storage_directory, segment_of, LocalXFSBinaryStore, SegmentInfo};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -70,6 +78,8 @@ pub struct CompactStats {
     pub moves_skipped: usize,
     pub bytes_copied: u64,
     pub bytes_freed: u64,
+    /// Freed by punching holes in sealed segments.
+    pub bytes_punched: u64,
     /// Shard keys that don't parse: their bucket is unknown, so no segment
     /// is compacted while any exist.
     pub unrecognized: usize,
@@ -84,6 +94,12 @@ struct Pending {
 }
 
 static PENDING: LazyLock<Mutex<Vec<Pending>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// Segments shards were moved out of, and when: not punched within the
+/// unlink grace, since a read may still be on a moved shard's old bytes.
+static MOVED_FROM: LazyLock<Mutex<HashMap<(String, String, u64), Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The live entries a segment had when it was last punched: punched again
+/// only once that changes.
+static PUNCHED: LazyLock<Mutex<HashMap<(String, String, u64), usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// A pass starts no new segment after this long.
 const PASS_MAX: Duration = Duration::from_secs(300);
 /// One pass at a time.
@@ -189,6 +205,7 @@ pub fn run_pass(dead: &[(String, u64, u64)]) -> CompactStats {
     let already: Vec<(String, String, u64)> = PENDING.lock().iter().map(|p| (p.user.clone(), p.bucket.clone(), p.seg)).collect();
 
     let mut candidates = Vec::new();
+    let mut to_punch = Vec::new();
     for (user, bucket, seg) in sealed {
         if already.iter().any(|(u, b, s)| *u == user && *b == bucket && *s == seg.id) {
             continue;
@@ -203,7 +220,12 @@ pub fn run_pass(dead: &[(String, u64, u64)]) -> CompactStats {
         if u < cfg.umax {
             let score = (1.0 - u) * seg.idle.as_secs_f64() / (1.0 + u);
             candidates.push((score, user, bucket, seg, entries));
+        } else {
+            to_punch.push((user, bucket, seg, entries));
         }
+    }
+    for (user, bucket, seg, entries) in to_punch {
+        punch_dead(&store, &cfg, &user, &bucket, &seg, entries, &mut stats);
     }
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
 
@@ -217,9 +239,9 @@ pub fn run_pass(dead: &[(String, u64, u64)]) -> CompactStats {
         entries.sort_by_key(|(_, o, _)| *o);
         let mut failed = false;
         for (sk, offset, size) in entries {
-            let moved = store
-                .read(&user, &bucket, offset, size)
-                .and_then(|bytes| store.write_survivor(&user, &bucket, &bytes))
+            let copied = store.copy_to_survivor(&user, &bucket, offset, size);
+            MOVED_FROM.lock().insert((user.clone(), bucket.clone(), seg.id), Instant::now());
+            let moved = copied
                 .map_err(|e| e.to_string())
                 .and_then(|to| move_shard_if(&sk, (offset, size), to).map_err(|e| e.to_string()));
             match moved {
@@ -247,4 +269,37 @@ pub fn run_pass(dead: &[(String, u64, u64)]) -> CompactStats {
     }
     retire_due(&store, &cfg, &mut stats);
     stats
+}
+
+/// Punches the whole blocks between `entries` (the segment's live shards)
+/// and after the last one, unless the segment had shards moved out of it
+/// within the unlink grace or nothing changed since it was last punched.
+fn punch_dead(store: &LocalXFSBinaryStore, cfg: &Config, user: &str, bucket: &str, seg: &SegmentInfo, mut entries: Vec<(String, u64, u64)>, stats: &mut CompactStats) {
+    let key = (user.to_string(), bucket.to_string(), seg.id);
+    if MOVED_FROM.lock().get(&key).is_some_and(|t| t.elapsed() < cfg.unlink_grace) {
+        return;
+    }
+    if PUNCHED.lock().get(&key) == Some(&entries.len()) {
+        return;
+    }
+    entries.sort_by_key(|(_, o, _)| *o);
+    let mut gaps = Vec::new();
+    let mut at = 0u64;
+    for (_, offset, size) in &entries {
+        let start = offset & ((1 << 40) - 1);
+        if start > at {
+            gaps.push((at, start - at));
+        }
+        at = at.max(start + size);
+    }
+    if seg.len > at {
+        gaps.push((at, seg.len - at));
+    }
+    match store.punch(user, bucket, seg.id, &gaps) {
+        Ok(freed) => {
+            stats.bytes_punched += freed;
+            PUNCHED.lock().insert(key, entries.len());
+        }
+        Err(e) => log::warn!("compactor: punching segment {} of {bucket:?} failed: {e}", seg.id),
+    }
 }
