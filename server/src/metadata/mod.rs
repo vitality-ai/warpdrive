@@ -205,6 +205,15 @@ pub trait MetadataStorage: Send + Sync {
     /// Returns (version_id, old_extents_to_gc).
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error>;
 
+    /// The S3 PUT metadata write as a future that can run on another thread,
+    /// for stores whose write waits on the network. `Err` hands `metadata`
+    /// back: the store has no async path, so the caller uses `put_object_v2`.
+    fn put_object_v2_async(
+        self: std::sync::Arc<Self>, _user_id: String, _bucket: String, _key: String, metadata: Metadata,
+    ) -> Result<futures::future::BoxFuture<'static, Result<(Option<String>, Vec<(u64, u64)>), String>>, Metadata> {
+        Err(metadata)
+    }
+
     // --- Deletion WAL ---
     fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error>;

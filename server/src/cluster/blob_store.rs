@@ -275,6 +275,26 @@ impl Storage for ClusterBlobStore {
         Ok(())
     }
 
+    /// Reserves the addresses in place, then returns the shard writes as a
+    /// future the PUT awaits on its HTTP worker. Each shard write goes over
+    /// the network, a node's own included, so the future never blocks.
+    fn write_async(&self, user_id: &str, bucket: &str, data: Vec<u8>) -> Option<futures::future::LocalBoxFuture<'static, Result<(u64, u64), String>>> {
+        let len = data.len() as u64;
+        let base = match self.alloc.allocate(user_id, bucket, len.max(1)) {
+            Ok(b) => b,
+            Err(e) => return Some(Box::pin(std::future::ready(Err(e.to_string())))),
+        };
+        let Some(state) = bridge::state() else {
+            return Some(Box::pin(std::future::ready(Err("cluster state not installed".to_string()))));
+        };
+        let (user, bucket) = (user_id.to_string(), bucket.to_string());
+        Some(Box::pin(async move {
+            let placement = write_blob(&state, &user, &blob_bucket(&bucket), &blob_key(base), &data).await.map_err(|e| e.to_string())?;
+            index_blob(&BlobRef { user_id: user, bucket, base, placement });
+            Ok((base, len))
+        }))
+    }
+
     /// A cache hit answers in place. A miss returns the shard reads as a
     /// future, so a GET awaits them on its HTTP worker instead of blocking
     /// a pool thread that blocks a bridge thread.

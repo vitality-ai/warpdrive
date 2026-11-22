@@ -70,6 +70,21 @@ impl MetadataService {
         self.store.put_object_v2(&self.user, bucket, key, &metadata)
     }
 
+    /// `put_object_full` without blocking the caller's thread when the store
+    /// has an async path (the replicated cluster store). The write runs on
+    /// the bridge runtime and the caller awaits it.
+    pub async fn put_object_full_async(
+        &self, bucket: &str, key: &str, metadata: Metadata,
+    ) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
+        match Arc::clone(&self.store).put_object_v2_async(self.user.clone(), bucket.to_string(), key.to_string(), metadata) {
+            Ok(fut) => crate::cluster::bridge::spawn(fut)
+                .await
+                .map_err(|e| actix_web::error::ErrorInternalServerError(format!("metadata write task failed: {e}")))?
+                .map_err(actix_web::error::ErrorInternalServerError),
+            Err(metadata) => self.store.put_object_v2(&self.user, bucket, key, &metadata),
+        }
+    }
+
     /// Read a fully-populated Metadata object (S3 GET / HEAD path).
     pub fn get_object_full(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         self.store.get_metadata(&self.user, bucket, key)

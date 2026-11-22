@@ -193,14 +193,21 @@ pub async fn s3_put_object_handler(
         let ctx = context.clone();
         let store_c = Arc::clone(&store);
         let buf = body_buf.clone();
-        let pair = web::block(move || {
-            store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string())
-        }).await
-        .map_err(|e| {
-            error!("PutObject: blocking write failed bucket={} key={}: {:?}", bucket, key, e);
-            actix_web::error::ErrorInternalServerError("storage write task failed")
-        })?
-        .map_err(|msg| {
+        // A store that writes over the network (the cluster) is awaited
+        // here. One that writes to local disk goes to the blocking pool.
+        let written = match store_c.write_async(&ctx.user_id, &ctx.bucket, buf) {
+            Some(fut) => fut.await,
+            None => {
+                let buf = body_buf.clone();
+                web::block(move || store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string()))
+                    .await
+                    .map_err(|e| {
+                        error!("PutObject: blocking write failed bucket={} key={}: {:?}", bucket, key, e);
+                        actix_web::error::ErrorInternalServerError("storage write task failed")
+                    })?
+            }
+        };
+        let pair = written.map_err(|msg| {
             error!("PutObject: write error bucket={} key={}: {}", bucket, key, msg);
             actix_web::error::ErrorInternalServerError(msg)
         })?;
@@ -277,25 +284,7 @@ pub async fn s3_put_object_handler(
         // For simple (non-multipart) objects, checksum_type is not set (leave None)
     }
 
-    // On the blocking pool, like the body write: on a cluster this waits on
-    // a replication round, and an HTTP worker blocked here can't serve
-    // anything else meanwhile.
-    let (version_id, old_extents) = {
-        let (owner, b, k) = (owner_id.clone(), bucket.clone(), key.clone());
-        // actix's `Error` can't cross threads: its status and message do,
-        // and it's rebuilt here with both.
-        web::block(move || {
-            MetadataService::new(&owner)
-                .and_then(|db| db.put_object_full(&b, &k, metadata))
-                .map_err(|e| (e.as_response_error().status_code(), e.to_string()))
-        })
-        .await
-        .map_err(|e| {
-            error!("PutObject: blocking metadata write failed bucket={} key={}: {:?}", bucket, key, e);
-            actix_web::error::ErrorInternalServerError("metadata write task failed")
-        })?
-        .map_err(|(status, msg)| Error::from(actix_web::error::InternalError::new(msg, status)))?
-    };
+    let (version_id, old_extents) = db.put_object_full_async(&bucket, &key, metadata).await?;
     if !old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &old_extents).ok();
     }

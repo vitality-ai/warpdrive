@@ -275,7 +275,7 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
 /// own copy is applied directly, not over HTTP: a request to itself would
 /// need a free HTTP worker on this node, and with every worker busy waiting
 /// on replication, there might be none.
-async fn send_to_peers(state: &ClusterState, peers: &[String], make: &dyn Fn() -> RecordOp) -> Vec<PeerReply> {
+async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() -> RecordOp + Sync)) -> Vec<PeerReply> {
     let me = self_addr();
     let requests = peers.iter().map(|peer| {
         let op = make();
@@ -321,7 +321,7 @@ const ORDERED_WRITE_ROUNDS: usize = 3;
 /// write came last from the client's point of view, so it's stamped above
 /// the highest `seq` seen and sent again to every peer. Peers that applied
 /// the first send apply the restamped copy too, since it's newer.
-async fn replicate_ordered(state: &ClusterState, peers: &[String], mut seq: u64, make: impl Fn(u64) -> RecordOp) -> usize {
+async fn replicate_ordered(state: &ClusterState, peers: &[String], mut seq: u64, make: impl Fn(u64) -> RecordOp + Sync) -> usize {
     let mut acked = 0;
     for round in 0..ORDERED_WRITE_ROUNDS {
         let replies = send_to_peers(state, peers, &|| make(seq)).await;

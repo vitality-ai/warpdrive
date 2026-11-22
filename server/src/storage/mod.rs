@@ -28,6 +28,13 @@ pub trait Storage: Send + Sync {
 
     /// `read` as a future the caller awaits on its own thread, for stores
     /// whose read waits on the network. `None`: use `read`, which blocks.
+    /// `write` as a future, for stores whose write waits on the network:
+    /// a PUT awaits it on its HTTP worker instead of parking a thread.
+    /// `None` means the store has no async path and the caller uses `write`.
+    fn write_async(&self, _user_id: &str, _bucket: &str, _data: Vec<u8>) -> Option<futures::future::LocalBoxFuture<'static, Result<(u64, u64), String>>> {
+        None
+    }
+
     fn read_async(&self, _user_id: &str, _bucket: &str, _offset: u64, _size: u64) -> Option<futures::future::LocalBoxFuture<'static, Result<Vec<u8>, String>>> {
         None
     }

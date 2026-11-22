@@ -57,6 +57,12 @@ static POOL: LazyLock<mpsc::Sender<Job>> = LazyLock::new(|| {
     tx
 });
 
+/// Runs `fut` as a task on the bridge runtime. Awaiting the handle does not
+/// block the caller's thread, unlike `run`.
+pub fn spawn<T: Send + 'static>(fut: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    RUNTIME.spawn(fut)
+}
+
 static STATE: OnceLock<web::Data<ClusterState>> = OnceLock::new();
 
 /// Makes this node's cluster state available to the cluster stores. Called

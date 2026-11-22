@@ -32,7 +32,7 @@
 
 use actix_web::error::{ErrorBadRequest, ErrorInternalServerError, ErrorNotFound};
 use actix_web::Error;
-use parking_lot::Mutex;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -237,6 +237,12 @@ pub trait RowWriter: Send + Sync {
     /// Writes `record` (or a tombstone at `seq` when `None`) for `key`,
     /// returning once it is durable on a write quorum.
     fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String>;
+
+    /// Async form of `write`, for callers that must not block a thread on
+    /// the quorum round trip. The default runs `write` now.
+    fn write_async(&self, key: String, seq: u64, record: Option<MetaRecord>) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(std::future::ready(self.write(&key, seq, record)))
+    }
 }
 
 static ROWS: std::sync::OnceLock<Arc<MetaRows>> = std::sync::OnceLock::new();
@@ -267,6 +273,19 @@ impl RowWriter for ClusterWriter {
         }
         Ok(())
     }
+
+    fn write_async(&self, key: String, seq: u64, record: Option<MetaRecord>) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async move {
+            let state = super::bridge::state().ok_or("cluster state not installed")?;
+            let peers = state.membership.peers();
+            let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
+            let acked = super::coordinator::replicate_meta_row(&state, &peers, &key, seq, record).await;
+            if acked < required {
+                return Err(format!("{acked}/{required} nodes stored the row"));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Applies row writes to this node's rows only.
@@ -292,17 +311,29 @@ impl RowWriter for LocalWriter {
 // ---------------------------------------------------------------- store
 
 /// Striped per-key locks: writes to one row are serialized on this node.
-struct KeyLocks(Vec<Mutex<()>>);
+///
+/// The stripes are async-aware mutexes so the async PUT path can hold one
+/// across a replication round trip without blocking a thread. Sync callers
+/// block their thread on the same mutex, as they did on the old blocking
+/// one, so both paths exclude each other. An async holder runs on the
+/// bridge runtime, never on a thread a sync caller is blocking.
+struct KeyLocks(Vec<tokio::sync::Mutex<()>>);
 
 impl KeyLocks {
     fn new() -> Self {
-        Self((0..256).map(|_| Mutex::new(())).collect())
+        Self((0..256).map(|_| tokio::sync::Mutex::new(())).collect())
     }
-    fn lock(&self, key: &str) -> parking_lot::MutexGuard<'_, ()> {
+    fn stripe(&self, key: &str) -> &tokio::sync::Mutex<()> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut h);
-        self.0[(h.finish() as usize) % self.0.len()].lock()
+        &self.0[(h.finish() as usize) % self.0.len()]
+    }
+    fn lock(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        futures::executor::block_on(self.stripe(key).lock())
+    }
+    async fn lock_async(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.stripe(key).lock().await
     }
 }
 
@@ -396,17 +427,53 @@ impl ReplicatedMetadataStore {
         let before = self.object(user, bucket, key).unwrap_or_default();
         let mut after = before.clone();
         let out = f(&mut after)?;
-        let old: BTreeMap<u64, &VersionEntry> = before.versions.iter().map(|v| (v.order, v)).collect();
-        let new: BTreeMap<u64, &VersionEntry> = after.versions.iter().map(|v| (v.order, v)).collect();
-        for (order, v) in &new {
-            if old.get(order) != Some(v) {
-                self.put(&version_key(user, bucket, key, *order), MetaValue::Version((*v).clone()))?;
+        for (row, value) in version_writes(user, bucket, key, &before, &after) {
+            match value {
+                Some(v) => self.put(&row, v)?,
+                None => self.remove(&row)?,
             }
         }
-        for order in old.keys().filter(|o| !new.contains_key(o)) {
-            self.remove(&version_key(user, bucket, key, *order))?;
-        }
         Ok(out)
+    }
+
+    async fn put_async(&self, key: String, value: MetaValue) -> Result<(), String> {
+        let seq = hlc::now();
+        self.writer.write_async(key, seq, Some(MetaRecord { seq, value })).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+    }
+
+    async fn remove_async(&self, key: String) -> Result<(), String> {
+        if self.rows.get(&key).is_none() {
+            return Ok(());
+        }
+        self.writer.write_async(key, hlc::now(), None).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+    }
+
+    /// The S3 PUT metadata write without blocking a thread: the same rows,
+    /// lock and order as `put_object_v2`, awaited instead of bridged.
+    async fn put_object_v2_owned(self: Arc<Self>, user: String, bucket: String, key: String, metadata: Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), String> {
+        let mode = self.mode(&bucket);
+        let (vid, replaced) = {
+            let _g = self.locks.lock_async(&versions_prefix(&user, &bucket, &key)).await;
+            let before = self.object(&user, &bucket, &key).unwrap_or_default();
+            let mut after = before.clone();
+            let out = put_version(mode, &user, &bucket, &metadata, &mut after);
+            for (row, value) in version_writes(&user, &bucket, &key, &before, &after) {
+                match value {
+                    Some(v) => self.put_async(row, v).await?,
+                    None => self.remove_async(row).await?,
+                }
+            }
+            out
+        };
+        let old_extents = match replaced {
+            Some(v) => {
+                self.remove_async(version_scoped("acl", &bucket, &key, &v.version_id)).await?;
+                self.remove_async(version_scoped("lck", &bucket, &key, &v.version_id)).await?;
+                v.meta.to_offset_size_list()
+            }
+            None => Vec::new(),
+        };
+        Ok(((!vid.is_empty()).then_some(vid), old_extents))
     }
 
     fn upload(&self, upload_id: &str) -> Option<UploadRow> {
@@ -470,6 +537,48 @@ impl ReplicatedMetadataStore {
     }
 }
 
+/// Adds a new version of an object for an S3 PUT under `mode`. Returns
+/// the version id and the version it replaced, if any.
+fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadata, o: &mut ObjectRow) -> (String, Option<VersionEntry>) {
+    let mut meta = metadata.clone();
+    meta.is_delete_marker = false;
+    let (vid, replaced) = match mode {
+        Versioning::Enabled => (new_version_id(), None),
+        Versioning::Suspended => {
+            let old = o.find("null").map(|i| o.versions.remove(i));
+            ("null".to_string(), old)
+        }
+        _ => (String::new(), o.versions.drain(..).last()),
+    };
+    meta.version_id = (!vid.is_empty()).then(|| vid.clone());
+    let blobs = blobs_for(user_id, bucket, &meta.to_offset_size_list());
+    // An unversioned overwrite takes the old version's slot: one row
+    // write, not a new row plus a tombstone.
+    let order = match (mode, &replaced) {
+        (Versioning::Disabled, Some(old)) => old.order,
+        _ => hlc::now(),
+    };
+    o.versions.push(VersionEntry { order, version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
+    (vid, replaced)
+}
+
+/// The row writes that turn `before` into `after`: new or changed version
+/// rows first, then tombstones for removed ones.
+fn version_writes(user: &str, bucket: &str, key: &str, before: &ObjectRow, after: &ObjectRow) -> Vec<(String, Option<MetaValue>)> {
+    let old: BTreeMap<u64, &VersionEntry> = before.versions.iter().map(|v| (v.order, v)).collect();
+    let new: BTreeMap<u64, &VersionEntry> = after.versions.iter().map(|v| (v.order, v)).collect();
+    let mut writes = Vec::new();
+    for (order, v) in &new {
+        if old.get(order) != Some(v) {
+            writes.push((version_key(user, bucket, key, *order), Some(MetaValue::Version((*v).clone()))));
+        }
+    }
+    for order in old.keys().filter(|o| !new.contains_key(o)) {
+        writes.push((version_key(user, bucket, key, *order), None));
+    }
+    writes
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Versioning {
     Disabled,
@@ -486,6 +595,10 @@ fn stats(objects: &[(String, ObjectRow)]) -> (u64, u64) {
 }
 
 impl MetadataStorage for ReplicatedMetadataStore {
+    fn put_object_v2_async(self: Arc<Self>, user_id: String, bucket: String, key: String, metadata: Metadata) -> Result<BoxFuture<'static, Result<(Option<String>, Vec<(u64, u64)>), String>>, Metadata> {
+        Ok(Box::pin(self.put_object_v2_owned(user_id, bucket, key, metadata)))
+    }
+
     // ---- objects (legacy native-API path) ----
 
     fn put_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
@@ -627,28 +740,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
 
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
         let mode = self.mode(bucket);
-        let (vid, replaced) = self.update_object(user_id, bucket, key, |o| {
-            let mut meta = metadata.clone();
-            meta.is_delete_marker = false;
-            let (vid, replaced) = match mode {
-                Versioning::Enabled => (new_version_id(), None),
-                Versioning::Suspended => {
-                    let old = o.find("null").map(|i| o.versions.remove(i));
-                    ("null".to_string(), old)
-                }
-                _ => (String::new(), o.versions.drain(..).last()),
-            };
-            meta.version_id = (!vid.is_empty()).then(|| vid.clone());
-            let blobs = blobs_for(user_id, bucket, &meta.to_offset_size_list());
-            // An unversioned overwrite takes the old version's slot: one row
-            // write, not a new row plus a tombstone.
-            let order = match (mode, &replaced) {
-                (Versioning::Disabled, Some(old)) => old.order,
-                _ => hlc::now(),
-            };
-            o.versions.push(VersionEntry { order, version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
-            Ok((vid, replaced))
-        })?;
+        let (vid, replaced) = self.update_object(user_id, bucket, key, |o| Ok(put_version(mode, user_id, bucket, metadata, o)))?;
         let old_extents = match replaced {
             Some(v) => {
                 self.forget_version(bucket, key, &v.version_id)?;
