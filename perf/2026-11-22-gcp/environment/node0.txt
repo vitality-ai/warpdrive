@@ -1,0 +1,73 @@
+## host
+wln-0
+machine_type: n2-standard-4
+zone: us-central1-a
+cpu_platform: Intel Cascade Lake
+captured_utc: 2026-11-22T19:54:55Z
+boot_utc: 2026-11-22 10:29:29
+## cpu
+Architecture:                            x86_64
+CPU(s):                                  4
+Model name:                              Intel(R) Xeon(R) CPU @ 2.80GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      2
+Socket(s):                               1
+Flags: (avx512 present)
+L1d cache:                               64 KiB (2 instances)
+L2 cache:                                2 MiB (2 instances)
+L3 cache:                                33 MiB (1 instance)
+NUMA node(s):                            1
+governor: none
+## memory
+               total        used        free      shared  buff/cache   available
+Mem:           15990         955         366           0       14668       14695
+## kernel and os
+6.8.0-1073-gcp
+Ubuntu 22.04.5 LTS
+## storage
+NAME    MODEL            SIZE ROTA TRAN
+sda     PersistentDisk    30G    1 
+nvme0n1 nvme_card        375G    0 nvme
+nvme0n1 scheduler: [none] mq-deadline  nr_requests: 1023 logical_block: 4096
+├─sda1       29.9G ext4     /
+├─sda14         4M          
+└─sda15       106M vfat     /boot/efi
+nvme0n1       375G          
+├─nvme0n1p1 187.5G xfs      
+└─nvme0n1p2 187.5G ext4     /mnt/nvme
+/mnt/nvme: /dev/nvme0n1p2 ext4   rw,noatime
+## tunables
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+vm.swappiness = 60
+net.core.somaxconn = 4096
+net.ipv4.tcp_congestion_control = cubic
+fs.file-max = 9223372036854775807
+ulimit_nofile: 1024
+## network
+ens5: 1460
+## binaries
+2026-11-22T17:42:38 comp_log.yaml
+2026-11-22T17:42:38 comp_sampler.sh
+2026-11-22T10:30:12 sampler.sh
+2026-11-22T10:30:10 server_log.yaml
+2026-11-22T11:14:01 wd-226
+2026-11-22T12:05:05 wd-ar
+2026-11-22T16:04:58 wd-as
+2026-11-22T17:42:38 wd-comp
+2026-11-22T17:42:38 wd-compold
+2026-11-22T15:56:19 wd-fx
+2026-11-22T11:14:01 wd-main
+2026-11-22T10:30:54 wd-par
+2026-11-22T17:02:31 wd-seg
+2026-11-22T17:02:31 wd-segbase
+wd-226 f1475278e5bc6632
+wd-ar 162b5251c5f8e164
+wd-as 27318ca70f80dba5
+wd-comp ad8b271642bdc848
+wd-compold b0e8dd9186621441
+wd-fx 58660e2ea8dd674f
+wd-main 868d75653edac3cc
+wd-par aa5ed4b615fcb372
+wd-seg 039d43aac3b50f6e
+wd-segbase cea80ef1f71b9ec3
