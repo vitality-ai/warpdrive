@@ -277,7 +277,25 @@ pub async fn s3_put_object_handler(
         // For simple (non-multipart) objects, checksum_type is not set (leave None)
     }
 
-    let (version_id, old_extents) = db.put_object_full(&bucket, &key, metadata)?;
+    // On the blocking pool, like the body write: on a cluster this waits on
+    // a replication round, and an HTTP worker blocked here can't serve
+    // anything else meanwhile.
+    let (version_id, old_extents) = {
+        let (owner, b, k) = (owner_id.clone(), bucket.clone(), key.clone());
+        // actix's `Error` can't cross threads: its status and message do,
+        // and it's rebuilt here with both.
+        web::block(move || {
+            MetadataService::new(&owner)
+                .and_then(|db| db.put_object_full(&b, &k, metadata))
+                .map_err(|e| (e.as_response_error().status_code(), e.to_string()))
+        })
+        .await
+        .map_err(|e| {
+            error!("PutObject: blocking metadata write failed bucket={} key={}: {:?}", bucket, key, e);
+            actix_web::error::ErrorInternalServerError("metadata write task failed")
+        })?
+        .map_err(|(status, msg)| Error::from(actix_web::error::InternalError::new(msg, status)))?
+    };
     if !old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &old_extents).ok();
     }

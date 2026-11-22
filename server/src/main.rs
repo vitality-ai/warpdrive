@@ -289,14 +289,17 @@ fn install_cluster_stores(state: &web::Data<ClusterState>) {
     info!("S3 handlers serve this node from the cluster (metadata log {meta_log})");
 }
 
-/// HTTP worker threads: `WARPDRIVE_HTTP_WORKERS`, else the larger of 32 and
-/// the core count.
+/// HTTP worker threads: `WARPDRIVE_HTTP_WORKERS`, else one per core.
+/// More workers than cores cost GETs 7 to 20% on GCP (4 cores, 32 workers),
+/// and nothing that waits on the network runs on a worker: object bytes and
+/// the PUT's metadata write go to the blocking pool, and GETs await their
+/// shard reads.
 fn http_workers() -> usize {
     std::env::var("WARPDRIVE_HTTP_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(32))
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
 fn build_cluster_state() -> web::Data<ClusterState> {
@@ -533,11 +536,6 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
     })
-    // The S3 handlers call metadata and storage synchronously, and on a
-    // cluster those calls wait on a replication round. Actix's default of one
-    // worker per core (2 on an n2-standard-2) then caps a node at 2 requests
-    // in flight: measured on GCP as ~800 4 KB PUT/s. WARPDRIVE_HTTP_WORKERS
-    // overrides the default of at least 32.
     .workers(http_workers())
     .bind(("0.0.0.0", port))?
     .run()
