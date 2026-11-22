@@ -208,7 +208,7 @@ impl BlobCache {
 
 pub struct ClusterBlobStore {
     alloc: Allocator,
-    cache: Mutex<BlobCache>,
+    cache: Arc<Mutex<BlobCache>>,
 }
 
 impl ClusterBlobStore {
@@ -219,7 +219,7 @@ impl ClusterBlobStore {
         log::info!("cluster blob store: node slot {slot}");
         // Recently read blobs, `WARPDRIVE_BLOB_CACHE_MB` (default 256, 0 disables).
         let budget_mb: usize = std::env::var("WARPDRIVE_BLOB_CACHE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256);
-        Ok(Self { alloc, cache: Mutex::new(BlobCache::new(budget_mb << 20)) })
+        Ok(Self { alloc, cache: Arc::new(Mutex::new(BlobCache::new(budget_mb << 20))) })
     }
 
     /// The bytes of the blob holding `offset`, with its start address.
@@ -273,6 +273,36 @@ impl Storage for ClusterBlobStore {
     fn delete(&self, _user_id: &str, bucket: &str, offset_size_list: &[(u64, u64)]) -> Result<(), Error> {
         log::trace!("cluster blob store: {} range(s) in {bucket} unreferenced, kept until space reclamation", offset_size_list.len());
         Ok(())
+    }
+
+    /// A cache hit answers in place. A miss returns the shard reads as a
+    /// future, so a GET awaits them on its HTTP worker instead of blocking
+    /// a pool thread that blocks a bridge thread.
+    fn read_async(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Option<futures::future::LocalBoxFuture<'static, Result<Vec<u8>, String>>> {
+        let slice = move |base: u64, bytes: &[u8]| -> Result<Vec<u8>, String> {
+            let start = (offset - base) as usize;
+            let end = start + size as usize;
+            bytes.get(start..end).map(<[u8]>::to_vec).ok_or_else(|| format!("range {offset:#x}+{size} runs past its blob at {base:#x} ({} bytes)", bytes.len()))
+        };
+        if size == 0 {
+            return Some(Box::pin(std::future::ready(Ok(Vec::new()))));
+        }
+        let Some((base, placement)) = lookup(user_id, bucket, offset) else {
+            return Some(Box::pin(std::future::ready(Err(format!("no stored range holds offset {offset:#x} in {bucket}")))));
+        };
+        let cache_key = (user_id.to_string(), bucket.to_string(), format!("{base:x}@{}", placement.wire_key));
+        if let Some(bytes) = self.cache.lock().get(&cache_key) {
+            return Some(Box::pin(std::future::ready(slice(base, &bytes))));
+        }
+        let Some(state) = bridge::state() else {
+            return Some(Box::pin(std::future::ready(Err("cluster state not installed".to_string()))));
+        };
+        let (user, ib, cache) = (user_id.to_string(), blob_bucket(bucket), Arc::clone(&self.cache));
+        Some(Box::pin(async move {
+            let bytes = Arc::new(read_blob(&state, &user, &ib, &placement).await.map_err(|e| e.to_string())?);
+            cache.lock().insert(cache_key, Arc::clone(&bytes));
+            slice(base, &bytes)
+        }))
     }
 
     fn verify(&self, user_id: &str, bucket: &str, offset: u64, size: u64, checksum: &[u8]) -> Result<bool, Error> {

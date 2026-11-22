@@ -25,6 +25,12 @@ pub trait Storage: Send + Sync {
 
     /// Verify data integrity for the specified range
     fn verify(&self, user_id: &str, bucket: &str, offset: u64, size: u64, checksum: &[u8]) -> Result<bool, Error>;
+
+    /// `read` as a future the caller awaits on its own thread, for stores
+    /// whose read waits on the network. `None`: use `read`, which blocks.
+    fn read_async(&self, _user_id: &str, _bucket: &str, _offset: u64, _size: u64) -> Option<futures::future::LocalBoxFuture<'static, Result<Vec<u8>, String>>> {
+        None
+    }
 }
 static OBJECT_STORE: OnceLock<Arc<dyn Storage>> = OnceLock::new();
 

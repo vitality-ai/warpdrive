@@ -515,13 +515,17 @@ pub async fn s3_get_object_handler(
                 return Ok::<Option<(Bytes, usize)>, Error>(None);
             }
             let (off, sz) = slices[idx];
-            let chunk = web::block(move || {
-                store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string())
-            }).await
-            .map_err(|e| {
-                error!("GetObject stream: task failed bucket={} key={} idx={}: {:?}", bucket_log, key_log, idx, e);
-                actix_web::error::ErrorInternalServerError(e)
-            })?
+            let read = match store.read_async(&ctx.user_id, &ctx.bucket, off, sz) {
+                Some(fut) => fut.await,
+                None => web::block(move || {
+                    store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string())
+                }).await
+                .map_err(|e| {
+                    error!("GetObject stream: task failed bucket={} key={} idx={}: {:?}", bucket_log, key_log, idx, e);
+                    actix_web::error::ErrorInternalServerError(e)
+                })?,
+            };
+            let chunk = read
             .map_err(|msg| {
                 error!("GetObject stream: read error bucket={} key={} idx={}: {}", bucket_log, key_log, idx, msg);
                 actix_web::error::ErrorInternalServerError(msg)
