@@ -852,6 +852,19 @@ pub async fn s3_delete_object_handler(
 
     use crate::metadata::sqlite_store::VersioningDeleteResult;
 
+    // A store with an async path (the cluster) does the whole metadata
+    // write, marker or removal, while this worker serves other requests.
+    if let Some(fut) = db.delete_object_async(&bucket, &key) {
+        let del_result = fut.await?;
+        info!("S3 DeleteObject: bucket={} key={}", bucket, key);
+        let mut resp = HttpResponse::NoContent();
+        if let VersioningDeleteResult::Marker { version_id } = del_result {
+            resp.insert_header(("x-amz-delete-marker", "true"));
+            resp.insert_header(("x-amz-version-id", version_id));
+        }
+        return Ok(resp.insert_header(("Content-Length", "0")).body(""));
+    }
+
     let del_result = db.delete_object_v2(&bucket, &key)?;
 
     info!("S3 DeleteObject: bucket={} key={}", bucket, key);

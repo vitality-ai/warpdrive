@@ -214,6 +214,16 @@ pub trait MetadataStorage: Send + Sync {
         Err(metadata)
     }
 
+    /// The whole S3 DeleteObject metadata write as a future that can run on
+    /// another thread: a delete marker under versioning, else the object's
+    /// removal. `None`: the store has no async path, and the caller uses
+    /// `delete_object_v2` and `delete_metadata`.
+    fn delete_object_async(
+        self: std::sync::Arc<Self>, _user_id: String, _bucket: String, _key: String,
+    ) -> Option<futures::future::BoxFuture<'static, Result<VersioningDeleteResult, String>>> {
+        None
+    }
+
     // --- Deletion WAL ---
     fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error>;

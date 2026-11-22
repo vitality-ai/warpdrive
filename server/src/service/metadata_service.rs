@@ -85,6 +85,18 @@ impl MetadataService {
         }
     }
 
+    /// The S3 DeleteObject metadata write, awaited without blocking the
+    /// caller's thread, when the store has an async path. `None` otherwise.
+    pub fn delete_object_async(&self, bucket: &str, key: &str) -> Option<impl std::future::Future<Output = Result<crate::metadata::VersioningDeleteResult, Error>>> {
+        let fut = Arc::clone(&self.store).delete_object_async(self.user.clone(), bucket.to_string(), key.to_string())?;
+        Some(async move {
+            crate::cluster::bridge::spawn(fut)
+                .await
+                .map_err(|e| actix_web::error::ErrorInternalServerError(format!("metadata write task failed: {e}")))?
+                .map_err(actix_web::error::ErrorInternalServerError)
+        })
+    }
+
     /// Read a fully-populated Metadata object (S3 GET / HEAD path).
     pub fn get_object_full(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         self.store.get_metadata(&self.user, bucket, key)

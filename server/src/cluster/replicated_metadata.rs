@@ -476,6 +476,59 @@ impl ReplicatedMetadataStore {
         Ok(((!vid.is_empty()).then_some(vid), old_extents))
     }
 
+    /// `update_object` awaited instead of bridged: the same lock, read and
+    /// row writes. Runs on the cluster runtime, never on an HTTP worker.
+    async fn update_object_async<T>(&self, user: &str, bucket: &str, key: &str, f: impl FnOnce(&mut ObjectRow) -> T) -> Result<T, String> {
+        let _g = self.locks.lock_async(&versions_prefix(user, bucket, key)).await;
+        let before = self.object(user, bucket, key).unwrap_or_default();
+        let mut after = before.clone();
+        let out = f(&mut after);
+        for (row, value) in version_writes(user, bucket, key, &before, &after) {
+            match value {
+                Some(v) => self.put_async(row, v).await?,
+                None => self.remove_async(row).await?,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn forget_version_async(&self, bucket: &str, key: &str, version_id: &str) -> Result<(), String> {
+        self.remove_async(version_scoped("acl", bucket, key, version_id)).await?;
+        self.remove_async(version_scoped("lck", bucket, key, version_id)).await
+    }
+
+    /// The whole S3 DeleteObject metadata write without blocking a thread:
+    /// a delete marker under versioning, else the object's removal. The
+    /// same rows as `delete_object_v2` followed by `delete_metadata`.
+    async fn delete_object_owned(self: Arc<Self>, user: String, bucket: String, key: String) -> Result<VersioningDeleteResult, String> {
+        let mode = self.mode(&bucket);
+        if mode == Versioning::Disabled {
+            if let Some(v) = self.update_object_async(&user, &bucket, &key, |o| o.versions.pop()).await? {
+                self.forget_version_async(&bucket, &key, &v.version_id).await?;
+            }
+            return Ok(VersioningDeleteResult::Deleted);
+        }
+        let (vid, replaced) = self
+            .update_object_async(&user, &bucket, &key, |o| {
+                let (vid, replaced) = if mode == Versioning::Enabled {
+                    (new_version_id(), None)
+                } else {
+                    ("null".to_string(), o.find("null").map(|i| o.versions.remove(i)))
+                };
+                let mut m = Metadata::from_offset_size_list(Vec::new());
+                m.is_delete_marker = true;
+                m.version_id = Some(vid.clone());
+                m.last_modified = Some(now_iso());
+                o.versions.push(VersionEntry { order: hlc::now(), version_id: vid.clone(), is_delete_marker: true, meta: m, tags: Vec::new(), parts_manifest: None, blobs: Vec::new() });
+                (vid, replaced)
+            })
+            .await?;
+        if let Some(v) = replaced {
+            self.forget_version_async(&bucket, &key, &v.version_id).await?;
+        }
+        Ok(VersioningDeleteResult::Marker { version_id: vid })
+    }
+
     fn upload(&self, upload_id: &str) -> Option<UploadRow> {
         match self.get(&upload_key(upload_id)) {
             Some(MetaValue::Upload(u)) => Some(u),
@@ -597,6 +650,10 @@ fn stats(objects: &[(String, ObjectRow)]) -> (u64, u64) {
 impl MetadataStorage for ReplicatedMetadataStore {
     fn put_object_v2_async(self: Arc<Self>, user_id: String, bucket: String, key: String, metadata: Metadata) -> Result<BoxFuture<'static, Result<(Option<String>, Vec<(u64, u64)>), String>>, Metadata> {
         Ok(Box::pin(self.put_object_v2_owned(user_id, bucket, key, metadata)))
+    }
+
+    fn delete_object_async(self: Arc<Self>, user_id: String, bucket: String, key: String) -> Option<BoxFuture<'static, Result<VersioningDeleteResult, String>>> {
+        Some(Box::pin(self.delete_object_owned(user_id, bucket, key)))
     }
 
     // ---- objects (legacy native-API path) ----
