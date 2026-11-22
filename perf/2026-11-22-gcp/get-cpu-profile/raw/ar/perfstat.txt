@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '94748':
+
+          37631.37 msec task-clock                       #    3.761 CPUs utilized             
+            471729      context-switches                 #   12.536 K/sec                     
+             54810      cpu-migrations                   #    1.456 K/sec                     
+
+      10.006172571 seconds time elapsed
+

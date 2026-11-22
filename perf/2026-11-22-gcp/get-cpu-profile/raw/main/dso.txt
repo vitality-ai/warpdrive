@@ -1,0 +1,4 @@
+    49.11%  wd-main          
+    26.58%  [kernel.kallsyms]
+    24.17%  libc.so.6        
+     0.14%  [vdso]           

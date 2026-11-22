@@ -1,0 +1,5 @@
+    48.52%  wd-ar            
+    30.62%  [kernel.kallsyms]
+    20.52%  libc.so.6        
+     0.17%  [vdso]           
+     0.17%  libm.so.6        

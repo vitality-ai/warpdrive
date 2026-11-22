@@ -1,0 +1,9 @@
+
+ Performance counter stats for process id '93786':
+
+          36711.10 msec task-clock                       #    3.670 CPUs utilized             
+            272001      context-switches                 #    7.409 K/sec                     
+             23107      cpu-migrations                   #  629.428 /sec                      
+
+      10.003526443 seconds time elapsed
+
