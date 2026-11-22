@@ -1,0 +1,25 @@
+experiment,run,setup,arm,clients,put_ops_s,put_p99_ms,get_ops_s,get_p99_ms,errors
+async,1,"RS(2,1) 4 KB",main,128,2604.9,79.0,6690.4,31.4,67
+async,2,"RS(2,1) 4 KB",#226 before async,128,2856.8,84.4,5314.4,37.4,0
+async,3,"RS(2,1) 4 KB",#226 async,128,3678.7,61.2,6278.3,32.6,0
+async,4,"RS(2,1) 4 KB",#226 async,128,3640.1,62.4,6203.4,33.0,0
+async,5,"RS(2,1) 4 KB",#226 before async,128,2794.2,90.4,5234.7,37.3,0
+async,6,"RS(2,1) 4 KB",main,128,2521.4,81.2,6634.1,31.0,30
+async,7,"RS(2,1) 1 MB",main,32,218.1,230.8,362.0,152.3,0
+async,8,"RS(2,1) 1 MB",#226 before async,32,263.3,187.0,576.5,86.2,0
+async,9,"RS(2,1) 1 MB",#226 async,32,252.6,191.4,554.2,104.3,0
+async,10,"RS(2,1) 1 MB",#226 async,32,230.3,216.8,491.2,113.7,0
+async,11,"RS(2,1) 1 MB",#226 before async,32,260.3,188.6,573.7,88.1,0
+async,12,"RS(2,1) 1 MB",main,32,226.9,226.3,375.4,149.2,0
+async,13,Single node 4 KB,main,128,1770.4,103.9,5529.4,27.8,0
+async,14,Single node 4 KB,#226 before async,128,1712.3,136.4,5247.2,58.7,0
+async,15,Single node 4 KB,#226 async,128,1772.7,103.2,5526.5,28.3,0
+async,16,Single node 4 KB,#226 async,128,1776.6,104.1,5536.5,27.8,0
+async,17,Single node 4 KB,#226 before async,128,1708.5,137.3,5261.4,58.8,0
+async,18,Single node 4 KB,main,128,1773.0,104.2,5515.4,28.4,0
+async,19,Single node 1 MB,main,32,310.3,137.1,1089.8,92.8,0
+async,20,Single node 1 MB,#226 before async,32,356.4,140.4,883.5,133.0,0
+async,21,Single node 1 MB,#226 async,32,286.8,166.1,1148.8,108.0,0
+async,22,Single node 1 MB,#226 async,32,287.2,168.8,1145.4,115.1,0
+async,23,Single node 1 MB,#226 before async,32,356.6,139.9,933.4,125.1,0
+async,24,Single node 1 MB,main,32,312.1,134.7,1094.7,91.4,0
