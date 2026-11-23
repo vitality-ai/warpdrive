@@ -34,8 +34,19 @@ use crate::storage::Storage;
 
 lazy_static! {
     static ref SHARD_META_STORE: Arc<dyn ShardMetaStore> = {
-        let log_path = std::env::var("WARPDRIVE_SHARD_META_LOG").unwrap_or_else(|_| "shard_meta.log".to_string());
-        Arc::new(BitcaskShardMetaStore::open(&log_path).expect("failed to open shard meta store log"))
+        // The shard index uses the same engine as the metadata rows
+        // (WARPDRIVE_META_ENGINE), so with an on-disk engine neither
+        // per-object store keeps every entry in RAM. Bitcask keeps its
+        // point-lookup (hash map) index here.
+        use super::meta_engine::{AnyEngine, MetaEngineKind};
+        let kind = MetaEngineKind::from_env().unwrap_or_else(|e| panic!("{e}"));
+        let path = std::env::var("WARPDRIVE_SHARD_META_LOG").unwrap_or_else(|_| kind.file_name("shard_meta"));
+        match kind {
+            MetaEngineKind::Bitcask => Arc::new(BitcaskShardMetaStore::open(&path).expect("failed to open shard meta store log")),
+            other => Arc::new(BitcaskShardMetaStore::with_engine(
+                AnyEngine::open(other, &path, "shard meta").unwrap_or_else(|e| panic!("failed to open shard meta store {path}: {e}")),
+            )),
+        }
     };
 }
 
