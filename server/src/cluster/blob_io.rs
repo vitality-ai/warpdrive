@@ -26,10 +26,54 @@ pub struct BlobPlacement {
     /// The shards' key on their nodes (`versioned_key`).
     pub wire_key: String,
     pub len: u64,
-    /// A small blob's bytes, base64, kept in the row itself
+    /// A small blob's bytes, kept in the row itself
     /// (`WARPDRIVE_INLINE_MAX_BYTES`, RFC 5 T1).
     #[serde(default)]
-    pub inline: Option<String>,
+    pub inline: Option<InlineBytes>,
+}
+
+/// Inline blob bytes: raw in a binary format (the RocksDB engine's records),
+/// base64 in a text one (JSON logs and the HTTP wire between nodes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineBytes(pub Vec<u8>);
+
+impl Serialize for InlineBytes {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&base64::Engine::encode(&b64(), &self.0))
+        } else {
+            s.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InlineBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = InlineBytes;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("inline bytes (base64 text or raw bytes)")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<InlineBytes, E> {
+                base64::Engine::decode(&b64(), v).map(InlineBytes).map_err(E::custom)
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<InlineBytes, E> {
+                Ok(InlineBytes(v.to_vec()))
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<InlineBytes, E> {
+                Ok(InlineBytes(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<InlineBytes, A::Error> {
+                let mut out = Vec::with_capacity(a.size_hint().unwrap_or(0));
+                while let Some(b) = a.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(InlineBytes(out))
+            }
+        }
+        if d.is_human_readable() { d.deserialize_str(V) } else { d.deserialize_bytes(V) }
+    }
 }
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
@@ -49,7 +93,7 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
             m,
             wire_key: String::new(),
             len: body.len() as u64,
-            inline: Some(base64::Engine::encode(&b64(), body)),
+            inline: Some(InlineBytes(body.to_vec())),
         });
     }
 
@@ -93,7 +137,7 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
 /// Reads a blob back: inline bytes, or any `k` shards decoded.
 pub async fn read_blob(state: &ClusterState, user_id: &str, bucket: &str, p: &BlobPlacement) -> Result<Vec<u8>, Error> {
     if let Some(data) = &p.inline {
-        return base64::Engine::decode(&b64(), data).map_err(|e| ErrorInternalServerError(format!("corrupt inline blob: {e}")));
+        return Ok(data.0.clone());
     }
     let gets = p.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
         let client = Arc::clone(&state.peer_client);

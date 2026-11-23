@@ -89,7 +89,7 @@ fn peer_client_from_env() -> Arc<dyn PeerClient> {
         _ => ("grpc", Arc::new(GrpcPeerClient::new())),
     };
     info!("Peer transport: {name}");
-    client
+    Arc::new(warp_drive::cluster::peer_client::LocalFirst { inner: client })
 }
 
 /// Whether this node can serve `/s3/...` (and root `/{bucket}/...`) yet.
@@ -424,6 +424,8 @@ async fn main() -> std::io::Result<()> {
         Err(e) => warn!("could not raise the open-file limit: {e}"),
     }
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    let one_node = !set("WARPDRIVE_PEERS") && !set("WARPDRIVE_JOIN_VIA");
     single_node_as_one_member_cluster(port);
     // Informational only -- the real per-request decision (`distributed_mode`,
     // below) is made from live membership, not this startup snapshot. A
@@ -503,6 +505,8 @@ async fn main() -> std::io::Result<()> {
     // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
     // candidate, also always running regardless of which PeerClient is
     // selected for outbound calls.
+    // The Redis front end, when WARPDRIVE_REDIS_PORT is set.
+    warp_drive::redis::serve_if_enabled(one_node);
     tokio::spawn(async move {
         info!("Starting raw-TCP shard server on {tcp_addr}");
         if let Err(e) = serve_tcp_shard(tcp_listener).await {

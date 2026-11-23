@@ -79,6 +79,48 @@ pub trait PeerClient: Send + Sync {
     }
 }
 
+/// Wraps a transport so this node's own shards stay in process: a shard
+/// for this node is stored or loaded directly, as its shard server would on
+/// receiving it, instead of going over loopback to that server. Shards for
+/// other nodes go over `inner`. The metadata record already works this way
+/// (`coordinator::send_to_peers`).
+pub struct LocalFirst {
+    pub inner: std::sync::Arc<dyn PeerClient>,
+}
+
+fn is_self(peer: &str) -> bool {
+    super::coordinator::self_addr().is_some_and(|me| peer.trim().trim_end_matches('/') == me)
+}
+
+#[async_trait]
+impl PeerClient for LocalFirst {
+    async fn put_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: Vec<u8>) -> Result<(), Error> {
+        if !is_self(peer) {
+            return self.inner.put_shard(peer, user_id, bucket, key, shard_idx, data).await;
+        }
+        let (u, b, k) = (user_id.to_string(), bucket.to_string(), key.to_string());
+        tokio::task::spawn_blocking(move || super::shard_storage::store_shard(&u, &b, &k, shard_idx, &data).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| ErrorBadGateway(format!("local shard store task failed: {e}")))?
+            .map_err(|e| ErrorBadGateway(format!("put_shard to {peer} (this node) failed: {e}")))
+    }
+
+    async fn get_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
+        if !is_self(peer) {
+            return self.inner.get_shard(peer, user_id, bucket, key, shard_idx).await;
+        }
+        let (u, b, k) = (user_id.to_string(), bucket.to_string(), key.to_string());
+        tokio::task::spawn_blocking(move || super::shard_storage::load_shard(&u, &b, &k, shard_idx).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| ErrorBadGateway(format!("local shard load task failed: {e}")))?
+            .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} (this node) failed: {e}")))
+    }
+
+    fn max_shard_size(&self) -> Option<usize> {
+        self.inner.max_shard_size()
+    }
+}
+
 pub struct HttpPeerClient {
     client: reqwest::Client,
 }

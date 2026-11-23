@@ -57,12 +57,15 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Values are MessagePack: binary, so a small object kept inline in its
+/// record is stored as raw bytes, and a read decodes the record in one pass.
+/// Field names are kept, so `#[serde(default)]` fields still work.
 fn encode<V: Serialize>(v: &V) -> io::Result<Vec<u8>> {
-    serde_json::to_vec(v).map_err(io_err)
+    rmp_serde::to_vec_named(v).map_err(io_err)
 }
 
 fn decode<V: DeserializeOwned>(b: &[u8]) -> Option<V> {
-    serde_json::from_slice(b).ok()
+    rmp_serde::from_slice(b).ok()
 }
 
 fn stripe_of(key: &str) -> usize {
