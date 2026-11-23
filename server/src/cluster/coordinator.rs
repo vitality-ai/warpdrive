@@ -844,8 +844,8 @@ pub(crate) async fn put_object_plain(
     // even though other peers still do. Skipping the broadcast on a local
     // miss would leave those other peers serving stale packed bytes
     // forever. Delete is idempotent on a receiver that has nothing to
-    // delete, so there's no cost to always sending it (see issue #153 and
-    // docs/reviews/v1.0.0-beta-code-review.md). Quorum-checked the same as
+    // delete, so there's no cost to always sending it (see issue #153).
+    // Quorum-checked the same as
     // every other write here: a PUT that can't confirm the stale pin was
     // actually cleared cluster-wide is treated as not fully succeeded.
     //

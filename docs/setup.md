@@ -23,17 +23,23 @@ to.
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
 
-- **libsqlite3-dev** and **FlatBuffers compiler (`flatc`)**
+- **libsqlite3-dev**, the **FlatBuffers compiler (`flatc`)**, and **clang** with
+  **libclang** (RocksDB, the default metadata engine, is C++ built from source)
 
   Ubuntu/Debian:
   ```bash
-  sudo apt-get update && sudo apt-get install -y libsqlite3-dev flatbuffers-compiler
+  sudo apt-get update && sudo apt-get install -y libsqlite3-dev flatbuffers-compiler clang libclang-dev
   ```
 
-  macOS (Homebrew):
+  macOS (Homebrew, with the Xcode command line tools for clang):
   ```bash
   brew install sqlite3 flatbuffers
   ```
+
+  RocksDB's bundled sources need `<cstdint>` included by hand on GCC 13 and
+  later. The repository's `.cargo/config.toml` does that (`CXXFLAGS`), so a
+  normal build needs nothing. If you set `CXXFLAGS` yourself, add
+  `-include cstdint` to it (#242).
 
 ---
 
@@ -75,10 +81,9 @@ parity-shard count explicitly — the smallest *redundant* config is `1 1`
 **This one tolerates a node down for reads only, not writes**: write quorum
 is `k+1` whenever `m == k` (MinIO's own rule for this edge case — see
 `required_write_acks` in `coordinator.rs`), which for `RS(1,1)` is `2` —
-i.e. *both* nodes. WarpDrive's distributed engine always requires at least
-1 parity shard (`m >= 1`) to compute, so two mirrored nodes is the floor;
-there's no "1-node cluster" mode — a single, unreplicated node is
-single-node mode (below), not a degenerate cluster.
+i.e. *both* nodes. Two mirrored nodes is the smallest layout with redundancy.
+A single node is a cluster of one with RS(1,0), no parity (see
+[A single node](#a-single-node) below).
 
 Each node listens on its own port starting at `9710` (`9710`, `9711`, ...).
 Credentials default to `adminkey` / `adminsecretkey123456` for SigV4 auth —
@@ -135,13 +140,12 @@ tooling that already targets it explicitly.)
 
 ---
 
-## Single-node mode (not the default)
+## A single node
 
-The same binary, started without `WARPDRIVE_PEERS`, at the same `/s3/...`
-URL as above — no separate mode to learn, just a different startup
-decision. Not recommended for new setups (use the cluster above), but
-still fully supported for a local scratch instance or anything that
-genuinely doesn't need multi-node redundancy.
+The same binary, started without `WARPDRIVE_PEERS`, is a cluster of one with
+RS(1,0): the same engine, the same `/s3/...` URL, compaction and lifecycle
+included. There's no redundancy, so it suits a local scratch instance or
+anything that doesn't need it.
 
 ```bash
 cd server
@@ -151,11 +155,18 @@ WARPDRIVE_ADMIN_SECRET_KEY=adminsecretkey123456 \
   ./target/release/warp_drive
 ```
 
-Must be started from the `server/` directory (it looks for `server_log.yaml`
-and needs writable `logs/` and `storage/` subdirectories). Verify with the
-exact same boto3 snippet above (`endpoint_url='http://localhost:9710/s3'`) —
-`create_bucket` also works here, since single-node mode has a real bucket
-registry (the cluster engine doesn't, by design — see the User Guide).
+Start it from the `server/` directory (it looks for `server_log.yaml` and
+writes its data there). Verify with the same boto3 snippet as above
+(`endpoint_url='http://localhost:9710/s3'`).
+
+- It listens on three ports, like any cluster node: `9710` (S3), `10710`
+  (gRPC) and `11710` (TCP). It sends its shards to itself over gRPC.
+- Set `WARPDRIVE_SELF_ADDR` if other processes reach it by a name other than
+  `http://127.0.0.1:<port>`, and `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M` to choose
+  another layout.
+- A data directory from an earlier release's single-node engine
+  (`metadata/metadata.sqlite`) isn't read: the node refuses to start next to
+  it. There's no migration in the beta. Move the old data away to start fresh.
 
 ---
 
