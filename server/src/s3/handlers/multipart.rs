@@ -338,7 +338,7 @@ pub async fn s3_upload_part_copy_handler(
 
     // Both awaited, never blocking this worker.
     let store = crate::storage::object_store();
-    let part_bytes = crate::storage::read_extents_any(std::sync::Arc::clone(&store), &auth_result.user_id, &src_bucket, &read_extents)
+    let part_bytes = crate::storage::read_extents_any(std::sync::Arc::clone(&store), &auth_result.user_id, &src_bucket, &read_extents, &crate::storage::Locators::of(&src_meta.chunks))
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
     let offset_size_list = vec![crate::storage::write_any(store, auth_result.user_id.clone(), auth_result.bucket.clone(), part_bytes.clone())
@@ -936,16 +936,18 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
             let part_size = part.sz;
 
             let slices = Arc::new(stream_slices(&extents));
+            let locs = Arc::new(crate::storage::Locators::of(&meta.chunks));
             let store = crate::storage::object_store();
             let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
             let byte_stream = stream::try_unfold(0usize, move |idx| {
                 let slices = Arc::clone(&slices);
+                let locs = Arc::clone(&locs);
                 let ctx = context.clone();
                 let store = Arc::clone(&store);
                 async move {
                     if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
                     let (off, sz) = slices[idx];
-                    let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz)
+                    let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz, locs.find(off))
                         .await.map_err(actix_web::error::ErrorInternalServerError)?;
                     Ok(Some((Bytes::from(chunk), idx + 1)))
                 }
@@ -983,16 +985,18 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
     let total_size = meta.size;
     let extents = meta.to_offset_size_list();
     let slices = Arc::new(stream_slices(&extents));
+    let locs = Arc::new(crate::storage::Locators::of(&meta.chunks));
     let store = crate::storage::object_store();
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let byte_stream = stream::try_unfold(0usize, move |idx| {
         let slices = Arc::clone(&slices);
+        let locs = Arc::clone(&locs);
         let ctx = context.clone();
         let store = Arc::clone(&store);
         async move {
             if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
             let (off, sz) = slices[idx];
-            let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz)
+            let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz, locs.find(off))
                 .await.map_err(actix_web::error::ErrorInternalServerError)?;
             Ok(Some((Bytes::from(chunk), idx + 1)))
         }

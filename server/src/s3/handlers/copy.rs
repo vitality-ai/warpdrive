@@ -111,7 +111,7 @@ pub async fn s3_copy_object_handler(
     // Both awaited, never blocking this worker: over the network on a
     // cluster, on the blocking pool for a local store.
     let store = crate::storage::object_store();
-    let src_data = crate::storage::read_extents_any(Arc::clone(&store), &src_context.user_id, &src_context.bucket, &src_meta.to_offset_size_list())
+    let src_data = crate::storage::read_extents_any(Arc::clone(&store), &src_context.user_id, &src_context.bucket, &src_meta.to_offset_size_list(), &crate::storage::Locators::of(&src_meta.chunks))
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
     let new_offset_size_list = vec![crate::storage::write_any(store, dst_context.user_id.clone(), dst_context.bucket.clone(), src_data.clone())

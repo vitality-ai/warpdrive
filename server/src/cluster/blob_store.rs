@@ -100,50 +100,52 @@ pub struct BlobRef {
     pub placement: BlobPlacement,
 }
 
-type IndexMap = HashMap<(String, String), std::collections::BTreeMap<u64, BlobPlacement>>;
+/// Blobs this node wrote whose metadata row hasn't claimed them yet: the
+/// handoff from `write`, which knows the placement, to the row that stores
+/// it. A row claims (removes) its entries when it's written. An entry whose
+/// PUT never wrote a row goes after `HANDOFF_TTL` (the audit sweep frees its
+/// shards). So it holds writes in flight, not every object: reads take the
+/// placement from the row they read (`Locator`), not from this node's memory.
+type Handoff = HashMap<(String, String, u64), (BlobPlacement, std::time::Instant)>;
 
-static INDEX: std::sync::LazyLock<parking_lot::RwLock<IndexMap>> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+static HANDOFF: std::sync::LazyLock<parking_lot::Mutex<Handoff>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// Adds a blob to this node's address index.
-pub fn index_blob(b: &BlobRef) {
-    INDEX.write().entry((b.user_id.clone(), b.bucket.clone())).or_default().insert(b.base, b.placement.clone());
-}
+const HANDOFF_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Drops a dead blob from this node's address index, only if the entry at its
-/// address still holds that blob. Called once its gc/ row is processed
-/// (gc.rs), past the grace period, so no read is still on it. Without it the
-/// index kept every blob ever written: about 300 bytes per write, on every
-/// node.
-pub fn unindex_blob(b: &BlobRef) -> bool {
-    let mut index = INDEX.write();
-    let key = (b.user_id.clone(), b.bucket.clone());
-    let Some(blobs) = index.get_mut(&key) else { return false };
-    if blobs.get(&b.base) != Some(&b.placement) {
-        return false;
+/// Records a blob just written, for its row to claim.
+pub fn hand_off(b: BlobRef) {
+    let mut h = HANDOFF.lock();
+    // Now and then, drop entries no row claimed.
+    if h.len() % 4096 == 4095 {
+        h.retain(|_, (_, at)| at.elapsed() < HANDOFF_TTL);
     }
-    blobs.remove(&b.base);
-    if blobs.is_empty() {
-        index.remove(&key);
-    }
-    true
+    h.insert((b.user_id, b.bucket, b.base), (b.placement, std::time::Instant::now()));
 }
 
-/// Blobs in this node's address index, for tests and metrics.
-pub fn indexed_blobs() -> usize {
-    INDEX.read().values().map(|m| m.len()).sum()
-}
-
-/// The blob whose range holds `offset`, as `(start address, placement)`.
-fn lookup(user_id: &str, bucket: &str, offset: u64) -> Option<(u64, BlobPlacement)> {
-    let index = INDEX.read();
-    let (base, p) = index.get(&(user_id.to_string(), bucket.to_string()))?.range(..=offset).next_back()?;
-    (offset < base + p.len.max(1)).then(|| (*base, p.clone()))
-}
-
-/// The blob starting at exactly `base`, for attaching to a metadata row.
-pub fn blob_at(user_id: &str, bucket: &str, base: u64) -> Option<BlobRef> {
-    let placement = INDEX.read().get(&(user_id.to_string(), bucket.to_string()))?.get(&base)?.clone();
+/// The blob this node wrote at `base`, if no row has claimed it yet.
+pub fn claim(user_id: &str, bucket: &str, base: u64) -> Option<BlobRef> {
+    let (placement, _) = HANDOFF.lock().remove(&(user_id.to_string(), bucket.to_string(), base))?;
     Some(BlobRef { user_id: user_id.to_string(), bucket: bucket.to_string(), base, placement })
+}
+
+/// Blobs waiting to be claimed, for tests and metrics.
+pub fn handoff_len() -> usize {
+    HANDOFF.lock().len()
+}
+
+/// A chunk's locator: the blob's reference, from the row it was read from.
+pub fn locator(b: &BlobRef) -> crate::storage::Locator {
+    crate::storage::Locator(Arc::new(b.clone()))
+}
+
+fn located(loc: Option<&crate::storage::Locator>, bucket: &str, offset: u64) -> Result<(u64, BlobPlacement), String> {
+    let b = loc
+        .and_then(|l| l.0.downcast_ref::<BlobRef>())
+        .ok_or_else(|| format!("read of {bucket} at {offset:#x} without its blob's placement (the chunk came from no cluster metadata row)"))?;
+    if offset < b.base || offset >= b.base + b.placement.len.max(1) {
+        return Err(format!("read of {bucket} at {offset:#x} outside its blob at {:#x}", b.base));
+    }
+    Ok((b.base, b.placement.clone()))
 }
 
 /// Hands out address ranges for one node.
@@ -246,13 +248,11 @@ impl ClusterBlobStore {
         Ok(Self { alloc, cache: Arc::new(Mutex::new(BlobCache::new(budget_mb << 20))) })
     }
 
-    /// The bytes of the blob holding `offset`, with its start address.
-    fn bytes_at(&self, user_id: &str, bucket: &str, offset: u64) -> Result<(u64, Arc<Vec<u8>>), Error> {
-        let (base, placement) =
-            lookup(user_id, bucket, offset).ok_or_else(|| ErrorInternalServerError(format!("no stored range holds offset {offset:#x} in {bucket}")))?;
+    /// The bytes of the blob at `base`.
+    fn blob_bytes(&self, user_id: &str, bucket: &str, base: u64, placement: BlobPlacement) -> Result<Arc<Vec<u8>>, Error> {
         let cache_key = (user_id.to_string(), bucket.to_string(), format!("{base:x}@{}", placement.wire_key));
         if let Some(bytes) = self.cache.lock().get(&cache_key) {
-            return Ok((base, bytes));
+            return Ok(bytes);
         }
         let state = bridge::state().ok_or_else(|| ErrorInternalServerError("cluster state not installed"))?;
         let (user, ib) = (user_id.to_string(), blob_bucket(bucket));
@@ -260,7 +260,7 @@ impl ClusterBlobStore {
             .map_err(ErrorInternalServerError)?;
         let bytes = Arc::new(bytes);
         self.cache.lock().insert(cache_key, Arc::clone(&bytes));
-        Ok((base, bytes))
+        Ok(bytes)
     }
 }
 
@@ -274,15 +274,21 @@ impl Storage for ClusterBlobStore {
         let (user, ib, key, body) = (user_id.to_string(), blob_bucket(bucket), blob_key(base), data.to_vec());
         let placement = bridge::run(move || async move { write_blob(&state, &user, &ib, &key, &body).await.map_err(|e| e.to_string()) })
             .map_err(ErrorInternalServerError)?;
-        index_blob(&BlobRef { user_id: user_id.to_string(), bucket: bucket.to_string(), base, placement });
+        hand_off(BlobRef { user_id: user_id.to_string(), bucket: bucket.to_string(), base, placement });
         Ok((base, len))
     }
 
+    /// Every cluster read needs the chunk's locator (`read_located`).
     fn read(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
+        self.read_located(user_id, bucket, offset, size, None)
+    }
+
+    fn read_located(&self, user_id: &str, bucket: &str, offset: u64, size: u64, loc: Option<&crate::storage::Locator>) -> Result<Vec<u8>, Error> {
         if size == 0 {
             return Ok(Vec::new());
         }
-        let (base, bytes) = self.bytes_at(user_id, bucket, offset)?;
+        let (base, placement) = located(loc, bucket, offset).map_err(ErrorInternalServerError)?;
+        let bytes = self.blob_bytes(user_id, bucket, base, placement)?;
         let start = (offset - base) as usize;
         let end = start + size as usize;
         if end > bytes.len() {
@@ -314,7 +320,7 @@ impl Storage for ClusterBlobStore {
         let (user, bucket) = (user_id.to_string(), bucket.to_string());
         Some(Box::pin(async move {
             let placement = write_blob(&state, &user, &blob_bucket(&bucket), &blob_key(base), &data).await.map_err(|e| e.to_string())?;
-            index_blob(&BlobRef { user_id: user, bucket, base, placement });
+            hand_off(BlobRef { user_id: user, bucket, base, placement });
             Ok((base, len))
         }))
     }
@@ -323,6 +329,10 @@ impl Storage for ClusterBlobStore {
     /// future, so a GET awaits them on its HTTP worker instead of blocking
     /// a pool thread that blocks a bridge thread.
     fn read_async(&self, user_id: &str, bucket: &str, offset: u64, size: u64) -> Option<futures::future::LocalBoxFuture<'static, Result<Vec<u8>, String>>> {
+        self.read_located_async(user_id, bucket, offset, size, None)
+    }
+
+    fn read_located_async(&self, user_id: &str, bucket: &str, offset: u64, size: u64, loc: Option<&crate::storage::Locator>) -> Option<futures::future::LocalBoxFuture<'static, Result<Vec<u8>, String>>> {
         let slice = move |base: u64, bytes: &[u8]| -> Result<Vec<u8>, String> {
             let start = (offset - base) as usize;
             let end = start + size as usize;
@@ -331,8 +341,9 @@ impl Storage for ClusterBlobStore {
         if size == 0 {
             return Some(Box::pin(std::future::ready(Ok(Vec::new()))));
         }
-        let Some((base, placement)) = lookup(user_id, bucket, offset) else {
-            return Some(Box::pin(std::future::ready(Err(format!("no stored range holds offset {offset:#x} in {bucket}")))));
+        let (base, placement) = match located(loc, bucket, offset) {
+            Ok(x) => x,
+            Err(e) => return Some(Box::pin(std::future::ready(Err(e)))),
         };
         let cache_key = (user_id.to_string(), bucket.to_string(), format!("{base:x}@{}", placement.wire_key));
         if let Some(bytes) = self.cache.lock().get(&cache_key) {
@@ -361,17 +372,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unindexing_removes_only_the_dead_blob_it_names() {
-        let p = |wk: &str| BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: wk.into(), len: 10, inline: None };
-        let b = |base, wk: &str| BlobRef { user_id: "u-unindex".into(), bucket: "b-unindex".into(), base, placement: p(wk) };
-        index_blob(&b(100, "x"));
-        index_blob(&b(200, "y"));
-        assert!(!unindex_blob(&b(100, "other")), "a different blob at that address stays");
-        assert!(unindex_blob(&b(100, "x")));
-        assert!(blob_at("u-unindex", "b-unindex", 100).is_none());
-        assert!(blob_at("u-unindex", "b-unindex", 200).is_some());
-        assert!(unindex_blob(&b(200, "y")));
-        assert!(!unindex_blob(&b(200, "y")));
+    fn a_row_claims_its_blob_once() {
+        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, inline: None };
+        hand_off(BlobRef { user_id: "u-claim".into(), bucket: "b-claim".into(), base: 100, placement: p.clone() });
+        assert!(claim("u-claim", "other", 100).is_none(), "another bucket's address is another blob");
+        assert_eq!(claim("u-claim", "b-claim", 100).map(|b| b.placement), Some(p));
+        assert!(claim("u-claim", "b-claim", 100).is_none(), "claimed once");
+    }
+
+    #[test]
+    fn a_read_needs_the_chunks_locator_and_stays_inside_its_blob() {
+        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, inline: None };
+        let loc = locator(&BlobRef { user_id: "u".into(), bucket: "b".into(), base: 100, placement: p });
+        assert!(located(None, "b", 100).is_err());
+        assert_eq!(located(Some(&loc), "b", 105).map(|(base, _)| base), Ok(100));
+        assert!(located(Some(&loc), "b", 110).is_err());
     }
 
     #[test]

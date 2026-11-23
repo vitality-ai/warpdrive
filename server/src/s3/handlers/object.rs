@@ -510,6 +510,7 @@ pub async fn s3_get_object_handler(
     log::trace!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
 
     let slices = Arc::new(slices);
+    let locs = Arc::new(crate::storage::Locators::of(&meta.chunks));
     let store = crate::storage::object_store();
     let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
     let bucket_log = bucket.clone();
@@ -517,6 +518,7 @@ pub async fn s3_get_object_handler(
 
     let byte_stream = stream::try_unfold(0usize, move |idx| {
         let slices = Arc::clone(&slices);
+        let locs = Arc::clone(&locs);
         let ctx = context.clone();
         let bucket_log = bucket_log.clone();
         let key_log = key_log.clone();
@@ -526,10 +528,11 @@ pub async fn s3_get_object_handler(
                 return Ok::<Option<(Bytes, usize)>, Error>(None);
             }
             let (off, sz) = slices[idx];
-            let read = match store.read_async(&ctx.user_id, &ctx.bucket, off, sz) {
+            let loc = locs.find(off);
+            let read = match store.read_located_async(&ctx.user_id, &ctx.bucket, off, sz, loc.as_ref()) {
                 Some(fut) => fut.await,
                 None => web::block(move || {
-                    store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string())
+                    store.read_located(&ctx.user_id, &ctx.bucket, off, sz, loc.as_ref()).map_err(|e| e.to_string())
                 }).await
                 .map_err(|e| {
                     error!("GetObject stream: task failed bucket={} key={} idx={}: {:?}", bucket_log, key_log, idx, e);

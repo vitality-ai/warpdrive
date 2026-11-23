@@ -128,7 +128,7 @@ pub(super) async fn s3_get_object_version_handler(bucket: &str, key: &str, versi
     let context = UserContext::with_bucket(
         auth_result.user_id.clone(), auth_result.bucket.clone()
     );
-    let body = crate::storage::read_extents_any(crate::storage::object_store(), &context.user_id, &context.bucket, &extents)
+    let body = crate::storage::read_extents_any(crate::storage::object_store(), &context.user_id, &context.bucket, &extents, &crate::storage::Locators::of(&meta.chunks))
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 

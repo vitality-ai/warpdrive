@@ -108,9 +108,6 @@ pub fn run() -> GcStats {
     for (_, blobs) in &due {
         for b in blobs {
             stats.blobs += 1;
-            // Past the grace period no read is on it: out of the address
-            // index, which otherwise grows with every write ever made.
-            super::blob_store::unindex_blob(b);
             if b.placement.inline.is_some() || b.placement.wire_key.is_empty() {
                 continue;
             }
