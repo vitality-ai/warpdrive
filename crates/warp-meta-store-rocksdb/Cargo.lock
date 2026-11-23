@@ -516,6 +516,7 @@ dependencies = [
 name = "warp-meta-store-rocksdb"
 version = "0.1.0"
 dependencies = [
+ "log",
  "rocksdb",
  "serde",
  "tempfile",

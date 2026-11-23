@@ -6,6 +6,7 @@ description = "RocksDB engine for WarpMetaStore: the same ordered records, with 
 publish = false
 
 [dependencies]
+log = "0.4"
 warp-meta-store = { path = "../warp-meta-store" }
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
 

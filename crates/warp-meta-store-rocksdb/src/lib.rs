@@ -8,9 +8,12 @@
 //! - Durability: every batch is synced to the write-ahead log before it
 //!   returns. RocksDB groups concurrent writers into one sync.
 //! - Memory: one LRU block cache shared by every RocksDB database in the
-//!   process, `WARPDRIVE_ROCKSDB_CACHE_MB` (default 256), holding data, index
-//!   and Bloom filter blocks, plus up to two 32 MB write buffers per
-//!   database. Memory doesn't grow with the number of keys.
+//!   process, holding data, index and Bloom filter blocks, plus up to two
+//!   32 MB write buffers per database. Memory doesn't grow with the number
+//!   of keys. The cache is the one setting: `WARPDRIVE_ROCKSDB_CACHE_MB`,
+//!   by default an eighth of the machine's memory (at least 256 MB). A
+//!   bigger cache helps reads once the hot rows outgrow it (measured on the
+//!   benchmarks branch, `perf/2026-11-22-gcp/metadata-engines`).
 //! - Order: RocksDB's default comparator is bytewise, as `OrderedKv` needs.
 
 use rocksdb::{BlockBasedOptions, Cache, DBCompressionType, Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
@@ -19,9 +22,27 @@ use std::path::Path;
 use std::sync::LazyLock;
 use warp_meta_store::OrderedKv;
 
+/// The machine's memory in MB, where it can be read (Linux).
+fn total_memory_mb() -> Option<usize> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: usize = info.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+/// The block cache size in MB: `WARPDRIVE_ROCKSDB_CACHE_MB`, else an eighth
+/// of the machine's memory, at least 256 MB.
+pub fn cache_mb() -> usize {
+    std::env::var("WARPDRIVE_ROCKSDB_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or_else(|| total_memory_mb().map_or(256, |m| (m / 8).max(256)))
+}
+
 /// The block cache every RocksDB database in this process shares.
 static CACHE: LazyLock<Cache> = LazyLock::new(|| {
-    let mb: usize = std::env::var("WARPDRIVE_ROCKSDB_CACHE_MB").ok().and_then(|v| v.trim().parse().ok()).filter(|m| *m > 0).unwrap_or(256);
+    let mb = cache_mb();
+    log::warn!("RocksDB block cache: {mb} MB (WARPDRIVE_ROCKSDB_CACHE_MB)");
     Cache::new_lru_cache(mb << 20)
 });
 
@@ -101,6 +122,15 @@ mod tests {
 
     fn engine<V>(path: &Path) -> KvEngine<V> {
         KvEngine::new(Box::new(RocksKv::open(path).unwrap()))
+    }
+
+    #[test]
+    fn the_cache_defaults_to_an_eighth_of_memory_and_at_least_256_mb() {
+        let mb = cache_mb();
+        assert!(mb >= 256);
+        if let (Some(total), Err(_)) = (total_memory_mb(), std::env::var("WARPDRIVE_ROCKSDB_CACHE_MB")) {
+            assert_eq!(mb, (total / 8).max(256));
+        }
     }
 
     #[test]
