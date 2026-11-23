@@ -1,7 +1,6 @@
 // Bucket-level handlers: ListBuckets, CreateBucket, DeleteBucket, HeadBucket.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use futures::StreamExt as _;
-use log::info;
 
 use std::collections::HashMap;
 
@@ -40,7 +39,7 @@ pub async fn s3_list_buckets_handler(
         );
         return Ok(HttpResponse::Ok().content_type("application/xml").body(xml));
     }
-    info!("S3 ListBuckets: user={}", auth_result.user_id);
+    log::trace!("S3 ListBuckets: user={}", auth_result.user_id);
 
     let db = MetadataService::new(&auth_result.user_id)?;
     let all_stats = db.list_buckets_with_stats()?;
@@ -151,12 +150,28 @@ pub async fn s3_create_bucket_handler(
     let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner()).unwrap_or_default();
 
+    if query.contains_key("lifecycle") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        let config = match crate::s3::lifecycle::parse(&body) {
+            Ok(c) => c,
+            Err(crate::s3::lifecycle::Invalid(code, msg)) => {
+                return Ok(s3_error(StatusCode::BAD_REQUEST, code, &msg, &format!("/{bucket}")));
+            }
+        };
+        // Stored normalized, so GET returns every rule with its ID.
+        db.set_bucket_lifecycle_awaited(&bucket, &crate::s3::lifecycle::to_xml(&config)).await?;
+        log::info!("S3 PutBucketLifecycleConfiguration: bucket={} rules={}", bucket, config.rules.len());
+        return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
+    }
+
     if query.contains_key("cors") {
         let auth_result = authenticate_s3_request(&req).await?;
         let db = MetadataService::new(&auth_result.user_id)?;
         if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
-        db.set_bucket_cors(&bucket, body.trim())?;
-        info!("S3 PutBucketCors: bucket={}", bucket);
+        db.set_bucket_cors_awaited(&bucket, body.trim()).await?;
+        log::info!("S3 PutBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::Ok()
             .insert_header(("Content-Length", "0"))
             .body(""));
@@ -171,13 +186,13 @@ pub async fn s3_create_bucket_handler(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    db.create_bucket_with_lock(&bucket, lock_enabled)?;
+    db.create_bucket_with_lock_awaited(&bucket, lock_enabled).await?;
 
     let location = extract_xml_tag(&body, "LocationConstraint")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !location.is_empty() {
-        db.set_bucket_location(&bucket, &location)?;
+        db.set_bucket_location_awaited(&bucket, &location).await?;
     }
 
     // Only store an ACL row when the request actually specifies one — otherwise the
@@ -187,12 +202,12 @@ pub async fn s3_create_bucket_handler(
             .iter().any(|h| req.headers().contains_key(*h));
     if has_acl_header {
         match resolve_effective_grants(&req, None, &auth_result.user_id, &auth_result.owner_display_name) {
-            Ok(grants) => db.set_bucket_acl(&bucket, &auth_result.user_id, &grants_to_json(&grants))?,
+            Ok(grants) => db.set_bucket_acl_awaited(&bucket, &auth_result.user_id, &grants_to_json(&grants)).await?,
             Err(resp) => return Ok(resp),
         }
     }
 
-    info!("S3 CreateBucket: bucket={} user={} location={:?}", bucket, auth_result.user_id, location);
+    log::info!("S3 CreateBucket: bucket={} user={} location={:?}", bucket, auth_result.user_id, location);
     Ok(HttpResponse::Ok()
         .insert_header(("Location", format!("/{}", bucket)))
         .insert_header(("Content-Length", "0"))
@@ -212,12 +227,21 @@ pub async fn s3_delete_bucket_handler(
     let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner()).unwrap_or_default();
 
+    if query.contains_key("lifecycle") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        db.delete_bucket_lifecycle_awaited(&bucket).await?;
+        log::info!("S3 DeleteBucketLifecycle: bucket={}", bucket);
+        return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
+    }
+
     if query.contains_key("cors") {
         let auth_result = authenticate_s3_request(&req).await?;
         let db = MetadataService::new(&auth_result.user_id)?;
         if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
-        db.delete_bucket_cors(&bucket)?;
-        info!("S3 DeleteBucketCors: bucket={}", bucket);
+        db.delete_bucket_cors_awaited(&bucket).await?;
+        log::info!("S3 DeleteBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
     }
 
@@ -240,8 +264,8 @@ pub async fn s3_delete_bucket_handler(
                            "The bucket you tried to delete is not empty", &bucket));
     }
 
-    db.delete_bucket(&bucket)?;
-    info!("S3 DeleteBucket: bucket={} user={}", bucket, auth_result.user_id);
+    db.delete_bucket_awaited(&bucket).await?;
+    log::info!("S3 DeleteBucket: bucket={} user={}", bucket, auth_result.user_id);
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }
 

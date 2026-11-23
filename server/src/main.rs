@@ -1,6 +1,6 @@
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
 use futures::StreamExt;
-use log::info;
+use log::{info, warn};
 use log4rs;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use warp_drive::service::deletion_worker::start_deletion_worker;
 use warp_drive::cluster::coordinator::{
     cluster_put_object, cluster_get_object, cluster_delete_object, cluster_put_retention,
     cluster_join, cluster_internal_put_location, cluster_internal_delete_location,
+    cluster_internal_update_location, cluster_internal_update_content_location, cluster_internal_meta_row,
     cluster_internal_put_content_location, cluster_internal_delete_content_location, cluster_content_record,
     cluster_put_bucket_config, cluster_internal_put_bucket_config,
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
@@ -41,7 +42,7 @@ use warp_drive::cluster::location_store::BitcaskLocationStore;
 use warp_drive::cluster::membership::Membership;
 use warp_drive::cluster::peer_client::{HttpPeerClient, PeerClient};
 use warp_drive::cluster::placement::ComputedPlacement;
-use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
+use warp_drive::cluster::tcp_peer_client::{serve_listener as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
 use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
 use warp_drive::cluster::packing::StripePacker;
 use warp_drive::s3::sts::sts_assume_role_with_web_identity;
@@ -82,11 +83,13 @@ fn ec_params_from_env() -> (usize, usize) {
 /// set `WARPDRIVE_PEER_TRANSPORT=http` or `=tcp` to use either instead
 /// (e.g. to re-run the comparison on different hardware).
 fn peer_client_from_env() -> Arc<dyn PeerClient> {
-    match std::env::var("WARPDRIVE_PEER_TRANSPORT").as_deref() {
-        Ok("http") => Arc::new(HttpPeerClient::new()),
-        Ok("tcp") => Arc::new(TcpPeerClient::new()),
-        _ => Arc::new(GrpcPeerClient::new()),
-    }
+    let (name, client): (&str, Arc<dyn PeerClient>) = match std::env::var("WARPDRIVE_PEER_TRANSPORT").as_deref() {
+        Ok("http") => ("http", Arc::new(HttpPeerClient::new())),
+        Ok("tcp") => ("tcp", Arc::new(TcpPeerClient::new())),
+        _ => ("grpc", Arc::new(GrpcPeerClient::new())),
+    };
+    info!("Peer transport: {name}");
+    client
 }
 
 /// Which engine should answer `/s3/...` (and root `/{bucket}/...`) for
@@ -178,12 +181,8 @@ async fn s3_put_object_dispatch(
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
-        Engine::Distributed => {
-            let body = buffer_payload(&req, payload).await?;
-            cluster_s3_put_object_authenticated(path, body, req, cluster_state).await
-        }
         Engine::NotReady => Err(not_ready_error()),
-        Engine::SingleNode => s3_put_object_handler(path, payload, req).await,
+        Engine::Distributed | Engine::SingleNode => s3_put_object_handler(path, payload, req).await,
     }
 }
 
@@ -193,9 +192,8 @@ async fn s3_get_object_dispatch(
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
-        Engine::Distributed => cluster_s3_get_object_authenticated(path, req, cluster_state).await,
         Engine::NotReady => Err(not_ready_error()),
-        Engine::SingleNode => s3_get_object_handler(path, req).await,
+        Engine::Distributed | Engine::SingleNode => s3_get_object_handler(path, req).await,
     }
 }
 
@@ -205,9 +203,8 @@ async fn s3_delete_object_dispatch(
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
-        Engine::Distributed => cluster_s3_delete_object_authenticated(path, req, cluster_state).await,
         Engine::NotReady => Err(not_ready_error()),
-        Engine::SingleNode => s3_delete_object_handler(path, req).await,
+        Engine::Distributed | Engine::SingleNode => s3_delete_object_handler(path, req).await,
     }
 }
 
@@ -217,9 +214,8 @@ async fn s3_head_object_dispatch(
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
-        Engine::Distributed => cluster_s3_head_object_authenticated(path, req, cluster_state).await,
         Engine::NotReady => Err(not_ready_error()),
-        Engine::SingleNode => s3_head_object_handler(path, req).await,
+        Engine::Distributed | Engine::SingleNode => s3_head_object_handler(path, req).await,
     }
 }
 
@@ -238,9 +234,8 @@ async fn s3_list_objects_dispatch(
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
-        Engine::Distributed => cluster_s3_list_objects(path, query, req, cluster_state).await,
         Engine::NotReady => Err(not_ready_error()),
-        Engine::SingleNode => s3_list_objects_handler(path, query, req).await,
+        Engine::Distributed | Engine::SingleNode => s3_list_objects_handler(path, query, req).await,
     }
 }
 
@@ -252,12 +247,8 @@ async fn s3_multipart_dispatch(
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
-        Engine::Distributed => {
-            let body = buffer_payload(&req, payload).await?;
-            cluster_s3_multipart_post_authenticated(path, body, req, cluster_state).await
-        }
         Engine::NotReady => Err(not_ready_error()),
-        Engine::SingleNode => s3_multipart_router(path, query, payload, req).await,
+        Engine::Distributed | Engine::SingleNode => s3_multipart_router(path, query, payload, req).await,
     }
 }
 
@@ -274,20 +265,46 @@ async fn s3_post_bucket_dispatch(
     req: HttpRequest,
     cluster_state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
-    if query.contains_key("delete") {
-        match pick_engine(&cluster_state) {
-            Engine::Distributed => {
-                let body = buffer_payload(&req, payload).await?;
-                return cluster_s3_delete_objects_authenticated(path, body, req, cluster_state).await;
-            }
-            Engine::NotReady => return Err(not_ready_error()),
-            Engine::SingleNode => {}
-        }
+    if let Engine::NotReady = pick_engine(&cluster_state) {
+        return Err(not_ready_error());
     }
     // Plain POST (form upload) has no cluster equivalent and is never
     // gated on cluster readiness -- it was never going to touch cluster
     // storage either way.
     s3_post_bucket_handler(path, query, payload, req).await
+}
+
+/// Makes this node's S3 handlers use the cluster: replicated metadata rows
+/// (`WARPDRIVE_META_LOG`) and erasure-coded object bytes, with address
+/// reservations in `WARPDRIVE_BLOB_ALLOC_LOG`.
+fn install_cluster_stores(state: &web::Data<ClusterState>) {
+    use warp_drive::cluster::{blob_store::ClusterBlobStore, bridge, replicated_metadata};
+    bridge::install(web::Data::clone(state));
+    let engine = warp_drive::cluster::meta_engine::MetaEngineKind::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let meta_log = std::env::var("WARPDRIVE_META_LOG").unwrap_or_else(|_| engine.default_path());
+    engine.refuse_other_engines_data("cluster_metadata", &meta_log).unwrap_or_else(|e| panic!("{e}"));
+    let rows = Arc::new(replicated_metadata::open_rows(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the S3 metadata store: {e}")));
+    replicated_metadata::install_rows(Arc::clone(&rows));
+    let meta = replicated_metadata::ReplicatedMetadataStore::new(rows, Box::new(replicated_metadata::ClusterWriter));
+    warp_drive::service::metadata_service::set_metadata_store(Arc::new(meta));
+    let alloc_log = std::env::var("WARPDRIVE_BLOB_ALLOC_LOG").unwrap_or_else(|_| "blob_alloc.log".to_string());
+    let blobs = ClusterBlobStore::open(&alloc_log).unwrap_or_else(|e| panic!("failed to start the cluster object store: {e}"));
+    warp_drive::storage::set_object_store(Arc::new(blobs));
+    warp_drive::cluster::reclaim::start(web::Data::clone(state));
+    info!("S3 handlers serve this node from the cluster (metadata: {engine:?} engine at {meta_log})");
+}
+
+/// HTTP worker threads: `WARPDRIVE_HTTP_WORKERS`, else one per core.
+/// More workers than cores cost GETs 7 to 20% on GCP (4 cores, 32 workers),
+/// and nothing that waits on the network runs on a worker: object bytes and
+/// the PUT's metadata write go to the blocking pool, and GETs await their
+/// shard reads.
+fn http_workers() -> usize {
+    std::env::var("WARPDRIVE_HTTP_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
 fn build_cluster_state() -> web::Data<ClusterState> {
@@ -349,6 +366,17 @@ fn build_cluster_state() -> web::Data<ClusterState> {
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
             || std::env::var("WARPDRIVE_JOIN_VIA").is_ok(),
     };
+    if state.configured_for_cluster {
+        let peers = state.membership.peers();
+        info!(
+            "Cluster: RS({k},{m}), self={}, {} peers {:?}, location log {location_log}",
+            std::env::var("WARPDRIVE_SELF_ADDR").unwrap_or_else(|_| "(not set)".to_string()),
+            peers.len(),
+            peers
+        );
+    } else {
+        info!("Single-node mode: WARPDRIVE_PEERS and WARPDRIVE_JOIN_VIA are not set");
+    }
     web::Data::new(state)
 }
 
@@ -356,6 +384,12 @@ fn build_cluster_state() -> web::Data<ClusterState> {
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
+    // Segment files take descriptors; a default soft limit of 1,024 would cap
+    // how much a node can store (#229).
+    match warp_drive::storage::local_store::raise_open_file_limit() {
+        Ok((soft, hard)) => info!("open-file limit {soft} (hard {hard})"),
+        Err(e) => warn!("could not raise the open-file limit: {e}"),
+    }
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
     // Informational only -- the real per-request decision (`distributed_mode`,
     // below) is made from live membership, not this startup snapshot. A
@@ -368,10 +402,20 @@ async fn main() -> std::io::Result<()> {
         "Starting HTTP server on 0.0.0.0:{port} (S3 under /s3/... and /, configured for cluster: {configured_for_cluster})"
     );
 
+    let cluster_state = build_cluster_state();
+
+    // A cluster node serves S3 through the same handlers as a single node,
+    // on replicated metadata and erasure-coded storage. Installed before
+    // anything touches the metadata or object store.
+    if configured_for_cluster {
+        install_cluster_stores(&cluster_state);
+    }
+    // Bucket lifecycle rules (expiry, noncurrent versions, stale uploads),
+    // on single nodes and clusters alike.
+    warp_drive::service::lifecycle_worker::start();
+
     let _deletion_worker_handle = start_deletion_worker();
     info!("Deletion worker started in background");
-
-    let cluster_state = build_cluster_state();
 
     // Join an existing cluster at startup, if configured. Both env vars
     // are required together: WARPDRIVE_SELF_ADDR is how other nodes should
@@ -388,39 +432,62 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
+    // Bind both shard ports here, before the HTTP server starts. If either
+    // is taken (most often by the previous process of this node, still
+    // shutting down after a restart), exit instead of running without shard
+    // servers: the node would accept S3 requests but couldn't send or
+    // receive shards. systemd or Kubernetes restarts it once the port frees.
+    let grpc_port = port + GRPC_PORT_OFFSET;
+    let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
+    let grpc_incoming = tonic::transport::server::TcpIncoming::new(grpc_addr, true, None).map_err(|e| {
+        log::error!("Can't bind gRPC shard port {grpc_addr}: {e}. Exiting.");
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, format!("gRPC shard port {grpc_addr}: {e}"))
+    })?;
+    let tcp_port = port + TCP_PORT_OFFSET;
+    let tcp_addr: std::net::SocketAddr = format!("0.0.0.0:{tcp_port}").parse().expect("invalid TCP bind address");
+    let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await.map_err(|e| {
+        log::error!("Can't bind raw-TCP shard port {tcp_addr}: {e}. Exiting.");
+        e
+    })?;
+
     // gRPC shard server runs alongside actix-web, on port+1000 — the
     // other half of the transport decision point. Always runs regardless
     // of which PeerClient is selected for outbound calls, so either node
     // in a benchmark pair can be dialed over gRPC.
-    let grpc_port = port + GRPC_PORT_OFFSET;
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
-        info!("Starting gRPC shard server on {addr}");
+        info!("Starting gRPC shard server on {grpc_addr}");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(make_grpc_shard_server())
-            .serve(addr)
+            .serve_with_incoming(grpc_incoming)
             .await
         {
-            log::error!("gRPC shard server failed: {e}");
+            log::error!("gRPC shard server failed: {e}. Exiting.");
+            std::process::exit(1);
         }
     });
 
     // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
     // candidate, also always running regardless of which PeerClient is
     // selected for outbound calls.
-    let tcp_port = port + TCP_PORT_OFFSET;
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{tcp_port}").parse().expect("invalid TCP bind address");
-        info!("Starting raw-TCP shard server on {addr}");
-        if let Err(e) = serve_tcp_shard(addr).await {
-            log::error!("TCP shard server failed: {e}");
+        info!("Starting raw-TCP shard server on {tcp_addr}");
+        if let Err(e) = serve_tcp_shard(tcp_listener).await {
+            log::error!("TCP shard server failed: {e}. Exiting.");
+            std::process::exit(1);
         }
     });
 
+    let access_log = std::env::var("WARPDRIVE_ACCESS_LOG").map(|v| v == "1").unwrap_or(false);
     HttpServer::new(move || {
         App::new()
-            .wrap(actix_web::middleware::Logger::default())
+            // Per-request access log, off by default so production pays nothing
+            // per request. WARPDRIVE_ACCESS_LOG=1 turns it on (needs INFO level).
+            .wrap(actix_web::middleware::Condition::new(access_log, actix_web::middleware::Logger::default()))
             .app_data(web::PayloadConfig::default().limit(MAX_BODY_BYTES))
+            // Internal record replication sends JSON bodies. An S3 metadata
+            // row holds every version of one key, so it can outgrow
+            // actix's 2 MB JSON default.
+            .app_data(web::JsonConfig::default().limit(64 << 20))
             .app_data(cluster_state.clone())
             // STS-compatible AssumeRoleWithWebIdentity: lets an operator federate
             // auth to their own external OIDC IdP instead of the admin pair or
@@ -437,6 +504,14 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/grpc_client_timing", web::get().to(cluster_grpc_client_timing))
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
+            .route("/cluster/_internal/meta", web::post().to(cluster_internal_meta_row))
+            .route("/cluster/_internal/reclaim/check", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_check))
+            .route("/cluster/_internal/reclaim/report", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_report))
+            .route("/cluster/_internal/gc/run", web::post().to(warp_drive::cluster::gc::cluster_internal_gc_run))
+            .route("/cluster/_internal/reclaim/run", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_run))
+            .route("/cluster/_internal/compact_logs", web::post().to(warp_drive::cluster::reclaim::cluster_internal_compact_logs))
+            .route("/cluster/_internal/location/update", web::post().to(cluster_internal_update_location))
+            .route("/cluster/_internal/content_location/update", web::post().to(cluster_internal_update_content_location))
             .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))
             .route("/cluster/_internal/content_location", web::delete().to(cluster_internal_delete_content_location))
             .route("/cluster/_internal/content_record/{bucket}/{key:.*}", web::get().to(cluster_content_record))
@@ -510,6 +585,7 @@ async fn main() -> std::io::Result<()> {
             .route("/{bucket}/",         web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
             .route("/{bucket}/{key:.*}", web::method(actix_web::http::Method::OPTIONS).to(s3_cors_not_configured_handler))
     })
+    .workers(http_workers())
     .bind(("0.0.0.0", port))?
     .run()
     .await

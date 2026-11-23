@@ -2,7 +2,6 @@
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
-use log::{info, warn};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,9 +10,7 @@ use serde_json;
 
 use crate::s3::auth::authenticate_s3_request;
 use crate::service::metadata_service::MetadataService;
-use crate::service::storage_service::{StorageService, StorageMode};
 use crate::service::user_context::UserContext;
-use crate::storage::config::StorageConfig;
 use crate::util::serializer::deserialize_offset_size;
 use crate::metadata::Metadata;
 
@@ -115,18 +112,18 @@ pub async fn s3_create_multipart_upload_handler(
     let mpu_legal_hold = req.headers().get("x-amz-object-lock-legal-hold")
         .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
 
-    db.create_multipart_upload(
+    db.create_multipart_upload_awaited(
         &upload_id, &bucket, &key,
         content_type.as_deref(), &metadata_json, &initiated_at,
         &mpu_checksum_algo, &mpu_checksum_type,
         &mpu_lock_mode, &mpu_lock_until, &mpu_legal_hold,
-    )?;
+    ).await?;
 
     if let Some(tagging_str) = req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()) {
-        db.set_multipart_tagging(&upload_id, tagging_str)?;
+        db.set_multipart_tagging_awaited(&upload_id, tagging_str).await?;
     }
 
-    info!("S3 CreateMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
+    log::trace!("S3 CreateMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -184,26 +181,18 @@ pub async fn s3_upload_part_handler(
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!("UploadPart: read error: {}", e);
+            log::trace!("UploadPart: read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         body.extend_from_slice(&chunk);
     }
 
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    // web::block: `Storage::write` now does a real (group-committed) fsync
-    // -- see `storage::group_commit`'s module doc -- so this has to go
-    // through `web::block` the same way `object.rs`'s PUT handler does;
-    // calling it directly here would block this actix worker's whole
-    // event loop for the fsync's duration.
-    let context_c = context.clone();
-    let body_c = body.clone();
-    let offset_size_list = web::block(move || {
-        StorageService::new().write_object(&context_c, &body_c, StorageMode::S3).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    // Awaited, never blocking this worker: over the network on a cluster,
+    // on the blocking pool for a local store (its write fsyncs).
+    let offset_size_list = vec![crate::storage::write_any(crate::storage::object_store(), context.user_id.clone(), context.bucket.clone(), body.to_vec())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?];
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
     let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
@@ -234,9 +223,9 @@ pub async fn s3_upload_part_handler(
         String::new()
     };
 
-    db.upsert_multipart_part(&upload_id, part_number, &etag, body.len() as u64, &extents_blob, &part_checksum_value)?;
+    db.upsert_multipart_part_awaited(&upload_id, part_number, &etag, body.len() as u64, &extents_blob, &part_checksum_value).await?;
 
-    info!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
+    log::trace!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
     let mut part_resp = HttpResponse::Ok();
     part_resp.insert_header(("ETag", etag));
     // Echo per-part checksum in response
@@ -347,21 +336,14 @@ pub async fn s3_upload_part_copy_handler(
         (range_slices(&src_extents, 0, src_size.saturating_sub(1)), src_size)
     };
 
-    let storage_service = StorageService::new();
-    let src_context = UserContext::with_bucket(auth_result.user_id.clone(), src_bucket.clone());
-    let part_bytes = storage_service.read_object(&src_context, &read_extents, StorageMode::S3)?;
-
-    let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
-    // web::block: same reasoning as UploadPart's matching fix -- `write_object`
-    // now does a real group-committed fsync.
-    let dst_context_c = dst_context.clone();
-    let part_bytes_c = part_bytes.clone();
-    let offset_size_list = web::block(move || {
-        StorageService::new().write_object(&dst_context_c, &part_bytes_c, StorageMode::S3).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    // Both awaited, never blocking this worker.
+    let store = crate::storage::object_store();
+    let part_bytes = crate::storage::read_extents_any(std::sync::Arc::clone(&store), &auth_result.user_id, &src_bucket, &read_extents, &crate::storage::Locators::of(&src_meta.chunks))
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let offset_size_list = vec![crate::storage::write_any(store, auth_result.user_id.clone(), auth_result.bucket.clone(), part_bytes.clone())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?];
 
     let part_number_i32: i32 = match part_number.parse() {
         Ok(n) if (1..=10000).contains(&n) => n,
@@ -378,7 +360,7 @@ pub async fn s3_upload_part_copy_handler(
 
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
     let etag = format!("\"{}\"", hex::encode(md5::compute(&part_bytes).0));
-    db.upsert_multipart_part(&upload_id, part_number_i32, &etag, part_size, &extents_blob, "")?;
+    db.upsert_multipart_part_awaited(&upload_id, part_number_i32, &etag, part_size, &extents_blob, "").await?;
 
     let last_modified = last_modified_now();
     let xml = format!(
@@ -444,7 +426,7 @@ pub async fn s3_complete_multipart_upload_handler(
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!("CompleteMultipartUpload: read error: {}", e);
+            log::trace!("CompleteMultipartUpload: read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         body_bytes.extend_from_slice(&chunk);
@@ -603,20 +585,20 @@ pub async fn s3_complete_multipart_upload_handler(
     final_metadata.checksum_algorithm = final_checksum_algo.clone();
     final_metadata.checksum_value = final_checksum_value.clone();
     final_metadata.checksum_type = final_checksum_type.clone();
-    let (mpu_vid, mpu_old_extents) = db.put_object_full(&bucket, &key, final_metadata)?;
+    let (mpu_vid, mpu_old_extents) = db.put_object_full_async(&bucket, &key, final_metadata).await?;
     if !mpu_old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &mpu_old_extents).ok();
     }
 
     let manifest_json = serde_json::to_string(&manifest).unwrap_or_else(|_| "[]".to_string());
-    db.set_parts_manifest(&bucket, &key, &manifest_json)?;
-    db.mark_multipart_completed(&upload_id, &multipart_etag)?;
-    db.delete_parts_for_upload(&upload_id)?;
+    db.set_parts_manifest_awaited(&bucket, &key, &manifest_json).await?;
+    db.mark_multipart_completed_awaited(&upload_id, &multipart_etag).await?;
+    db.delete_parts_for_upload_awaited(&upload_id).await?;
 
     let tagging_str = db.get_multipart_tagging(&upload_id).unwrap_or_default();
     if !tagging_str.is_empty() {
         let tags = parse_url_tags(&tagging_str);
-        let _ = db.set_object_tags(&bucket, &key, &tags);
+        let _ = db.set_object_tags_awaited(&bucket, &key, &tags).await;
     }
 
     // Apply object lock from multipart upload metadata
@@ -626,15 +608,15 @@ pub async fn s3_complete_multipart_upload_handler(
     if !lock_mode.is_empty() || !legal_hold.is_empty() {
         let effective_vid = mpu_vid.as_deref().unwrap_or("");
         let hold_opt = if legal_hold.is_empty() { None } else { Some(legal_hold.as_str()) };
-        let _ = db.put_object_lock(
+        let _ = db.put_object_lock_awaited(
             &bucket, &key, effective_vid,
             if lock_mode.is_empty() { None } else { Some(lock_mode.as_str()) },
             if lock_until.is_empty() { None } else { Some(lock_until.as_str()) },
             hold_opt,
-        );
+        ).await;
     }
 
-    info!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
+    log::trace!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
     let mut resp = complete_multipart_xml_response(
         &bucket, &key, &multipart_etag,
         final_checksum_algo.as_deref(), final_checksum_value.as_deref(), final_checksum_type.as_deref(),
@@ -716,10 +698,10 @@ pub async fn s3_abort_multipart_upload_handler(
         let extents = deserialize_offset_size(&part.extents_blob)?;
         db.queue_deletion(&bucket, &key, &extents)?;
     }
-    db.delete_parts_for_upload(&upload_id)?;
-    db.delete_multipart_upload(&upload_id)?;
+    db.delete_parts_for_upload_awaited(&upload_id).await?;
+    db.delete_multipart_upload_awaited(&upload_id).await?;
 
-    info!("S3 AbortMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
+    log::trace!("S3 AbortMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
     Ok(HttpResponse::NoContent()
         .insert_header(("Content-Length", "0"))
         .body(""))
@@ -954,18 +936,19 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
             let part_size = part.sz;
 
             let slices = Arc::new(stream_slices(&extents));
-            let store = StorageConfig::from_env().create_store();
+            let locs = Arc::new(crate::storage::Locators::of(&meta.chunks));
+            let store = crate::storage::object_store();
             let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
             let byte_stream = stream::try_unfold(0usize, move |idx| {
                 let slices = Arc::clone(&slices);
+                let locs = Arc::clone(&locs);
                 let ctx = context.clone();
                 let store = Arc::clone(&store);
                 async move {
                     if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
                     let (off, sz) = slices[idx];
-                    let chunk = web::block(move || store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string()))
-                        .await.map_err(actix_web::error::ErrorInternalServerError)?
-                        .map_err(actix_web::error::ErrorInternalServerError)?;
+                    let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz, locs.find(off))
+                        .await.map_err(actix_web::error::ErrorInternalServerError)?;
                     Ok(Some((Bytes::from(chunk), idx + 1)))
                 }
             });
@@ -1002,18 +985,19 @@ pub(super) async fn s3_get_part_handler(bucket: &str, key: &str, part_num: i32, 
     let total_size = meta.size;
     let extents = meta.to_offset_size_list();
     let slices = Arc::new(stream_slices(&extents));
-    let store = StorageConfig::from_env().create_store();
+    let locs = Arc::new(crate::storage::Locators::of(&meta.chunks));
+    let store = crate::storage::object_store();
     let context = UserContext::with_bucket(auth_result.user_id.clone(), auth_result.bucket.clone());
     let byte_stream = stream::try_unfold(0usize, move |idx| {
         let slices = Arc::clone(&slices);
+        let locs = Arc::clone(&locs);
         let ctx = context.clone();
         let store = Arc::clone(&store);
         async move {
             if idx >= slices.len() { return Ok::<Option<(Bytes, usize)>, Error>(None); }
             let (off, sz) = slices[idx];
-            let chunk = web::block(move || store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string()))
-                .await.map_err(actix_web::error::ErrorInternalServerError)?
-                .map_err(actix_web::error::ErrorInternalServerError)?;
+            let chunk = crate::storage::read_any(store, ctx.user_id, ctx.bucket, off, sz, locs.find(off))
+                .await.map_err(actix_web::error::ErrorInternalServerError)?;
             Ok(Some((Bytes::from(chunk), idx + 1)))
         }
     });

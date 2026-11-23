@@ -1,7 +1,6 @@
 // s3_list_objects_handler, s3_delete_objects_handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use futures::StreamExt as _;
-use log::{info, warn};
 
 use std::collections::HashMap;
 
@@ -41,6 +40,16 @@ pub async fn s3_list_objects_handler(
 
     if query.contains_key("cors") {
         return s3_get_bucket_cors_inner(&bucket, &req).await;
+    }
+
+    if query.contains_key("lifecycle") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        return Ok(match db.get_bucket_lifecycle(&bucket)? {
+            Some(xml) => HttpResponse::Ok().content_type("application/xml").body(xml),
+            None => s3_error(StatusCode::NOT_FOUND, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist", &format!("/{bucket}")),
+        });
     }
 
     if query.contains_key("tagging") {
@@ -122,10 +131,10 @@ pub async fn s3_list_objects_handler(
 
     let fetch_owner = is_v2 && query.get("fetch-owner").map(|s| s == "true").unwrap_or(false);
 
-    info!("S3 ListObjects{}: bucket={} prefix={:?} delim={:?} max_keys={} marker={:?}",
+    log::trace!("S3 ListObjects{}: bucket={} prefix={:?} delim={:?} max_keys={} marker={:?}",
           if is_v2 { "V2" } else { "V1" }, bucket, prefix, delimiter, max_keys, effective_marker);
 
-    let all_keys = db.list_objects(&bucket)?;
+    let all_keys = db.list_objects_with_prefix(&bucket, prefix)?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
 
     let mut contents_xml   = String::new();
@@ -344,7 +353,7 @@ pub async fn s3_delete_objects_handler(
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!("DeleteObjects: payload read error: {}", e);
+            log::trace!("DeleteObjects: payload read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         body_bytes.extend_from_slice(&chunk);
@@ -436,7 +445,7 @@ pub async fn s3_delete_objects_handler(
                     db.queue_deletion(&bucket, key, &extents).ok();
                 }
             }
-            match db.delete_specific_version(&bucket, key, vid) {
+            match db.delete_specific_version_awaited(&bucket, key, vid).await {
                 Ok(result) => {
                     if result.was_delete_marker {
                         deleted_xml.push_str(&format!(
@@ -517,6 +526,21 @@ pub async fn s3_delete_objects_handler(
         }
 
         use crate::metadata::sqlite_store::VersioningDeleteResult;
+        // The cluster store does the whole delete, marker or removal, as an
+        // awaited task.
+        if let Some(fut) = db.delete_object_async(&bucket, key) {
+            match fut.await {
+                Ok(VersioningDeleteResult::Marker { version_id }) => deleted_xml.push_str(&format!(
+                    "    <Deleted><Key>{k}</Key><DeleteMarker>true</DeleteMarker>\
+                     <DeleteMarkerVersionId>{v}</DeleteMarkerVersionId></Deleted>\n",
+                    k = xml_escape(key), v = xml_escape(&version_id),
+                )),
+                Ok(VersioningDeleteResult::Deleted) | Err(_) => deleted_xml.push_str(&format!(
+                    "    <Deleted><Key>{}</Key></Deleted>\n", xml_escape(key),
+                )),
+            }
+            continue;
+        }
         match db.delete_object_v2(&bucket, key) {
             Ok(VersioningDeleteResult::Marker { version_id }) => {
                 deleted_xml.push_str(&format!(
@@ -542,7 +566,7 @@ pub async fn s3_delete_objects_handler(
         }
     }
 
-    info!("S3 DeleteObjects: bucket={} objects={}", bucket, objects.len());
+    log::trace!("S3 DeleteObjects: bucket={} objects={}", bucket, objects.len());
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

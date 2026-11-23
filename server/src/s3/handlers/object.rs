@@ -2,7 +2,7 @@
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
-use log::{debug, error, info, warn};
+use log::error;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +12,6 @@ use crate::s3::auth::{authenticate_s3_request, authenticate_s3_request_allow_ano
 use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
-use crate::storage::config::StorageConfig;
 
 use super::checksum::{compute_checksum, parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use super::common::*;
@@ -100,7 +99,7 @@ pub async fn s3_put_object_handler(
 
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    info!("S3 PutObject: bucket={} key={} user={}", bucket, key, owner_id);
+    log::trace!("S3 PutObject: bucket={} key={} user={}", bucket, key, owner_id);
 
     let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
 
@@ -172,30 +171,43 @@ pub async fn s3_put_object_handler(
             if stripped.is_empty() { None } else { Some(stripped.join(", ")) }
         });
 
-    let store = StorageConfig::from_env().create_store();
+    let store = crate::storage::object_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
     let mut body_buf: Vec<u8> = Vec::new();
 
     while let Some(chunk_result) = payload.next().await {
         let chunk = chunk_result.map_err(|e| {
-            warn!("PutObject: payload read error: {}", e);
+            log::trace!("PutObject: payload read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         if chunk.is_empty() { continue; }
 
         body_buf.extend_from_slice(&chunk);
+    }
 
+    // One write for the whole body, not one per network chunk. The body is
+    // already buffered for the ETag, so this costs no extra memory, and on
+    // a cluster each write is a full erasure-coded round with its own
+    // replicated record: a 1 MB body used to take 20 or more of them.
+    if !body_buf.is_empty() {
         let ctx = context.clone();
         let store_c = Arc::clone(&store);
-        let buf = chunk.to_vec();
-        let pair = web::block(move || {
-            store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string())
-        }).await
-        .map_err(|e| {
-            error!("PutObject: blocking write failed bucket={} key={}: {:?}", bucket, key, e);
-            actix_web::error::ErrorInternalServerError("storage write task failed")
-        })?
-        .map_err(|msg| {
+        let buf = body_buf.clone();
+        // A store that writes over the network (the cluster) is awaited
+        // here. One that writes to local disk goes to the blocking pool.
+        let written = match store_c.write_async(&ctx.user_id, &ctx.bucket, buf) {
+            Some(fut) => fut.await,
+            None => {
+                let buf = body_buf.clone();
+                web::block(move || store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string()))
+                    .await
+                    .map_err(|e| {
+                        error!("PutObject: blocking write failed bucket={} key={}: {:?}", bucket, key, e);
+                        actix_web::error::ErrorInternalServerError("storage write task failed")
+                    })?
+            }
+        };
+        let pair = written.map_err(|msg| {
             error!("PutObject: write error bucket={} key={}: {}", bucket, key, msg);
             actix_web::error::ErrorInternalServerError(msg)
         })?;
@@ -272,7 +284,7 @@ pub async fn s3_put_object_handler(
         // For simple (non-multipart) objects, checksum_type is not set (leave None)
     }
 
-    let (version_id, old_extents) = db.put_object_full(&bucket, &key, metadata)?;
+    let (version_id, old_extents) = db.put_object_full_async(&bucket, &key, metadata).await?;
     if !old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &old_extents).ok();
     }
@@ -281,7 +293,7 @@ pub async fn s3_put_object_handler(
         let resource = format!("/{}/{}", bucket, key);
         let tags = parse_url_tags(tagging_str);
         if let Err(resp) = validate_tags(&tags, &resource) { return Ok(resp); }
-        db.set_object_tags(&bucket, &key, &tags)?;
+        db.set_object_tags_awaited(&bucket, &key, &tags).await?;
     }
 
     // Apply object lock — from per-object headers or bucket default retention
@@ -308,11 +320,11 @@ pub async fn s3_put_object_handler(
     }
 
     if lock_mode.is_some() || obj_legal_hold.is_some() {
-        let _ = db.put_object_lock(
+        let _ = db.put_object_lock_awaited(
             &bucket, &key, effective_vid,
             lock_mode.as_deref(), lock_until.as_deref(),
             obj_legal_hold.as_deref(),
-        );
+        ).await;
     }
 
     // Only store an ACL row when the request actually specifies one — otherwise the
@@ -323,12 +335,12 @@ pub async fn s3_put_object_handler(
     if has_acl_header {
         let owner_display = if owner_id == ADMIN_USER_ID { crate::s3::auth::admin_display_name() } else { auth_result.owner_display_name.clone() };
         match resolve_effective_grants(&req, None, &owner_id, &owner_display) {
-            Ok(grants) => db.set_object_acl(&bucket, &key, effective_vid, &owner_id, &grants_to_json(&grants))?,
+            Ok(grants) => db.set_object_acl_awaited(&bucket, &key, effective_vid, &owner_id, &grants_to_json(&grants)).await?,
             Err(resp) => return Ok(resp),
         }
     }
 
-    debug!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
+    log::trace!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("ETag", etag));
     let resp_vid = version_id.as_deref().unwrap_or("");
@@ -337,6 +349,10 @@ pub async fn s3_put_object_handler(
     }
     if let Some(ref m) = lock_mode { resp.insert_header(("x-amz-object-lock-mode", m.clone())); }
     if let Some(ref u) = lock_until { resp.insert_header(("x-amz-object-lock-retain-until-date", u.clone())); }
+    let put_tags = || req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()).map(parse_url_tags).unwrap_or_default();
+    if let Some(h) = crate::s3::lifecycle::header_for(&db, &bucket, &key, put_tags, size, chrono::Utc::now()) {
+        resp.insert_header(("x-amz-expiration", h));
+    }
     // Echo checksum header in response
     if let Some((ref algo, ref value)) = checksum_result {
         let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
@@ -491,16 +507,18 @@ pub async fn s3_get_object_handler(
         RangeResult::None => (stream_slices(&extents), total_size, None),
     };
 
-    info!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
+    log::trace!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
 
     let slices = Arc::new(slices);
-    let store = StorageConfig::from_env().create_store();
+    let locs = Arc::new(crate::storage::Locators::of(&meta.chunks));
+    let store = crate::storage::object_store();
     let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
     let bucket_log = bucket.clone();
     let key_log = key.clone();
 
     let byte_stream = stream::try_unfold(0usize, move |idx| {
         let slices = Arc::clone(&slices);
+        let locs = Arc::clone(&locs);
         let ctx = context.clone();
         let bucket_log = bucket_log.clone();
         let key_log = key_log.clone();
@@ -510,13 +528,18 @@ pub async fn s3_get_object_handler(
                 return Ok::<Option<(Bytes, usize)>, Error>(None);
             }
             let (off, sz) = slices[idx];
-            let chunk = web::block(move || {
-                store.read(&ctx.user_id, &ctx.bucket, off, sz).map_err(|e| e.to_string())
-            }).await
-            .map_err(|e| {
-                error!("GetObject stream: task failed bucket={} key={} idx={}: {:?}", bucket_log, key_log, idx, e);
-                actix_web::error::ErrorInternalServerError(e)
-            })?
+            let loc = locs.find(off);
+            let read = match store.read_located_async(&ctx.user_id, &ctx.bucket, off, sz, loc.as_ref()) {
+                Some(fut) => fut.await,
+                None => web::block(move || {
+                    store.read_located(&ctx.user_id, &ctx.bucket, off, sz, loc.as_ref()).map_err(|e| e.to_string())
+                }).await
+                .map_err(|e| {
+                    error!("GetObject stream: task failed bucket={} key={} idx={}: {:?}", bucket_log, key_log, idx, e);
+                    actix_web::error::ErrorInternalServerError(e)
+                })?,
+            };
+            let chunk = read
             .map_err(|msg| {
                 error!("GetObject stream: read error bucket={} key={} idx={}: {}", bucket_log, key_log, idx, msg);
                 actix_web::error::ErrorInternalServerError(msg)
@@ -681,13 +704,19 @@ pub async fn s3_head_object_handler(
     let content_type = meta.content_type.clone().unwrap_or_else(|| "application/octet-stream".into());
     let last_modified = meta.last_modified.clone().unwrap_or_default();
 
-    info!("S3 HeadObject: bucket={} key={} size={}", bucket, key, meta.size);
+    log::trace!("S3 HeadObject: bucket={} key={} size={}", bucket, key, meta.size);
 
     let object_size = meta.size;
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("Content-Type", content_type));
     resp.insert_header(("ETag", etag));
     resp.insert_header(("Accept-Ranges", "bytes"));
+    if let Some(created) = crate::s3::lifecycle::parse_time(&last_modified) {
+        let tags = || db.get_object_tags(&bucket, &key).unwrap_or_default();
+        if let Some(h) = crate::s3::lifecycle::header_for(&db, &bucket, &key, tags, object_size, created) {
+            resp.insert_header(("x-amz-expiration", h));
+        }
+    }
     if !last_modified.is_empty() {
         resp.insert_header(("Last-Modified", last_modified_for_header(&last_modified)));
     }
@@ -836,9 +865,22 @@ pub async fn s3_delete_object_handler(
 
     use crate::metadata::sqlite_store::VersioningDeleteResult;
 
+    // A store with an async path (the cluster) does the whole metadata
+    // write, marker or removal, while this worker serves other requests.
+    if let Some(fut) = db.delete_object_async(&bucket, &key) {
+        let del_result = fut.await?;
+        log::trace!("S3 DeleteObject: bucket={} key={}", bucket, key);
+        let mut resp = HttpResponse::NoContent();
+        if let VersioningDeleteResult::Marker { version_id } = del_result {
+            resp.insert_header(("x-amz-delete-marker", "true"));
+            resp.insert_header(("x-amz-version-id", version_id));
+        }
+        return Ok(resp.insert_header(("Content-Length", "0")).body(""));
+    }
+
     let del_result = db.delete_object_v2(&bucket, &key)?;
 
-    info!("S3 DeleteObject: bucket={} key={}", bucket, key);
+    log::trace!("S3 DeleteObject: bucket={} key={}", bucket, key);
 
     let mut resp = HttpResponse::NoContent();
     match del_result {

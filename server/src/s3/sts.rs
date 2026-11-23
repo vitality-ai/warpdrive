@@ -14,7 +14,7 @@ use actix_web::{web, Error, HttpRequest, HttpResponse};
 use actix_web::http::StatusCode;
 use jsonwebtoken::jwk::JwkSet;
 use lazy_static::lazy_static;
-use log::{debug, warn};
+use log::debug;
 use parking_lot::RwLock;
 use rand::Rng;
 use std::collections::HashMap;
@@ -290,7 +290,7 @@ fn form_decode(s: &str) -> String {
 }
 
 fn sts_error_response(status: StatusCode, code: &str, message: &str) -> HttpResponse {
-    warn!("STS error: {code}: {message}");
+    log::trace!("STS error: {code}: {message}");
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">

@@ -10,12 +10,13 @@
 //! objects never use.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use parking_lot::RwLock;
-use crate::storage::durable_log::DurableAppendLog;
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+use super::location_store::record_key;
+use warp_meta_store::{Record, WarpMetaStore};
+pub use warp_meta_store::{Applied, Entry};
+use warp_meta_store::BitcaskEngine;
 
 /// One stripe's placement pin: which peers hold its `k+m` shards, the
 /// shared bin size (`capacity`, what every shard in this stripe is padded
@@ -104,6 +105,9 @@ pub struct ContentDependentRecord {
     /// field existed, whose shards are at the old, unversioned key.
     #[serde(default)]
     pub version: String,
+    /// See `LocationRecord::seq`.
+    #[serde(default)]
+    pub seq: u64,
     /// True when the caller's own `units_header` left part of the body
     /// uncovered (`verify_stripes_reconstruct_original` allows this --
     /// see its doc -- a legitimate choice for a caller like a row-group
@@ -187,157 +191,89 @@ impl ContentDependentRecord {
 }
 
 pub trait ContentLocationStore: Send + Sync {
-    fn put(&self, record: ContentDependentRecord) -> io::Result<()>;
+    /// See `LocationStore::put`: same ordering rule, other record shape.
+    fn put(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>>;
+    /// See `LocationStore::update`.
+    fn update(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>>;
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord>;
-    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()>;
-    /// See `LocationStore::list` — same minimal-S3-surface purpose, for the
-    /// content-dependent half of a bucket's objects.
+    fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<ContentDependentRecord>>;
+    fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<ContentDependentRecord>>;
+    /// See `LocationStore::list`, for the content-dependent half of a
+    /// bucket's objects.
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
-    /// See `LocationStore::compact` — same reasoning and same mechanism
-    /// (#163), applied to this store's own log.
+    /// See `LocationStore::compact`.
     fn compact(&self) -> io::Result<()>;
+    /// Whether the log has built up enough dead lines to compact (RFC 6
+    /// step 2: more than twice its live entries).
+    fn compaction_due(&self) -> bool {
+        false
+    }
 }
 
-/// Length-prefixed, same scheme and same reasoning as `location_store.rs`'s
-/// `record_key` (#150: a plain `/` separator lets bucket `a/b` + key `c`
-/// and bucket `a` + key `b/c` collide onto the same index entry; the same
-/// risk applies one level up to `user_id`, so it gets the same treatment).
-fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
-    format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
+impl Record for ContentDependentRecord {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
 }
 
-/// `BTreeMap`, not `HashMap` (#163) — see `location_store.rs`'s matching
-/// doc comment, same reasoning: `record_key`'s length-prefixed bucket
-/// still groups each bucket's keys contiguously, so lexicographic order
-/// makes `list`'s prefix lookup a bounded range scan.
-pub struct BitcaskContentLocationStore {
-    log_path: PathBuf,
-    /// Owns the file, the dup'd sync-only handle, and the group-commit
-    /// batching needed to make an append durable without paying one
-    /// fsync per write -- see `storage::durable_log`'s module doc.
-    log: DurableAppendLog,
-    index: RwLock<BTreeMap<String, ContentDependentRecord>>,
-    /// #155 — see `location_store.rs`'s matching field doc for why this
-    /// is needed: without one lock held across both the log append and
-    /// the index update, a concurrent put/delete for the same key can
-    /// apply to the log and the index in different orders, so a restart
-    /// (which only ever replays the log) can disagree with what the live
-    /// index had.
-    write_lock: parking_lot::Mutex<()>,
+/// `ContentLocationStore` on ordered records over a per-node `Engine`.
+pub struct BitcaskContentLocationStore<E = BitcaskEngine<Entry<ContentDependentRecord>>> {
+    log: WarpMetaStore<ContentDependentRecord, E>,
 }
 
 impl BitcaskContentLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        let log_path: PathBuf = log_path.as_ref().to_path_buf();
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        Ok(Self { log: WarpMetaStore::new(BitcaskEngine::open(log_path, "content location")?) })
+    }
 
-        let mut index = BTreeMap::new();
-        if log_path.exists() {
-            let f = File::open(&log_path)?;
-            let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
-            let last_idx = lines.len().saturating_sub(1);
-            for (i, line) in lines.iter().enumerate() {
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<(String, Option<ContentDependentRecord>)>(line) {
-                    Ok((rk, Some(r))) => {
-                        index.insert(rk, r);
-                    }
-                    Ok((rk, None)) => {
-                        index.remove(&rk);
-                    }
-                    // Same reasoning as `ShardMetaStore::open` (#152): only
-                    // the last line can be a torn write from a crash
-                    // mid-append, so quarantine just that one with a
-                    // warning instead of refusing to start.
-                    Err(e) if i == last_idx => {
-                        log::warn!(
-                            "content location log {}: ignoring malformed trailing line, \
-                             likely a torn write from a crash: {e}",
-                            log_path.display()
-                        );
-                    }
-                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                }
-            }
-        }
-
-        let log = DurableAppendLog::open(&log_path)?;
-        Ok(Self {
-            log_path,
-            log,
-            index: RwLock::new(index),
-            write_lock: parking_lot::Mutex::new(()),
-        })
+    pub fn path(&self) -> &Path {
+        self.log.engine().path()
     }
 }
 
-impl ContentLocationStore for BitcaskContentLocationStore {
-    fn put(&self, record: ContentDependentRecord) -> io::Result<()> {
-        let rk = record_key(&record.user_id, &record.bucket, &record.key);
-        let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // #155: held across both the append and the index update, so a
-        // concurrent put/delete for the same key can never apply to the
-        // log and the index in different orders. Released before the
-        // durability wait below -- see `location_store.rs::put`'s
-        // matching comment for why that matters for group commit.
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().insert(rk, record);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+impl<E: warp_meta_store::Engine<Entry<ContentDependentRecord>>> BitcaskContentLocationStore<E> {
+    /// The store on any engine.
+    pub fn with_engine(engine: E) -> Self {
+        Self { log: WarpMetaStore::new(engine) }
+    }
+}
+
+impl<E: warp_meta_store::Engine<Entry<ContentDependentRecord>>> ContentLocationStore for BitcaskContentLocationStore<E> {
+    fn put(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>> {
+        self.log.put(record_key(&record.user_id, &record.bucket, &record.key), record)
+    }
+
+    fn update(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>> {
+        self.log.update(record_key(&record.user_id, &record.bucket, &record.key), record)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord> {
-        self.index.read().get(&record_key(user_id, bucket, key)).cloned()
+        self.log.get(&record_key(user_id, bucket, key))
     }
 
-    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
-        let rk = record_key(user_id, bucket, key);
-        let line = serde_json::to_string(&(rk.clone(), Option::<ContentDependentRecord>::None))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().remove(&rk);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+    fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<ContentDependentRecord>> {
+        self.log.entry(&record_key(user_id, bucket, key))
+    }
+
+    fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<ContentDependentRecord>> {
+        self.log.delete(record_key(user_id, bucket, key), seq)
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
         let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
-        self.index
-            .read()
-            .range(full_prefix.clone()..)
-            .take_while(|(k, _)| k.starts_with(&full_prefix))
-            .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
-            .collect()
+        self.log.list_live(&full_prefix, |k, r| (k[bucket_prefix.len()..].to_string(), r.original_len as u64))
     }
 
     fn compact(&self) -> io::Result<()> {
-        // #155: same `write_lock` as `put`/`delete`, so compaction can't
-        // interleave with either.
-        let _write_guard = self.write_lock.lock();
-        let index = self.index.read();
-        let tmp_path = self.log_path.with_extension("compact.tmp");
-        {
-            let mut tmp = File::create(&tmp_path)?;
-            for (rk, record) in index.iter() {
-                let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                writeln!(tmp, "{line}")?;
-            }
-            tmp.flush()?;
-        }
-        self.log.replace_with_compacted(&tmp_path, &self.log_path)
+        self.log.compact()
+    }
+
+    fn compaction_due(&self) -> bool {
+        self.log.engine().compaction_due()
     }
 }
 
@@ -345,6 +281,7 @@ impl ContentLocationStore for BitcaskContentLocationStore {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn sample(bucket: &str, key: &str) -> ContentDependentRecord {
         sample_for("u1", bucket, key)
@@ -368,6 +305,7 @@ mod tests {
                 bins: vec![vec!["u0".into()], vec!["u1".into()], vec![]],
             }],
             version: "v1".to_string(),
+            seq: 1,
             has_sparse_gaps: false,
             sorted_unit_locations: Vec::new(),
             etag: None,
@@ -467,7 +405,7 @@ mod tests {
         assert_eq!(store.get("alice", "logs", "k1").unwrap(), alice_rec);
         assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec);
 
-        store.delete("alice", "logs", "k1").unwrap();
+        store.delete("alice", "logs", "k1", 2).unwrap();
         assert!(store.get("alice", "logs", "k1").is_none());
         assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec, "deleting alice's record must not touch bob's");
     }
@@ -497,7 +435,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BitcaskContentLocationStore::open(dir.path().join("cloc.log")).unwrap();
         store.put(sample("b1", "k1")).unwrap();
-        store.delete("u1", "b1", "k1").unwrap();
+        store.delete("u1", "b1", "k1", 2).unwrap();
         assert!(store.get("u1", "b1", "k1").is_none());
     }
 
@@ -558,7 +496,7 @@ mod tests {
         store.put(sample("b1", "keep")).unwrap();
         for i in 0..20 {
             store.put(sample("b1", &format!("churn{i}"))).unwrap();
-            store.delete("u1", "b1", &format!("churn{i}")).unwrap();
+            store.delete("u1", "b1", &format!("churn{i}"), 2).unwrap();
         }
         let size_before = std::fs::metadata(&log_path).unwrap().len();
 
@@ -589,40 +527,5 @@ mod tests {
         store.put(sample("b1", "k2")).unwrap();
         assert_eq!(store.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
         assert_eq!(store.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
-    }
-
-    /// Same invariant and same reasoning as `location_store.rs`'s matching
-    /// test (#155): the live index and a fresh replay of the log must
-    /// always agree, however a concurrent put/delete race on the same key
-    /// actually resolved.
-    #[test]
-    fn concurrent_put_delete_on_the_same_key_never_diverges_log_from_index() {
-        use std::thread;
-
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("cloc.log");
-        let store = std::sync::Arc::new(BitcaskContentLocationStore::open(&log_path).unwrap());
-
-        let handles: Vec<_> = (0..16)
-            .map(|t| {
-                let store = std::sync::Arc::clone(&store);
-                thread::spawn(move || {
-                    for i in 0..50 {
-                        if (t + i) % 2 == 0 {
-                            store.put(sample("b1", "racykey")).unwrap();
-                        } else {
-                            let _ = store.delete("u1", "b1", "racykey");
-                        }
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let live = store.get("u1", "b1", "racykey");
-        let replayed = BitcaskContentLocationStore::open(&log_path).unwrap().get("u1", "b1", "racykey");
-        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

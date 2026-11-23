@@ -106,13 +106,33 @@ The techniques below each remove a part of that cost.
 | | Technique | What it removes | Status |
 |---|---|---|---|
 | T1 | **Inline small objects.** A small object's bytes go inside its `LocationRecord`, which is already replicated to every node with the write quorum. | PUT: the whole shard round. GET: every network hop, since the receiving node serves from its own copy. | Implemented, opt-in: `WARPDRIVE_INLINE_MAX_BYTES` (default 0, capped at 128 KiB) |
-| T2 | **Drop the redundant local cleanup.** | One sync in sequence on every PUT. | Implemented, on by default. Skipped only when this node's `WARPDRIVE_SELF_ADDR` is in the peer list, so the broadcast is known to reach it. |
+| T2 | **Drop the redundant local cleanup.** | One sync in sequence on every PUT. | Implemented, on by default. Skipped only when this node's `WARPDRIVE_SELF_ADDR` is in the peer list, so the broadcast reaches it. If that one delivery fails while quorum succeeds, the coordinator writes its own copy locally before acknowledging (see *Consistency contract*). |
 | T3 | **One durable append per shard write.** Shard bytes and the shard-index entry go into one log append with one sync. | One of the two sequential syncs on every shard holder. | Next |
 | T4 | **Record rides with the shards.** Shard holders get the record in the same message as their shard, marked pending, and it goes live when write quorum is reached. Nodes that hold no shard get the record in parallel. | The second network round for sharded objects. | Next |
 | T5 | **Local shard short-circuit.** When the coordinator holds a shard itself, read or write it directly instead of over gRPC to itself. Also covers N=1 (single node as RS(1,0)). | One network hop per request on the coordinator's own shard. | Next |
 | T6 | **Hedged reads.** Ask for k+1 shards and decode from the first k that arrive. | Tail latency from one slow node. | Later |
 
-**Durability stays the same.** T1 writes the record to the same quorum as today's records (3 of 5 nodes for RS(3,2)), each synced, so an acknowledged inline object survives losing any two nodes, like an erasure-coded one. T4 keeps the rule from #151: a record only becomes visible once its shards have reached write quorum.
+**Durability after acknowledgment.** A PUT is acknowledged once a write quorum has it: `k` shard holders for an erasure-coded object (`k+1` when `m == k`), and the same number of record copies for an inline one. So what an acknowledged object survives depends on how many copies actually landed, not on `m`:
+
+| Object | Acknowledged with | Survives losing |
+|---|---|---|
+| Erasure-coded, all `k+m` shards written | `k+m` shards | any `m` shard holders |
+| Erasure-coded, degraded write | as few as `k` shards | none of those `k` holders, until repair rewrites the missing shards (#206, #207) |
+| Inline (T1) | as few as quorum record copies | all but one of those copies. The object is then readable only through a node that still holds its record. Other nodes answer `NoSuchKey`, since there's no read-through. |
+
+T1 doesn't change these rules. It writes the record to the same quorum as today's records, each copy synced. Checked live on a 5-node RS(3,2) cluster: with two nodes down, an inline and a sharded PUT both succeed. After losing two of the three remaining nodes, the inline object reads back from the node that still holds its record, and the sharded object can't be decoded. Repair (#207) is what makes degraded writes survive further losses.
+
+T4 keeps the rule from #151: a record only becomes visible once its shards have reached write quorum.
+
+**Consistency contract.** What a reader sees today:
+- **Read after write, through the coordinator.** Once a PUT or DELETE succeeds, the node that coordinated it returns the new state. It checks its own copy of the records after the broadcast and writes locally if its own delivery failed (this closes the T2 stale read where a failed self-delivery left an old packed record in place).
+- **Other nodes.** A node that received the write returns the new state. A node that missed it (it was down, or its delivery failed while quorum still succeeded) keeps returning the old state until something rewrites the record. There's no repair or anti-entropy yet (#207), so there's no bound on how long that lasts.
+- **Concurrent writes to one key.** Each node keeps whichever record arrives last, so two racing writes can leave nodes on different values, and a restart replays the same disagreement. RFC 6 fixes this with ordered record writes: every record carries a hybrid-logical-clock stamp, a node applies a write only if it's newer than what it holds, and so every node that receives both writes ends on the same one. Checked live: with ordering, a late, older write is refused on every node and all five agree before and after a restart. Without it, two of five nodes return the older value.
+- **Deployment guidance until then.** One writer per key. Writes to different keys, and writes by different users, are safe from any node, since the user is part of every record key. Per-key ownership with conditional writes (`If-Match`, `If-None-Match`) is future work. See `docs/Production-Deployment.md`, *Concurrent writes to the same key*.
+
+**Future work: per-key write ownership.** Ordered writes give last-writer-wins, which is what S3 promises for plain concurrent PUTs. They can't give compare-and-write: conditional writes (`If-Match`, `If-None-Match: *`) need the check and the write at one point, and two concurrent tag or retention updates on one version still race, so one update is lost. Not scheduled. Recorded here as a suggestion.
+- **What others do.** MinIO takes a distributed namespace lock (dsync, majority quorum) on `bucket/object` around the metadata commit in `putObject` (`cmd/erasure-object.go`), and takes it before the precondition check for conditional writes. Blobasaur is single-writer by construction: a key hashes to one node and one shard with one writer task, and it has no replicas yet.
+- **Suggestion.** Each key gets an owner, its first live node in placement order. Record writes for the key go through the owner, which checks preconditions, stamps the write and broadcasts it. That needs no separate lock round. If the owner is down, the next node in placement order takes over. Ordering stamps keep the handover safe, since a write from a deposed owner arrives with an older stamp and is refused.
 
 **The cost T1 trades:**
 - **Disk.** An inline object is stored on every node (5x for a 5-node cluster) instead of 1.67x, and the copies grow with cluster size.

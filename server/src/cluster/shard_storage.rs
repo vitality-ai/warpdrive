@@ -34,8 +34,19 @@ use crate::storage::Storage;
 
 lazy_static! {
     static ref SHARD_META_STORE: Arc<dyn ShardMetaStore> = {
-        let log_path = std::env::var("WARPDRIVE_SHARD_META_LOG").unwrap_or_else(|_| "shard_meta.log".to_string());
-        Arc::new(BitcaskShardMetaStore::open(&log_path).expect("failed to open shard meta store log"))
+        // The shard index uses the same engine as the metadata rows
+        // (WARPDRIVE_META_ENGINE), so with an on-disk engine neither
+        // per-object store keeps every entry in RAM. Bitcask keeps its
+        // point-lookup (hash map) index here.
+        use super::meta_engine::{AnyEngine, MetaEngineKind};
+        let kind = MetaEngineKind::from_env().unwrap_or_else(|e| panic!("{e}"));
+        let path = std::env::var("WARPDRIVE_SHARD_META_LOG").unwrap_or_else(|_| kind.file_name("shard_meta"));
+        match kind {
+            MetaEngineKind::Bitcask => Arc::new(BitcaskShardMetaStore::open(&path).expect("failed to open shard meta store log")),
+            other => Arc::new(BitcaskShardMetaStore::with_engine(
+                AnyEngine::open(other, &path, "shard meta").unwrap_or_else(|e| panic!("failed to open shard meta store {path}: {e}")),
+            )),
+        }
     };
 }
 
@@ -137,6 +148,61 @@ pub fn shard_key(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> St
     format!("{}:{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key, shard_idx)
 }
 
+/// One shard this node holds, as named by its shard key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardId {
+    pub user_id: String,
+    pub bucket: String,
+    pub wire_key: String,
+    pub idx: usize,
+}
+
+/// Inverts `shard_key`. `None` for a key it didn't produce.
+pub fn parse_shard_key(sk: &str) -> Option<ShardId> {
+    fn take_prefixed(s: &str) -> Option<(&str, &str)> {
+        let (len, rest) = s.split_once(':')?;
+        let len: usize = len.parse().ok()?;
+        let field = rest.get(..len)?;
+        let rest = rest.get(len..)?.strip_prefix(':')?;
+        Some((field, rest))
+    }
+    let (user_id, rest) = take_prefixed(sk)?;
+    let (bucket, rest) = take_prefixed(rest)?;
+    let (wire_key, idx) = rest.rsplit_once(':')?;
+    Some(ShardId { user_id: user_id.to_string(), bucket: bucket.to_string(), wire_key: wire_key.to_string(), idx: idx.parse().ok()? })
+}
+
+/// Whether the shard index log is due for compaction (RFC 6 step 2).
+pub fn shard_index_compaction_due() -> bool {
+    SHARD_META_STORE.compaction_due()
+}
+
+/// Compacts the shard index log. Writers aren't stalled while it runs.
+pub fn compact_shard_index() -> std::io::Result<()> {
+    SHARD_META_STORE.compact()
+}
+
+/// Points a shard at its new copy, only if it still points at `from`
+/// (RFC 6 step 4: the compactor moving a survivor).
+pub fn move_shard_if(shard_key: &str, from: (u64, u64), to: (u64, u64)) -> std::io::Result<bool> {
+    SHARD_META_STORE.move_if(shard_key, from, to)
+}
+
+/// Where a shard is on this node, if it holds it.
+pub fn shard_location(shard_key: &str) -> Option<(u64, u64)> {
+    SHARD_META_STORE.get(shard_key)
+}
+
+/// `delete_shard_if` for many shards, with one sync for all of them.
+pub fn delete_shards_if(shards: &[(String, (u64, u64))]) -> std::io::Result<usize> {
+    SHARD_META_STORE.delete_many_if_at(shards)
+}
+
+/// Every shard this node holds: `(shard key, offset, size)`.
+pub fn shard_entries() -> Vec<(String, u64, u64)> {
+    SHARD_META_STORE.entries().into_iter().map(|(k, (o, s))| (k, o, s)).collect()
+}
+
 pub fn store_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), Error> {
     let request_start = Instant::now();
     let sk = shard_key(user_id, bucket, key, shard_idx);
@@ -169,6 +235,16 @@ pub fn load_shard(user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_shard_key_inverts_shard_key() {
+        for (u, b, k, i) in [("u", "b", "k:v1", 0), ("", "\u{1}blobs\u{1}bkt", "00000000000000ff:18a-0", 2), ("a:b", "c", "x:y:z", 11)] {
+            let sk = shard_key(u, b, k, i);
+            assert_eq!(parse_shard_key(&sk), Some(ShardId { user_id: u.into(), bucket: b.into(), wire_key: k.into(), idx: i }), "{sk:?}");
+        }
+        assert_eq!(parse_shard_key("not a shard key"), None);
+        assert_eq!(parse_shard_key("5:ab:1:b:k:0"), None);
+    }
 
     #[test]
     fn store_then_load_round_trips() {

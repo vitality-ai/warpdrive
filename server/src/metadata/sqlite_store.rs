@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{params, Connection};
 use std::sync::Arc;
-use log::{warn, info, error};
+use log::{info, error};
 use actix_web::Error;
 use lazy_static::lazy_static;
 use std::env;
@@ -35,7 +35,7 @@ fn get_db_path() -> PathBuf {
             PathBuf::from(path)
         }
         Err(_) => {
-            warn!("Metadata database location not defined in environment");
+            log::info!("DB_FILE not set, using metadata/metadata.sqlite");
             let default_path = Path::new("metadata").join("metadata.sqlite");
             if let Some(parent) = default_path.parent() {
                 std::fs::create_dir_all(parent).expect("Failed to create metadata directory");
@@ -166,6 +166,15 @@ lazy_static! {
             )",
             [],
         ).expect("Failed to create object_lock table");
+
+        // Lifecycle configuration per bucket
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bucket_lifecycle (
+                bucket        TEXT PRIMARY KEY,
+                lifecycle_xml TEXT NOT NULL
+            )",
+            [],
+        ).expect("Failed to create bucket_lifecycle table");
 
         // CORS configuration per bucket
         conn.execute(
@@ -320,7 +329,7 @@ impl MetadataStorage for SQLiteMetadataStore {
                 row.get::<_, String>(13)?,
             ))
         }).map_err(|e| {
-            warn!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
+            log::trace!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
             actix_web::error::ErrorNotFound(format!(
                 "No data found for key: {} in bucket: {}, The key does not exist", object_id, bucket
             ))
@@ -563,6 +572,39 @@ impl MetadataStorage for SQLiteMetadataStore {
         SQLiteMetadataStore::get_bucket_cors(self, bucket)
     }
 
+    fn set_bucket_lifecycle(&self, bucket: &str, xml: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock();
+        conn.execute("INSERT OR REPLACE INTO bucket_lifecycle (bucket, lifecycle_xml) VALUES (?1, ?2)", params![bucket, xml])
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>, Error> {
+        let conn = DB_CONN.lock();
+        match conn.query_row("SELECT lifecycle_xml FROM bucket_lifecycle WHERE bucket = ?1", params![bucket], |r| r.get::<_, String>(0)) {
+            Ok(x) => Ok(Some(x)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock();
+        conn.execute("DELETE FROM bucket_lifecycle WHERE bucket = ?1", params![bucket]).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    fn list_lifecycle_buckets(&self) -> Result<Vec<(String, String, String)>, Error> {
+        let conn = DB_CONN.lock();
+        let mut stmt = conn
+            .prepare("SELECT l.bucket, b.user, l.lifecycle_xml FROM bucket_lifecycle l JOIN buckets b ON b.name = l.bucket")
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(rows.flatten().collect())
+    }
+
     fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
         SQLiteMetadataStore::delete_bucket_cors(self, bucket)
     }
@@ -781,7 +823,7 @@ impl SQLiteMetadataStore {
             "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, bucket, key, offset_size_bytes],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
-        info!("Queued deletion user={} bucket={} key={} chunks={}", user_id, bucket, key, offset_size_list.len());
+        log::trace!("Queued deletion user={} bucket={} key={} chunks={}", user_id, bucket, key, offset_size_list.len());
         Ok(())
     }
 

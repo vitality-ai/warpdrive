@@ -32,7 +32,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
-use crate::storage::durable_log::DurableAppendLog;
+use warp_meta_store::durable_log::DurableAppendLog;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BucketPlacementConfig {
@@ -67,7 +67,7 @@ pub trait BucketConfigStore: Send + Sync {
 pub struct BitcaskBucketConfigStore {
     /// Owns the file, the dup'd sync-only handle, and the group-commit
     /// batching needed to make an append durable without paying one
-    /// fsync per write -- see `storage::durable_log`'s module doc. This
+    /// fsync per write -- see `warp_meta_store::durable_log`'s module doc. This
     /// store's own doc above explains why durability matters here more
     /// than for shard/location writes: a bucket-config write is
     /// synchronously replicated to every peer and all of them must ack,
@@ -125,6 +125,10 @@ impl BucketConfigStore for BitcaskBucketConfigStore {
         let ticket = {
             let _write_guard = self.write_lock.lock();
             let ticket = self.log.append_line(&line)?;
+            log::info!(
+                "Bucket config set: bucket={} packer={} overhead_threshold={}%",
+                config.bucket, config.packer_name, config.overhead_threshold_pct
+            );
             self.index.write().insert(config.bucket.clone(), config);
             ticket
         };

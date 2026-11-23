@@ -6,7 +6,6 @@ use actix_web::error::ErrorNotFound;
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::Mutex;
-use log::info;
 
 /// Mock implementation of Storage for testing
 pub struct MockBinaryStore {
@@ -69,7 +68,7 @@ impl Storage for MockBinaryStore {
             + bucket_entry.get(&bucket_entry.keys().copied().max().unwrap_or(0)).map(|v| v.len() as u64).unwrap_or(0);
         let size = data.len() as u64;
         bucket_entry.insert(next_offset, data.to_vec());
-        info!("Mock: Wrote data for user {} bucket {} at offset {} size {}", user_id, bucket, next_offset, size);
+        log::trace!("Mock: Wrote data for user {} bucket {} at offset {} size {}", user_id, bucket, next_offset, size);
         Ok((next_offset, size))
     }
 
@@ -106,7 +105,7 @@ impl Storage for MockBinaryStore {
                 store.remove(user_id);
             }
         }
-        info!("Mock: Deleted {} ranges for user {} bucket {}", offset_size_list.len(), user_id, bucket);
+        log::trace!("Mock: Deleted {} ranges for user {} bucket {}", offset_size_list.len(), user_id, bucket);
         Ok(())
     }
 

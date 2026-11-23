@@ -93,6 +93,7 @@ impl Membership {
         let mut peers = self.peers.write();
         if !peers.iter().any(|p| p == peer) {
             peers.push(peer.to_string());
+            log::info!("Peer joined: {peer} (cluster size now {})", peers.len());
         }
         peers.clone()
     }
@@ -104,6 +105,7 @@ impl Membership {
         for p in incoming {
             if !peers.iter().any(|existing| existing == p) {
                 peers.push(p.clone());
+                log::info!("Peer learned from cluster: {p} (cluster size now {})", peers.len());
             }
         }
     }

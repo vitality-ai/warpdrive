@@ -5,6 +5,8 @@ FROM rust:1.88-slim-bookworm
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    clang \
+    libclang-dev \
     libsqlite3-dev \
     sqlite3 \
     && rm -rf /var/lib/apt/lists/*
@@ -18,8 +20,9 @@ ENV DB_FILE /data/metadata.sqlite
 
 RUN mkdir /data
 
-# Copy project files
+# Copy project files. The server depends on crates/ by path (../crates/...).
 COPY server/ /server/
+COPY crates/ /crates/
 COPY scripts/docker_cluster_entrypoint.sh /server/docker_cluster_entrypoint.sh
 RUN chmod +x /server/docker_cluster_entrypoint.sh
 

@@ -1,0 +1,8 @@
+# RocksDB's bundled C++ sources (librocksdb-sys) use uint64_t without
+# #include <cstdint>. GCC 13 and later no longer pull that header in through
+# other standard headers, so the build fails there ("'uint64_t' has not been
+# declared"), as on the ubuntu-latest CI runners. Including it for every C++
+# file fixes any compiler and any RocksDB version. A CXXFLAGS already set in
+# the environment takes precedence over this.
+[env]
+CXXFLAGS = "-include cstdint"

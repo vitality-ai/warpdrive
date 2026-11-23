@@ -58,6 +58,8 @@ cover/
 
 # Django stuff:
 *.log
+# RocksDB metadata stores (WARPDRIVE_META_ENGINE=rocksdb, the default)
+*.rocks/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

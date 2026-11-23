@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::content_location_store::{ContentDependentRecord, StripeRecord, UnitMeta};
-use super::coordinator::{replicate_location_delete, required_write_acks, ClusterState};
+use super::coordinator::{replicate_content_location_put, replicate_location_delete, required_write_acks, ClusterState};
 use super::ec::ErasureCoder;
 use super::location_store::ObjectS3Metadata;
 use super::packing::Stripe;
@@ -307,6 +307,7 @@ pub async fn put_object_content_dependent(
         units: units_header.to_vec(),
         stripes: stripe_records,
         version,
+        seq: warp_meta_store::hlc::now(),
         has_sparse_gaps,
         sorted_unit_locations,
         etag: s3_meta.etag.clone(),
@@ -323,32 +324,19 @@ pub async fn put_object_content_dependent(
     };
 
     // Replicate to *every* known peer, not just the union of this object's
-    // stripe peers — same reasoning as `coordinator.rs`'s
-    // `replicate_location_put`: a GET can land on any node, and only a node
-    // holding a copy of this pin can find the object at all.
-    let puts = peers.iter().cloned().map(|peer| {
-        let client = state.location_http.clone();
-        let record = record.clone();
-        async move {
-            let url = format!("{}/cluster/_internal/content_location", peer.trim_end_matches('/'));
-            client.post(&url).json(&record).send().await.map(|r| r.status().is_success()).unwrap_or(false)
-        }
-    });
-    let results = join_all(puts).await;
-    let acked = results.iter().filter(|ok| **ok).count();
+    // stripe peers: a GET can land on any node, and only a node holding a
+    // copy of this pin can find the object at all.
+    let acked = replicate_content_location_put(state, &record, &peers).await;
     if acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "content-location pin quorum not met: {acked}/{required_acks} peers stored the record"
         )));
     }
 
-    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup,
-    // and the same unconditional-broadcast fix: this *coordinator* only
-    // needed quorum to receive the original plain pin, so it may have no
-    // local copy even though other peers still do. Don't gate the
-    // tombstone broadcast on a local `.is_some()` check (see issue #153).
-    let _ = state.location_store.delete(user_id, bucket, key);
-    let cleanup_acked = replicate_location_delete(state, user_id, bucket, key, &peers).await;
+    // Symmetric case to `put_object_plain`'s stale-packed-record cleanup:
+    // a plain record left by an earlier write of this key is tombstoned
+    // on every peer, unconditionally (#153), at this write's `seq`.
+    let cleanup_acked = replicate_location_delete(state, user_id, bucket, key, record.seq, &peers).await;
     if cleanup_acked < required_acks {
         return Err(ErrorInternalServerError(format!(
             "wrote the new object, but could not confirm the stale plain pin was cleared cluster-wide: \
@@ -412,7 +400,7 @@ async fn fetch_and_decode_stripe(
     }
 
     if shards[..record.k].iter().all(|s| s.is_some()) {
-        log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode=0.00ms shard_count={} (data shards only)", record.k);
+        log::trace!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode=0.00ms shard_count={} (data shards only)", record.k);
         return Ok(shards.into_iter().take(record.k).map(|s| s.expect("checked all Some above")).collect());
     }
 
@@ -440,7 +428,7 @@ async fn fetch_and_decode_stripe(
         .and_then(|decoder| decoder.decode_shards(&shards))
         .map_err(|e| ErrorInternalServerError(e.to_string()));
     let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1000.0;
-    log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={} (fallback, data shard missing)", stripe.shard_peers.len());
+    log::trace!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={} (fallback, data shard missing)", stripe.shard_peers.len());
     decoded
 }
 
@@ -551,7 +539,7 @@ pub async fn get_object_content_dependent_range(
         v
     };
 
-    log::info!(
+    log::trace!(
         "bucket={} key={} range-GET touched {}/{} stripes",
         record.bucket,
         record.key,
@@ -581,7 +569,7 @@ pub async fn get_object_content_dependent_range(
     });
     let t_all_stripes = std::time::Instant::now();
     let fetched: Vec<(usize, Vec<Vec<u8>>)> = futures::future::try_join_all(stripe_fetches).await?;
-    log::info!(
+    log::trace!(
         "bucket={} key={} all {} stripe(s) fetched+decoded in {:.2}ms (concurrent)",
         record.bucket, record.key, needed_stripes.len(), t_all_stripes.elapsed().as_secs_f64() * 1000.0
     );

@@ -96,6 +96,8 @@ jobs:
       WARPDRIVE_ADMIN_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
       WARPDRIVE_ADMIN_SECRET_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
       WARPDRIVE_ADMIN_DISPLAY_NAME: Warpdrive Admin
+      # Lifecycle "days" of 10 s, the suite's lc_debug_interval (test only).
+      WARPDRIVE_LIFECYCLE_DEBUG_DAY_SECS: "10"
     steps:
     - uses: actions/checkout@v4
 
@@ -167,6 +169,43 @@ jobs:
           ${{ runner.temp }}/cluster/node*/logs/application.log
 
   # Rust server tests
+  # RFC 6: overwrites and deletes free disk on a real cluster. Writes,
+  # overwrites, deletes and multipart leftovers, runs the gc/ passes under
+  # load, and fails unless every node frees segment bytes and every surviving
+  # object reads back exactly, also after a restart. The bytes freed per node
+  # go to the job summary.
+  compaction-test:
+    name: Compaction frees disk (5-node cluster)
+    needs: build-server
+    runs-on: ubuntu-latest
+    env:
+      WARPDRIVE_ADMIN_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
+      WARPDRIVE_ADMIN_SECRET_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download server binary
+      uses: actions/download-artifact@v4
+      with:
+        name: warp_drive-release
+        path: server/target/release
+
+    - run: chmod +x server/target/release/warp_drive
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - run: pip install boto3
+
+    - name: Compaction frees disk
+      run: python3 .github/ci/compaction_test.py server/target/release/warp_drive "$RUNNER_TEMP/compaction"
+
+    - name: Node logs on failure
+      if: failure()
+      run: tail -n 40 "$RUNNER_TEMP"/compaction/node*/node.out || true
+
   server-tests:
     name: Server tests
     runs-on: ubuntu-latest

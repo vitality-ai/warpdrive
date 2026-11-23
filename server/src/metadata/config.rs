@@ -3,7 +3,7 @@
 use crate::metadata::{MetadataStorage, sqlite_store::SQLiteMetadataStore, mock_store::MockMetadataStore};
 use std::sync::Arc;
 use std::env;
-use log::{info, warn};
+use log::warn;
 
 /// Available metadata storage backends
 #[derive(Debug, Clone, PartialEq)]
@@ -51,7 +51,7 @@ impl MetadataConfig {
             Ok(backend_str) => {
                 match backend_str.parse::<MetadataBackend>() {
                     Ok(backend) => {
-                        info!("Using metadata backend from environment: {:?}", backend);
+                        log::trace!("Using metadata backend from environment: {:?}", backend);
                         backend
                     }
                     Err(e) => {
@@ -61,7 +61,7 @@ impl MetadataConfig {
                 }
             }
             Err(_) => {
-                info!("No metadata backend specified in environment, using default SQLite");
+                log::trace!("No metadata backend specified in environment, using default SQLite");
                 MetadataBackend::default()
             }
         };
@@ -73,11 +73,11 @@ impl MetadataConfig {
     pub fn create_store(&self) -> Arc<dyn MetadataStorage> {
         match self.backend {
             MetadataBackend::SQLite => {
-                info!("Creating SQLite metadata store");
+                log::trace!("Creating SQLite metadata store");
                 Arc::new(SQLiteMetadataStore::new())
             }
             MetadataBackend::Mock => {
-                info!("Creating Mock metadata store");
+                log::trace!("Creating Mock metadata store");
                 Arc::new(MockMetadataStore::new())
             }
         }

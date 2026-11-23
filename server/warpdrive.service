@@ -10,6 +10,8 @@ EnvironmentFile=/etc/warpdrive/warpdrive.env
 ExecStart=/usr/bin/warp_drive
 Restart=on-failure
 RestartSec=5
+# Segment files take descriptors (#229).
+LimitNOFILE=1048576
 WorkingDirectory=/var/lib/warpdrive
 
 [Install]

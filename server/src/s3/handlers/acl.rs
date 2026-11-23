@@ -397,8 +397,8 @@ async fn put_acl_response(bucket: &str, key: Option<&str>, body: &[u8], req: &Ht
     if let Err(resp) = check_block_public_acls(&db, bucket, &grants) { return Ok(resp); }
 
     match (key, version_id) {
-        (Some(key), Some(version_id)) => db.set_object_acl(bucket, key, &version_id, &auth_result.user_id, &grants_to_json(&grants))?,
-        _ => db.set_bucket_acl(bucket, &auth_result.user_id, &grants_to_json(&grants))?,
+        (Some(key), Some(version_id)) => db.set_object_acl_awaited(bucket, key, &version_id, &auth_result.user_id, &grants_to_json(&grants)).await?,
+        _ => db.set_bucket_acl_awaited(bucket, &auth_result.user_id, &grants_to_json(&grants)).await?,
     }
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
@@ -492,13 +492,13 @@ pub(super) async fn s3_put_public_access_block_inner(bucket: &str, body: &[u8], 
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    db.set_public_access_block(
+    db.set_public_access_block_awaited(
         bucket,
         flag("BlockPublicAcls"),
         flag("IgnorePublicAcls"),
         flag("BlockPublicPolicy"),
         flag("RestrictPublicBuckets"),
-    )?;
+    ).await?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -510,7 +510,7 @@ pub(super) async fn s3_delete_public_access_block_inner(bucket: &str, req: &Http
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
 
-    db.delete_public_access_block(bucket)?;
+    db.delete_public_access_block_awaited(bucket).await?;
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }
 

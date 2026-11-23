@@ -1,0 +1,15 @@
+[package]
+name = "warp-meta-store-rocksdb"
+version = "0.1.0"
+edition = "2021"
+description = "RocksDB engine for WarpMetaStore: the same ordered records, with memory bounded by a block cache"
+publish = false
+
+[dependencies]
+log = "0.4"
+warp-meta-store = { path = "../warp-meta-store" }
+rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3"

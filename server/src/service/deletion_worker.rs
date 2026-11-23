@@ -67,19 +67,25 @@ impl DeletionWorker {
             return Ok(());
         }
         
-        info!("Processing {} deletion events", events.len());
-        
+        let total = events.len();
+        let (mut freed, mut failed) = (0u64, 0usize);
         for event in events {
-            if let Err(e) = self.process_deletion_event(&event).await {
-                error!("Failed to process deletion event {}: {}", event.id, e);
-                // Continue with other events even if one fails
-            } else {
-                // Mark as processed through metadata service
-                if let Err(e) = metadata_service.mark_deletion_processed(event.id) {
-                    error!("Failed to mark deletion event {} as processed: {}", event.id, e);
+            match self.process_deletion_event(&event).await {
+                Err(e) => {
+                    failed += 1;
+                    error!("Failed to process deletion event {}: {}", event.id, e);
+                    // Continue with other events even if one fails
+                }
+                Ok(bytes) => {
+                    freed += bytes;
+                    // Mark as processed through metadata service
+                    if let Err(e) = metadata_service.mark_deletion_processed(event.id) {
+                        error!("Failed to mark deletion event {} as processed: {}", event.id, e);
+                    }
                 }
             }
         }
+        info!("Deletion worker: processed {total} events, freed {freed} bytes, {failed} failed");
         
         // Clean up old processed events
         if let Err(e) = metadata_service.cleanup_old_deletions() {
@@ -90,8 +96,8 @@ impl DeletionWorker {
     }
     
     /// Process a single deletion event
-    async fn process_deletion_event(&self, event: &DeletionEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Processing deletion: user={}, bucket={}, key={}, chunks={}", 
+    async fn process_deletion_event(&self, event: &DeletionEvent) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        log::trace!("Processing deletion: user={}, bucket={}, key={}, chunks={}", 
               event.user_id, event.bucket, event.key, event.offset_size_list.len());
 
         // Create user context for this deletion
@@ -104,14 +110,14 @@ impl DeletionWorker {
         }
 
         let freed_bytes = self.calculate_total_size(&event.offset_size_list);
-        info!("Freed {} bytes for user {} bucket {}", freed_bytes, event.user_id, event.bucket);
+        log::trace!("Freed {} bytes for user {} bucket {}", freed_bytes, event.user_id, event.bucket);
 
         // Check if we should trigger compaction
         // For now, we'll leave holes until there's enough free space at top of file
         // This is a simplified approach - in the future we can add compaction logic here
         // that checks if free space at top >= some threshold, then compact
-        
-        Ok(())
+
+        Ok(freed_bytes)
     }
     
     /// Calculate total size of chunks to be deleted

@@ -16,10 +16,14 @@ use std::collections::HashMap;
 pub struct DataChunk {
     pub offset: u64,
     pub size: u64,
+    /// Where the bytes live, attached by the metadata store that returned
+    /// the chunk (the cluster: the blob's placement). Not stored.
+    #[serde(skip)]
+    pub loc: Option<crate::storage::Locator>,
 }
 
 /// Full metadata for a stored S3 object
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
     pub chunks: Vec<DataChunk>,
     /// Legacy catch-all properties map (kept for backward compat; prefer typed fields below).
@@ -59,7 +63,7 @@ impl Metadata {
         let size: u64 = offset_size_list.iter().map(|(_, s)| s).sum();
         let chunks = offset_size_list
             .into_iter()
-            .map(|(offset, size)| DataChunk { offset, size })
+            .map(|(offset, size)| DataChunk { offset, size, loc: None })
             .collect();
         Self {
             chunks,
@@ -181,6 +185,11 @@ pub trait MetadataStorage: Send + Sync {
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error>;
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error>;
     fn list_objects(&self, user_id: &str, bucket: &str) -> Result<Vec<ObjectId>, Error>;
+    /// Keys starting with `prefix`, in key order. Backends that can range
+    /// scan should override this. The default filters `list_objects`.
+    fn list_objects_with_prefix(&self, user_id: &str, bucket: &str, prefix: &str) -> Result<Vec<ObjectId>, Error> {
+        Ok(self.list_objects(user_id, bucket)?.into_iter().filter(|k| k.starts_with(prefix)).collect())
+    }
     fn object_exists(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<bool, Error>;
     fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error>;
     fn update_object_id(&self, user_id: &str, bucket: &str, old_object_id: &str, new_object_id: &str) -> Result<(), Error>;
@@ -200,6 +209,42 @@ pub trait MetadataStorage: Send + Sync {
     /// Returns (version_id, old_extents_to_gc).
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error>;
 
+    /// The S3 PUT metadata write as a future that can run on another thread,
+    /// for stores whose write waits on the network. `Err` hands `metadata`
+    /// back: the store has no async path, so the caller uses `put_object_v2`.
+    fn put_object_v2_async(
+        self: std::sync::Arc<Self>, _user_id: String, _bucket: String, _key: String, metadata: Metadata,
+    ) -> Result<futures::future::BoxFuture<'static, Result<(Option<String>, Vec<(u64, u64)>), String>>, Metadata> {
+        Err(metadata)
+    }
+
+    /// The whole S3 DeleteObject metadata write as a future that can run on
+    /// another thread: a delete marker under versioning, else the object's
+    /// removal. `None`: the store has no async path, and the caller uses
+    /// `delete_object_v2` and `delete_metadata`.
+    fn delete_object_async(
+        self: std::sync::Arc<Self>, _user_id: String, _bucket: String, _key: String,
+    ) -> Option<futures::future::BoxFuture<'static, Result<VersioningDeleteResult, String>>> {
+        None
+    }
+
+    /// `upsert_multipart_part` as a future that can run on another thread.
+    /// The error carries its HTTP status. `None`: no async path.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_multipart_part_async(
+        self: std::sync::Arc<Self>, _upload_id: String, _part_number: i32, _etag: String, _size: u64, _extents_blob: Vec<u8>, _checksum_value: String,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), (u16, String)>>> {
+        None
+    }
+
+    /// `delete_specific_version` as a future that can run on another
+    /// thread. `None`: no async path.
+    fn delete_specific_version_async(
+        self: std::sync::Arc<Self>, _user_id: String, _bucket: String, _key: String, _version_id: String,
+    ) -> Option<futures::future::BoxFuture<'static, Result<DeleteSpecificResult, String>>> {
+        None
+    }
+
     // --- Deletion WAL ---
     fn get_pending_deletions(&self, limit: i32) -> Result<Vec<DeletionEvent>, Error>;
     fn mark_deletion_processed(&self, id: i64) -> Result<(), Error>;
@@ -207,6 +252,21 @@ pub trait MetadataStorage: Send + Sync {
 
     // --- CORS ---
     fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error>;
+    /// A bucket's lifecycle configuration (validated XML). A store without
+    /// lifecycle support refuses it, so rules are never silently ignored.
+    fn set_bucket_lifecycle(&self, _bucket: &str, _xml: &str) -> Result<(), Error> {
+        Err(actix_web::error::ErrorNotImplemented("lifecycle rules are not supported by this metadata store"))
+    }
+    fn get_bucket_lifecycle(&self, _bucket: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+    fn delete_bucket_lifecycle(&self, _bucket: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Every bucket with lifecycle rules: (bucket, owner, XML).
+    fn list_lifecycle_buckets(&self) -> Result<Vec<(String, String, String)>, Error> {
+        Ok(Vec::new())
+    }
     fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error>;
     fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error>;
 
@@ -307,9 +367,9 @@ mod tests {
 
     #[test]
     fn test_data_chunk_equality() {
-        let chunk1 = DataChunk { offset: 100, size: 200 };
-        let chunk2 = DataChunk { offset: 100, size: 200 };
-        let chunk3 = DataChunk { offset: 100, size: 300 };
+        let chunk1 = DataChunk { offset: 100, size: 200, loc: None };
+        let chunk2 = DataChunk { offset: 100, size: 200, loc: None };
+        let chunk3 = DataChunk { offset: 100, size: 300, loc: None };
         assert_eq!(chunk1, chunk2);
         assert_ne!(chunk1, chunk3);
     }

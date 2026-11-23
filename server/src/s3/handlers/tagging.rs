@@ -69,7 +69,7 @@ pub(super) async fn s3_put_bucket_tagging_inner(bucket: &str, body: &[u8], req: 
     let tags = parse_tag_xml(&xml);
     if let Err(resp) = validate_tags(&tags, bucket) { return Ok(resp); }
 
-    db.set_bucket_tags(bucket, &tags)?;
+    db.set_bucket_tags_awaited(bucket, &tags).await?;
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -97,7 +97,7 @@ pub(super) async fn s3_delete_bucket_tagging_inner(bucket: &str, req: &HttpReque
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
 
-    db.delete_bucket_tags(bucket)?;
+    db.delete_bucket_tags_awaited(bucket).await?;
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -123,7 +123,7 @@ pub(super) async fn s3_put_object_tagging_inner(bucket: &str, key: &str, body: &
     let tags = parse_tag_xml(&xml);
     if let Err(resp) = validate_tags(&tags, &resource) { return Ok(resp); }
 
-    db.set_object_tags(bucket, key, &tags)?;
+    db.set_object_tags_awaited(bucket, key, &tags).await?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -153,6 +153,6 @@ pub(super) async fn s3_delete_object_tagging_inner(bucket: &str, key: &str, req:
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, bucket) { return Ok(resp); }
 
-    db.delete_object_tags(bucket, key)?;
+    db.delete_object_tags_awaited(bucket, key).await?;
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }
