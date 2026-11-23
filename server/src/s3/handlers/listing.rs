@@ -1,7 +1,6 @@
 // s3_list_objects_handler, s3_delete_objects_handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use futures::StreamExt as _;
-use log::{info, warn};
 
 use std::collections::HashMap;
 
@@ -122,7 +121,7 @@ pub async fn s3_list_objects_handler(
 
     let fetch_owner = is_v2 && query.get("fetch-owner").map(|s| s == "true").unwrap_or(false);
 
-    info!("S3 ListObjects{}: bucket={} prefix={:?} delim={:?} max_keys={} marker={:?}",
+    log::trace!("S3 ListObjects{}: bucket={} prefix={:?} delim={:?} max_keys={} marker={:?}",
           if is_v2 { "V2" } else { "V1" }, bucket, prefix, delimiter, max_keys, effective_marker);
 
     let all_keys = db.list_objects_with_prefix(&bucket, prefix)?;
@@ -344,7 +343,7 @@ pub async fn s3_delete_objects_handler(
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!("DeleteObjects: payload read error: {}", e);
+            log::trace!("DeleteObjects: payload read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         body_bytes.extend_from_slice(&chunk);
@@ -557,7 +556,7 @@ pub async fn s3_delete_objects_handler(
         }
     }
 
-    info!("S3 DeleteObjects: bucket={} objects={}", bucket, objects.len());
+    log::trace!("S3 DeleteObjects: bucket={} objects={}", bucket, objects.len());
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

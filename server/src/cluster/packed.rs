@@ -400,7 +400,7 @@ async fn fetch_and_decode_stripe(
     }
 
     if shards[..record.k].iter().all(|s| s.is_some()) {
-        log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode=0.00ms shard_count={} (data shards only)", record.k);
+        log::trace!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode=0.00ms shard_count={} (data shards only)", record.k);
         return Ok(shards.into_iter().take(record.k).map(|s| s.expect("checked all Some above")).collect());
     }
 
@@ -428,7 +428,7 @@ async fn fetch_and_decode_stripe(
         .and_then(|decoder| decoder.decode_shards(&shards))
         .map_err(|e| ErrorInternalServerError(e.to_string()));
     let decode_ms = t_decode_start.elapsed().as_secs_f64() * 1000.0;
-    log::info!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={} (fallback, data shard missing)", stripe.shard_peers.len());
+    log::trace!("stripe {stripe_index}: fetch={fetch_ms:.2}ms decode={decode_ms:.2}ms shard_count={} (fallback, data shard missing)", stripe.shard_peers.len());
     decoded
 }
 
@@ -539,7 +539,7 @@ pub async fn get_object_content_dependent_range(
         v
     };
 
-    log::info!(
+    log::trace!(
         "bucket={} key={} range-GET touched {}/{} stripes",
         record.bucket,
         record.key,
@@ -569,7 +569,7 @@ pub async fn get_object_content_dependent_range(
     });
     let t_all_stripes = std::time::Instant::now();
     let fetched: Vec<(usize, Vec<Vec<u8>>)> = futures::future::try_join_all(stripe_fetches).await?;
-    log::info!(
+    log::trace!(
         "bucket={} key={} all {} stripe(s) fetched+decoded in {:.2}ms (concurrent)",
         record.bucket, record.key, needed_stripes.len(), t_all_stripes.elapsed().as_secs_f64() * 1000.0
     );

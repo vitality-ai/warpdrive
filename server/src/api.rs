@@ -1,6 +1,5 @@
 //api.rs
 use actix_web::{web, HttpRequest, HttpResponse,Error };
-use log::info;
 
 use crate::service::{get_service, put_service ,append_service , delete_service, update_key_service,update_service};
 
@@ -10,7 +9,7 @@ async fn put(
     payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    info!("Uploading data with key: {}", key);
+    log::trace!("Uploading data with key: {}", key);
     put_service(key.into_inner(), payload, req).await
 }
 
@@ -19,7 +18,7 @@ async fn get(
     key: web::Path<String>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    info!("checking key and retrieving : {}", key);
+    log::trace!("checking key and retrieving : {}", key);
     get_service(key.into_inner(), req).await
 }
 
@@ -30,7 +29,7 @@ async fn append(
     payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    info!("appending data with key: {}", key);
+    log::trace!("appending data with key: {}", key);
     append_service(key.into_inner(), payload, req).await
 }
 
@@ -39,7 +38,7 @@ async fn delete(
     key: web::Path<String>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    info!("deleting data with key: {}", key);
+    log::trace!("deleting data with key: {}", key);
     delete_service(key.into_inner(), req).await
 }
 
@@ -50,7 +49,7 @@ async fn update_key(
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let (old_key, new_key) = path.into_inner();
-    info!("updating old key with key: {}", new_key);
+    log::trace!("updating old key with key: {}", new_key);
     update_key_service(old_key, new_key, req).await
 }
 
@@ -61,6 +60,6 @@ async fn update(
     payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    info!("Uploading data with key: {}", key);
+    log::trace!("Uploading data with key: {}", key);
     update_service(key.into_inner(), payload, req).await
 }

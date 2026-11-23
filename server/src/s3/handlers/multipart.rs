@@ -2,7 +2,6 @@
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
-use log::{info, warn};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,7 +123,7 @@ pub async fn s3_create_multipart_upload_handler(
         db.set_multipart_tagging_awaited(&upload_id, tagging_str).await?;
     }
 
-    info!("S3 CreateMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
+    log::trace!("S3 CreateMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -182,7 +181,7 @@ pub async fn s3_upload_part_handler(
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!("UploadPart: read error: {}", e);
+            log::trace!("UploadPart: read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         body.extend_from_slice(&chunk);
@@ -226,7 +225,7 @@ pub async fn s3_upload_part_handler(
 
     db.upsert_multipart_part_awaited(&upload_id, part_number, &etag, body.len() as u64, &extents_blob, &part_checksum_value).await?;
 
-    info!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
+    log::trace!("S3 UploadPart: bucket={} key={} part={} size={}", bucket, key, part_number, body.len());
     let mut part_resp = HttpResponse::Ok();
     part_resp.insert_header(("ETag", etag));
     // Echo per-part checksum in response
@@ -427,7 +426,7 @@ pub async fn s3_complete_multipart_upload_handler(
     let mut body_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!("CompleteMultipartUpload: read error: {}", e);
+            log::trace!("CompleteMultipartUpload: read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         body_bytes.extend_from_slice(&chunk);
@@ -617,7 +616,7 @@ pub async fn s3_complete_multipart_upload_handler(
         ).await;
     }
 
-    info!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
+    log::trace!("S3 CompleteMultipartUpload: bucket={} key={} parts={} etag={}", bucket, key, total_parts, multipart_etag);
     let mut resp = complete_multipart_xml_response(
         &bucket, &key, &multipart_etag,
         final_checksum_algo.as_deref(), final_checksum_value.as_deref(), final_checksum_type.as_deref(),
@@ -702,7 +701,7 @@ pub async fn s3_abort_multipart_upload_handler(
     db.delete_parts_for_upload_awaited(&upload_id).await?;
     db.delete_multipart_upload_awaited(&upload_id).await?;
 
-    info!("S3 AbortMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
+    log::trace!("S3 AbortMultipartUpload: bucket={} key={} uploadId={}", bucket, key, upload_id);
     Ok(HttpResponse::NoContent()
         .insert_header(("Content-Length", "0"))
         .body(""))

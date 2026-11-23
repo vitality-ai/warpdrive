@@ -185,6 +185,17 @@ So route each key's writes through one writer: one process or one service instan
 
 This is a stopgap until two pieces of work land. Ordered record writes (RFC 6) make every node end on the same write when two collide, as last-writer-wins. Per-key ownership with conditional writes (`If-Match`, `If-None-Match`) is later work. Until then, the cluster doesn't enforce either. See `RFCs/RFC5/RFC5-one-object-service.md`, *Consistency contract*.
 
+## Logs
+
+Each pod logs at `info` (startup, configuration, background jobs, nothing per request) to stdout, so `kubectl logs warpdrive-0` (or
+your cluster's log collector) has everything. A copy also goes to
+`/server/logs/application.log` inside the container, which isn't on the
+`/data` volume and is lost when the pod is replaced. See
+[Logs](setup.md#logs) for raising the level while debugging.
+
+`cluster_location.log` and the other `*.log` files under `/data` are
+cluster metadata, not logs. Don't rotate or delete them.
+
 ## What's deliberately left for you to decide
 
 - **Resource requests/limits** (CPU/memory per pod) — this depends on your
