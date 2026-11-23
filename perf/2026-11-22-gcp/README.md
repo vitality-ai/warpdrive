@@ -39,3 +39,4 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `segments-ab` | Do segment files cost throughput, against one file per bucket? |
 | `oversize-ab` | What happens when a shard is as large as a segment or larger? |
 | `compaction-run1` | Does the first, sweep-driven compactor keep disk near live data, and at what cost? |
+| `compaction-run2` | Fixed sweep against gc/ rows: which free path is better? |
