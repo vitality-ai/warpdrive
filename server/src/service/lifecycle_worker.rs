@@ -22,9 +22,11 @@ use crate::metadata::sqlite_store::VersionRow;
 use crate::s3::lifecycle::{self, day, expires_at, parse_time, Config};
 use crate::service::metadata_service::{metadata_store, MetadataService};
 
+/// Hourly in production. With shortened test days, a tenth of a day (at
+/// least 100 ms), so an expiry lands well inside the next day.
 fn tick() -> Duration {
     if lifecycle::debug_days() {
-        Duration::from_secs(1)
+        (day().to_std().unwrap_or(Duration::from_secs(1)) / 10).max(Duration::from_millis(100))
     } else {
         Duration::from_secs(3600)
     }
