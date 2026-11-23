@@ -96,8 +96,10 @@ jobs:
       WARPDRIVE_ADMIN_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
       WARPDRIVE_ADMIN_SECRET_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
       WARPDRIVE_ADMIN_DISPLAY_NAME: Warpdrive Admin
-      # Lifecycle "days" of 10 s, the suite's lc_debug_interval (test only).
-      WARPDRIVE_LIFECYCLE_DEBUG_DAY_SECS: "10"
+      # Lifecycle "days" of 2 s (test only), matching lc_debug_interval in
+      # s3tests.conf. The lifecycle tests sleep whole days, so this keeps
+      # them to about 2-3 minutes in all.
+      WARPDRIVE_LIFECYCLE_DEBUG_DAY_SECS: "2"
     steps:
     - uses: actions/checkout@v4
 
