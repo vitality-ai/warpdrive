@@ -3,13 +3,15 @@
 ## Introduction
 
 WarpDrive is an S3-compatible object store for disaggregated data systems
-and AI/ML workloads. Its storage layout follows Facebook's Haystack paper:
-objects are appended to large files, and a small record points at each one.
+and AI/ML workloads. Each object is erasure coded across nodes. Each node
+appends the shards it holds to 64 MB segment files, and a metadata row,
+replicated to every node, records where every object's bytes live.
 
 The architecture is set by [RFC 5](../RFCs/RFC5/RFC5-one-object-service.md):
 one S3 module and one object service, with everything below them pluggable.
-A single node is a one-node cluster. Space comes back through compaction, set
-by [RFC 6](../RFCs/RFC6/). See [Implementation status](#implementation-status).
+A single node is a cluster of one. Compaction gives back the space of deleted
+and overwritten objects ([RFC 6](../RFCs/RFC6/)). See
+[Implementation status](#implementation-status).
 
 ## Composable design
 
