@@ -1,9 +1,10 @@
 //! The engine under the S3 metadata rows, chosen at startup.
 //!
-//! The metadata store is a `WarpMetaStore`. Its engine is either the KV
-//! engine (`BitcaskEngine`, from `warp-meta-store`, the default), the SQL
-//! engine (`SqliteEngine`, from `warp-meta-store-sqlite`) or any ordered
-//! key-value store run through `warp_meta_store::KvEngine` (today RocksDB,
+//! The metadata store is a `WarpMetaStore`. Its engine is RocksDB (the
+//! default, through `KvEngine`), the KV engine (`BitcaskEngine`, from
+//! `warp-meta-store`, every row in RAM), the SQL
+//! engine (`SqliteEngine`, from `warp-meta-store-sqlite`) or another ordered
+//! key-value store run through `warp_meta_store::KvEngine` (RocksDB comes
 //! from `warp-meta-store-rocksdb`), picked with
 //! `WARPDRIVE_META_ENGINE=bitcask|sqlite|rocksdb`. All give the same ordering
 //! and answers. Where the bytes live, and so how memory grows, changes:
@@ -26,29 +27,29 @@ use warp_meta_store_sqlite::SqliteEngine;
 /// Which engine stores the metadata rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaEngineKind {
-    /// Append-only log plus an in-memory index. The default.
+    /// Append-only log plus every row in memory.
     Bitcask,
     /// One SQLite table.
     Sqlite,
     /// RocksDB through `KvEngine`: rows on disk, memory bounded by a
-    /// shared block cache.
+    /// shared block cache. The default.
     Rocksdb,
 }
 
 impl MetaEngineKind {
-    /// `WARPDRIVE_META_ENGINE`, `bitcask` when unset.
+    /// `WARPDRIVE_META_ENGINE`, `rocksdb` when unset.
     pub fn from_env() -> Result<Self, String> {
         match std::env::var("WARPDRIVE_META_ENGINE") {
-            Err(_) => Ok(Self::Bitcask),
+            Err(_) => Ok(Self::Rocksdb),
             Ok(v) => Self::parse(&v),
         }
     }
 
     pub fn parse(v: &str) -> Result<Self, String> {
         match v.trim().to_ascii_lowercase().as_str() {
-            "" | "bitcask" | "kv" => Ok(Self::Bitcask),
+            "bitcask" | "kv" => Ok(Self::Bitcask),
             "sqlite" | "sql" => Ok(Self::Sqlite),
-            "rocksdb" | "rocks" => Ok(Self::Rocksdb),
+            "" | "rocksdb" | "rocks" => Ok(Self::Rocksdb),
             other => Err(format!("WARPDRIVE_META_ENGINE={other:?}: expected bitcask, sqlite or rocksdb")),
         }
     }
@@ -56,6 +57,29 @@ impl MetaEngineKind {
     /// The file the rows live in when `WARPDRIVE_META_LOG` doesn't name one.
     pub fn default_path(self) -> String {
         self.file_name("cluster_metadata")
+    }
+
+    /// Every engine.
+    pub const ALL: [Self; 3] = [Self::Bitcask, Self::Sqlite, Self::Rocksdb];
+
+    /// Refuses to start on a fresh store when another engine's store is
+    /// sitting at its default name in the same directory: the node would
+    /// otherwise come up empty next to its old metadata.
+    pub fn refuse_other_engines_data(self, stem: &str, path: &str) -> Result<(), String> {
+        if Path::new(path).exists() {
+            return Ok(());
+        }
+        for other in Self::ALL.into_iter().filter(|o| *o != self) {
+            let theirs = other.file_name(stem);
+            if Path::new(&theirs).exists() {
+                return Err(format!(
+                    "{theirs} holds metadata written by the {other:?} engine, and this node is set to {self:?} (WARPDRIVE_META_ENGINE). \
+                     Set WARPDRIVE_META_ENGINE={} to keep using it, or move it away to start empty. There is no migration between engines.",
+                    format!("{other:?}").to_ascii_lowercase()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `stem` with this engine's file extension.
@@ -200,7 +224,18 @@ mod tests {
         assert_eq!(MetaEngineKind::parse("bitcask"), Ok(MetaEngineKind::Bitcask));
         assert_eq!(MetaEngineKind::parse(" SQLite "), Ok(MetaEngineKind::Sqlite));
         assert_eq!(MetaEngineKind::parse("RocksDB"), Ok(MetaEngineKind::Rocksdb));
+        assert_eq!(MetaEngineKind::parse(""), Ok(MetaEngineKind::Rocksdb), "RocksDB is the default");
         assert!(MetaEngineKind::parse("leveldb").is_err());
+    }
+
+    #[test]
+    fn a_node_refuses_to_start_empty_next_to_another_engines_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stem, at) = (dir.path().join("m").to_string_lossy().to_string(), |k: MetaEngineKind, s: &str| k.file_name(s));
+        AnyEngine::<u64>::open(MetaEngineKind::Bitcask, at(MetaEngineKind::Bitcask, &stem), "test").unwrap().put("k".into(), 1).unwrap();
+        let e = MetaEngineKind::Rocksdb.refuse_other_engines_data(&stem, &at(MetaEngineKind::Rocksdb, &stem)).unwrap_err();
+        assert!(e.contains("Bitcask") && e.contains("WARPDRIVE_META_ENGINE=bitcask"), "{e}");
+        assert!(MetaEngineKind::Bitcask.refuse_other_engines_data(&stem, &at(MetaEngineKind::Bitcask, &stem)).is_ok(), "its own data is fine");
     }
 
     #[test]
