@@ -397,7 +397,13 @@ async fn handle_connection(mut stream: TcpStream) {
 }
 
 pub async fn serve(addr: std::net::SocketAddr) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    serve_listener(TcpListener::bind(addr).await?).await
+}
+
+/// Serve on a listener the caller already bound, so a bind failure (for
+/// example the port is still held by a previous process) surfaces at
+/// startup instead of inside a background task.
+pub async fn serve_listener(listener: TcpListener) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let _ = stream.set_nodelay(true);

@@ -42,7 +42,7 @@ use warp_drive::cluster::location_store::BitcaskLocationStore;
 use warp_drive::cluster::membership::Membership;
 use warp_drive::cluster::peer_client::{HttpPeerClient, PeerClient};
 use warp_drive::cluster::placement::ComputedPlacement;
-use warp_drive::cluster::tcp_peer_client::{serve as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
+use warp_drive::cluster::tcp_peer_client::{serve_listener as serve_tcp_shard, TcpPeerClient, TCP_PORT_OFFSET};
 use warp_drive::cluster::bucket_config::{BitcaskBucketConfigStore, BucketConfigStore};
 use warp_drive::cluster::packing::StripePacker;
 use warp_drive::s3::sts::sts_assume_role_with_web_identity;
@@ -415,32 +415,48 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
+    // Bind both shard ports here, before the HTTP server starts. If either
+    // is taken (most often by the previous process of this node, still
+    // shutting down after a restart), exit instead of running without shard
+    // servers: the node would accept S3 requests but couldn't send or
+    // receive shards. systemd or Kubernetes restarts it once the port frees.
+    let grpc_port = port + GRPC_PORT_OFFSET;
+    let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
+    let grpc_incoming = tonic::transport::server::TcpIncoming::new(grpc_addr, true, None).map_err(|e| {
+        log::error!("Can't bind gRPC shard port {grpc_addr}: {e}. Exiting.");
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, format!("gRPC shard port {grpc_addr}: {e}"))
+    })?;
+    let tcp_port = port + TCP_PORT_OFFSET;
+    let tcp_addr: std::net::SocketAddr = format!("0.0.0.0:{tcp_port}").parse().expect("invalid TCP bind address");
+    let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await.map_err(|e| {
+        log::error!("Can't bind raw-TCP shard port {tcp_addr}: {e}. Exiting.");
+        e
+    })?;
+
     // gRPC shard server runs alongside actix-web, on port+1000 — the
     // other half of the transport decision point. Always runs regardless
     // of which PeerClient is selected for outbound calls, so either node
     // in a benchmark pair can be dialed over gRPC.
-    let grpc_port = port + GRPC_PORT_OFFSET;
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{grpc_port}").parse().expect("invalid gRPC bind address");
-        info!("Starting gRPC shard server on {addr}");
+        info!("Starting gRPC shard server on {grpc_addr}");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(make_grpc_shard_server())
-            .serve(addr)
+            .serve_with_incoming(grpc_incoming)
             .await
         {
-            log::error!("gRPC shard server failed: {e}");
+            log::error!("gRPC shard server failed: {e}. Exiting.");
+            std::process::exit(1);
         }
     });
 
     // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
     // candidate, also always running regardless of which PeerClient is
     // selected for outbound calls.
-    let tcp_port = port + TCP_PORT_OFFSET;
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{tcp_port}").parse().expect("invalid TCP bind address");
-        info!("Starting raw-TCP shard server on {addr}");
-        if let Err(e) = serve_tcp_shard(addr).await {
-            log::error!("TCP shard server failed: {e}");
+        info!("Starting raw-TCP shard server on {tcp_addr}");
+        if let Err(e) = serve_tcp_shard(tcp_listener).await {
+            log::error!("TCP shard server failed: {e}. Exiting.");
+            std::process::exit(1);
         }
     });
 
