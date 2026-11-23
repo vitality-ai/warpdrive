@@ -175,7 +175,7 @@ jobs:
   # object reads back exactly, also after a restart. The bytes freed per node
   # go to the job summary.
   compaction-test:
-    name: Compaction frees disk (5-node cluster)
+    name: Compaction frees disk (5 nodes and a single node)
     needs: build-server
     runs-on: ubuntu-latest
     env:
@@ -202,9 +202,14 @@ jobs:
     - name: Compaction frees disk
       run: python3 .github/ci/compaction_test.py server/target/release/warp_drive "$RUNNER_TEMP/compaction"
 
+    # A single node started with no peer settings: a one-member cluster,
+    # RS(1,0), running the same compaction.
+    - name: Compaction frees disk on a single node
+      run: NODES=1 python3 .github/ci/compaction_test.py server/target/release/warp_drive "$RUNNER_TEMP/compaction-single"
+
     - name: Node logs on failure
       if: failure()
-      run: tail -n 40 "$RUNNER_TEMP"/compaction/node*/node.out || true
+      run: tail -n 40 "$RUNNER_TEMP"/compaction*/node*/node.out || true
 
   server-tests:
     name: Server tests

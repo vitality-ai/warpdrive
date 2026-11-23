@@ -60,16 +60,36 @@ pub trait ErasureCoder: Send + Sync {
 pub struct ReedSolomonCoder {
     k: usize,
     m: usize,
-    rs: ReedSolomon,
+    /// `None` for `m == 0`: no parity, the data shards alone (a single node
+    /// is RS(1,0)).
+    rs: Option<ReedSolomon>,
 }
 
 impl ReedSolomonCoder {
     pub fn new(k: usize, m: usize) -> Result<Self, EcError> {
-        if k == 0 || m == 0 {
-            return Err(EcError::Config("k and m must both be >= 1".into()));
+        if k == 0 {
+            return Err(EcError::Config("k must be >= 1".into()));
         }
-        let rs = ReedSolomon::new(k, m).map_err(|e| EcError::Config(format!("{e:?}")))?;
+        let rs = if m == 0 { None } else { Some(ReedSolomon::new(k, m).map_err(|e| EcError::Config(format!("{e:?}")))?) };
         Ok(Self { k, m, rs })
+    }
+
+    /// Computes parity into `shards` (k data then m parity), if there is any.
+    fn add_parity(&self, shards: &mut [Vec<u8>]) -> Result<(), EcError> {
+        match &self.rs {
+            Some(rs) => rs.encode(shards).map_err(|e| EcError::Codec(format!("{e:?}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Fills in missing data shards from parity. Without parity every data
+    /// shard has to be present.
+    fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), EcError> {
+        match &self.rs {
+            Some(rs) => rs.reconstruct_data(shards).map_err(|e| EcError::Codec(format!("{e:?}"))),
+            None if shards.iter().take(self.k).all(|s| s.is_some()) => Ok(()),
+            None => Err(EcError::TooFewShards),
+        }
     }
 }
 
@@ -93,9 +113,7 @@ impl ErasureCoder for ReedSolomonCoder {
             shards.push(vec![0u8; shard_len]);
         }
 
-        self.rs
-            .encode(&mut shards)
-            .map_err(|e| EcError::Codec(format!("{e:?}")))?;
+        self.add_parity(&mut shards)?;
 
         Ok(EncodedObject { shards, original_len })
     }
@@ -107,9 +125,7 @@ impl ErasureCoder for ReedSolomonCoder {
         }
 
         let mut shards: Vec<Option<Vec<u8>>> = shards.to_vec();
-        self.rs
-            .reconstruct_data(&mut shards)
-            .map_err(|e| EcError::Codec(format!("{e:?}")))?;
+        self.reconstruct(&mut shards)?;
 
         let mut data = Vec::with_capacity(original_len);
         for shard in shards.iter().take(self.k) {
@@ -135,9 +151,7 @@ impl ErasureCoder for ReedSolomonCoder {
         for _ in 0..self.m {
             data_shards.push(vec![0u8; shard_len]);
         }
-        self.rs
-            .encode(&mut data_shards)
-            .map_err(|e| EcError::Codec(format!("{e:?}")))?;
+        self.add_parity(&mut data_shards)?;
         Ok(data_shards)
     }
 
@@ -147,9 +161,7 @@ impl ErasureCoder for ReedSolomonCoder {
             return Err(EcError::TooFewShards);
         }
         let mut shards: Vec<Option<Vec<u8>>> = shards.to_vec();
-        self.rs
-            .reconstruct_data(&mut shards)
-            .map_err(|e| EcError::Codec(format!("{e:?}")))?;
+        self.reconstruct(&mut shards)?;
         Ok(shards
             .into_iter()
             .take(self.k)
@@ -229,5 +241,19 @@ mod tests {
         let coder = ReedSolomonCoder::new(3, 2).unwrap();
         let bins = vec![b"only one bin".to_vec()];
         assert!(matches!(coder.encode_shards(bins), Err(EcError::Config(_))));
+    }
+
+    #[test]
+    fn rs_1_0_is_the_data_itself_and_needs_it_all() {
+        let coder = ReedSolomonCoder::new(1, 0).unwrap();
+        let enc = coder.encode(b"hello world").unwrap();
+        assert_eq!(enc.shards, vec![b"hello world".to_vec()], "one shard, no parity");
+        assert_eq!(coder.decode(&[Some(enc.shards[0].clone())], enc.original_len).unwrap(), b"hello world");
+        assert!(matches!(coder.decode(&[None], enc.original_len), Err(EcError::TooFewShards)));
+        let k2 = ReedSolomonCoder::new(2, 0).unwrap();
+        let enc = k2.encode(b"abcde").unwrap();
+        assert_eq!(enc.shards.len(), 2);
+        assert_eq!(k2.decode(&enc.shards.iter().cloned().map(Some).collect::<Vec<_>>(), 5).unwrap(), b"abcde");
+        assert!(ReedSolomonCoder::new(0, 1).is_err());
     }
 }
