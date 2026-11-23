@@ -53,8 +53,8 @@ where soak 1's after-run audit found 0. This fits gc/ rows that weren't due yet:
 - The audit doesn't count pending gc/ rows, so it reports the shards of those written more than 2 minutes earlier as
   reclaimable.
 
-The nodes were wiped for soak 3 before the audit could be rerun after a rest. Soak 3's audit runs after the canary's
-full read-back and settles it.
+Soak 3 settled it. There the audit waited 240 s after the stop, so every gc/ row was due and processed, and it found
+0 reclaimable shards on every node.
 
 ## Files
 
