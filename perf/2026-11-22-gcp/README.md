@@ -40,3 +40,4 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `oversize-ab` | What happens when a shard is as large as a segment or larger? |
 | `compaction-run1` | Does the first, sweep-driven compactor keep disk near live data, and at what cost? |
 | `compaction-run2` | Fixed sweep against gc/ rows: which free path is better? |
+| `soak1` | Does #224 hold up for an hour of steady load? |
