@@ -45,3 +45,4 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `soak3` | Does 766060b stop the memory growth? (yes: flat under writes, audit finds 0 to free) |
 | `sizing-bitcask` | How much memory does each object cost with the Bitcask engine? (about 3.3 KB on every node: 8 GB holds about 2 M objects) |
 | `metadata-engines` | Bitcask against RocksDB at the engine level, and which RocksDB settings matter for reads (only the block cache) |
+| `sizing-rocksdb` | Memory per object with RocksDB metadata (#237): half Bitcask's, but still growing about 1.1 KB per object until #238 |
