@@ -19,7 +19,7 @@ growth it showed was already found and fixed (below). Soak 3 runs the fix.
 - Canary: 277,204 checked operations, **all OK**. That's 110,696 PUTs, 110,893 GETs, 13,901 LISTs, 27,938 deletes,
   10,994 multipart uploads and 2,782 aborts. The stop came before its final read-back of every object, so that last
   check didn't run here.
-- Background load: 2.92 M overwrites at 1,622/s with **0 errors** (p50 33 ms, p99 65 ms). The read phase's
+- Background load: 2.92 M overwrites at 1,622/s with **0 errors** (p50 33 ms, p90 65 ms, p99 117 ms). The read phase's
   per-second trace was lost: `s3_bench` writes it when the phase ends, and the stop came first.
 - No panics on any node.
 
