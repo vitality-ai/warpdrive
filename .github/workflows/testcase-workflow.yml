@@ -96,6 +96,8 @@ jobs:
       WARPDRIVE_ADMIN_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
       WARPDRIVE_ADMIN_SECRET_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
       WARPDRIVE_ADMIN_DISPLAY_NAME: Warpdrive Admin
+      # Lifecycle "days" of 10 s, the suite's lc_debug_interval (test only).
+      WARPDRIVE_LIFECYCLE_DEBUG_DAY_SECS: "10"
     steps:
     - uses: actions/checkout@v4
 

@@ -150,6 +150,22 @@ pub async fn s3_create_bucket_handler(
     let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner()).unwrap_or_default();
 
+    if query.contains_key("lifecycle") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        let config = match crate::s3::lifecycle::parse(&body) {
+            Ok(c) => c,
+            Err(crate::s3::lifecycle::Invalid(code, msg)) => {
+                return Ok(s3_error(StatusCode::BAD_REQUEST, code, &msg, &format!("/{bucket}")));
+            }
+        };
+        // Stored normalized, so GET returns every rule with its ID.
+        db.set_bucket_lifecycle_awaited(&bucket, &crate::s3::lifecycle::to_xml(&config)).await?;
+        log::info!("S3 PutBucketLifecycleConfiguration: bucket={} rules={}", bucket, config.rules.len());
+        return Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""));
+    }
+
     if query.contains_key("cors") {
         let auth_result = authenticate_s3_request(&req).await?;
         let db = MetadataService::new(&auth_result.user_id)?;
@@ -210,6 +226,15 @@ pub async fn s3_delete_bucket_handler(
 
     let query: HashMap<String, String> = web::Query::<HashMap<String, String>>::from_query(req.query_string())
         .map(|q| q.into_inner()).unwrap_or_default();
+
+    if query.contains_key("lifecycle") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        db.delete_bucket_lifecycle_awaited(&bucket).await?;
+        log::info!("S3 DeleteBucketLifecycle: bucket={}", bucket);
+        return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
+    }
 
     if query.contains_key("cors") {
         let auth_result = authenticate_s3_request(&req).await?;

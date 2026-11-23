@@ -248,6 +248,21 @@ pub trait MetadataStorage: Send + Sync {
 
     // --- CORS ---
     fn set_bucket_cors(&self, bucket: &str, cors_xml: &str) -> Result<(), Error>;
+    /// A bucket's lifecycle configuration (validated XML). A store without
+    /// lifecycle support refuses it, so rules are never silently ignored.
+    fn set_bucket_lifecycle(&self, _bucket: &str, _xml: &str) -> Result<(), Error> {
+        Err(actix_web::error::ErrorNotImplemented("lifecycle rules are not supported by this metadata store"))
+    }
+    fn get_bucket_lifecycle(&self, _bucket: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+    fn delete_bucket_lifecycle(&self, _bucket: &str) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Every bucket with lifecycle rules: (bucket, owner, XML).
+    fn list_lifecycle_buckets(&self) -> Result<Vec<(String, String, String)>, Error> {
+        Ok(Vec::new())
+    }
     fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error>;
     fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error>;
 

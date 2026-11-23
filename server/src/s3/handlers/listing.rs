@@ -42,6 +42,16 @@ pub async fn s3_list_objects_handler(
         return s3_get_bucket_cors_inner(&bucket, &req).await;
     }
 
+    if query.contains_key("lifecycle") {
+        let auth_result = authenticate_s3_request(&req).await?;
+        let db = MetadataService::new(&auth_result.user_id)?;
+        if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
+        return Ok(match db.get_bucket_lifecycle(&bucket)? {
+            Some(xml) => HttpResponse::Ok().content_type("application/xml").body(xml),
+            None => s3_error(StatusCode::NOT_FOUND, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist", &format!("/{bucket}")),
+        });
+    }
+
     if query.contains_key("tagging") {
         return s3_get_bucket_tagging_inner(&bucket, &req).await;
     }
