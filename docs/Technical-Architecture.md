@@ -2,10 +2,33 @@
 
 ## Introduction
 
-WarpDrive is an S3-compatible object store for disaggregated data systems
-and AI/ML workloads. Each object is erasure coded across nodes. Each node
-appends the shards it holds to 64 MB segment files, and a metadata row,
-replicated to every node, records where every object's bytes live.
+WarpDrive is an S3-compatible object store built as a **composable storage
+substrate for disaggregated data systems**: query engines, vector search and
+AI/ML pipelines that keep their data in object storage and read it back
+through S3 ([position paper](https://vldb.org/2026/Workshops/VLDB-Workshops-2026/CDMS/CDMS26_8.pdf),
+CDMS at VLDB 2026). Such systems read in patterns (a column, a range of rows,
+the partitions nearest a query vector), and a store that knows the pattern can
+place data so those reads touch less of it.
+
+Three principles decide how it's built, in this order:
+
+1. **Fast and distributed by default.** Every bucket is erasure coded across
+   nodes, written with concurrent fan-out and a write quorum, with no setup.
+2. **Explainable, for SLAs.** Every operation can report a real number an
+   operator could put in an SLA: storage overhead, the quorum it met,
+   per-phase latency, where each object's bytes were placed.
+3. **Customizable without risk.** Placement, packing, codecs and the metadata
+   engine are pluggable. A customization reports what it costs, and falls back
+   to the safe default if it would fail a write or exceed its budget, so it
+   can't take the system down. Content-dependent placement packs data by how a
+   workload reads it. Measured with unmodified engines: Lance vector search
+   4-5.5 times faster on the SIFT1M benchmark with identical recall, and 20-41
+   times on a larger dataset, and a selective TPC-H query through DuckDB 149
+   times faster ([results](benchmarks/v1.0.0-results.md)).
+
+Underneath, each object is erasure coded across nodes. Each node appends the
+shards it holds to 64 MB segment files, and a metadata row, replicated to every
+node, records where every object's bytes live.
 
 The architecture is set by [RFC 5](../RFCs/RFC5/RFC5-one-object-service.md):
 one S3 module and one object service, with everything below them pluggable.
