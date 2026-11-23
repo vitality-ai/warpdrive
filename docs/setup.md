@@ -243,6 +243,11 @@ cluster across multiple machines, see
 
 ---
 
+## Advanced setup
+
+What a node keeps in memory, how to size machines, the metadata engine choice and the one tuning setting (the RocksDB
+block cache) are in [Advanced Setup](advanced-setup.md).
+
 ## Troubleshooting
 
 - Ensure all prerequisites are installed and available in your PATH.
