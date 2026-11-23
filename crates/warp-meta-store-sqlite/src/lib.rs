@@ -187,6 +187,23 @@ where
         Ok(removed)
     }
 
+    fn scan_range<T>(&self, after: Option<&str>, upto: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
+        let conn = self.conn.lock();
+        let mut out = Vec::new();
+        let (lo, hi) = (after.unwrap_or("").as_bytes().to_vec(), upto.as_bytes().to_vec());
+        let sql = if after.is_some() { "SELECT key, value FROM kv WHERE key > ?1 AND key <= ?2 ORDER BY key" } else { "SELECT key, value FROM kv WHERE key >= ?1 AND key <= ?2 ORDER BY key" };
+        let Ok(mut stmt) = conn.prepare_cached(sql) else { return out };
+        let Ok(mut rows) = stmt.query(params![lo, hi]) else { return out };
+        while let Ok(Some(row)) = rows.next() {
+            let (Ok(k), Ok(v)) = (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)) else { continue };
+            let (Ok(k), Some(v)) = (String::from_utf8(k), decode::<V>(&v)) else { continue };
+            if let Some(t) = f(&k, &v) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
     fn scan_prefix<T>(&self, prefix: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         let mut out = Vec::new();
         self.walk(prefix, None, false, |k, v| {

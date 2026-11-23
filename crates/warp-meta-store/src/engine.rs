@@ -64,6 +64,9 @@ pub trait Engine<V>: Send + Sync {
     /// entry written during it may be seen before or after the write, and
     /// one that moves to a key already scanned is missed.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
+    /// `f` over the entries with `after < key <= upto` (no lower bound when
+    /// `after` is `None`), in key order. Not a snapshot, as `scan_prefix`.
+    fn scan_range<T>(&self, after: Option<&str>, upto: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
     /// The entry with the greatest key that is at most `key`, starts with
     /// `prefix`, and whose value `accept` takes.
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(String, V)>;
@@ -96,21 +99,22 @@ pub trait Index<V>: Default + Send + Sync {
     /// `after`, in key order. Returns the last key visited if it visited
     /// `limit`, so the scan can resume after it. Only for an `ORDERED`
     /// index.
-    fn scan_chunk<T>(&self, _prefix: &str, _after: Option<&str>, _limit: usize, _f: &mut impl FnMut(&str, &V) -> Option<T>, _out: &mut Vec<T>) -> Option<String> {
+    fn scan_chunk<T>(&self, _prefix: &str, _after: Option<&str>, _upto: Option<&str>, _limit: usize, _f: &mut impl FnMut(&str, &V) -> Option<T>, _out: &mut Vec<T>) -> Option<String> {
         None
     }
 }
 
 impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
     const ORDERED: bool = true;
-    fn scan_chunk<T>(&self, prefix: &str, after: Option<&str>, limit: usize, f: &mut impl FnMut(&str, &V) -> Option<T>, out: &mut Vec<T>) -> Option<String> {
+    fn scan_chunk<T>(&self, prefix: &str, after: Option<&str>, upto: Option<&str>, limit: usize, f: &mut impl FnMut(&str, &V) -> Option<T>, out: &mut Vec<T>) -> Option<String> {
         let start = match after {
             Some(a) => std::ops::Bound::Excluded(a),
             None => std::ops::Bound::Included(prefix),
         };
         let mut n = 0;
         let mut last = None;
-        for (k, v) in self.range::<str, _>((start, std::ops::Bound::Unbounded)).take_while(|(k, _)| k.starts_with(prefix)).take(limit) {
+        let within = |k: &String| k.starts_with(prefix) && upto.is_none_or(|u| k.as_str() <= u);
+        for (k, v) in self.range::<str, _>((start, std::ops::Bound::Unbounded)).take_while(|(k, _)| within(k)).take(limit) {
             if let Some(t) = f(k, v) {
                 out.push(t);
             }
@@ -394,7 +398,29 @@ where
         let mut out = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            match self.index.read().scan_chunk(prefix, after.as_deref(), SCAN_CHUNK, &mut f, &mut out) {
+            match self.index.read().scan_chunk(prefix, after.as_deref(), None, SCAN_CHUNK, &mut f, &mut out) {
+                Some(last) => after = Some(last),
+                None => return out,
+            }
+        }
+    }
+
+    fn scan_range<T>(&self, after: Option<&str>, upto: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
+        if !I::ORDERED {
+            let mut hits = Vec::new();
+            self.index.read().for_each(|k, v| {
+                if after.is_none_or(|a| k.as_str() > a) && k.as_str() <= upto {
+                    hits.push((k.clone(), v.clone()));
+                }
+            });
+            hits.sort_by(|a, b| a.0.cmp(&b.0));
+            return hits.into_iter().filter_map(|(k, v)| f(&k, &v)).collect();
+        }
+        let mut out = Vec::new();
+        let mut after: Option<String> = after.map(str::to_string);
+        loop {
+            // A chunk under each brief read lock, as in scan_prefix.
+            match self.index.read().scan_chunk("", after.as_deref(), Some(upto), SCAN_CHUNK, &mut f, &mut out) {
                 Some(last) => after = Some(last),
                 None => return out,
             }
@@ -697,6 +723,21 @@ mod tests {
         });
         w.join().unwrap();
         assert!(wrote_during_scan, "a write waited for the whole scan");
+    }
+
+    #[test]
+    fn scan_range_visits_only_keys_after_and_up_to_its_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for i in 0..10_000u64 {
+            e.put(format!("g/{i:06}"), i).unwrap();
+        }
+        e.put("h/x".into(), 1).unwrap();
+        let got = e.scan_range(Some("g/000099"), "g/005000", |_, v| Some(*v));
+        assert_eq!(got.len(), 4901);
+        assert_eq!((got[0], *got.last().unwrap()), (100, 5000));
+        assert_eq!(e.scan_range(None, "g/000002", |_, v| Some(*v)), vec![0, 1, 2]);
+        assert!(e.scan_range(Some("g/009999"), "g/zzz", |_, v| Some(*v)).is_empty());
     }
 
     #[test]

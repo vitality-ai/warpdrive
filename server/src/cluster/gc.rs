@@ -9,15 +9,17 @@
 //! (`WARPDRIVE_RECLAIM_GRACE_SECS`) that it hasn't processed yet, names its
 //! own shards of those blobs, and hands them to the compactor, which drops
 //! their index entries and frees their space. A local cursor (`gc_cursor`)
-//! remembers how far it got, so a row is processed once. Rows older than
-//! `WARPDRIVE_GC_RETAIN_SECS` (a day) are removed from this node's copy.
+//! remembers how far it got, so a row is processed once, and a processed
+//! row leaves this node's copy at once: each node keeps its copy only for
+//! its own shards. A pass reads only the rows after the cursor and past the
+//! grace period, a range of time-ordered keys, so it costs what died since
+//! the last pass and not what is stored.
 //!
 //! The work is proportional to what died, with no scan and no questions to
 //! peers. The reclaim sweep (`reclaim.rs`) stays as a daily audit for what
 //! no `gc/` row names: shards of writes that never committed, and rows a
 //! node missed.
 
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use warp_meta_store::hlc;
@@ -61,10 +63,6 @@ fn save_cursor(key: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-fn retain() -> Duration {
-    Duration::from_secs(std::env::var("WARPDRIVE_GC_RETAIN_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(86_400))
-}
-
 /// What one pass found and freed.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GcStats {
@@ -93,9 +91,13 @@ pub fn run() -> GcStats {
     let grace = super::reclaim::config().grace.as_nanos() as u64;
     let now = hlc::now();
     let cursor = load_cursor();
+    // Keys are gc/{hlc}: the rows due are the range after the cursor up to
+    // now minus the grace period.
+    let upto = format!("{PREFIX}{:016x}", now.saturating_sub(grace));
+    let after = if cursor.is_empty() { PREFIX.to_string() } else { cursor.clone() };
     let due: Vec<(String, Vec<BlobRef>)> = rows
-        .list_live(PREFIX, |k, r| match &r.value {
-            MetaValue::Gc(blobs) if k > cursor.as_str() && key_nanos(k).is_some_and(|t| now.saturating_sub(t) >= grace) => Some((k.to_string(), blobs.clone())),
+        .list_live_range(Some(&after), &upto, |k, r| match &r.value {
+            MetaValue::Gc(blobs) if k.starts_with(PREFIX) => Some((k.to_string(), blobs.clone())),
             _ => None,
         })
         .into_iter()
@@ -119,20 +121,19 @@ pub fn run() -> GcStats {
     stats.compact = super::compactor::run_pass(&dead);
     // After the compactor dropped the entries: a crash before this line
     // processes the rows again, which finds nothing left to drop.
-    let mut cursor = cursor;
     if let Some((last, _)) = due.last() {
-        match save_cursor(last) {
-            Ok(()) => cursor = last.clone(),
-            Err(e) => log::warn!("gc: saving the cursor failed: {e}"),
+        if let Err(e) = save_cursor(last) {
+            log::warn!("gc: saving the cursor failed: {e}");
+            return stats;
         }
-    }
-    // Only rows already processed are retired.
-    let old = now.saturating_sub(retain().as_nanos() as u64);
-    for k in rows.list_live(PREFIX, |k, _| k.to_string()) {
-        if key_nanos(&k).is_some_and(|t| t < old) && k <= cursor {
-            if rows.delete(k, hlc::now()).is_ok() {
-                stats.rows_retired += 1;
-            }
+        // Processed: out of this node's copy, in one batch with one sync. No
+        // tombstone: a gc/ key is written once, and its replicas land within
+        // milliseconds, long before it is due.
+        use warp_meta_store::Engine;
+        let keys: Vec<String> = due.iter().map(|(k, _)| k.clone()).collect();
+        match rows.engine().delete_many_if(&keys, |_, _| false) {
+            Ok(n) => stats.rows_retired = n,
+            Err(e) => log::warn!("gc: dropping processed rows failed: {e}"),
         }
     }
     stats
