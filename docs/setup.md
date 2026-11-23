@@ -94,6 +94,14 @@ in the User Guide for every node, join, and transport env var, including
 how to make a node's own address (`WARPDRIVE_SELF_ADDR`) and the port it
 binds (`WARPDRIVE_PORT`) configurable per host.
 
+Set `WARPDRIVE_SELF_ADDR` on every node, to its own entry in
+`WARPDRIVE_PEERS`. Each node finds its slot in the peer list from it (the
+slot keeps the object addresses nodes hand out from colliding). Without it,
+a node falls back to the one peer whose port matches its own
+`WARPDRIVE_PORT`, which only works when every node uses a different port.
+With several hosts on the same port, a node won't start without it (or an
+explicit `WARPDRIVE_NODE_SLOT`, 0-255).
+
 ---
 
 ### 4. Verify with boto3

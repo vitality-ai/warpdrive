@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use super::common::*;
 use crate::metadata::Metadata;
 use crate::service::metadata_service::MetadataService;
-use crate::storage::config::StorageConfig;
 use super::tagging::{parse_tag_xml, validate_tags};
 
 type HmacSha1 = Hmac<Sha1>;
@@ -406,21 +405,11 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
     let db = MetadataService::new(&user_id)?;
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    // web::block: `Storage::write` now does a real (group-committed) fsync
-    // -- see `storage::group_commit`'s module doc -- so this has to go
-    // through `web::block` the same way `object.rs`'s PUT handler does;
-    // calling it directly here would block this actix worker's whole
-    // event loop for the fsync's duration.
-    let store = StorageConfig::from_env().create_store();
-    let user_id_owned = user_id.clone();
-    let bucket_owned = bucket.clone();
-    let file_bytes = form.file_bytes.clone();
-    let (offset, size) = web::block(move || {
-        store.write(&user_id_owned, &bucket_owned, &file_bytes).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    // Awaited: over the network on a cluster, the blocking pool for a
+    // local store (its write fsyncs).
+    let (offset, size) = crate::storage::write_any(crate::storage::object_store(), user_id.clone(), bucket.clone(), form.file_bytes.to_vec())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
 
     let etag = md5_etag(&form.file_bytes);
     let content_type = f.get("content-type").cloned();
@@ -439,7 +428,7 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
     }
     metadata.user_metadata = user_metadata;
 
-    let (version_id, old_extents) = db.put_object_full(&bucket, &key, metadata)?;
+    let (version_id, old_extents) = db.put_object_full_async(&bucket, &key, metadata).await?;
     if !old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &old_extents).ok();
     }
@@ -455,7 +444,7 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
             user_id.clone()
         };
         match super::acl::expand_canned(acl_value, &user_id, &owner_display) {
-            Ok(grants) => db.set_object_acl(&bucket, &key, effective_vid, &user_id, &super::acl::grants_to_json(&grants))?,
+            Ok(grants) => db.set_object_acl_awaited(&bucket, &key, effective_vid, &user_id, &super::acl::grants_to_json(&grants)).await?,
             Err(resp) => return Ok(resp),
         }
     }
@@ -464,7 +453,7 @@ async fn s3_post_object_handler_inner(bucket: String, payload: Multipart) -> Res
         let tags = parse_tag_xml(tagging_xml);
         let resource = format!("/{}/{}", bucket, key);
         if let Err(resp) = validate_tags(&tags, &resource) { return Ok(resp); }
-        db.set_object_tags(&bucket, &key, &tags)?;
+        db.set_object_tags_awaited(&bucket, &key, &tags).await?;
     }
 
     let success_status = f.get("success_action_status").and_then(|s| s.parse::<u16>().ok());

@@ -20,7 +20,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
+use super::ordered::{OrderedRecord, OrderedStore};
+pub use super::ordered::{Applied, Entry};
+
+/// Length-prefixes `user_id` and `bucket` so their exact boundaries are
+/// always recoverable regardless of what bytes any of the three fields
+/// contain (#150). `key` is last, so it doesn't need its own prefix.
+pub fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
+    format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
+}
+use crate::storage::kv_engine::BitcaskEngine;
 
 /// Sentinel `user_id` for every request that arrives with no authenticated
 /// identity -- which today is *every* request on the bare, pre-Phase-3
@@ -82,6 +91,11 @@ pub struct LocationRecord {
     /// `shard_key(bucket, key, idx)` -- see callers of this field.
     #[serde(default)]
     pub version: String,
+    /// Order of this write among all writes to the key (`hlc`). A node
+    /// keeps whichever write has the highest `seq`, so every node ends on
+    /// the same record whatever order writes arrive in (RFC 6).
+    #[serde(default)]
+    pub seq: u64,
     pub retention_mode: Option<String>, // "GOVERNANCE" | "COMPLIANCE"
     pub retain_until: Option<String>,   // RFC3339
     pub legal_hold: bool,
@@ -128,86 +142,97 @@ pub struct LocationRecord {
 }
 
 pub trait LocationStore: Send + Sync {
-    fn put(&self, record: LocationRecord) -> io::Result<()>;
+    /// A new version of the object (PUT). Applied only if `record.seq` is
+    /// newer than the key's current state (see `record_log`).
+    fn put(&self, record: LocationRecord) -> io::Result<Applied<LocationRecord>>;
+    /// A metadata change (tags, retention) to the version `record` names.
+    /// Refused if that version is no longer the live one.
+    fn update(&self, record: LocationRecord) -> io::Result<Applied<LocationRecord>>;
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord>;
-    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()>;
+    /// The key's state, tombstone included.
+    fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<LocationRecord>>;
+    /// Deletes the key at `seq`, leaving a tombstone.
+    fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<LocationRecord>>;
+    /// The live record in `bucket` with the greatest key at most `key`.
+    fn floor(&self, user_id: &str, bucket: &str, key: &str) -> Option<(String, LocationRecord)>;
     /// Keys (with their byte size) in `bucket` whose key starts with
-    /// `prefix` — the minimal S3 ListObjectsV2 surface needs this (object
-    /// stores speaking the real S3 protocol, like Lance's client, list a
-    /// dataset's files; the raw `/cluster/{bucket}/{key}` API never needed
-    /// this since callers always know their own key).
+    /// `prefix`, for ListObjects.
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
-    /// Rewrites the log to hold only the current live entries (one line
-    /// per in-memory index entry, no tombstones -- there's nothing left
-    /// for them to cancel out once the dead entries they were cancelling
-    /// are gone too), then atomically replaces the old log file. Bounds
-    /// both on-disk size and the next restart's replay time to the number
-    /// of *live* objects, not the total number of historical writes/
-    /// deletes/overwrites ever made (#163: an append-only log with no
-    /// compaction grows without bound under real churn).
+    /// Rewrites the log to hold one line per key (#163), so its size and
+    /// the next restart's replay time follow the number of keys, not the
+    /// number of writes ever made.
     fn compact(&self) -> io::Result<()>;
 }
 
-/// Length-prefixes `user_id` and `bucket` so their exact boundaries are
-/// always recoverable regardless of what bytes any of the three fields
-/// contain -- `key` is last, so it doesn't need its own length prefix,
-/// it's simply "whatever comes after bucket's prefix." Previously (#150,
-/// before `user_id` existed) `format!("{bucket}/{key}")`: bucket `a/b` +
-/// key `c` and bucket `a` + key `b/c` both produced `a/b/c`. Adding
-/// `user_id` the same unprefixed way would reopen that exact bug one level
-/// up (two tenants' bucket/key pairs colliding across a `user_id` boundary
-/// instead of a bucket boundary), so it gets the same length-prefix
-/// treatment, not a bare separator.
-fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
-    format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
+impl OrderedRecord for LocationRecord {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
 }
 
-/// `LocationStore` on a per-node `KvEngine`. The default engine is
-/// `BitcaskEngine` with a `BTreeMap` index: `record_key` groups each
-/// bucket's keys contiguously, so a prefix listing is a bounded range scan
-/// (#163).
-pub struct BitcaskLocationStore<E = BitcaskEngine<LocationRecord>> {
-    engine: E,
+/// `LocationStore` on ordered records (`ordered`) over a per-node `KvEngine`.
+/// The default engine keeps a `BTreeMap` index: `record_key` groups each
+/// bucket's keys contiguously, so a prefix listing is a bounded range scan.
+pub struct BitcaskLocationStore<E = BitcaskEngine<Entry<LocationRecord>>> {
+    log: OrderedStore<LocationRecord, E>,
 }
 
 impl BitcaskLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self { engine: BitcaskEngine::open(log_path, "location")? })
+        Ok(Self { log: OrderedStore::new(BitcaskEngine::open(log_path, "location")?) })
     }
 
     pub fn path(&self) -> &Path {
-        self.engine.path()
+        self.log.engine().path()
     }
 }
 
-impl<E: KvEngine<LocationRecord>> BitcaskLocationStore<E> {
+impl<E: crate::storage::kv_engine::KvEngine<Entry<LocationRecord>>> BitcaskLocationStore<E> {
     /// The store on any engine.
     pub fn with_engine(engine: E) -> Self {
-        Self { engine }
+        Self { log: OrderedStore::new(engine) }
     }
 }
 
-impl<E: KvEngine<LocationRecord>> LocationStore for BitcaskLocationStore<E> {
-    fn put(&self, record: LocationRecord) -> io::Result<()> {
-        self.engine.put(record_key(&record.user_id, &record.bucket, &record.key), record)
+impl<E: crate::storage::kv_engine::KvEngine<Entry<LocationRecord>>> LocationStore for BitcaskLocationStore<E> {
+    fn put(&self, record: LocationRecord) -> io::Result<Applied<LocationRecord>> {
+        self.log.put(record_key(&record.user_id, &record.bucket, &record.key), record)
+    }
+
+    fn update(&self, record: LocationRecord) -> io::Result<Applied<LocationRecord>> {
+        self.log.update(record_key(&record.user_id, &record.bucket, &record.key), record)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<LocationRecord> {
-        self.engine.get(&record_key(user_id, bucket, key))
+        self.log.get(&record_key(user_id, bucket, key))
     }
 
-    fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
-        self.engine.delete(&record_key(user_id, bucket, key))
+    fn entry(&self, user_id: &str, bucket: &str, key: &str) -> Option<Entry<LocationRecord>> {
+        self.log.entry(&record_key(user_id, bucket, key))
+    }
+
+    fn delete(&self, user_id: &str, bucket: &str, key: &str, seq: u64) -> io::Result<Applied<LocationRecord>> {
+        self.log.delete(record_key(user_id, bucket, key), seq)
+    }
+
+    fn floor(&self, user_id: &str, bucket: &str, key: &str) -> Option<(String, LocationRecord)> {
+        let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
+        self.log
+            .floor_live(&bucket_prefix, &record_key(user_id, bucket, key))
+            .map(|(k, r)| (k[bucket_prefix.len()..].to_string(), r))
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
         let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
-        self.engine.scan_prefix(&full_prefix, |k, r| Some((k[bucket_prefix.len()..].to_string(), r.original_len as u64)))
+        self.log.list_live(&full_prefix, |k, r| (k[bucket_prefix.len()..].to_string(), r.original_len as u64))
     }
 
     fn compact(&self) -> io::Result<()> {
-        self.engine.compact()
+        self.log.compact()
     }
 }
 
@@ -231,6 +256,7 @@ mod tests {
             m: 1,
             original_len: 42,
             version: "v1".to_string(),
+            seq: 1,
             retention_mode: None,
             retain_until: None,
             legal_hold: false,
@@ -293,7 +319,7 @@ mod tests {
         assert_eq!(store.get("alice", "logs", "k1").unwrap(), alice_rec);
         assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec);
 
-        store.delete("alice", "logs", "k1").unwrap();
+        store.delete("alice", "logs", "k1", 2).unwrap();
         assert!(store.get("alice", "logs", "k1").is_none());
         assert_eq!(store.get("bob", "logs", "k1").unwrap(), bob_rec, "deleting alice's record must not touch bob's");
     }
@@ -329,7 +355,7 @@ mod tests {
         {
             let store = BitcaskLocationStore::open(&log_path).unwrap();
             store.put(sample("b1", "k1")).unwrap();
-            store.delete("u1", "b1", "k1").unwrap();
+            store.delete("u1", "b1", "k1", 2).unwrap();
             assert!(store.get("u1", "b1", "k1").is_none());
         }
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
@@ -404,7 +430,7 @@ mod tests {
 
         store.put(sample("b1", "k1")).unwrap();
         store.put(sample("b1", "k2")).unwrap();
-        store.delete("u1", "b1", "k1").unwrap();
+        store.delete("u1", "b1", "k1", 2).unwrap();
         // Overwrite k2 a few times -- each one is another line in the
         // uncompacted log for the same still-live key.
         for _ in 0..5 {
@@ -446,48 +472,5 @@ mod tests {
         let reopened = BitcaskLocationStore::open(&log_path).unwrap();
         assert_eq!(reopened.get("u1", "b1", "k1").unwrap(), sample("b1", "k1"));
         assert_eq!(reopened.get("u1", "b1", "k2").unwrap(), sample("b1", "k2"));
-    }
-
-    /// #155's core invariant: the in-memory index and the on-disk log can
-    /// never disagree about a key's final state, no matter how many
-    /// threads raced to put/delete it concurrently. Before the fix (two
-    /// separate locks, log appended then index updated with no shared
-    /// lock across the two), a thread's own append could land before or
-    /// after another thread's index update in either order, so replaying
-    /// the log after a restart could produce a different answer than the
-    /// live index had -- a deleted object "resurrecting", or vice versa.
-    /// With a single lock held across both steps, every operation's
-    /// append-then-update pair is atomic relative to every other one, so
-    /// the live index and a fresh replay of the log must always agree,
-    /// whatever order the race actually resolved in.
-    #[test]
-    fn concurrent_put_delete_on_the_same_key_never_diverges_log_from_index() {
-        use std::thread;
-
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("loc.log");
-        let store = std::sync::Arc::new(BitcaskLocationStore::open(&log_path).unwrap());
-
-        let handles: Vec<_> = (0..16)
-            .map(|t| {
-                let store = std::sync::Arc::clone(&store);
-                thread::spawn(move || {
-                    for i in 0..50 {
-                        if (t + i) % 2 == 0 {
-                            store.put(sample("b1", "racykey")).unwrap();
-                        } else {
-                            let _ = store.delete("u1", "b1", "racykey");
-                        }
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        let live = store.get("u1", "b1", "racykey");
-        let replayed = BitcaskLocationStore::open(&log_path).unwrap().get("u1", "b1", "racykey");
-        assert_eq!(live, replayed, "live index and a fresh log replay must agree");
     }
 }

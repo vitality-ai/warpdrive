@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use crate::metadata::Metadata;
 use crate::s3::auth::authenticate_s3_request;
 use crate::service::metadata_service::MetadataService;
-use crate::service::storage_service::{StorageService, StorageMode};
+use crate::service::storage_service::StorageService;
+use std::sync::Arc;
 use crate::service::user_context::UserContext;
 use crate::util::serializer::deserialize_offset_size;
 
@@ -108,19 +109,15 @@ pub async fn s3_copy_object_handler(
     let src_context = UserContext::with_bucket(auth_result.user_id.clone(), src_bucket.clone());
     let dst_context = UserContext::with_bucket(auth_result.user_id.clone(), dst_bucket.clone());
 
-    let storage_service = StorageService::new();
-    let src_data = storage_service.read_object(&src_context, &src_meta.to_offset_size_list(), StorageMode::S3)?;
-    // web::block: `write_object` now does a real group-committed fsync --
-    // see `storage::group_commit`'s module doc -- so this has to go
-    // through `web::block` the same way `object.rs`'s PUT handler does.
-    let dst_context_c = dst_context.clone();
-    let src_data_c = src_data.clone();
-    let new_offset_size_list = web::block(move || {
-        StorageService::new().write_object(&dst_context_c, &src_data_c, StorageMode::S3).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("blocking task failed: {e}")))?
-    .map_err(actix_web::error::ErrorInternalServerError)?;
+    // Both awaited, never blocking this worker: over the network on a
+    // cluster, on the blocking pool for a local store.
+    let store = crate::storage::object_store();
+    let src_data = crate::storage::read_extents_any(Arc::clone(&store), &src_context.user_id, &src_context.bucket, &src_meta.to_offset_size_list())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let new_offset_size_list = vec![crate::storage::write_any(store, dst_context.user_id.clone(), dst_context.bucket.clone(), src_data.clone())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?];
 
     let directive = req.headers().get("x-amz-metadata-directive")
         .and_then(|v| v.to_str().ok())
@@ -157,7 +154,7 @@ pub async fn s3_copy_object_handler(
     let last_modified = last_modified_now();
 
     if db.check_key(&dst_bucket, &dst_key)? {
-        storage_service.delete_object(&dst_context, &dst_key)?;
+        StorageService::new().delete_object(&dst_context, &dst_key)?;
     }
 
     let new_offset_size_bytes = crate::util::serializer::serialize_offset_size(&new_offset_size_list)?;
@@ -171,7 +168,7 @@ pub async fn s3_copy_object_handler(
     dst_meta.last_modified = Some(last_modified.clone());
     dst_meta.user_metadata = user_metadata;
 
-    let (copy_vid, copy_old_extents) = db.put_object_full(&dst_bucket, &dst_key, dst_meta)?;
+    let (copy_vid, copy_old_extents) = db.put_object_full_async(&dst_bucket, &dst_key, dst_meta).await?;
     if !copy_old_extents.is_empty() {
         db.queue_deletion(&dst_bucket, &dst_key, &copy_old_extents).ok();
     }
@@ -182,7 +179,7 @@ pub async fn s3_copy_object_handler(
     if has_acl_header {
         let dst_vid = copy_vid.as_deref().unwrap_or("");
         match resolve_effective_grants(&req, None, &auth_result.user_id, &auth_result.owner_display_name) {
-            Ok(grants) => db.set_object_acl(&dst_bucket, &dst_key, dst_vid, &auth_result.user_id, &grants_to_json(&grants))?,
+            Ok(grants) => db.set_object_acl_awaited(&dst_bucket, &dst_key, dst_vid, &auth_result.user_id, &grants_to_json(&grants)).await?,
             Err(resp) => return Ok(resp),
         }
     }

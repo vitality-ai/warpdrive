@@ -48,7 +48,7 @@ pub async fn s3_put_bucket_object_lock_inner(bucket: &str, body: &[u8], req: &Ht
             return Ok(s3_error(StatusCode::CONFLICT, "InvalidBucketState",
                                "Object lock can only be enabled on a versioning-enabled bucket", bucket));
         }
-        db.set_bucket_object_lock_enabled(bucket, true)?;
+        db.set_bucket_object_lock_enabled_awaited(bucket, true).await?;
     }
 
     // Parse Rule/DefaultRetention
@@ -90,7 +90,7 @@ pub async fn s3_put_bucket_object_lock_inner(bucket: &str, body: &[u8], req: &Ht
                                "DefaultRetention must specify Days or Years", bucket));
         }
 
-        db.put_object_lock_config(bucket, &mode, days, years)?;
+        db.put_object_lock_config_awaited(bucket, &mode, days, years).await?;
     }
 
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
@@ -209,7 +209,7 @@ pub async fn s3_put_object_retention_inner(bucket: &str, key: &str, body: &[u8],
         }
     }
 
-    db.put_object_lock(bucket, key, &vid, Some(&mode), Some(&retain_until), None)?;
+    db.put_object_lock_awaited(bucket, key, &vid, Some(&mode), Some(&retain_until), None).await?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
 
@@ -289,7 +289,7 @@ pub async fn s3_put_object_legal_hold_inner(bucket: &str, key: &str, body: &[u8]
             .unwrap_or_default()
     });
 
-    db.set_object_legal_hold(bucket, key, &vid, &status)?;
+    db.set_object_legal_hold_awaited(bucket, key, &vid, &status).await?;
     Ok(HttpResponse::Ok().insert_header(("Content-Length", "0")).body(""))
 }
 

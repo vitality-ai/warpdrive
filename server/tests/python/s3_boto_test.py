@@ -424,7 +424,15 @@ def main():
         return 1
     
     print("✅ S3 client created successfully")
-    
+
+    # The object tests write into TEST_BUCKET, so it has to exist: S3
+    # answers NoSuchBucket otherwise.
+    try:
+        s3_client.create_bucket(Bucket=TEST_BUCKET)
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            raise
+
     # Define test functions
     tests = [
         ("S3 PUT Object", lambda: test_s3_put_object(s3_client)),
