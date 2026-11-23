@@ -6,4 +6,5 @@
 
 | Folder | Question |
 |---|---|
-| `size-sweep` | Bitcask against RocksDB with #238, 4 KB to 64 MB objects: the last experiment before the release |
+| `size-sweep` | Bitcask against RocksDB with #238, 4 KB to 64 MB objects |
+| `soak` | 30 min of overwrites and reads with the canary on RocksDB with #238: the last check before the release (passed) |
