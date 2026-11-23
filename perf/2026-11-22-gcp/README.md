@@ -46,3 +46,4 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `sizing-bitcask` | How much memory does each object cost with the Bitcask engine? (about 3.3 KB on every node: 8 GB holds about 2 M objects) |
 | `metadata-engines` | Bitcask against RocksDB at the engine level, and which RocksDB settings matter for reads (only the block cache) |
 | `sizing-rocksdb` | Memory per object with RocksDB metadata (#237): half Bitcask's, but still growing about 1.1 KB per object until #238 |
+| `sizing-combined` | RocksDB with #238: 0.25 GB per node at 1.5 M objects and 0.7-0.9 GB at 4.3 M, 1 s startup, throughput steady |
