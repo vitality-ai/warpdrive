@@ -1,0 +1,19 @@
+start,rocksdb,keys=1000000,threads=64,cache_mb=256,value_bytes=816,rss_mb=11,opts=KVB_X=1
+load,engine,keys_done,secs,puts_per_s,p50_us,p99_us,p999_us,rss_mb
+load,rocksdb,104045,3.8,27335,1728,5120,8192,40
+load,rocksdb,203187,7.6,26076,1728,5376,10240,67
+load,rocksdb,303600,11.6,25090,1792,6400,27648,59
+load,rocksdb,402240,15.6,24645,1792,6144,28672,100
+load,rocksdb,502621,19.4,26402,1792,5376,8192,118
+load,rocksdb,602575,23.4,24964,1856,6144,23552,134
+load,rocksdb,703855,27.8,23002,1920,6656,98304,140
+load,rocksdb,803980,31.6,26336,1792,5376,6912,145
+load,rocksdb,900773,35.6,24184,1920,6912,22528,159
+load,rocksdb,1000000,40.2,21558,1920,7680,94208,157
+get,engine,gets_per_s,p50_us,p99_us,p999_us,missing,rss_mb
+get,rocksdb,163229,12,10240,73728,0,424
+scan,engine,scans,rows_per_scan,p50_us,p99_us
+scan,rocksdb,200,1000,1267,1435
+reopen,engine,open_secs,found_sample,rss_mb,keys
+reopen,rocksdb,0.2,true,218,1000000
+186M	/mnt/nvme/kvb-r

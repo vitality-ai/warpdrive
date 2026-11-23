@@ -43,3 +43,5 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `soak1` | Does #224 hold up for an hour of steady load? |
 | `soak2` | Does 1f8bb42 fix soak 1's memory growth? (gc/ rows fixed; a second leak found and fixed in 766060b) |
 | `soak3` | Does 766060b stop the memory growth? (yes: flat under writes, audit finds 0 to free) |
+| `sizing-bitcask` | How much memory does each object cost with the Bitcask engine? (about 3.3 KB on every node: 8 GB holds about 2 M objects) |
+| `metadata-engines` | Bitcask against RocksDB at the engine level, and which RocksDB settings matter for reads (only the block cache) |

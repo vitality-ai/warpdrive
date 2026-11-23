@@ -1,0 +1,12 @@
+[package]
+name = "kvbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+warp-meta-store = { path = "../../../../crates/warp-meta-store" }
+rocksdb = "0.22.0"
+
+[profile.release]
+debug = 1

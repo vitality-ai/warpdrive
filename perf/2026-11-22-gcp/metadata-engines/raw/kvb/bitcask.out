@@ -1,0 +1,19 @@
+start,bitcask,keys=1000000,threads=64,cache_mb=256,value_bytes=816,rss_mb=9
+load,engine,keys_done,secs,puts_per_s,p50_us,p99_us,p999_us,rss_mb
+load,bitcask,100825,20.2,4989,10240,57344,90112,168
+load,bitcask,200226,39.4,5175,10752,51200,73728,322
+load,bitcask,300240,58.8,5153,10752,53248,81920,476
+load,bitcask,400401,78.0,5215,10240,49152,73728,631
+load,bitcask,500186,96.8,5306,10240,49152,69632,786
+load,bitcask,601053,116.0,5252,9728,47104,65536,941
+load,bitcask,700047,135.9,4998,10240,49152,73728,1094
+load,bitcask,800531,155.9,5022,9728,51200,81920,1250
+load,bitcask,900925,175.3,5173,9728,47104,65536,1405
+load,bitcask,1000000,194.5,5158,7936,45056,65536,1557
+get,engine,gets_per_s,p50_us,p99_us,p999_us,missing,rss_mb
+get,bitcask,875700,2,3,59392,0,1557
+scan,engine,scans,rows_per_scan,p50_us,p99_us
+scan,bitcask,200,1000,56,186
+reopen,engine,open_secs,found_sample,rss_mb,keys
+reopen,bitcask,4.4,true,1974,1000000
+953M	/mnt/nvme/kvb-bitcask
