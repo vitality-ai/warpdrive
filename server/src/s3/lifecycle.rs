@@ -305,10 +305,21 @@ pub fn expiration_header(c: &Config, key: &str, tags: &[(String, String)], size:
 }
 
 /// The `x-amz-expiration` header for an object in `bucket`, from the
-/// bucket's stored rules, if any rule expires it.
-pub fn header_for(db: &crate::service::metadata_service::MetadataService, bucket: &str, key: &str, tags: &[(String, String)], size: u64, created: DateTime<Utc>) -> Option<String> {
+/// bucket's stored rules, if any rule expires it. A bucket without rules
+/// costs one bucket lookup; `tags` is called only when a rule filters on
+/// tags, so the object's tags are read only then.
+pub fn header_for(
+    db: &crate::service::metadata_service::MetadataService,
+    bucket: &str,
+    key: &str,
+    tags: impl FnOnce() -> Vec<(String, String)>,
+    size: u64,
+    created: DateTime<Utc>,
+) -> Option<String> {
     let xml = db.get_bucket_lifecycle(bucket).ok()??;
-    expiration_header(&parse(&xml).ok()?, key, tags, size, created)
+    let config = parse(&xml).ok()?;
+    let tags = if config.rules.iter().any(|r| !r.filter.tags.is_empty()) { tags() } else { Vec::new() };
+    expiration_header(&config, key, &tags, size, created)
 }
 
 #[cfg(test)]
