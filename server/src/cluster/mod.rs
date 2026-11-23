@@ -4,6 +4,9 @@
 pub mod ec;
 pub mod packing;
 pub mod placement;
+pub mod reclaim;
+pub mod compactor;
+pub mod gc;
 pub mod membership;
 pub mod meta_engine;
 pub mod shard_meta_store;

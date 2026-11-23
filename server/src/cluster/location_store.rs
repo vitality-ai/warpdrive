@@ -162,6 +162,11 @@ pub trait LocationStore: Send + Sync {
     /// the next restart's replay time follow the number of keys, not the
     /// number of writes ever made.
     fn compact(&self) -> io::Result<()>;
+    /// Whether the log has built up enough dead lines to compact (RFC 6
+    /// step 2: more than twice its live entries).
+    fn compaction_due(&self) -> bool {
+        false
+    }
 }
 
 impl Record for LocationRecord {
@@ -233,6 +238,10 @@ impl<E: warp_meta_store::Engine<Entry<LocationRecord>>> LocationStore for Bitcas
 
     fn compact(&self) -> io::Result<()> {
         self.log.compact()
+    }
+
+    fn compaction_due(&self) -> bool {
+        self.log.engine().compaction_due()
     }
 }
 

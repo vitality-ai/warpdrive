@@ -203,6 +203,11 @@ pub trait ContentLocationStore: Send + Sync {
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)>;
     /// See `LocationStore::compact`.
     fn compact(&self) -> io::Result<()>;
+    /// Whether the log has built up enough dead lines to compact (RFC 6
+    /// step 2: more than twice its live entries).
+    fn compaction_due(&self) -> bool {
+        false
+    }
 }
 
 impl Record for ContentDependentRecord {
@@ -265,6 +270,10 @@ impl<E: warp_meta_store::Engine<Entry<ContentDependentRecord>>> ContentLocationS
 
     fn compact(&self) -> io::Result<()> {
         self.log.compact()
+    }
+
+    fn compaction_due(&self) -> bool {
+        self.log.engine().compaction_due()
     }
 }
 

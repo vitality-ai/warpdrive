@@ -1,0 +1,22 @@
+# name|fs|args (one factor at a time around base)
+base|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-32|xfs|--segment-mb 32 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-64|xfs|--segment-mb 64 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-128|xfs|--segment-mb 128 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-512|xfs|--segment-mb 512 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-1024|xfs|--segment-mb 1024 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+umax-0.2|xfs|--segment-mb 256 --umax 0.2 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+umax-0.3|xfs|--segment-mb 256 --umax 0.3 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+umax-0.4|xfs|--segment-mb 256 --umax 0.4 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+umax-0.6|xfs|--segment-mb 256 --umax 0.6 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+umax-0.7|xfs|--segment-mb 256 --umax 0.7 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+policy-greedy|xfs|--segment-mb 256 --umax 0.5 --policy greedy --layout C --copy cfr --rate-mbps 50
+layout-A|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout A --copy cfr --rate-mbps 50
+copy-rw|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy rw --rate-mbps 50
+rate_mbps-25|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 25
+rate_mbps-100|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 100
+rate_mbps-200|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 200
+rate_mbps-0|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 0
+nocompact|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50 --compact 0
+ext4-copy-cfr|ext4|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+ext4-copy-rw|ext4|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy rw --rate-mbps 50

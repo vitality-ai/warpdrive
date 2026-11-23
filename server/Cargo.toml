@@ -25,6 +25,7 @@ maintainer-scripts = "pkg-scripts"
 systemd-units = { unit-scripts = ".", unit-name = "warpdrive", enable = true, start = true }
 
 [dependencies]
+libc = "0.2"
 actix-web = "4.11.0"
 bincode = "1.3.3"
 bytes = "1.7.2"

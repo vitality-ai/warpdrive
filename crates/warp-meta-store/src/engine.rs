@@ -18,6 +18,7 @@
 //! log at startup.
 
 use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -42,9 +43,30 @@ pub trait Engine<V>: Send + Sync {
     /// to every other write to the engine. Returns the value it replaced,
     /// or `check`'s error without writing anything.
     fn put_if<T>(&self, key: String, value: V, check: impl FnOnce(Option<&V>) -> Result<(), T>) -> io::Result<Result<Option<V>, T>>;
+    /// Durably removes `key` only if `keep` returns false for its current
+    /// value, atomically with respect to every other write. Returns whether
+    /// it removed anything. A missing key is left alone.
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool>;
+    /// `delete_if` for many keys, durable on return. An engine can make the
+    /// whole batch durable at once instead of one key at a time. Returns
+    /// how many it removed.
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        let mut removed = 0;
+        for k in keys {
+            removed += self.delete_if(k, |v| keep(k, v))? as usize;
+        }
+        Ok(removed)
+    }
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
+    ///
+    /// Not a snapshot: writers aren't held off for the whole scan, so an
+    /// entry written during it may be seen before or after the write, and
+    /// one that moves to a key already scanned is missed.
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
+    /// `f` over the entries with `after < key <= upto` (no lower bound when
+    /// `after` is `None`), in key order. Not a snapshot, as `scan_prefix`.
+    fn scan_range<T>(&self, after: Option<&str>, upto: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
     /// The entry with the greatest key that is at most `key`, starts with
     /// `prefix`, and whose value `accept` takes.
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(String, V)>;
@@ -52,12 +74,19 @@ pub trait Engine<V>: Send + Sync {
     fn snapshot(&self) -> Vec<(String, V)>;
     /// Reclaims space taken by overwritten and deleted entries.
     fn compact(&self) -> io::Result<()>;
+    /// Whether enough space has built up that `compact` is worth running.
+    /// Engines that reclaim on their own answer `false`.
+    fn compaction_due(&self) -> bool {
+        false
+    }
 }
 
 /// The in-memory index a `BitcaskEngine` keeps. `BTreeMap` makes prefix
 /// scans a bounded range walk. `HashMap` is faster for stores that only
 /// do point lookups.
 pub trait Index<V>: Default + Send + Sync {
+    /// Keys iterate in order, so a scan can resume after a key.
+    const ORDERED: bool;
     fn get(&self, key: &str) -> Option<&V>;
     /// Returns the value it replaced.
     fn insert(&mut self, key: String, value: V) -> Option<V>;
@@ -66,9 +95,34 @@ pub trait Index<V>: Default + Send + Sync {
     fn for_each(&self, f: impl FnMut(&String, &V));
     fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T>;
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)>;
+    /// `f` over up to `limit` entries starting with `prefix` and after
+    /// `after`, in key order. Returns the last key visited if it visited
+    /// `limit`, so the scan can resume after it. Only for an `ORDERED`
+    /// index.
+    fn scan_chunk<T>(&self, _prefix: &str, _after: Option<&str>, _upto: Option<&str>, _limit: usize, _f: &mut impl FnMut(&str, &V) -> Option<T>, _out: &mut Vec<T>) -> Option<String> {
+        None
+    }
 }
 
 impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
+    const ORDERED: bool = true;
+    fn scan_chunk<T>(&self, prefix: &str, after: Option<&str>, upto: Option<&str>, limit: usize, f: &mut impl FnMut(&str, &V) -> Option<T>, out: &mut Vec<T>) -> Option<String> {
+        let start = match after {
+            Some(a) => std::ops::Bound::Excluded(a),
+            None => std::ops::Bound::Included(prefix),
+        };
+        let mut n = 0;
+        let mut last = None;
+        let within = |k: &String| k.starts_with(prefix) && upto.is_none_or(|u| k.as_str() <= u);
+        for (k, v) in self.range::<str, _>((start, std::ops::Bound::Unbounded)).take_while(|(k, _)| within(k)).take(limit) {
+            if let Some(t) = f(k, v) {
+                out.push(t);
+            }
+            n += 1;
+            last = Some(k);
+        }
+        (n == limit).then(|| last.cloned()).flatten()
+    }
     fn get(&self, key: &str) -> Option<&V> {
         BTreeMap::get(self, key)
     }
@@ -116,6 +170,7 @@ impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
 }
 
 impl<V: Send + Sync> Index<V> for HashMap<String, V> {
+    const ORDERED: bool = false;
     fn get(&self, key: &str) -> Option<&V> {
         HashMap::get(self, key)
     }
@@ -150,9 +205,24 @@ pub struct BitcaskEngine<V, I = BTreeMap<String, V>> {
     /// and the index always apply writes in the same order. Released before
     /// the durability wait, so group commit can batch many writers' syncs.
     write_lock: Mutex<()>,
+    /// Lines in the log file, live or not. With the index size, tells when
+    /// the log is worth compacting.
+    lines: AtomicU64,
+    /// One compaction at a time.
+    compacting: Mutex<()>,
     label: &'static str,
     _value: std::marker::PhantomData<fn() -> V>,
 }
+
+/// A log is compacted once it holds more than this many lines per live
+/// entry (RFC 6: "more than twice the size of its live entries").
+const COMPACT_RATIO: u64 = 2;
+/// ...and at least this many lines, so small logs aren't rewritten often.
+const COMPACT_MIN_LINES: u64 = 10_000;
+/// Entries copied per read-lock hold while compacting.
+const COMPACT_CHUNK: usize = 4096;
+/// Entries a scan visits per read lock.
+const SCAN_CHUNK: usize = 4096;
 
 impl<V, I> BitcaskEngine<V, I>
 where
@@ -168,6 +238,7 @@ where
         }
 
         let mut index = I::default();
+        let mut lines_read = 0u64;
         if log_path.exists() {
             let f = File::open(&log_path)?;
             let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
@@ -176,6 +247,7 @@ where
                 if line.is_empty() {
                     continue;
                 }
+                lines_read += 1;
                 match serde_json::from_str::<(String, Option<V>)>(line) {
                     Ok((key, Some(v))) => {
                         index.insert(key, v);
@@ -201,6 +273,8 @@ where
             log,
             index: RwLock::new(index),
             write_lock: Mutex::new(()),
+            lines: AtomicU64::new(lines_read),
+            compacting: Mutex::new(()),
             label,
             _value: std::marker::PhantomData,
         })
@@ -231,6 +305,7 @@ where
         let ticket = {
             let _write_guard = self.write_lock.lock();
             let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
             self.index.write().insert(key, value);
             ticket
         };
@@ -249,6 +324,7 @@ where
                 return Ok(Err(e));
             }
             let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
             let previous = self.index.write().insert(key, value);
             (ticket, previous)
         };
@@ -256,19 +332,99 @@ where
         Ok(Ok(previous))
     }
 
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
+        let line = Self::line(key, None)?;
+        let ticket = {
+            let _write_guard = self.write_lock.lock();
+            match self.index.read().get(key) {
+                Some(v) if !keep(v) => {}
+                _ => return Ok(false),
+            }
+            let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
+            self.index.write().remove(key);
+            ticket
+        };
+        self.log.sync_ticket(ticket)?;
+        Ok(true)
+    }
+
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        // Appended in chunks under the write lock, so writers wait at most
+        // one chunk, then made durable by one sync: a sync covers every
+        // line appended before its ticket.
+        let mut removed = 0;
+        let mut last = None;
+        for chunk in keys.chunks(4096) {
+            let _write_guard = self.write_lock.lock();
+            for key in chunk {
+                match self.index.read().get(key) {
+                    Some(v) if !keep(key, v) => {}
+                    _ => continue,
+                }
+                last = Some(self.log.append_line(&Self::line(key, None)?)?);
+                self.lines.fetch_add(1, Ordering::Relaxed);
+                self.index.write().remove(key);
+                removed += 1;
+            }
+        }
+        if let Some(ticket) = last {
+            self.log.sync_ticket(ticket)?;
+        }
+        Ok(removed)
+    }
+
     fn delete(&self, key: &str) -> io::Result<()> {
         let line = Self::line(key, None)?;
         let ticket = {
             let _write_guard = self.write_lock.lock();
             let ticket = self.log.append_line(&line)?;
+            self.lines.fetch_add(1, Ordering::Relaxed);
             self.index.write().remove(key);
             ticket
         };
         self.log.sync_ticket(ticket)
     }
 
-    fn scan_prefix<T>(&self, prefix: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
-        self.index.read().scan_prefix(prefix, f)
+    fn scan_prefix<T>(&self, prefix: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
+        // An ordered index is scanned in chunks, each under its own brief
+        // read lock, so writers get in between them. One long scan under
+        // the lock held off every writer, and the readers queued behind
+        // them: on GCP a full scan per reclaim request cut PUTs from
+        // 3,700/s to 400/s.
+        if !I::ORDERED {
+            return self.index.read().scan_prefix(prefix, f);
+        }
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            match self.index.read().scan_chunk(prefix, after.as_deref(), None, SCAN_CHUNK, &mut f, &mut out) {
+                Some(last) => after = Some(last),
+                None => return out,
+            }
+        }
+    }
+
+    fn scan_range<T>(&self, after: Option<&str>, upto: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
+        if !I::ORDERED {
+            let mut hits = Vec::new();
+            self.index.read().for_each(|k, v| {
+                if after.is_none_or(|a| k.as_str() > a) && k.as_str() <= upto {
+                    hits.push((k.clone(), v.clone()));
+                }
+            });
+            hits.sort_by(|a, b| a.0.cmp(&b.0));
+            return hits.into_iter().filter_map(|(k, v)| f(&k, &v)).collect();
+        }
+        let mut out = Vec::new();
+        let mut after: Option<String> = after.map(str::to_string);
+        loop {
+            // A chunk under each brief read lock, as in scan_prefix.
+            match self.index.read().scan_chunk("", after.as_deref(), Some(upto), SCAN_CHUNK, &mut f, &mut out) {
+                Some(last) => after = Some(last),
+                None => return out,
+            }
+        }
     }
 
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(String, V)> {
@@ -282,29 +438,67 @@ where
         out
     }
 
-    /// Rewrites the log to one line per live entry, then atomically
-    /// replaces it (#163). Holds the write lock for the rewrite.
+    /// Rewrites the log to one line per live entry and atomically replaces
+    /// it (#163), without stalling writers (RFC 6, section 8):
+    ///
+    /// 1. **Cut**, under the write lock for an instant: note the log's
+    ///    length. Every line before it is already in the index.
+    /// 2. **Snapshot**, without the write lock: every live entry, copied out
+    ///    of the index in chunks under brief read locks, to a temp file,
+    ///    synced. Writers keep appending past the cut meanwhile.
+    /// 3. **Tail and swap**, under the write lock: append the lines written
+    ///    since the cut, sync, and rename the temp file over the log.
+    ///
+    /// Replaying the result gives the index: a key changed after the cut is
+    /// in the tail, which replays after the snapshot and wins. A write
+    /// waiting on its sync at the swap is in the temp file, which is synced
+    /// before the rename.
     fn compact(&self) -> io::Result<()> {
-        let _write_guard = self.write_lock.lock();
-        let index = self.index.read();
+        let Some(_one_at_a_time) = self.compacting.try_lock() else { return Ok(()) };
+        let cut = {
+            let _write_guard = self.write_lock.lock();
+            std::fs::metadata(&self.log_path)?.len()
+        };
+
         let tmp_path = self.log_path.with_extension("compact.tmp");
-        {
-            let mut tmp = io::BufWriter::new(File::create(&tmp_path)?);
-            let mut err = None;
-            index.for_each(|k, v| {
-                if err.is_none() {
-                    if let Err(e) = Self::line(k, Some(v)).and_then(|l| writeln!(tmp, "{l}")) {
-                        err = Some(e);
-                    }
-                }
-            });
-            if let Some(e) = err {
-                return Err(e);
+        let mut tmp = io::BufWriter::new(File::create(&tmp_path)?);
+        let mut keys = Vec::new();
+        self.index.read().for_each(|k, _| keys.push(k.clone()));
+        let mut written = 0u64;
+        for chunk in keys.chunks(COMPACT_CHUNK) {
+            let lines: Vec<String> = {
+                let index = self.index.read();
+                chunk.iter().filter_map(|k| index.get(k).map(|v| Self::line(k, Some(v)))).collect::<io::Result<_>>()?
+            };
+            for l in &lines {
+                writeln!(tmp, "{l}")?;
             }
-            tmp.flush()?;
+            written += lines.len() as u64;
         }
-        log::debug!("{} log {} compacted to {} entries", self.label, self.log_path.display(), index.len());
-        self.log.replace_with_compacted(&tmp_path, &self.log_path)
+        tmp.flush()?;
+        tmp.get_ref().sync_data()?;
+
+        let _write_guard = self.write_lock.lock();
+        let mut tail = Vec::new();
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = File::open(&self.log_path)?;
+            f.seek(SeekFrom::Start(cut))?;
+            f.read_to_end(&mut tail)?;
+        }
+        let tail_lines = tail.iter().filter(|b| **b == b'\n').count() as u64;
+        tmp.write_all(&tail)?;
+        tmp.flush()?;
+        drop(tmp);
+        self.log.replace_with_compacted(&tmp_path, &self.log_path)?;
+        self.lines.store(written + tail_lines, Ordering::Relaxed);
+        log::debug!("{} log {} compacted: {written} live entries, {tail_lines} lines written during the compaction", self.label, self.log_path.display());
+        Ok(())
+    }
+
+    fn compaction_due(&self) -> bool {
+        let lines = self.lines.load(Ordering::Relaxed);
+        lines >= COMPACT_MIN_LINES && lines > COMPACT_RATIO * self.index.read().len() as u64
     }
 }
 
@@ -318,6 +512,68 @@ mod tests {
 
     fn open(dir: &tempfile::TempDir) -> TestEngine {
         TestEngine::open(dir.path().join("e.log"), "test").unwrap()
+    }
+
+    #[test]
+    fn compaction_is_due_only_when_the_log_is_mostly_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for i in 0..COMPACT_MIN_LINES {
+            e.put("k".into(), i).unwrap();
+        }
+        assert!(e.compaction_due(), "10k lines for 1 live entry");
+        e.compact().unwrap();
+        assert!(!e.compaction_due(), "one line after compacting");
+        let fresh = TestEngine::open(dir.path().join("e.log"), "test").unwrap();
+        assert_eq!(fresh.get("k"), Some(COMPACT_MIN_LINES - 1));
+        assert!(!fresh.compaction_due(), "the line count is rebuilt on open");
+    }
+
+    /// Writers run during a compaction: none waits for the snapshot, and
+    /// the compacted log replays to exactly the index's final state.
+    #[test]
+    fn compaction_does_not_stall_writers_and_keeps_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = std::sync::Arc::new(open(&dir));
+        // Prefilled from 8 threads so group commit batches the syncs.
+        std::thread::scope(|sc| {
+            for t in 0..8u64 {
+                let e = &e;
+                sc.spawn(move || {
+                    for i in (t..40_000u64).step_by(8) {
+                        e.put(format!("k{}", i % 20_000), i).unwrap();
+                    }
+                });
+            }
+        });
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let (e, done) = (e.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut worst = std::time::Duration::ZERO;
+                    let mut n = 0u64;
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) || n < 200 {
+                        let t0 = std::time::Instant::now();
+                        let key = format!("k{}", (t * 7919 + n) % 25_000);
+                        if n % 5 == 0 { e.delete(&key).unwrap() } else { e.put(key, 1_000_000 + n).unwrap() }
+                        worst = worst.max(t0.elapsed());
+                        n += 1;
+                    }
+                    worst
+                })
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        e.compact().unwrap();
+        let compact_time = t0.elapsed();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worst = writers.into_iter().map(|w| w.join().unwrap()).max().unwrap();
+        assert!(worst < compact_time / 2, "a writer waited {worst:?}, the compaction took {compact_time:?}");
+        let expected = e.snapshot();
+        drop(e);
+        let reopened = TestEngine::open(dir.path().join("e.log"), "test").unwrap();
+        assert_eq!(reopened.snapshot(), expected, "the compacted log replays to the final index");
     }
 
     #[test]
@@ -406,6 +662,82 @@ mod tests {
         assert_eq!(e.put_if("k".into(), 6, |cur| if cur.is_none() { Ok(()) } else { Err("exists") }).unwrap(), Err("exists"));
         assert_eq!(e.put_if("k".into(), 7, |cur| if cur == Some(&5) { Ok(()) } else { Err("changed") }).unwrap(), Ok(Some(5)));
         assert_eq!(open(&dir).get("k"), Some(7), "a refused write left nothing in the log");
+    }
+
+    #[test]
+    fn delete_if_removes_only_when_keep_says_no_and_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        e.put("k".into(), 5).unwrap();
+        assert!(!e.delete_if("k", |v| *v != 4).unwrap(), "the value moved on: kept");
+        assert!(!e.delete_if("missing", |_| false).unwrap());
+        assert_eq!(e.get("k"), Some(5));
+        assert!(e.delete_if("k", |v| *v != 5).unwrap());
+        assert_eq!(e.get("k"), None);
+        assert_eq!(open(&dir).get("k"), None, "the delete is in the log");
+    }
+
+    #[test]
+    fn delete_many_if_removes_only_the_unchanged_and_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for i in 0..10_000u64 {
+            e.put(format!("k{i}"), i).unwrap();
+        }
+        e.put("k5".into(), 999).unwrap(); // changed since the caller looked
+        let keys: Vec<String> = (0..10_000).map(|i| format!("k{i}")).chain(["missing".to_string()]).collect();
+        let removed = e.delete_many_if(&keys, |k, v| *v != k[1..].parse::<u64>().unwrap()).unwrap();
+        assert_eq!(removed, 9_999);
+        assert_eq!(e.get("k5"), Some(999));
+        let replayed = open(&dir);
+        assert_eq!(replayed.get("k5"), Some(999));
+        assert_eq!(replayed.get("k6"), None);
+        assert_eq!(replayed.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn a_chunked_scan_sees_every_entry_in_order_and_lets_writers_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = std::sync::Arc::new(open(&dir));
+        for i in 0..20_000u64 {
+            e.put(format!("a/{i:06}"), i).unwrap();
+        }
+        e.put("b/x".into(), 1).unwrap();
+        let got = e.scan_prefix("a/", |k, v| Some((k.to_string(), *v)));
+        assert_eq!(got.len(), 20_000);
+        assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(got[12_345], ("a/012345".to_string(), 12_345));
+        // A writer gets in while a slow scan is running.
+        let (e2, done) = (std::sync::Arc::clone(&e), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let d2 = std::sync::Arc::clone(&done);
+        let w = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            e2.put("a/zzz".into(), 7).unwrap();
+            d2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut wrote_during_scan = false;
+        e.scan_prefix("a/", |_, _| {
+            std::thread::sleep(std::time::Duration::from_micros(10));
+            wrote_during_scan |= done.load(std::sync::atomic::Ordering::SeqCst);
+            None::<()>
+        });
+        w.join().unwrap();
+        assert!(wrote_during_scan, "a write waited for the whole scan");
+    }
+
+    #[test]
+    fn scan_range_visits_only_keys_after_and_up_to_its_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for i in 0..10_000u64 {
+            e.put(format!("g/{i:06}"), i).unwrap();
+        }
+        e.put("h/x".into(), 1).unwrap();
+        let got = e.scan_range(Some("g/000099"), "g/005000", |_, v| Some(*v));
+        assert_eq!(got.len(), 4901);
+        assert_eq!((got[0], *got.last().unwrap()), (100, 5000));
+        assert_eq!(e.scan_range(None, "g/000002", |_, v| Some(*v)), vec![0, 1, 2]);
+        assert!(e.scan_range(Some("g/009999"), "g/zzz", |_, v| Some(*v)).is_empty());
     }
 
     #[test]

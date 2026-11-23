@@ -1,6 +1,6 @@
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
 use futures::StreamExt;
-use log::info;
+use log::{info, warn};
 use log4rs;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -287,6 +287,7 @@ fn install_cluster_stores(state: &web::Data<ClusterState>) {
     let alloc_log = std::env::var("WARPDRIVE_BLOB_ALLOC_LOG").unwrap_or_else(|_| "blob_alloc.log".to_string());
     let blobs = ClusterBlobStore::open(&alloc_log).unwrap_or_else(|e| panic!("failed to start the cluster object store: {e}"));
     warp_drive::storage::set_object_store(Arc::new(blobs));
+    warp_drive::cluster::reclaim::start(web::Data::clone(state));
     info!("S3 handlers serve this node from the cluster (metadata: {engine:?} engine at {meta_log})");
 }
 
@@ -369,6 +370,12 @@ fn build_cluster_state() -> web::Data<ClusterState> {
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
     log4rs::init_file("server_log.yaml", Default::default()).unwrap();
+    // Segment files take descriptors; a default soft limit of 1,024 would cap
+    // how much a node can store (#229).
+    match warp_drive::storage::local_store::raise_open_file_limit() {
+        Ok((soft, hard)) => info!("open-file limit {soft} (hard {hard})"),
+        Err(e) => warn!("could not raise the open-file limit: {e}"),
+    }
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
     // Informational only -- the real per-request decision (`distributed_mode`,
     // below) is made from live membership, not this startup snapshot. A
@@ -462,6 +469,11 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
             .route("/cluster/_internal/meta", web::post().to(cluster_internal_meta_row))
+            .route("/cluster/_internal/reclaim/check", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_check))
+            .route("/cluster/_internal/reclaim/report", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_report))
+            .route("/cluster/_internal/gc/run", web::post().to(warp_drive::cluster::gc::cluster_internal_gc_run))
+            .route("/cluster/_internal/reclaim/run", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_run))
+            .route("/cluster/_internal/compact_logs", web::post().to(warp_drive::cluster::reclaim::cluster_internal_compact_logs))
             .route("/cluster/_internal/location/update", web::post().to(cluster_internal_update_location))
             .route("/cluster/_internal/content_location/update", web::post().to(cluster_internal_update_content_location))
             .route("/cluster/_internal/location", web::delete().to(cluster_internal_delete_location))

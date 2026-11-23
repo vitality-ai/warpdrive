@@ -205,6 +205,11 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
         self.engine.floor(prefix, key, |e| e.live().is_some()).and_then(|(k, e)| e.into_live().map(|r| (k, r)))
     }
 
+    /// `f` over every live record with `after < key <= upto`.
+    pub fn list_live_range<T>(&self, after: Option<&str>, upto: &str, mut f: impl FnMut(&str, &R) -> T) -> Vec<T> {
+        self.engine.scan_range(after, upto, |k, e| e.live().map(|r| f(k, r)))
+    }
+
     /// `f` over every live record whose key starts with `prefix`.
     pub fn list_live<T>(&self, prefix: &str, mut f: impl FnMut(&str, &R) -> T) -> Vec<T> {
         self.engine.scan_prefix(prefix, |k, e| e.live().map(|r| f(k, r)))

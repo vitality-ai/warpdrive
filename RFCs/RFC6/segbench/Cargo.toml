@@ -1,0 +1,11 @@
+[package]
+name = "segbench"
+version = "0.1.0"
+edition = "2021"
+description = "RFC 6 experiment: segment storage with compaction under a churn workload"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+debug = 1

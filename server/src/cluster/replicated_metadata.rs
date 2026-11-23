@@ -157,6 +157,11 @@ pub enum MetaValue {
     Upload(UploadRow),
     Acl { owner: String, grants: String },
     Lock(LockRow),
+    /// Blobs a write just stopped referencing (RFC 6 step 6). Written after
+    /// the rows that dropped them, so a crash in between leaks space and
+    /// never frees a referenced blob. Each node frees its own shards of
+    /// them once the grace period has passed (`gc.rs`).
+    Gc(Vec<BlobRef>),
 }
 
 /// One replicated row, with its place in the row's write order.
@@ -469,8 +474,7 @@ impl ReplicatedMetadataStore {
         };
         let old_extents = match replaced {
             Some(v) => {
-                self.remove_async(version_scoped("acl", &bucket, &key, &v.version_id)).await?;
-                self.remove_async(version_scoped("lck", &bucket, &key, &v.version_id)).await?;
+                self.forget_version_async(&bucket, &key, &v).await?;
                 v.meta.to_offset_size_list()
             }
             None => Vec::new(),
@@ -494,9 +498,20 @@ impl ReplicatedMetadataStore {
         Ok(out)
     }
 
-    async fn forget_version_async(&self, bucket: &str, key: &str, version_id: &str) -> Result<(), String> {
-        self.remove_async(version_scoped("acl", bucket, key, version_id)).await?;
-        self.remove_async(version_scoped("lck", bucket, key, version_id)).await
+    /// A version is gone: its ACL and lock rows go, and its blobs are dead.
+    async fn forget_version_async(&self, bucket: &str, key: &str, v: &VersionEntry) -> Result<(), String> {
+        self.remove_async(version_scoped("acl", bucket, key, &v.version_id)).await?;
+        self.remove_async(version_scoped("lck", bucket, key, &v.version_id)).await?;
+        self.gc_async(v.blobs.clone()).await
+    }
+
+    /// Records `blobs` as dead (a `gc/` row), after whatever dropped them.
+    async fn gc_async(&self, blobs: Vec<BlobRef>) -> Result<(), String> {
+        let blobs = super::gc::with_shards(blobs);
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        self.put_async(super::gc::new_key(), MetaValue::Gc(blobs)).await
     }
 
     /// The whole S3 DeleteObject metadata write without blocking a thread:
@@ -506,7 +521,7 @@ impl ReplicatedMetadataStore {
         let mode = self.mode(&bucket);
         if mode == Versioning::Disabled {
             if let Some(v) = self.update_object_async(&user, &bucket, &key, |o| o.versions.pop()).await? {
-                self.forget_version_async(&bucket, &key, &v.version_id).await?;
+                self.forget_version_async(&bucket, &key, &v).await?;
             }
             return Ok(VersioningDeleteResult::Deleted);
         }
@@ -526,7 +541,7 @@ impl ReplicatedMetadataStore {
             })
             .await?;
         if let Some(v) = replaced {
-            self.forget_version_async(&bucket, &key, &v.version_id).await?;
+            self.forget_version_async(&bucket, &key, &v).await?;
         }
         Ok(VersioningDeleteResult::Marker { version_id: vid })
     }
@@ -597,9 +612,20 @@ impl ReplicatedMetadataStore {
     }
 
     /// Drops the ACL and lock rows of a removed version.
-    fn forget_version(&self, bucket: &str, key: &str, version_id: &str) -> Result<(), Error> {
-        self.remove(&version_scoped("acl", bucket, key, version_id))?;
-        self.remove(&version_scoped("lck", bucket, key, version_id))
+    /// A version is gone: its ACL and lock rows go, and its blobs are dead.
+    fn forget_version(&self, bucket: &str, key: &str, v: &VersionEntry) -> Result<(), Error> {
+        self.remove(&version_scoped("acl", bucket, key, &v.version_id))?;
+        self.remove(&version_scoped("lck", bucket, key, &v.version_id))?;
+        self.gc(v.blobs.clone())
+    }
+
+    /// Records `blobs` as dead (a `gc/` row), after whatever dropped them.
+    fn gc(&self, blobs: Vec<BlobRef>) -> Result<(), Error> {
+        let blobs = super::gc::with_shards(blobs);
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        self.put(&super::gc::new_key(), MetaValue::Gc(blobs))
     }
 }
 
@@ -670,11 +696,15 @@ impl MetadataStorage for ReplicatedMetadataStore {
     ) -> Option<BoxFuture<'static, Result<(), (u16, String)>>> {
         Some(Box::pin(async move {
             let extents = crate::util::serializer::deserialize_offset_size(&extents_blob).map_err(|e| (400, e.to_string()))?;
+            let mut replaced = Vec::new();
             self.update_upload_async(&upload_id, |u| {
                 let blobs = blobs_for(&u.user_id, &u.bucket, &extents);
-                u.parts.insert(part_number, PartRow { etag, size, extents_blob, checksum_value, blobs });
+                if let Some(old) = u.parts.insert(part_number, PartRow { etag, size, extents_blob, checksum_value, blobs }) {
+                    replaced = old.blobs;
+                }
             })
-            .await
+            .await?;
+            self.gc_async(replaced).await.map_err(|e| (500, e))
         }))
     }
 
@@ -684,7 +714,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
             let removed = self.update_object_async(&user_id, &bucket, &key, move |o| o.find(&vid).map(|i| o.versions.remove(i))).await?;
             match removed {
                 Some(v) => {
-                    self.forget_version_async(&bucket, &key, &v.version_id).await?;
+                    self.forget_version_async(&bucket, &key, &v).await?;
                     Ok(DeleteSpecificResult { found: true, was_delete_marker: v.is_delete_marker, version_id: v.shown_id() })
                 }
                 None => Ok(DeleteSpecificResult { found: false, was_delete_marker: false, version_id }),
@@ -720,7 +750,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
     fn delete_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<(), Error> {
         let removed = self.update_object(user_id, bucket, object_id, |o| Ok(o.versions.pop()))?;
         match removed {
-            Some(v) => self.forget_version(bucket, object_id, &v.version_id),
+            Some(v) => self.forget_version(bucket, object_id, &v),
             None => Err(not_found(bucket, object_id)),
         }
     }
@@ -840,7 +870,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
         let (vid, replaced) = self.update_object(user_id, bucket, key, |o| Ok(put_version(mode, user_id, bucket, metadata, o)))?;
         let old_extents = match replaced {
             Some(v) => {
-                self.forget_version(bucket, key, &v.version_id)?;
+                self.forget_version(bucket, key, &v)?;
                 v.meta.to_offset_size_list()
             }
             None => Vec::new(),
@@ -917,7 +947,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
             Ok((vid, replaced))
         })?;
         if let Some(v) = replaced {
-            self.forget_version(bucket, key, &v.version_id)?;
+            self.forget_version(bucket, key, &v)?;
         }
         Ok(VersioningDeleteResult::Marker { version_id: vid })
     }
@@ -926,7 +956,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
         let removed = self.update_object(user_id, bucket, key, |o| Ok(o.find(version_id).map(|i| o.versions.remove(i))))?;
         match removed {
             Some(v) => {
-                self.forget_version(bucket, key, &v.version_id)?;
+                self.forget_version(bucket, key, &v)?;
                 Ok(DeleteSpecificResult { found: true, was_delete_marker: v.is_delete_marker, version_id: v.shown_id() })
             }
             None => Ok(DeleteSpecificResult { found: false, was_delete_marker: false, version_id: version_id.to_string() }),
@@ -1161,13 +1191,16 @@ impl MetadataStorage for ReplicatedMetadataStore {
 
     fn upsert_multipart_part(&self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8], checksum_value: &str) -> Result<(), Error> {
         let extents = crate::util::serializer::deserialize_offset_size(extents_blob)?;
+        let mut replaced = Vec::new();
         self.update_upload(upload_id, |u| {
             let blobs = blobs_for(&u.user_id, &u.bucket, &extents);
-            u.parts.insert(
-                part_number,
-                PartRow { etag: etag.to_string(), size, extents_blob: extents_blob.to_vec(), checksum_value: checksum_value.to_string(), blobs },
-            );
-        })
+            let part = PartRow { etag: etag.to_string(), size, extents_blob: extents_blob.to_vec(), checksum_value: checksum_value.to_string(), blobs };
+            if let Some(old) = u.parts.insert(part_number, part) {
+                replaced = old.blobs;
+            }
+        })?;
+        // A part uploaded again under the same number: the old one is dead.
+        self.gc(replaced)
     }
 
     fn list_multipart_parts(&self, upload_id: &str) -> Result<Vec<MultipartPartRow>, Error> {
@@ -1182,11 +1215,22 @@ impl MetadataStorage for ReplicatedMetadataStore {
             .unwrap_or_default())
     }
 
+    /// Clears an upload's parts. A part blob the object's current version
+    /// holds moved there (CompleteMultipartUpload): it lives on. Every
+    /// other one is dead: all of them on an abort, the parts left out on a
+    /// completion.
     fn delete_parts_for_upload(&self, upload_id: &str) -> Result<(), Error> {
-        if self.upload(upload_id).is_none() {
+        let Some(up) = self.upload(upload_id) else {
             return Ok(());
-        }
-        self.update_upload(upload_id, |u| u.parts.clear())
+        };
+        let kept: std::collections::HashSet<String> =
+            self.latest(&up.user_id, &up.bucket, &up.key).map(|v| v.blobs.iter().map(|b| b.placement.wire_key.clone()).collect()).unwrap_or_default();
+        let mut dead = Vec::new();
+        self.update_upload(upload_id, |u| {
+            dead.extend(u.parts.values().flat_map(|p| p.blobs.iter()).filter(|b| !kept.contains(&b.placement.wire_key)).cloned());
+            u.parts.clear();
+        })?;
+        self.gc(dead)
     }
 
     fn get_parts_manifest(&self, user_id: &str, bucket: &str, key: &str) -> Result<Option<String>, Error> {

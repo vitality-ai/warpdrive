@@ -151,6 +151,59 @@ where
         Ok(Ok(current))
     }
 
+    fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
+        let current: Option<V> = tx
+            .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+            .optional()
+            .map_err(io_err)?
+            .and_then(|b| decode(&b));
+        match current {
+            Some(v) if !keep(&v) => {}
+            _ => return Ok(false),
+        }
+        tx.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
+        tx.commit().map_err(io_err)?;
+        Ok(true)
+    }
+
+    fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
+        let mut removed = 0;
+        for key in keys {
+            let current: Option<V> = tx
+                .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(io_err)?
+                .and_then(|b| decode(&b));
+            if matches!(current, Some(v) if !keep(key, &v)) {
+                tx.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
+                removed += 1;
+            }
+        }
+        tx.commit().map_err(io_err)?;
+        Ok(removed)
+    }
+
+    fn scan_range<T>(&self, after: Option<&str>, upto: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
+        let conn = self.conn.lock();
+        let mut out = Vec::new();
+        let (lo, hi) = (after.unwrap_or("").as_bytes().to_vec(), upto.as_bytes().to_vec());
+        let sql = if after.is_some() { "SELECT key, value FROM kv WHERE key > ?1 AND key <= ?2 ORDER BY key" } else { "SELECT key, value FROM kv WHERE key >= ?1 AND key <= ?2 ORDER BY key" };
+        let Ok(mut stmt) = conn.prepare_cached(sql) else { return out };
+        let Ok(mut rows) = stmt.query(params![lo, hi]) else { return out };
+        while let Ok(Some(row)) = rows.next() {
+            let (Ok(k), Ok(v)) = (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)) else { continue };
+            let (Ok(k), Some(v)) = (String::from_utf8(k), decode::<V>(&v)) else { continue };
+            if let Some(t) = f(&k, &v) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
     fn scan_prefix<T>(&self, prefix: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         let mut out = Vec::new();
         self.walk(prefix, None, false, |k, v| {
@@ -232,6 +285,18 @@ mod tests {
         assert_eq!(e.get("k"), Some(5));
         assert_eq!(e.put_if("k".into(), 7, |cur| if cur == Some(&5) { Ok(()) } else { Err("changed") }).unwrap(), Ok(Some(5)));
         assert_eq!(e.get("k"), Some(7));
+    }
+
+    #[test]
+    fn delete_if_removes_only_when_keep_says_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = SqliteEngine::<u64>::open(dir.path().join("kv.db")).unwrap();
+        e.put("k".into(), 5).unwrap();
+        assert!(!e.delete_if("k", |v| *v != 4).unwrap());
+        assert!(!e.delete_if("missing", |_| false).unwrap());
+        assert_eq!(e.get("k"), Some(5));
+        assert!(e.delete_if("k", |v| *v != 5).unwrap());
+        assert_eq!(e.get("k"), None);
     }
 
     #[test]

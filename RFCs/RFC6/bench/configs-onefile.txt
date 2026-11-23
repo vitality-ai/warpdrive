@@ -1,0 +1,8 @@
+# name|fs|args: segments vs one file per bucket (the layout today), same workload as the main matrix
+base|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-64|xfs|--segment-mb 64 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+segment_mb-128|xfs|--segment-mb 128 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50
+onefile-rewrite|xfs|--segment-mb 1048576 --onefile 1 --umax 0.5 --policy costbenefit --layout A --copy cfr --rate-mbps 50
+onefile-rewrite-u0.7|xfs|--segment-mb 1048576 --onefile 1 --umax 0.7 --policy costbenefit --layout A --copy cfr --rate-mbps 50
+onefile-punch|xfs|--segment-mb 1048576 --compact 0 --punch 1
+nocompact|xfs|--segment-mb 256 --umax 0.5 --policy costbenefit --layout C --copy cfr --rate-mbps 50 --compact 0
