@@ -112,8 +112,6 @@ Since then:
 
 ## Cluster engine internals
 
-Correctness review log: [`docs/reviews/v1.0.0-beta-code-review.md`](reviews/v1.0.0-beta-code-review.md).
-
 Every deployed node is **symmetric**: the same binary, both a storage node
 (it stores the shards it receives in 64 MB segment files, `local_store.rs`) and a coordinator that can accept a request, decide
 placement, and fan out to peers. There is no
