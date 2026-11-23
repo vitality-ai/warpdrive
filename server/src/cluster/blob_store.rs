@@ -109,6 +109,30 @@ pub fn index_blob(b: &BlobRef) {
     INDEX.write().entry((b.user_id.clone(), b.bucket.clone())).or_default().insert(b.base, b.placement.clone());
 }
 
+/// Drops a dead blob from this node's address index, only if the entry at its
+/// address still holds that blob. Called once its gc/ row is processed
+/// (gc.rs), past the grace period, so no read is still on it. Without it the
+/// index kept every blob ever written: about 300 bytes per write, on every
+/// node.
+pub fn unindex_blob(b: &BlobRef) -> bool {
+    let mut index = INDEX.write();
+    let key = (b.user_id.clone(), b.bucket.clone());
+    let Some(blobs) = index.get_mut(&key) else { return false };
+    if blobs.get(&b.base) != Some(&b.placement) {
+        return false;
+    }
+    blobs.remove(&b.base);
+    if blobs.is_empty() {
+        index.remove(&key);
+    }
+    true
+}
+
+/// Blobs in this node's address index, for tests and metrics.
+pub fn indexed_blobs() -> usize {
+    INDEX.read().values().map(|m| m.len()).sum()
+}
+
 /// The blob whose range holds `offset`, as `(start address, placement)`.
 fn lookup(user_id: &str, bucket: &str, offset: u64) -> Option<(u64, BlobPlacement)> {
     let index = INDEX.read();
@@ -335,6 +359,20 @@ impl Storage for ClusterBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unindexing_removes_only_the_dead_blob_it_names() {
+        let p = |wk: &str| BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: wk.into(), len: 10, inline: None };
+        let b = |base, wk: &str| BlobRef { user_id: "u-unindex".into(), bucket: "b-unindex".into(), base, placement: p(wk) };
+        index_blob(&b(100, "x"));
+        index_blob(&b(200, "y"));
+        assert!(!unindex_blob(&b(100, "other")), "a different blob at that address stays");
+        assert!(unindex_blob(&b(100, "x")));
+        assert!(blob_at("u-unindex", "b-unindex", 100).is_none());
+        assert!(blob_at("u-unindex", "b-unindex", 200).is_some());
+        assert!(unindex_blob(&b(200, "y")));
+        assert!(!unindex_blob(&b(200, "y")));
+    }
 
     #[test]
     fn addresses_never_overlap_and_a_restart_never_reuses_one() {

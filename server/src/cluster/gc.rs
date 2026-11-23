@@ -39,9 +39,10 @@ fn key_nanos(key: &str) -> Option<u64> {
     u64::from_str_radix(key.strip_prefix(PREFIX)?, 16).ok()
 }
 
-/// The blobs that have shards on nodes: inline blobs live in their row.
+/// The blobs a gc/ row names: every dead blob, inline ones included. An inline
+/// blob has no shards to free, but its address index entry goes too.
 pub fn with_shards(blobs: Vec<BlobRef>) -> Vec<BlobRef> {
-    blobs.into_iter().filter(|b| b.placement.inline.is_none() && !b.placement.wire_key.is_empty()).collect()
+    blobs
 }
 
 fn cursor_path() -> String {
@@ -107,6 +108,12 @@ pub fn run() -> GcStats {
     for (_, blobs) in &due {
         for b in blobs {
             stats.blobs += 1;
+            // Past the grace period no read is on it: out of the address
+            // index, which otherwise grows with every write ever made.
+            super::blob_store::unindex_blob(b);
+            if b.placement.inline.is_some() || b.placement.wire_key.is_empty() {
+                continue;
+            }
             let bucket = blob_bucket(&b.bucket);
             for idx in 0..b.placement.shard_peers.len() {
                 let sk = shard_key(&b.user_id, &bucket, &b.placement.wire_key, idx);
