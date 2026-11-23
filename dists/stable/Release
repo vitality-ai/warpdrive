@@ -1,19 +1,19 @@
 Origin: Vitality AI
 Label: Warpdrive
 Codename: stable
-Date: Mon, 23 Nov 2026 11:15:08 UTC
+Date: Mon, 23 Nov 2026 11:20:31 UTC
 Architectures: amd64
 Components: main
 Description: Warpdrive S3-compatible object storage
 MD5Sum:
- cb38590620078f5b6ecce0e94aa822ae 666 main/binary-amd64/Packages
- 7caf39cb0833908605db94849fcfd25b 464 main/binary-amd64/Packages.gz
+ 08aaa1645777283f032791634a6de727 666 main/binary-amd64/Packages
+ 9cdb51085cf857f3fd49e01f9b94dd7d 465 main/binary-amd64/Packages.gz
  8a8edf0111dc1c9cd4fbc68e920b77b5 125 main/binary-amd64/Release
 SHA1:
- 12dfc4d7125ab549d249b4cffdab43476c49bfb3 666 main/binary-amd64/Packages
- a48a7b880c1e2f67386b8a7dcf5386e59b460d23 464 main/binary-amd64/Packages.gz
+ 5fec992661dd83656fb719b10a9f2f1c0e682ecc 666 main/binary-amd64/Packages
+ ec822c76bfff8ebb564d3eee6463b3bfdef0807d 465 main/binary-amd64/Packages.gz
  9570c7e6ef6f79a794b03a214c42013fe689cf93 125 main/binary-amd64/Release
 SHA256:
- 988e6d96135748a59cbcc0ac179d60b2b8f28cbadd5de27c287696cf177eaaf0 666 main/binary-amd64/Packages
- 8d64f0fd2decb2f9d49bcf74c93370b1d2185d26c0996ae94e15346cf590ed53 464 main/binary-amd64/Packages.gz
+ faf1f16dc3362c7af860f2e9ad0194e0a23a11672b522755d9038c541e0c580f 666 main/binary-amd64/Packages
+ 4fd0b3d7fb91d65c76835703781c5f63d5314671c96336e741fda5e6ad53ee89 465 main/binary-amd64/Packages.gz
  909e609b6e4e1c5967de217c6b02b8e3d8b019d42569891d5945992d19600fa3 125 main/binary-amd64/Release
