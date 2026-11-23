@@ -216,10 +216,7 @@ impl RecordOp {
                 let rows = super::replicated_metadata::rows()
                     .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
                 match m.record {
-                    Some(r) => {
-                        super::replicated_metadata::index_record(&r);
-                        rows.put(m.key, r)?.into()
-                    }
+                    Some(r) => rows.put(m.key, r)?.into(),
                     None => rows.delete(m.key, m.seq)?.into(),
                 }
             }

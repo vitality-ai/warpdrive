@@ -16,6 +16,10 @@ use std::collections::HashMap;
 pub struct DataChunk {
     pub offset: u64,
     pub size: u64,
+    /// Where the bytes live, attached by the metadata store that returned
+    /// the chunk (the cluster: the blob's placement). Not stored.
+    #[serde(skip)]
+    pub loc: Option<crate::storage::Locator>,
 }
 
 /// Full metadata for a stored S3 object
@@ -59,7 +63,7 @@ impl Metadata {
         let size: u64 = offset_size_list.iter().map(|(_, s)| s).sum();
         let chunks = offset_size_list
             .into_iter()
-            .map(|(offset, size)| DataChunk { offset, size })
+            .map(|(offset, size)| DataChunk { offset, size, loc: None })
             .collect();
         Self {
             chunks,
@@ -348,9 +352,9 @@ mod tests {
 
     #[test]
     fn test_data_chunk_equality() {
-        let chunk1 = DataChunk { offset: 100, size: 200 };
-        let chunk2 = DataChunk { offset: 100, size: 200 };
-        let chunk3 = DataChunk { offset: 100, size: 300 };
+        let chunk1 = DataChunk { offset: 100, size: 200, loc: None };
+        let chunk2 = DataChunk { offset: 100, size: 200, loc: None };
+        let chunk3 = DataChunk { offset: 100, size: 300, loc: None };
         assert_eq!(chunk1, chunk2);
         assert_ne!(chunk1, chunk3);
     }

@@ -43,9 +43,8 @@ use crate::metadata::{
     BucketStats, DeleteSpecificResult, DeletionEvent, Metadata, MetadataStorage, MultipartPartRow, MultipartUploadRow,
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
-use super::blob_store::{blob_at, index_blob, BlobRef};
+use super::blob_store::{claim, locator, BlobRef};
 use super::meta_engine::{AnyEngine, MetaEngineKind};
-use warp_meta_store::Engine;
 
 // ---------------------------------------------------------------- rows
 
@@ -185,29 +184,46 @@ impl Record for MetaRecord {
 pub type MetaRows = WarpMetaStore<MetaRecord, AnyEngine<Entry<MetaRecord>>>;
 
 pub fn open_rows(kind: MetaEngineKind, path: &str) -> std::io::Result<MetaRows> {
-    let rows: MetaRows = WarpMetaStore::new(AnyEngine::open(kind, path, "s3 metadata")?);
-    for (_, entry) in rows.engine().snapshot() {
-        if let Some(r) = entry.live() {
-            index_record(r);
+    Ok(WarpMetaStore::new(AnyEngine::open(kind, path, "s3 metadata")?))
+}
+
+/// The blobs behind a row's extents, for the row to store. A blob this node
+/// just wrote comes from the write handoff (`claim`); one the object already
+/// has (a metadata update) from `known`; a completed upload's parts from
+/// `more` (the upload rows), read only if needed. An extent none of them
+/// knows fails the write: a row without its placement could never be read.
+fn blobs_for(user: &str, bucket: &str, extents: &[(u64, u64)], known: &[BlobRef], more: &dyn Fn() -> Vec<BlobRef>) -> Result<Vec<BlobRef>, String> {
+    let mut extra: Option<Vec<BlobRef>> = None;
+    let same = |b: &&BlobRef, base: u64| b.base == base && b.user_id == user && b.bucket == bucket;
+    extents
+        .iter()
+        .map(|&(base, _)| {
+            if let Some(b) = claim(user, bucket, base) {
+                return Ok(b);
+            }
+            if let Some(b) = known.iter().find(|b| same(b, base)) {
+                return Ok(b.clone());
+            }
+            extra
+                .get_or_insert_with(more)
+                .iter()
+                .find(|b| same(b, base))
+                .cloned()
+                .ok_or_else(|| format!("no blob placement known for {bucket} at {base:#x}"))
+        })
+        .collect()
+}
+
+impl VersionEntry {
+    /// The version's metadata with each chunk's locator, so a read of the
+    /// chunk goes straight to its blob's placement.
+    fn located_meta(&self) -> Metadata {
+        let mut m = self.meta.clone();
+        for c in &mut m.chunks {
+            c.loc = self.blobs.iter().find(|b| b.base == c.offset).map(locator);
         }
+        m
     }
-    Ok(rows)
-}
-
-/// Adds every blob a row references to this node's address index, so this
-/// node can read them. Called for each row it applies, and at startup.
-pub fn index_record(r: &MetaRecord) {
-    match &r.value {
-        MetaValue::Version(v) => v.blobs.iter().for_each(index_blob),
-        MetaValue::Upload(u) => u.parts.values().flat_map(|p| &p.blobs).for_each(index_blob),
-        _ => {}
-    }
-}
-
-/// The placements of the blobs starting at `extents`' offsets, as this
-/// node's index knows them (it wrote them, or applied their rows).
-fn blobs_for(user: &str, bucket: &str, extents: &[(u64, u64)]) -> Vec<BlobRef> {
-    extents.iter().filter_map(|(offset, _)| blob_at(user, bucket, *offset)).collect()
 }
 
 fn bucket_key(bucket: &str) -> String {
@@ -301,10 +317,7 @@ pub struct LocalWriter(pub Arc<MetaRows>);
 impl RowWriter for LocalWriter {
     fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String> {
         let res = match record {
-            Some(r) => {
-                index_record(&r);
-                self.0.put(key.to_string(), r)
-            }
+            Some(r) => self.0.put(key.to_string(), r),
             None => self.0.delete(key.to_string(), seq),
         }
         .map_err(|e| e.to_string())?;
@@ -463,7 +476,8 @@ impl ReplicatedMetadataStore {
             let _g = self.locks.lock_async(&versions_prefix(&user, &bucket, &key)).await;
             let before = self.object(&user, &bucket, &key).unwrap_or_default();
             let mut after = before.clone();
-            let out = put_version(mode, &user, &bucket, &metadata, &mut after);
+            let uploads = self.upload_blobs_fn(&user, &bucket);
+            let out = put_version(mode, &user, &bucket, &metadata, &mut after, &uploads)?;
             for (row, value) in version_writes(&user, &bucket, &key, &before, &after) {
                 match value {
                     Some(v) => self.put_async(row, v).await?,
@@ -557,6 +571,22 @@ impl ReplicatedMetadataStore {
         self.put_async(key, MetaValue::Upload(row)).await.map_err(|e| (500, e))
     }
 
+    /// Every part blob of the bucket's uploads, read when a new version
+    /// reuses blobs the handoff doesn't hold: CompleteMultipartUpload, whose
+    /// parts were claimed by their part rows.
+    fn upload_blobs_fn<'a>(&'a self, user: &'a str, bucket: &'a str) -> impl Fn() -> Vec<BlobRef> + 'a {
+        move || {
+            self.rows
+                .list_live("upl/", |_, r| match &r.value {
+                    MetaValue::Upload(u) if u.user_id == user && u.bucket == bucket => u.parts.values().flat_map(|p| p.blobs.iter().cloned()).collect(),
+                    _ => Vec::new(),
+                })
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+
     fn upload(&self, upload_id: &str) -> Option<UploadRow> {
         match self.get(&upload_key(upload_id)) {
             Some(MetaValue::Upload(u)) => Some(u),
@@ -631,9 +661,12 @@ impl ReplicatedMetadataStore {
 
 /// Adds a new version of an object for an S3 PUT under `mode`. Returns
 /// the version id and the version it replaced, if any.
-fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadata, o: &mut ObjectRow) -> (String, Option<VersionEntry>) {
+fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadata, o: &mut ObjectRow, uploads: &dyn Fn() -> Vec<BlobRef>) -> Result<(String, Option<VersionEntry>), String> {
     let mut meta = metadata.clone();
     meta.is_delete_marker = false;
+    // Before any version is dropped: a new version may reuse their blobs.
+    let known: Vec<BlobRef> = o.versions.iter().flat_map(|v| v.blobs.iter().cloned()).collect();
+    let blobs = blobs_for(user_id, bucket, &meta.to_offset_size_list(), &known, uploads)?;
     let (vid, replaced) = match mode {
         Versioning::Enabled => (new_version_id(), None),
         Versioning::Suspended => {
@@ -643,7 +676,6 @@ fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadat
         _ => (String::new(), o.versions.drain(..).last()),
     };
     meta.version_id = (!vid.is_empty()).then(|| vid.clone());
-    let blobs = blobs_for(user_id, bucket, &meta.to_offset_size_list());
     // An unversioned overwrite takes the old version's slot: one row
     // write, not a new row plus a tombstone.
     let order = match (mode, &replaced) {
@@ -651,7 +683,7 @@ fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadat
         _ => hlc::now(),
     };
     o.versions.push(VersionEntry { order, version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
-    (vid, replaced)
+    Ok((vid, replaced))
 }
 
 /// The row writes that turn `before` into `after`: new or changed version
@@ -697,13 +729,19 @@ impl MetadataStorage for ReplicatedMetadataStore {
         Some(Box::pin(async move {
             let extents = crate::util::serializer::deserialize_offset_size(&extents_blob).map_err(|e| (400, e.to_string()))?;
             let mut replaced = Vec::new();
-            self.update_upload_async(&upload_id, |u| {
-                let blobs = blobs_for(&u.user_id, &u.bucket, &extents);
-                if let Some(old) = u.parts.insert(part_number, PartRow { etag, size, extents_blob, checksum_value, blobs }) {
-                    replaced = old.blobs;
+            let mut unknown = None;
+            self.update_upload_async(&upload_id, |u| match blobs_for(&u.user_id, &u.bucket, &extents, &[], &Vec::new) {
+                Ok(blobs) => {
+                    if let Some(old) = u.parts.insert(part_number, PartRow { etag, size, extents_blob, checksum_value, blobs }) {
+                        replaced = old.blobs;
+                    }
                 }
+                Err(e) => unknown = Some(e),
             })
             .await?;
+            if let Some(e) = unknown {
+                return Err((500, e));
+            }
             self.gc_async(replaced).await.map_err(|e| (500, e))
         }))
     }
@@ -733,7 +771,8 @@ impl MetadataStorage for ReplicatedMetadataStore {
             if o.latest().is_some_and(|v| !v.is_delete_marker) {
                 return Err(ErrorBadRequest("Key already exists"));
             }
-            let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list());
+            let known: Vec<BlobRef> = o.versions.iter().flat_map(|v| v.blobs.iter().cloned()).collect();
+            let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list(), &known, &Vec::new).map_err(ErrorInternalServerError)?;
             o.versions = vec![VersionEntry { order: hlc::now(), version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
             Ok(())
         })
@@ -742,7 +781,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
     fn get_metadata(&self, user_id: &str, bucket: &str, object_id: &str) -> Result<Metadata, Error> {
         self.latest(user_id, bucket, object_id)
             .filter(|v| !v.is_delete_marker)
-            .map(|v| v.meta)
+            .map(|v| v.located_meta())
             .ok_or_else(|| not_found(bucket, object_id))
     }
 
@@ -792,8 +831,9 @@ impl MetadataStorage for ReplicatedMetadataStore {
     fn update_metadata(&self, user_id: &str, bucket: &str, object_id: &str, metadata: &Metadata) -> Result<(), Error> {
         self.update_object(user_id, bucket, object_id, |o| match o.versions.last_mut() {
             Some(v) if !v.is_delete_marker => {
+                let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list(), &v.blobs, &Vec::new).map_err(ErrorInternalServerError)?;
                 v.meta = metadata.clone();
-                v.blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list());
+                v.blobs = blobs;
                 Ok(())
             }
             _ => Err(not_found(bucket, object_id)),
@@ -867,7 +907,8 @@ impl MetadataStorage for ReplicatedMetadataStore {
 
     fn put_object_v2(&self, user_id: &str, bucket: &str, key: &str, metadata: &Metadata) -> Result<(Option<String>, Vec<(u64, u64)>), Error> {
         let mode = self.mode(bucket);
-        let (vid, replaced) = self.update_object(user_id, bucket, key, |o| Ok(put_version(mode, user_id, bucket, metadata, o)))?;
+        let uploads = self.upload_blobs_fn(user_id, bucket);
+        let (vid, replaced) = self.update_object(user_id, bucket, key, |o| put_version(mode, user_id, bucket, metadata, o, &uploads).map_err(ErrorInternalServerError))?;
         let old_extents = match replaced {
             Some(v) => {
                 self.forget_version(bucket, key, &v)?;
@@ -966,7 +1007,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
     fn get_object_version(&self, user_id: &str, bucket: &str, key: &str, version_id: &str) -> Result<Metadata, Error> {
         let o = self.object(user_id, bucket, key).ok_or_else(|| not_found(bucket, key))?;
         let v = o.find(version_id).map(|i| &o.versions[i]).ok_or_else(|| not_found(bucket, key))?;
-        let mut m = v.meta.clone();
+        let mut m = v.located_meta();
         m.is_delete_marker = v.is_delete_marker;
         m.version_id = Some(v.shown_id());
         Ok(m)
@@ -1192,13 +1233,19 @@ impl MetadataStorage for ReplicatedMetadataStore {
     fn upsert_multipart_part(&self, upload_id: &str, part_number: i32, etag: &str, size: u64, extents_blob: &[u8], checksum_value: &str) -> Result<(), Error> {
         let extents = crate::util::serializer::deserialize_offset_size(extents_blob)?;
         let mut replaced = Vec::new();
-        self.update_upload(upload_id, |u| {
-            let blobs = blobs_for(&u.user_id, &u.bucket, &extents);
-            let part = PartRow { etag: etag.to_string(), size, extents_blob: extents_blob.to_vec(), checksum_value: checksum_value.to_string(), blobs };
-            if let Some(old) = u.parts.insert(part_number, part) {
-                replaced = old.blobs;
+        let mut unknown = None;
+        self.update_upload(upload_id, |u| match blobs_for(&u.user_id, &u.bucket, &extents, &[], &Vec::new) {
+            Ok(blobs) => {
+                let part = PartRow { etag: etag.to_string(), size, extents_blob: extents_blob.to_vec(), checksum_value: checksum_value.to_string(), blobs };
+                if let Some(old) = u.parts.insert(part_number, part) {
+                    replaced = old.blobs;
+                }
             }
+            Err(e) => unknown = Some(e),
         })?;
+        if let Some(e) = unknown {
+            return Err(ErrorInternalServerError(e));
+        }
         // A part uploaded again under the same number: the old one is dead.
         self.gc(replaced)
     }
@@ -1363,8 +1410,19 @@ macro_rules! metadata_store_tests {
         (dir, s)
     }
 
+    /// An extent of `size` bytes this node just wrote for user `u`, bucket
+    /// `b`: handed off for the row that claims it, as a real PUT does. Each
+    /// gets its own address, so tests running in parallel never share one.
+    fn written(size: u64) -> (u64, u64) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
+        let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
+        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec!["p".into()], k: 1, m: 0, wire_key: format!("{base:x}"), len: size, inline: None };
+        super::super::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
+        (base, size)
+    }
+
     fn meta(size: u64, etag: &str) -> Metadata {
-        let mut m = Metadata::from_offset_size_list(vec![(1000, size)]);
+        let mut m = Metadata::from_offset_size_list(vec![written(size)]);
         m.etag = Some(etag.into());
         m.last_modified = Some(now_iso());
         m
@@ -1374,8 +1432,9 @@ macro_rules! metadata_store_tests {
     fn an_unversioned_overwrite_replaces_and_returns_the_old_extents() {
         let (_d, s) = store();
         s.create_bucket("u", "b").unwrap();
-        assert_eq!(s.put_object_v2("u", "b", "k", &meta(5, "a")).unwrap(), (None, vec![]));
-        assert_eq!(s.put_object_v2("u", "b", "k", &meta(7, "b")).unwrap(), (None, vec![(1000, 5)]));
+        let first = meta(5, "a");
+        assert_eq!(s.put_object_v2("u", "b", "k", &first).unwrap(), (None, vec![]));
+        assert_eq!(s.put_object_v2("u", "b", "k", &meta(7, "b")).unwrap(), (None, first.to_offset_size_list()));
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().etag.as_deref(), Some("b"));
         assert_eq!(s.list_objects("u", "b").unwrap(), vec!["k".to_string()]);
         assert!(matches!(s.delete_object_v2("u", "b", "k").unwrap(), VersioningDeleteResult::Deleted));
@@ -1410,8 +1469,9 @@ macro_rules! metadata_store_tests {
         s.set_versioning_state("u", "b", "enabled").unwrap();
         let (v1, _) = s.put_object_v2("u", "b", "k", &meta(1, "v1")).unwrap();
         s.set_versioning_state("u", "b", "suspended").unwrap();
-        assert_eq!(s.put_object_v2("u", "b", "k", &meta(2, "n1")).unwrap().0.as_deref(), Some("null"));
-        assert_eq!(s.put_object_v2("u", "b", "k", &meta(3, "n2")).unwrap(), (Some("null".into()), vec![(1000, 2)]));
+        let n1 = meta(2, "n1");
+        assert_eq!(s.put_object_v2("u", "b", "k", &n1).unwrap().0.as_deref(), Some("null"));
+        assert_eq!(s.put_object_v2("u", "b", "k", &meta(3, "n2")).unwrap(), (Some("null".into()), n1.to_offset_size_list()));
         let (rows, ..) = s.list_object_versions_full("u", "b", "", "", "", 1000).unwrap();
         assert_eq!(rows.iter().map(|r| r.version_id.clone()).collect::<Vec<_>>(), vec!["null".to_string(), v1.unwrap()]);
     }
@@ -1489,13 +1549,51 @@ macro_rules! metadata_store_tests {
     }
 
     #[test]
+    fn a_read_gets_each_chunks_placement_from_the_row() {
+        let (_d, s) = store();
+        s.create_bucket("u", "b").unwrap();
+        let m = meta(9, "a");
+        s.put_object_v2("u", "b", "k", &m).unwrap();
+        let got = s.get_metadata("u", "b", "k").unwrap();
+        let b = got.chunks[0].loc.as_ref().and_then(|l| l.0.downcast_ref::<BlobRef>()).expect("the chunk carries its locator");
+        assert_eq!((b.base, b.placement.len), (m.chunks[0].offset, 9));
+        // A metadata update keeps the same blobs, taken from the version.
+        s.update_metadata("u", "b", "k", &m).unwrap();
+        assert!(s.get_metadata("u", "b", "k").unwrap().chunks[0].loc.is_some());
+    }
+
+    #[test]
+    fn a_row_for_bytes_this_node_never_wrote_is_refused() {
+        let (_d, s) = store();
+        s.create_bucket("u", "b").unwrap();
+        let unknown = Metadata::from_offset_size_list(vec![(7, 3)]);
+        assert!(s.put_object_v2("u", "b", "k", &unknown).is_err(), "a row without its placement could never be read");
+        assert!(s.get_metadata("u", "b", "k").is_err());
+    }
+
+    #[test]
+    fn completing_an_upload_takes_the_parts_blobs_from_the_upload() {
+        let (_d, s) = store();
+        s.create_bucket("u", "b").unwrap();
+        s.create_multipart_upload("upc", "u", "b", "k", None, "{}", "t", "", "", "", "", "").unwrap();
+        let (p1, p2) = (written(5), written(6));
+        let ser = |e| crate::util::serializer::serialize_offset_size(&vec![e]).unwrap();
+        s.upsert_multipart_part("upc", 1, "e1", 5, &ser(p1), "").unwrap();
+        s.upsert_multipart_part("upc", 2, "e2", 6, &ser(p2), "").unwrap();
+        // The parts' blobs were claimed by their part rows: the object row
+        // finds them in the upload.
+        s.put_object_v2("u", "b", "k", &Metadata::from_offset_size_list(vec![p1, p2])).unwrap();
+        assert!(s.get_metadata("u", "b", "k").unwrap().chunks.iter().all(|c| c.loc.is_some()));
+    }
+
+    #[test]
     fn multipart_uploads_and_parts() {
         let (_d, s) = store();
         s.create_multipart_upload("up1", "u", "b", "k", None, "{}", "t", "", "", "", "", "").unwrap();
-        let ext = |o: u64, n: u64| crate::util::serializer::serialize_offset_size(&vec![(o, n)]).unwrap();
-        s.upsert_multipart_part("up1", 2, "e2", 20, &ext(100, 20), "").unwrap();
-        s.upsert_multipart_part("up1", 1, "e1", 10, &ext(0, 10), "").unwrap();
-        s.upsert_multipart_part("up1", 1, "e1b", 11, &ext(50, 11), "").unwrap();
+        let ext = |n: u64| crate::util::serializer::serialize_offset_size(&vec![written(n)]).unwrap();
+        s.upsert_multipart_part("up1", 2, "e2", 20, &ext(20), "").unwrap();
+        s.upsert_multipart_part("up1", 1, "e1", 10, &ext(10), "").unwrap();
+        s.upsert_multipart_part("up1", 1, "e1b", 11, &ext(11), "").unwrap();
         let parts = s.list_multipart_parts("up1").unwrap();
         assert_eq!(parts.iter().map(|p| (p.part_number, p.etag.as_str())).collect::<Vec<_>>(), vec![(1, "e1b"), (2, "e2")]);
         assert_eq!(s.list_bucket_multipart_uploads("b").unwrap().len(), 1);
@@ -1529,7 +1627,7 @@ macro_rules! metadata_store_tests {
             s.put_object_v2("u", "b", "k", &meta(4, "e")).unwrap();
             // An upload's parts are a map keyed by part number.
             s.create_multipart_upload("up", "u", "b", "k2", None, "{}", "t", "", "", "", "", "").unwrap();
-            let ext = crate::util::serializer::serialize_offset_size(&vec![(0, 10)]).unwrap();
+            let ext = crate::util::serializer::serialize_offset_size(&vec![written(10)]).unwrap();
             s.upsert_multipart_part("up", 3, "e3", 10, &ext, "").unwrap();
         }
         let rows = Arc::new(open_rows(KIND, &path).unwrap());
