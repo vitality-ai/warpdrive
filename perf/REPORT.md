@@ -17,7 +17,7 @@ How to read the numbers:
 | Name | VMs | Erasure code | Used for |
 |---|---|---|---|
 | A, 2026-11-20 | 5 x n2-standard-2 (2 vCPU, 8 GB, local NVMe) + client n2-standard-2 | RS(3,2) | #217 against #226, 4 KB |
-| B, 2026-11-21 to 22 | node 0 n2-standard-4 (15 GB), nodes 1-2 n2-standard-2 (8 GB), local NVMe; client n2-standard-4 | RS(2,1), or single node | async I/O, segments, compaction, soaks, sizing |
+| B, 2026-11-21 to 22 | node 0 n2-standard-4 (15 GB), nodes 1-2 n2-standard-2 (8 GB), local NVMe, and client n2-standard-4 | RS(2,1), or single node | async I/O, segments, compaction, soaks, sizing |
 | C, 2026-11-23 | 5 x n2-standard-2 + client n2-standard-2 | RS(3,2) | final size sweep and soak |
 
 The project's cap is 12 vCPUs, which sets these shapes. Hardware and software per VM: each date folder's `environment/`.
@@ -133,7 +133,7 @@ byte throughout.
 |---|---|---|---|---|
 | 1 | 4c2aeeb | held: 1,639 objects, 0 mismatches | **killed for memory** at minute 57: gc/ rows kept for a day, and every pass scanned all of them | 1f8bb42: passes read only the rows due and drop them |
 | 2 | 1f8bb42 | held: 277,204 checks, 0 failures | metadata flat, but memory still grew while writing: the blob address index never dropped dead blobs | 766060b |
-| 3 | 766060b | held: 147,361 checks, 0 failures | **flat under full write load**; audit finds 0 to free | |
+| 3 | 766060b | held: 147,361 checks, 0 failures | **flat under full write load**, and the audit finds 0 to free | |
 
 ![soak 1](2026-11-22-gcp/soak1/resources.png)
 ![soak 2](2026-11-22-gcp/soak2/resources.png)
@@ -208,14 +208,14 @@ clients over nodes should do better. These are measurements, not guarantees.
 
 | | Expect |
 |---|---|
-| Durability | every write synced before it's acknowledged, and erasure-coded across nodes (default RS(3,2): a fully written object survives the loss of any 2 nodes; a write acknowledged with fewer shards isn't repaired yet, #206) |
+| Durability | every write synced before it's acknowledged, and erasure-coded across nodes (default RS(3,2): a fully written object survives the loss of any 2 nodes. A write acknowledged with fewer shards isn't repaired yet, #206) |
 | Correctness under load | 0 mismatches and 0 errors in every soak and canary run |
 | Memory per node | flat with object count: under 1 GB at 4.3 M objects (plus the RocksDB cache you configure) |
 | Startup | about 1 s, at any object count measured |
 | Disk while overwriting | live data plus write rate x (grace period + 1 to 2 min) |
 | Small objects, RS(3,2), 2-vCPU nodes | about 1,300-1,500 PUT/s and 2,200-2,400 GET/s at 4 KB |
 | Large objects, RS(3,2), 2-vCPU nodes | about 130 MB/s PUT and 250-290 MB/s GET from 1 to 8 MB |
-| Objects over 256 MB | supported for PUT up to about 512 MB on RS(2,1); GET of a blob over 256 MB is very slow (#230) |
+| Objects over 256 MB | PUT works up to about 512 MB on RS(2,1). GET of a blob over 256 MB is very slow (#230) |
 
 ## Known gaps, tracked
 
