@@ -83,11 +83,13 @@ fn ec_params_from_env() -> (usize, usize) {
 /// set `WARPDRIVE_PEER_TRANSPORT=http` or `=tcp` to use either instead
 /// (e.g. to re-run the comparison on different hardware).
 fn peer_client_from_env() -> Arc<dyn PeerClient> {
-    match std::env::var("WARPDRIVE_PEER_TRANSPORT").as_deref() {
-        Ok("http") => Arc::new(HttpPeerClient::new()),
-        Ok("tcp") => Arc::new(TcpPeerClient::new()),
-        _ => Arc::new(GrpcPeerClient::new()),
-    }
+    let (name, client): (&str, Arc<dyn PeerClient>) = match std::env::var("WARPDRIVE_PEER_TRANSPORT").as_deref() {
+        Ok("http") => ("http", Arc::new(HttpPeerClient::new())),
+        Ok("tcp") => ("tcp", Arc::new(TcpPeerClient::new())),
+        _ => ("grpc", Arc::new(GrpcPeerClient::new())),
+    };
+    info!("Peer transport: {name}");
+    client
 }
 
 /// Which engine should answer `/s3/...` (and root `/{bucket}/...`) for
@@ -363,6 +365,17 @@ fn build_cluster_state() -> web::Data<ClusterState> {
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
             || std::env::var("WARPDRIVE_JOIN_VIA").is_ok(),
     };
+    if state.configured_for_cluster {
+        let peers = state.membership.peers();
+        info!(
+            "Cluster: RS({k},{m}), self={}, {} peers {:?}, location log {location_log}",
+            std::env::var("WARPDRIVE_SELF_ADDR").unwrap_or_else(|_| "(not set)".to_string()),
+            peers.len(),
+            peers
+        );
+    } else {
+        info!("Single-node mode: WARPDRIVE_PEERS and WARPDRIVE_JOIN_VIA are not set");
+    }
     web::Data::new(state)
 }
 
@@ -460,9 +473,12 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    let access_log = std::env::var("WARPDRIVE_ACCESS_LOG").map(|v| v == "1").unwrap_or(false);
     HttpServer::new(move || {
         App::new()
-            .wrap(actix_web::middleware::Logger::default())
+            // Per-request access log, off by default so production pays nothing
+            // per request. WARPDRIVE_ACCESS_LOG=1 turns it on (needs INFO level).
+            .wrap(actix_web::middleware::Condition::new(access_log, actix_web::middleware::Logger::default()))
             .app_data(web::PayloadConfig::default().limit(MAX_BODY_BYTES))
             // Internal record replication sends JSON bodies. An S3 metadata
             // row holds every version of one key, so it can outgrow

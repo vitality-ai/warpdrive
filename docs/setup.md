@@ -243,6 +243,110 @@ cluster across multiple machines, see
 
 ---
 
+## Logs
+
+`warp_drive` reads `server_log.yaml` from its working directory. The
+default level is `info`, which logs startup, cluster and bucket changes,
+and background job summaries, never anything per request.
+
+| Level | What it logs |
+|---|---|
+| `error` | Something failed and needs attention |
+| `warn` | Degraded but still serving: a peer down, a failed replication |
+| `info` (default) | Startup and configuration, nodes joining the cluster, bucket create/delete and config changes, background job summaries (e.g. space freed by the deletion worker) |
+| `debug` | Diagnostic detail that doesn't grow with traffic: resolved config, credential cache refreshes, STS sessions issued |
+| `trace` | Everything per request: each S3 call, rejected requests (bad signature, missing key), step-by-step internals |
+
+Every message goes to two places: the console (stdout) and
+`logs/application.log` under the working directory. The file rotates at
+100 MB and keeps 5 old files (`application.1.log` to `application.5.log`).
+
+### Reading logs
+
+**`.deb` package (systemd)**
+
+```bash
+journalctl -u warpdrive -f                                   # follow
+journalctl -u warpdrive --since "1 hour ago"
+sudo tail -f /var/lib/warpdrive/logs/application.log
+```
+
+**Release archive**
+
+The console is the terminal you started it from. The file is
+`logs/application.log` inside the extracted folder:
+
+```bash
+tail -f logs/application.log
+```
+
+**Docker image**
+
+```bash
+docker logs -f <container>
+docker exec <container> tail -f /server/logs/application.log
+docker cp <container>:/server/logs ./warpdrive-logs           # copy out, rotated files included
+```
+
+The log file sits in the container's own filesystem, not on the `/data`
+volume, so it's lost when the container is removed. `docker logs` has the
+same messages.
+
+**Docker cluster entrypoint** (`docker_cluster_entrypoint.sh`)
+
+Each node writes under its own directory on the `/data` mount:
+
+```bash
+tail -f data/node0/logs/application.log    # node 0, from the host
+tail -f data/node0/node.out                # node 0's console output
+```
+
+**Kubernetes** (see [Production Deployment](Production-Deployment.md))
+
+```bash
+kubectl logs -f warpdrive-0
+kubectl logs warpdrive-0 --previous        # the container before its last restart
+kubectl exec warpdrive-0 -- tail -f /server/logs/application.log
+```
+
+### More detail while debugging
+
+In `server_log.yaml`, change the `warp_drive` logger at the bottom to `debug`,
+or to `trace` to see every request:
+
+```yaml
+loggers:
+  warp_drive:
+    level: debug
+```
+
+Change only that logger, not `root`. At `debug`, `root` also turns on the
+HTTP and gRPC libraries, which log every network frame and slow the
+server down several times over. The file is re-read every 30 seconds, so a
+running server picks up the change without a restart. Set it back to
+`info` when you're done, because `trace` writes several lines for every
+request.
+
+| Install | `server_log.yaml` |
+|---|---|
+| `.deb` | `/var/lib/warpdrive/server_log.yaml` |
+| Release archive | the extracted folder |
+| Docker image | `/server/server_log.yaml`. Edit with `docker exec`, or mount your own: `-v ./server_log.yaml:/server/server_log.yaml` |
+| Docker cluster entrypoint | `data/node<N>/server_log.yaml` (one per node) |
+
+The per-request access log is off unless the server is started with
+`WARPDRIVE_ACCESS_LOG=1`. It logs at `info`, so it shows at the default
+level once enabled.
+
+### Files that are not logs
+
+`cluster_location.log`, `cluster_content_location.log`,
+`cluster_bucket_config.log` and `shard_meta.log` hold cluster metadata
+(where each object's shards live). Don't delete or rotate them. They're
+how a node finds the objects it stores.
+
+---
+
 ## Troubleshooting
 
 - Ensure all prerequisites are installed and available in your PATH.

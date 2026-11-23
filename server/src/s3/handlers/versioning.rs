@@ -177,7 +177,7 @@ pub(super) async fn s3_list_object_versions_handler_inner(bucket: &str, req: &Ht
     let owner_id         = xml_escape(&auth_result.user_id);
     let owner_display    = xml_escape(&auth_result.owner_display_name);
 
-    log::info!("S3 ListObjectVersions: bucket={}", bucket);
+    log::trace!("S3 ListObjectVersions: bucket={}", bucket);
 
     let (rows, is_truncated, next_key, next_vid) = db.list_object_versions_full(
         bucket, &prefix, &key_marker, &version_id_marker, max_keys,

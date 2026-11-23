@@ -1,6 +1,5 @@
 // CopyObject handler.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
-use log::info;
 
 use std::collections::HashMap;
 
@@ -57,7 +56,7 @@ pub async fn s3_copy_object_handler(
                            "Access Denied", &format!("/{}/{}", src_bucket, src_key)));
     }
 
-    info!("S3 CopyObject: {}/{} → {}/{}", src_bucket, src_key, dst_bucket, dst_key);
+    log::trace!("S3 CopyObject: {}/{} → {}/{}", src_bucket, src_key, dst_bucket, dst_key);
 
     let db = MetadataService::new(&auth_result.user_id)?;
     if let Err(resp) = require_bucket(&db, &src_bucket) { return Ok(resp); }

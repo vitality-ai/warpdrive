@@ -125,6 +125,10 @@ impl BucketConfigStore for BitcaskBucketConfigStore {
         let ticket = {
             let _write_guard = self.write_lock.lock();
             let ticket = self.log.append_line(&line)?;
+            log::info!(
+                "Bucket config set: bucket={} packer={} overhead_threshold={}%",
+                config.bucket, config.packer_name, config.overhead_threshold_pct
+            );
             self.index.write().insert(config.bucket.clone(), config);
             ticket
         };

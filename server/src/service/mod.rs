@@ -7,7 +7,7 @@ pub mod deletion_worker;
 use actix_web::{ web, HttpResponse,Error, HttpRequest};
 use futures::StreamExt;
 use bytes::BytesMut;
-use log::{info, error, warn};
+use log::error;
 use actix_web::error::{ErrorInternalServerError,ErrorBadRequest};
 use log_mdc;
 
@@ -53,20 +53,20 @@ fn header_handler(req: HttpRequest) -> Result<UserContext, Error> {
 pub async fn put_service(key: String, mut payload: web::Payload, req: HttpRequest) -> Result<HttpResponse, Error>{
 
     let context = header_handler(req)?;
-    info!("PUT service called for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
+    log::trace!("PUT service called for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
 
     let db = MetadataService::new(&context.user_id)?;
-    info!("MetadataService created for user: {}", context.user_id);
+    log::trace!("MetadataService created for user: {}", context.user_id);
     
     let key_exists = db.check_key(&context.bucket, &key).map_err(ErrorInternalServerError)?;
-    info!("Key exists check result: {} for key: {} in bucket: {}", key_exists, key, context.bucket);
+    log::trace!("Key exists check result: {} for key: {} in bucket: {}", key_exists, key, context.bucket);
     
     if key_exists {
-        warn!("Key already exists: {} in bucket: {}", key, context.bucket);
+        log::trace!("Key already exists: {} in bucket: {}", key, context.bucket);
         return Ok(HttpResponse::BadRequest().body("Key already exists"));
     }
 
-    info!("Starting chunk load for user: {}, bucket: {}", context.user_id, context.bucket);
+    log::trace!("Starting chunk load for user: {}, bucket: {}", context.user_id, context.bucket);
     let mut bytes = BytesMut::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(ErrorInternalServerError)?;
@@ -78,7 +78,7 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
         return Ok(HttpResponse::BadRequest().body("No data was uploaded"));
     }
 
-    info!("Total received data size: {} bytes", bytes.len());
+    log::trace!("Total received data size: {} bytes", bytes.len());
 
     // Write incoming FlatBuffers payload to storage and collect (offset, size).
     // `Storage::write` now does a real (group-committed) fsync -- see
@@ -105,21 +105,21 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
         return Ok(HttpResponse::BadRequest().body("No data in data list"));
     }
 
-    info!("Serializing offset and size and uploading");
+    log::trace!("Serializing offset and size and uploading");
 
-    info!("Serializing offset_size_list with {} entries", offset_size_list.len());
+    log::trace!("Serializing offset_size_list with {} entries", offset_size_list.len());
     let offset_size_bytes = serialize_offset_size(&offset_size_list)?;
-    info!("Successfully serialized offset_size_bytes, size: {} bytes", offset_size_bytes.len());
+    log::trace!("Successfully serialized offset_size_bytes, size: {} bytes", offset_size_bytes.len());
 
-    info!("Writing metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
+    log::trace!("Writing metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
     db.write_metadata(&context.bucket, &key, &offset_size_bytes)
         .map_err(|e| {
             error!("Failed to write metadata for user: {}, bucket: {}, key: {}: {}", context.user_id, context.bucket, key, e);
             ErrorInternalServerError(e)
         })?;
-    info!("Successfully wrote metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
+    log::trace!("Successfully wrote metadata for user: {}, bucket: {}, key: {}", context.user_id, context.bucket, key);
 
-    info!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
+    log::trace!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
     Ok(HttpResponse::Ok().body(format!("Data uploaded successfully: key = {}, bucket = {}", key, context.bucket)))
 }
 
@@ -129,13 +129,13 @@ pub async fn get_service(key: String, req: HttpRequest)-> Result<HttpResponse, E
 
     let db = MetadataService::new(&context.user_id)?;
     db.check_key_nonexistance(&context.bucket, &key)?;
-    info!("Retrieving data for key: {} in bucket: {}", key, context.bucket);
+    log::trace!("Retrieving data for key: {} in bucket: {}", key, context.bucket);
 
     // Connect to the SQLite database and retrieve offset and size data
     let offset_size_bytes = match db.read_metadata(&context.bucket, &key) {
         Ok(offset_size_bytes) => offset_size_bytes,
         Err(e) => {
-            warn!("Key does not exist or database error: {}", e);
+            log::trace!("Key does not exist or database error: {}", e);
             return Ok(HttpResponse::BadRequest().body("Key does not exist"));
         }
     };
@@ -158,7 +158,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
 
     let db = MetadataService::new(&context.user_id)?;
     db.check_key_nonexistance(&context.bucket, &key)?;
-    info!("Starting chunk load");
+    log::trace!("Starting chunk load");
     let mut bytes = BytesMut::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(ErrorInternalServerError)?;
@@ -169,7 +169,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
         return Ok(HttpResponse::BadRequest().body("No data was uploaded"));
     }
     
-    info!("Total received data size: {} bytes", bytes.len());
+    log::trace!("Total received data size: {} bytes", bytes.len());
 
     // Write additional FlatBuffers payload chunks to storage.
     // web::block: `write_object` now does a real group-committed fsync --
@@ -190,12 +190,12 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
         return Ok(HttpResponse::BadRequest().body("No data in data list"));
     }
    
-    info!("Serializing offset and size and uploading");
+    log::trace!("Serializing offset and size and uploading");
 
     let offset_size_bytes = match db.read_metadata(&context.bucket, &key) {
         Ok(offset_size_bytes) => offset_size_bytes,
         Err(e) => {
-            warn!("Key does not exist or database error: {}", e);
+            log::trace!("Key does not exist or database error: {}", e);
             return Ok(HttpResponse::BadRequest().body("Key does not exist"));
         }
     };
@@ -211,7 +211,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
     db.append_metadata(&context.bucket, &key, &offset_size_bytes_append)
             .map_err(ErrorInternalServerError)?;
     
-    info!("Data apended successfully with key: {}", key);
+    log::trace!("Data apended successfully with key: {}", key);
     Ok(HttpResponse::Ok().body(format!("Data appended successfully: key = {}", key)))
     
 }
@@ -243,7 +243,7 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     let db = MetadataService::new(&context.user_id)?;
     db.check_key_nonexistance(&context.bucket, &key)?;
 
-    info!("Starting chunk load");
+    log::trace!("Starting chunk load");
     let mut bytes = BytesMut::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(ErrorInternalServerError)?;
@@ -255,8 +255,8 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
         return Ok(HttpResponse::BadRequest().body("No data was uploaded"));
     }
     
-    info!("Total received data size: {} bytes", bytes.len());
-    info!("Starting deserialization");
+    log::trace!("Total received data size: {} bytes", bytes.len());
+    log::trace!("Starting deserialization");
     
     // Rewrite with provided FlatBuffers payload.
     // web::block: same reasoning as `append_service`'s matching fix above --
@@ -280,7 +280,7 @@ pub async  fn update_service(key: String, mut payload: web::Payload, req: HttpRe
     db.update_metadata(&context.bucket, &key, &offset_size_bytes)
     .map_err(ErrorInternalServerError)?;
 
-    info!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
+    log::trace!("Data uploaded successfully with key: {} in bucket: {}", key, context.bucket);
     Ok(HttpResponse::Ok().body(format!("Data uploaded successfully: key = {}, bucket = {}", key, context.bucket)))
 
 

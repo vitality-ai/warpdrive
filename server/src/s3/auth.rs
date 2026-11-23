@@ -96,7 +96,7 @@ fn auth_config_from_env() -> (Option<String>, Option<String>, u64) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_SECS);
     if let Some(ref u) = base_url {
-        debug!(
+        log::trace!(
             "S3 auth: Vitality Console at {} (cache per access_key: secret + registered bucket set)",
             u
         );
@@ -197,7 +197,7 @@ async fn load_or_refresh_credential_bundle(
         let cached = CREDENTIAL_CACHE.read();
         if let Some(c) = cached.get(&cache_key) {
             if c.expires_at > Instant::now() {
-                debug!(
+                log::trace!(
                     "S3 credential cache HIT access_key={} owner={} allowed_bucket_count={}",
                     access_key_log_prefix(access_key),
                     c.owner_id,
@@ -443,11 +443,11 @@ fn verify_sigv4(
     // SigV4 signatures are hex; accept either upper/lowercase from clients and
     // verify in constant time against the computed HMAC bytes.
     let provided_sig = hex::decode(parsed.signature.trim()).map_err(|_| {
-        warn!("SigV4 signature is not valid hex");
+        log::trace!("SigV4 signature is not valid hex");
         ErrorUnauthorized("Invalid signature format")
     })?;
     if mac.verify_slice(&provided_sig).is_err() {
-        warn!(
+        log::trace!(
             "SigV4 signature mismatch (canonical_uri={}, query_len={})",
             canonical_uri,
             canonical_query_string.len()
@@ -738,11 +738,11 @@ fn verify_sigv4_presigned(req: &HttpRequest, secret_key: &str, parsed: &ParsedPr
     mac.update(string_to_sign.as_bytes());
 
     let provided_sig = hex::decode(parsed.signature.trim()).map_err(|_| {
-        warn!("Presigned V4 signature is not valid hex");
+        log::trace!("Presigned V4 signature is not valid hex");
         ErrorUnauthorized("Invalid signature format")
     })?;
     if mac.verify_slice(&provided_sig).is_err() {
-        warn!("Presigned V4 signature mismatch (uri={}, query_len={})", canonical_uri, canonical_query_string.len());
+        log::trace!("Presigned V4 signature mismatch (uri={}, query_len={})", canonical_uri, canonical_query_string.len());
         return Err(s3_access_denied("Signature does not match"));
     }
     Ok(())
@@ -761,7 +761,7 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
     if let (Some(ref aak), Some(ref ask)) = (&admin_access_key, &admin_secret_key) {
         if access_key == *aak {
             verify_sigv4_presigned(req, ask, &parsed)?;
-            debug!("Presigned V4 auth: admin bypass OK bucket={:?}", bucket);
+            log::trace!("Presigned V4 auth: admin bypass OK bucket={:?}", bucket);
             return Ok(S3AuthResult {
                 access_key,
                 user_id: ADMIN_USER_ID.to_string(),
@@ -782,7 +782,7 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
         load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
 
     if cache_hit && allowed_buckets.is_empty() && !bucket.is_empty() {
-        warn!(
+        log::info!(
             "Presigned V4 auth: empty cached bucket set for path_bucket={:?} — invalidating and re-fetching",
             bucket
         );
@@ -795,7 +795,7 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
     }
 
     if !bucket.is_empty() && !allowed_buckets.contains(&bucket) {
-        warn!(
+        log::trace!(
             "Presigned V4 auth: FORBIDDEN path_bucket={:?} not in cached Console bucket set {:?}",
             bucket, allowed_buckets
         );
@@ -808,7 +808,7 @@ async fn authenticate_presigned_v4(req: &HttpRequest, query: &HashMap<String, St
     allowed_buckets_vec.sort();
 
     verify_sigv4_presigned(req, &secret_key, &parsed)?;
-    debug!("Presigned V4 auth: Console OK bucket={:?} user={}", bucket, owner_id);
+    log::trace!("Presigned V4 auth: Console OK bucket={:?} user={}", bucket, owner_id);
     Ok(S3AuthResult {
         access_key,
         owner_display_name: owner_id.clone(),
@@ -876,7 +876,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
     let bucket = extract_bucket_from_path(req)?;
 
     if !is_list_buckets_request(req) && bucket.is_empty() {
-        warn!(
+        log::trace!(
             "S3 auth: empty bucket in path for {} {} — use path-style endpoint so the URL is /s3/{{bucket}}/key",
             req.method(),
             req.path()
@@ -893,7 +893,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
                 // S3 never rejects this outright (e.g. anonymous ListBuckets returns 200
                 // with an empty list) — the caller gates on `is_anonymous` against the
                 // resource's stored ACL.
-                debug!("S3 auth: anonymous request path_bucket={:?}", bucket);
+                log::trace!("S3 auth: anonymous request path_bucket={:?}", bucket);
                 return Ok(S3AuthResult {
                     access_key: String::new(),
                     user_id: String::new(),
@@ -904,7 +904,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
                     is_anonymous: true,
                 });
             }
-            warn!("Missing Authorization header");
+            log::trace!("Missing Authorization header");
             return Err(s3_access_denied("Access Denied"));
         }
     };
@@ -912,7 +912,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
     let parsed = parse_authorization_header_full(auth_header)?;
     let access_key = parsed.access_key.clone();
 
-    debug!(
+    log::trace!(
         "S3 auth: request_path={} extracted_bucket={:?} list_buckets={}",
         req.path(), bucket, is_list_buckets_request(req)
     );
@@ -924,7 +924,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
     if let (Some(ref aak), Some(ref ask)) = (&admin_access_key, &admin_secret_key) {
         if access_key == *aak {
             verify_sigv4(req, ask, &parsed)?;
-            debug!("S3 auth: admin bypass OK path_bucket={:?}", bucket);
+            log::trace!("S3 auth: admin bypass OK path_bucket={:?}", bucket);
             return Ok(S3AuthResult {
                 access_key,
                 user_id: ADMIN_USER_ID.to_string(),
@@ -947,7 +947,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if provided_token != sess.session_token {
-            warn!(
+            log::trace!(
                 "S3 auth: STS session token missing/mismatched for access_key={}",
                 access_key_log_prefix(&access_key)
             );
@@ -957,13 +957,13 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
         }
         verify_sigv4(req, &sess.secret_access_key, &parsed)?;
         if !bucket.is_empty() && !sess.allowed_buckets.iter().any(|b| b == &bucket) {
-            warn!(
+            log::trace!(
                 "S3 auth: FORBIDDEN path_bucket={:?} not in STS session scope {:?}",
                 bucket, sess.allowed_buckets
             );
             return Err(ErrorForbidden("Bucket is not in this session's scope"));
         }
-        debug!(
+        log::trace!(
             "S3 auth: STS session OK user={} path_bucket={:?}",
             sess.user_id, bucket
         );
@@ -982,11 +982,14 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
     let (base_url, service_secret, cache_ttl_secs) = auth_config_from_env();
 
     let base_url = base_url.ok_or_else(|| {
-        warn!("VITALITY_CONSOLE_URL not set and no admin credentials configured");
+        // A configuration problem, so it's the same on every request: log once.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| warn!("No authentication configured: set WARPDRIVE_ADMIN_ACCESS_KEY/WARPDRIVE_ADMIN_SECRET_KEY or VITALITY_CONSOLE_URL. Every request will be rejected."));
         s3_access_denied("No authentication method configured (set WARPDRIVE_ADMIN_ACCESS_KEY or VITALITY_CONSOLE_URL)")
     })?;
     let service_secret = service_secret.ok_or_else(|| {
-        warn!("WARPDRIVE_SERVICE_SECRET not set");
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| warn!("WARPDRIVE_SERVICE_SECRET not set, so Vitality Console auth can't be used. Every Console-authenticated request will be rejected."));
         s3_access_denied("WARPDRIVE_SERVICE_SECRET must be set when using Vitality Console")
     })?;
 
@@ -994,7 +997,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
         load_or_refresh_credential_bundle(&access_key, &base_url, &service_secret, cache_ttl_secs).await?;
 
     if cache_hit && allowed_buckets.is_empty() && !bucket.is_empty() {
-        warn!(
+        log::info!(
             "S3 auth: empty cached bucket set for path_bucket={:?} — invalidating and re-fetching",
             bucket
         );
@@ -1007,7 +1010,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
     }
 
     if !bucket.is_empty() && !allowed_buckets.contains(&bucket) {
-        warn!(
+        log::trace!(
             "S3 auth: FORBIDDEN path_bucket={:?} not in cached Console bucket set {:?}",
             bucket, allowed_buckets
         );
@@ -1020,7 +1023,7 @@ async fn authenticate_s3_request_inner(req: &HttpRequest, allow_anonymous: bool)
     allowed_buckets_vec.sort();
 
     verify_sigv4(req, &secret_key, &parsed)?;
-    debug!(
+    log::trace!(
         "S3 auth: Console path OK request_path={} user={} path_bucket={:?}",
         req.path(), owner_id, bucket
     );

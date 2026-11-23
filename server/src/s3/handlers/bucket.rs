@@ -1,7 +1,6 @@
 // Bucket-level handlers: ListBuckets, CreateBucket, DeleteBucket, HeadBucket.
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use futures::StreamExt as _;
-use log::info;
 
 use std::collections::HashMap;
 
@@ -40,7 +39,7 @@ pub async fn s3_list_buckets_handler(
         );
         return Ok(HttpResponse::Ok().content_type("application/xml").body(xml));
     }
-    info!("S3 ListBuckets: user={}", auth_result.user_id);
+    log::trace!("S3 ListBuckets: user={}", auth_result.user_id);
 
     let db = MetadataService::new(&auth_result.user_id)?;
     let all_stats = db.list_buckets_with_stats()?;
@@ -156,7 +155,7 @@ pub async fn s3_create_bucket_handler(
         let db = MetadataService::new(&auth_result.user_id)?;
         if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
         db.set_bucket_cors_awaited(&bucket, body.trim()).await?;
-        info!("S3 PutBucketCors: bucket={}", bucket);
+        log::info!("S3 PutBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::Ok()
             .insert_header(("Content-Length", "0"))
             .body(""));
@@ -192,7 +191,7 @@ pub async fn s3_create_bucket_handler(
         }
     }
 
-    info!("S3 CreateBucket: bucket={} user={} location={:?}", bucket, auth_result.user_id, location);
+    log::info!("S3 CreateBucket: bucket={} user={} location={:?}", bucket, auth_result.user_id, location);
     Ok(HttpResponse::Ok()
         .insert_header(("Location", format!("/{}", bucket)))
         .insert_header(("Content-Length", "0"))
@@ -217,7 +216,7 @@ pub async fn s3_delete_bucket_handler(
         let db = MetadataService::new(&auth_result.user_id)?;
         if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
         db.delete_bucket_cors_awaited(&bucket).await?;
-        info!("S3 DeleteBucketCors: bucket={}", bucket);
+        log::info!("S3 DeleteBucketCors: bucket={}", bucket);
         return Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""));
     }
 
@@ -241,7 +240,7 @@ pub async fn s3_delete_bucket_handler(
     }
 
     db.delete_bucket_awaited(&bucket).await?;
-    info!("S3 DeleteBucket: bucket={} user={}", bucket, auth_result.user_id);
+    log::info!("S3 DeleteBucket: bucket={} user={}", bucket, auth_result.user_id);
     Ok(HttpResponse::NoContent().insert_header(("Content-Length", "0")).body(""))
 }
 

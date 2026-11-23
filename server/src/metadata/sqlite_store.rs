@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{params, Connection};
 use std::sync::Arc;
-use log::{warn, info, error};
+use log::{info, error};
 use actix_web::Error;
 use lazy_static::lazy_static;
 use std::env;
@@ -35,7 +35,7 @@ fn get_db_path() -> PathBuf {
             PathBuf::from(path)
         }
         Err(_) => {
-            warn!("Metadata database location not defined in environment");
+            log::info!("DB_FILE not set, using metadata/metadata.sqlite");
             let default_path = Path::new("metadata").join("metadata.sqlite");
             if let Some(parent) = default_path.parent() {
                 std::fs::create_dir_all(parent).expect("Failed to create metadata directory");
@@ -320,7 +320,7 @@ impl MetadataStorage for SQLiteMetadataStore {
                 row.get::<_, String>(13)?,
             ))
         }).map_err(|e| {
-            warn!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
+            log::trace!("get_metadata: not found user={} bucket={} key={}: {}", user_id, bucket, object_id, e);
             actix_web::error::ErrorNotFound(format!(
                 "No data found for key: {} in bucket: {}, The key does not exist", object_id, bucket
             ))
@@ -781,7 +781,7 @@ impl SQLiteMetadataStore {
             "INSERT INTO deletion_queue (user_id, bucket, key, offset_size_list) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, bucket, key, offset_size_bytes],
         ).map_err(actix_web::error::ErrorInternalServerError)?;
-        info!("Queued deletion user={} bucket={} key={} chunks={}", user_id, bucket, key, offset_size_list.len());
+        log::trace!("Queued deletion user={} bucket={} key={} chunks={}", user_id, bucket, key, offset_size_list.len());
         Ok(())
     }
 

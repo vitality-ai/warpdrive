@@ -2,7 +2,7 @@
 use actix_web::{web, HttpRequest, HttpResponse, Error, http::StatusCode};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _};
-use log::{debug, error, info, warn};
+use log::error;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,7 +99,7 @@ pub async fn s3_put_object_handler(
 
     if let Err(resp) = require_bucket(&db, &bucket) { return Ok(resp); }
 
-    info!("S3 PutObject: bucket={} key={} user={}", bucket, key, owner_id);
+    log::trace!("S3 PutObject: bucket={} key={} user={}", bucket, key, owner_id);
 
     let context = UserContext::with_bucket(owner_id.clone(), auth_result.bucket.clone());
 
@@ -177,7 +177,7 @@ pub async fn s3_put_object_handler(
 
     while let Some(chunk_result) = payload.next().await {
         let chunk = chunk_result.map_err(|e| {
-            warn!("PutObject: payload read error: {}", e);
+            log::trace!("PutObject: payload read error: {}", e);
             actix_web::error::ErrorInternalServerError("Error reading payload")
         })?;
         if chunk.is_empty() { continue; }
@@ -340,7 +340,7 @@ pub async fn s3_put_object_handler(
         }
     }
 
-    debug!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
+    log::trace!("S3 PutObject OK: bucket={} key={} size={} etag={}", bucket, key, size, etag);
     let mut resp = HttpResponse::Ok();
     resp.insert_header(("ETag", etag));
     let resp_vid = version_id.as_deref().unwrap_or("");
@@ -503,7 +503,7 @@ pub async fn s3_get_object_handler(
         RangeResult::None => (stream_slices(&extents), total_size, None),
     };
 
-    info!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
+    log::trace!("S3 GetObject: bucket={} key={} total={} response_len={}", bucket, key, total_size, response_len);
 
     let slices = Arc::new(slices);
     let store = crate::storage::object_store();
@@ -697,7 +697,7 @@ pub async fn s3_head_object_handler(
     let content_type = meta.content_type.clone().unwrap_or_else(|| "application/octet-stream".into());
     let last_modified = meta.last_modified.clone().unwrap_or_default();
 
-    info!("S3 HeadObject: bucket={} key={} size={}", bucket, key, meta.size);
+    log::trace!("S3 HeadObject: bucket={} key={} size={}", bucket, key, meta.size);
 
     let object_size = meta.size;
     let mut resp = HttpResponse::Ok();
@@ -856,7 +856,7 @@ pub async fn s3_delete_object_handler(
     // write, marker or removal, while this worker serves other requests.
     if let Some(fut) = db.delete_object_async(&bucket, &key) {
         let del_result = fut.await?;
-        info!("S3 DeleteObject: bucket={} key={}", bucket, key);
+        log::trace!("S3 DeleteObject: bucket={} key={}", bucket, key);
         let mut resp = HttpResponse::NoContent();
         if let VersioningDeleteResult::Marker { version_id } = del_result {
             resp.insert_header(("x-amz-delete-marker", "true"));
@@ -867,7 +867,7 @@ pub async fn s3_delete_object_handler(
 
     let del_result = db.delete_object_v2(&bucket, &key)?;
 
-    info!("S3 DeleteObject: bucket={} key={}", bucket, key);
+    log::trace!("S3 DeleteObject: bucket={} key={}", bucket, key);
 
     let mut resp = HttpResponse::NoContent();
     match del_result {

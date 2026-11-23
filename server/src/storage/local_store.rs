@@ -11,7 +11,7 @@ use actix_web::Error;
 use actix_web::error::ErrorInternalServerError;
 use log::{debug, trace, warn};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use lazy_static::lazy_static;
 use warp_meta_store::group_commit::GroupCommit;
@@ -343,26 +343,24 @@ fn bucket_files(dir: PathBuf, segment_bytes: u64, create: bool) -> io::Result<Ar
     Ok(Arc::clone(BUCKETS.lock().entry(dir).or_insert(fresh)))
 }
 
-/// The root every user's bucket directories live under.
+/// The root every user's bucket directories live under, resolved once. This runs on every shard read and write,
+/// so the environment lookup, the warning and the directory check must not
+/// repeat per request.
 pub fn get_storage_directory() -> PathBuf {
-    // Try to get the storage directory from environment variable
-    match env::var("STORAGE_DIRECTORY") {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| match env::var("STORAGE_DIRECTORY") {
         Ok(dir) => {
             debug!("Using storage directory from environment: {}", dir);
             PathBuf::from(dir)
         }
         Err(_) => {
-            warn!("Storage directory not defined in environment");
-            // Use default directory "./storage"            
+            log::info!("STORAGE_DIRECTORY not set, using ./storage");
             let default_path = PathBuf::from("storage");
-            if !default_path.exists() {
-                std::fs::create_dir_all(&default_path)
-                    .expect("Failed to create default storage directory");
-            }
-            debug!("Using default storage directory: {}", default_path.display());
+            std::fs::create_dir_all(&default_path).expect("Failed to create default storage directory");
             default_path
         }
-    }
+    })
+    .clone()
 }
 
 /// Local XFS binary storage implementation
@@ -525,7 +523,7 @@ impl Storage for LocalXFSBinaryStore {
         // Key is not part of the low-level contract anymore; deletion is range-based
         metadata_store.queue_deletion(user_id, bucket, "", offset_size_list)?;
         
-        debug!("Queued deletion event for user {} bucket {} with {} chunks", 
+        log::trace!("Queued deletion event for user {} bucket {} with {} chunks", 
               user_id, bucket, offset_size_list.len());
         Ok(())
     }

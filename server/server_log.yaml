@@ -1,20 +1,53 @@
-# Console: only WARN and ERROR (less noise when tailing docker logs).
-# File: full INFO trail for debugging (see logs/application.log).
+# Levels, from least to most output:
+#   error  something failed and needs attention
+#   warn   degraded but still serving (a peer down, a failed replication)
+#   info   startup, configuration, cluster membership (nodes joining),
+#          bucket create/delete and config changes, background job
+#          summaries. Never per request.
+#   debug  diagnostic detail that doesn't grow with traffic: resolved
+#          config, credential cache refreshes, STS sessions issued
+#   trace  everything per request, including rejected requests and
+#          step-by-step internals
+#
+# The default is `info`. To debug WarpDrive, raise `warp_drive` below to
+# `debug`, or to `trace` to see every request. Leave `root` alone: at
+# `debug`, the HTTP and gRPC libraries log every frame and the server slows
+# down several times over.
+# This file is re-read every 30 seconds, so no restart is needed.
+#
+# The per-request access log is separate: it needs WARPDRIVE_ACCESS_LOG=1 at
+# startup and `level: info`.
+#
+# The file is relative to the working directory and rotates at 100 MB,
+# keeping 5 old files (application.1.log ... application.5.log).
+refresh_rate: 30 seconds
+
 appenders:
   stdout:
     kind: console
-    filters:
-      - kind: threshold
-        level: warn
     encoder:
       pattern: "{d} - {l} - {m}{n}"
   file:
-    kind: file
+    kind: rolling_file
     path: "logs/application.log"
     encoder:
       pattern: "{d} - {l} - {m}{n}"
+    policy:
+      trigger:
+        kind: size
+        limit: 100 mb
+      roller:
+        kind: fixed_window
+        pattern: "logs/application.{}.log"
+        base: 1
+        count: 5
+
 root:
   level: info
   appenders:
     - stdout
     - file
+
+loggers:
+  warp_drive:
+    level: info

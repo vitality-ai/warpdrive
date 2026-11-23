@@ -15,7 +15,7 @@ use actix_web::{web, Error, HttpResponse};
 use actix_web::http::StatusCode;
 use crate::s3::handlers::common::s3_err;
 use futures::future::join_all;
-use log::{info, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -569,7 +569,7 @@ pub(crate) async fn cluster_put_object_inner(
         .map(|s| s.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(false);
     if forced_plain {
-        info!("bucket={bucket} key={key} x-warpd-computable-units: false — explicit opt-out of this bucket's custom placement");
+        log::trace!("bucket={bucket} key={key} x-warpd-computable-units: false — explicit opt-out of this bucket's custom placement");
         return put_object_plain(user_id, &bucket, &key, &body, state, s3_meta)
             .await
             .map(|r| attach_placement_headers(r, "plain", None));
@@ -618,7 +618,7 @@ pub(crate) async fn cluster_put_object_inner(
                 .await
                 .map(|r| attach_placement_headers(r, "packed", Some(overhead)));
         }
-        info!(
+        log::trace!(
             "bucket={bucket} key={key} content-dependent overhead {overhead:.3}% exceeds bucket threshold \
              {:.3}% (packer={:?}) — falling back to plain erasure coding for this object",
             config.overhead_threshold_pct, config.packer_name
