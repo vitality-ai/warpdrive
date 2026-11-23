@@ -47,6 +47,15 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
+/// Number of syncs issued by every `GroupCommit` in this process. One sync
+/// can cover many writes, so this divided by operations gives syncs per
+/// write. Reported by the cluster timing endpoint.
+static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn sync_count() -> u64 {
+    SYNC_COUNT.load(Ordering::Relaxed)
+}
+
 /// Anything `wait_for_durable` can call a real flush-to-stable-storage on.
 /// A trait, not a bare `&File`, so a test can supply a fake that counts
 /// calls and introduces artificial delay -- the only deterministic way to
@@ -111,6 +120,7 @@ impl GroupCommit {
         // after this read, so it's guaranteed to cover all of them.
         let target = self.next_ticket.load(Ordering::Acquire);
         syncable.sync()?;
+        SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
         self.synced_through.fetch_max(target, Ordering::AcqRel);
         Ok(())
     }

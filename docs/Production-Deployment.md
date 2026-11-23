@@ -172,6 +172,19 @@ spec:
             storage: 50Gi   # size for your own workload -- not a verified number
 ```
 
+## Concurrent writes to the same key
+
+Use one writer per key. If two clients write the same key at the same time, nodes can end up disagreeing on which write won, and a restart keeps that disagreement. "Write" here means PUT, DELETE, CopyObject into the key, and changes to its tags, retention or legal hold.
+
+What is safe without any coordination:
+- **Different keys**, from any number of clients, through any nodes.
+- **Different users.** The user is part of every object's record, so two users writing the same bucket and key name never touch each other's object.
+- **One writer per key**, sending its requests through any node. Reads can go to any node.
+
+So route each key's writes through one writer: one process or one service instance owns a key (or a prefix, or a tenant's keys) and serializes its writes. Spread different owners across nodes as you like.
+
+This is a stopgap until two pieces of work land. Ordered record writes (RFC 6) make every node end on the same write when two collide, as last-writer-wins. Per-key ownership with conditional writes (`If-Match`, `If-None-Match`) is later work. Until then, the cluster doesn't enforce either. See `RFCs/RFC5/RFC5-one-object-service.md`, *Consistency contract*.
+
 ## What's deliberately left for you to decide
 
 - **Resource requests/limits** (CPU/memory per pod) — this depends on your

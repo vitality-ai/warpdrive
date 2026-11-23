@@ -10,12 +10,10 @@
 //! objects never use.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use parking_lot::RwLock;
-use crate::storage::durable_log::DurableAppendLog;
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
 
 /// One stripe's placement pin: which peers hold its `k+m` shards, the
 /// shared bin size (`capacity`, what every shard in this stripe is padded
@@ -206,138 +204,50 @@ fn record_key(user_id: &str, bucket: &str, key: &str) -> String {
     format!("{}:{}:{}:{}:{}", user_id.len(), user_id, bucket.len(), bucket, key)
 }
 
-/// `BTreeMap`, not `HashMap` (#163) — see `location_store.rs`'s matching
-/// doc comment, same reasoning: `record_key`'s length-prefixed bucket
-/// still groups each bucket's keys contiguously, so lexicographic order
-/// makes `list`'s prefix lookup a bounded range scan.
-pub struct BitcaskContentLocationStore {
-    log_path: PathBuf,
-    /// Owns the file, the dup'd sync-only handle, and the group-commit
-    /// batching needed to make an append durable without paying one
-    /// fsync per write -- see `storage::durable_log`'s module doc.
-    log: DurableAppendLog,
-    index: RwLock<BTreeMap<String, ContentDependentRecord>>,
-    /// #155 — see `location_store.rs`'s matching field doc for why this
-    /// is needed: without one lock held across both the log append and
-    /// the index update, a concurrent put/delete for the same key can
-    /// apply to the log and the index in different orders, so a restart
-    /// (which only ever replays the log) can disagree with what the live
-    /// index had.
-    write_lock: parking_lot::Mutex<()>,
+/// `ContentLocationStore` on a per-node `KvEngine`, same layout and
+/// reasoning as `BitcaskLocationStore`.
+pub struct BitcaskContentLocationStore<E = BitcaskEngine<ContentDependentRecord>> {
+    engine: E,
 }
 
 impl BitcaskContentLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        let log_path: PathBuf = log_path.as_ref().to_path_buf();
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        Ok(Self { engine: BitcaskEngine::open(log_path, "content location")? })
+    }
 
-        let mut index = BTreeMap::new();
-        if log_path.exists() {
-            let f = File::open(&log_path)?;
-            let lines: Vec<String> = BufReader::new(f).lines().collect::<io::Result<_>>()?;
-            let last_idx = lines.len().saturating_sub(1);
-            for (i, line) in lines.iter().enumerate() {
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<(String, Option<ContentDependentRecord>)>(line) {
-                    Ok((rk, Some(r))) => {
-                        index.insert(rk, r);
-                    }
-                    Ok((rk, None)) => {
-                        index.remove(&rk);
-                    }
-                    // Same reasoning as `ShardMetaStore::open` (#152): only
-                    // the last line can be a torn write from a crash
-                    // mid-append, so quarantine just that one with a
-                    // warning instead of refusing to start.
-                    Err(e) if i == last_idx => {
-                        log::warn!(
-                            "content location log {}: ignoring malformed trailing line, \
-                             likely a torn write from a crash: {e}",
-                            log_path.display()
-                        );
-                    }
-                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                }
-            }
-        }
-
-        let log = DurableAppendLog::open(&log_path)?;
-        Ok(Self {
-            log_path,
-            log,
-            index: RwLock::new(index),
-            write_lock: parking_lot::Mutex::new(()),
-        })
+    pub fn path(&self) -> &Path {
+        self.engine.path()
     }
 }
 
-impl ContentLocationStore for BitcaskContentLocationStore {
+impl<E: KvEngine<ContentDependentRecord>> BitcaskContentLocationStore<E> {
+    /// The store on any engine.
+    pub fn with_engine(engine: E) -> Self {
+        Self { engine }
+    }
+}
+
+impl<E: KvEngine<ContentDependentRecord>> ContentLocationStore for BitcaskContentLocationStore<E> {
     fn put(&self, record: ContentDependentRecord) -> io::Result<()> {
-        let rk = record_key(&record.user_id, &record.bucket, &record.key);
-        let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // #155: held across both the append and the index update, so a
-        // concurrent put/delete for the same key can never apply to the
-        // log and the index in different orders. Released before the
-        // durability wait below -- see `location_store.rs::put`'s
-        // matching comment for why that matters for group commit.
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().insert(rk, record);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+        self.engine.put(record_key(&record.user_id, &record.bucket, &record.key), record)
     }
 
     fn get(&self, user_id: &str, bucket: &str, key: &str) -> Option<ContentDependentRecord> {
-        self.index.read().get(&record_key(user_id, bucket, key)).cloned()
+        self.engine.get(&record_key(user_id, bucket, key))
     }
 
     fn delete(&self, user_id: &str, bucket: &str, key: &str) -> io::Result<()> {
-        let rk = record_key(user_id, bucket, key);
-        let line = serde_json::to_string(&(rk.clone(), Option::<ContentDependentRecord>::None))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let ticket = {
-            let _write_guard = self.write_lock.lock();
-            let ticket = self.log.append_line(&line)?;
-            self.index.write().remove(&rk);
-            ticket
-        };
-        self.log.sync_ticket(ticket)
+        self.engine.delete(&record_key(user_id, bucket, key))
     }
 
     fn list(&self, user_id: &str, bucket: &str, prefix: &str) -> Vec<(String, u64)> {
         let bucket_prefix = format!("{}:{}:{}:{}:", user_id.len(), user_id, bucket.len(), bucket);
         let full_prefix = format!("{bucket_prefix}{prefix}");
-        self.index
-            .read()
-            .range(full_prefix.clone()..)
-            .take_while(|(k, _)| k.starts_with(&full_prefix))
-            .map(|(k, v)| (k[bucket_prefix.len()..].to_string(), v.original_len as u64))
-            .collect()
+        self.engine.scan_prefix(&full_prefix, |k, r| Some((k[bucket_prefix.len()..].to_string(), r.original_len as u64)))
     }
 
     fn compact(&self) -> io::Result<()> {
-        // #155: same `write_lock` as `put`/`delete`, so compaction can't
-        // interleave with either.
-        let _write_guard = self.write_lock.lock();
-        let index = self.index.read();
-        let tmp_path = self.log_path.with_extension("compact.tmp");
-        {
-            let mut tmp = File::create(&tmp_path)?;
-            for (rk, record) in index.iter() {
-                let line = serde_json::to_string(&(rk.clone(), Some(record.clone())))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                writeln!(tmp, "{line}")?;
-            }
-            tmp.flush()?;
-        }
-        self.log.replace_with_compacted(&tmp_path, &self.log_path)
+        self.engine.compact()
     }
 }
 
@@ -345,6 +255,7 @@ impl ContentLocationStore for BitcaskContentLocationStore {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn sample(bucket: &str, key: &str) -> ContentDependentRecord {
         sample_for("u1", bucket, key)

@@ -447,6 +447,61 @@ pub(crate) async fn cluster_put_object_inner(
         .map(|r| attach_placement_headers(r, "plain", None))
 }
 
+/// Upper bound for `WARPDRIVE_INLINE_MAX_BYTES`. An inline object lives in
+/// its location record, which every node keeps in memory and on disk, so a
+/// larger threshold trades memory on every node for fewer shard writes.
+const INLINE_MAX_CAP: usize = 128 * 1024;
+
+/// Objects of at most this many bytes are stored inside their location
+/// record instead of as erasure-coded shards (RFC 5, T1). Set with
+/// `WARPDRIVE_INLINE_MAX_BYTES`. Default 0: every object is erasure coded.
+///
+/// An inline object costs one replicated record write instead of k+m
+/// shard writes plus the record, and a GET is served from the receiving
+/// node's own copy. The cost: the bytes are held in memory and on disk on
+/// every node, instead of spread as shards.
+fn inline_max_bytes() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let configured = std::env::var("WARPDRIVE_INLINE_MAX_BYTES").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+        let max = configured.min(INLINE_MAX_CAP);
+        if configured > INLINE_MAX_CAP {
+            log::warn!("WARPDRIVE_INLINE_MAX_BYTES={configured} is above the {INLINE_MAX_CAP}-byte limit, using {INLINE_MAX_CAP}");
+        }
+        if max > 0 {
+            log::info!("Objects up to {max} bytes are stored inline in their location record");
+        }
+        max
+    })
+}
+
+/// This node's own address (`WARPDRIVE_SELF_ADDR`), if configured.
+fn self_addr() -> Option<&'static str> {
+    static ADDR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ADDR.get_or_init(|| std::env::var("WARPDRIVE_SELF_ADDR").ok().map(|a| a.trim().trim_end_matches('/').to_string()).filter(|a| !a.is_empty()))
+        .as_deref()
+}
+
+/// Whether a broadcast to `peers` also reaches this node. When it does, a
+/// separate local write of the same change is redundant.
+fn peers_include_self(peers: &[String]) -> bool {
+    peers_include(self_addr(), peers)
+}
+
+fn peers_include(addr: Option<&str>, peers: &[String]) -> bool {
+    addr.is_some_and(|me| peers.iter().any(|p| p.trim().trim_end_matches('/') == me))
+}
+
+/// The bytes of an inline object, if this record holds one.
+fn inline_bytes(record: &LocationRecord, key: &str) -> Result<Option<Vec<u8>>, Error> {
+    match &record.inline_data {
+        None => Ok(None),
+        Some(b64) => base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map(Some)
+            .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!("corrupt inline object: {e}"), key)),
+    }
+}
+
 async fn put_object_plain(
     user_id: &str, bucket: &str, key: &str, body: &[u8], state: &ClusterState, s3_meta: &ObjectS3Metadata,
 ) -> Result<HttpResponse, Error> {
@@ -485,56 +540,67 @@ async fn put_object_plain(
         }
     }
 
-    // Placement resolved fresh, against the peer list as it is *right now*.
-    // This is the only place ComputedPlacement is ever called for this key.
-    let chosen = state.placement.place(&bucket, &key, &peers, k, m);
-
-    let t0 = std::time::Instant::now();
-    let encoded = state
-        .ec
-        .encode(&body)
-        .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
-    state.timing.encode.record(t0.elapsed());
-
     let required_acks = required_write_acks(k, m);
-
-    // #151: every version of an object writes its shards under a brand
-    // new key (`versioned_key`), never overwriting the previous version's
-    // shards in place. This is what actually prevents corruption on a
-    // failed or concurrent overwrite -- the pin below is only flipped to
-    // this `version` after quorum, so until (and unless) that happens, a
-    // reader still using the *old* pin keeps reading the old version's
-    // shards, completely untouched by this write, however it turns out.
     let version = new_version_id();
-    let wire_key = versioned_key(&key, &version);
 
-    let t0 = std::time::Instant::now();
-    let puts = chosen
-        .iter()
-        .cloned()
-        .zip(encoded.shards.into_iter())
-        .enumerate()
-        .map(|(idx, (peer, shard))| {
-            let client = Arc::clone(&state.peer_client);
-            let bucket = bucket.clone();
-            let wire_key = wire_key.clone();
-            async move {
-                let res = client.put_shard(&peer, user_id, &bucket, &wire_key, idx, shard).await;
-                if let Err(ref e) = res {
-                    warn!("put_shard idx={idx} peer={peer} failed: {e}");
+    // A small object skips placement, encoding and the shard round. Its
+    // bytes go inside the location record, which is replicated to every
+    // node below with the same write quorum as shards (see
+    // `inline_max_bytes`).
+    let inline = inline_max_bytes() > 0 && body.len() <= inline_max_bytes();
+    let (chosen, acked) = if inline {
+        (Vec::new(), required_acks)
+    } else {
+        // Placement resolved fresh, against the peer list as it is *right now*.
+        // This is the only place ComputedPlacement is ever called for this key.
+        let chosen = state.placement.place(&bucket, &key, &peers, k, m);
+
+        let t0 = std::time::Instant::now();
+        let encoded = state
+            .ec
+            .encode(&body)
+            .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
+        state.timing.encode.record(t0.elapsed());
+
+        // #151: every version of an object writes its shards under a brand
+        // new key (`versioned_key`), never overwriting the previous version's
+        // shards in place. This is what actually prevents corruption on a
+        // failed or concurrent overwrite -- the pin below is only flipped to
+        // this `version` after quorum, so until (and unless) that happens, a
+        // reader still using the *old* pin keeps reading the old version's
+        // shards, completely untouched by this write, however it turns out.
+        let wire_key = versioned_key(&key, &version);
+
+        let t0 = std::time::Instant::now();
+        let puts = chosen
+            .iter()
+            .cloned()
+            .zip(encoded.shards.into_iter())
+            .enumerate()
+            .map(|(idx, (peer, shard))| {
+                let client = Arc::clone(&state.peer_client);
+                let bucket = bucket.clone();
+                let wire_key = wire_key.clone();
+                async move {
+                    let res = client.put_shard(&peer, user_id, &bucket, &wire_key, idx, shard).await;
+                    if let Err(ref e) = res {
+                        warn!("put_shard idx={idx} peer={peer} failed: {e}");
+                    }
+                    res
                 }
-                res
-            }
-        });
+            });
 
-    let results = join_all(puts).await;
-    state.timing.shard_fanout.record(t0.elapsed());
-    let acked = results.iter().filter(|r| r.is_ok()).count();
-    if acked < required_acks {
-        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
-            "write quorum not met: {acked}/{required_acks} peers acknowledged (RS({k},{m}))"
-        ), &key));
-    }
+        let results = join_all(puts).await;
+        state.timing.shard_fanout.record(t0.elapsed());
+        let acked = results.iter().filter(|r| r.is_ok()).count();
+        if acked < required_acks {
+            return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
+                "write quorum not met: {acked}/{required_acks} peers acknowledged (RS({k},{m}))"
+            ), &key));
+        }
+        (chosen, acked)
+    };
+    let t_shards = std::time::Instant::now();
 
     // Pin the resolved placement — this, not the hash function, is what
     // makes reads stable across later membership changes. Replicated to
@@ -552,7 +618,7 @@ async fn put_object_plain(
         shard_peers: chosen.clone(),
         k,
         m,
-        original_len: encoded.original_len,
+        original_len: body.len(),
         version,
         retention_mode: None,
         retain_until: None,
@@ -572,6 +638,7 @@ async fn put_object_plain(
         // separate PutObjectTagging call, never inherited from whatever
         // the previous version had.
         tags: Vec::new(),
+        inline_data: inline.then(|| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body)),
     };
 
     // This key may have previously been written content-dependent (packed)
@@ -611,17 +678,25 @@ async fn put_object_plain(
         // here doesn't fail the PUT, but it's logged rather than silently
         // discarded -- a real disk error (e.g. out of space) on this node
         // shouldn't vanish just because the write still succeeded cluster-wide.
-        let store = Arc::clone(&state.content_location_store);
-        let user_id_owned = user_id.to_string();
-        let bucket_owned = bucket.clone();
-        let key_owned = key.clone();
-        let result = web::block(move || store.delete(&user_id_owned, &bucket_owned, &key_owned).map_err(|e| e.to_string())).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("stale content-location pin cleanup failed for {bucket}/{key}: {e}"),
-            Err(e) => log::warn!("stale content-location pin cleanup blocking task failed for {bucket}/{key}: {e}"),
+        //
+        // When `peers` includes this node, the broadcast below already
+        // deletes the local copy, so the local delete only repeats it as an
+        // extra fsync before the broadcast starts (RFC 5, T2). It's skipped
+        // only when this node can confirm its own address is in `peers`.
+        if !peers_include_self(&peers) {
+            let store = Arc::clone(&state.content_location_store);
+            let user_id_owned = user_id.to_string();
+            let bucket_owned = bucket.clone();
+            let key_owned = key.clone();
+            let result = web::block(move || store.delete(&user_id_owned, &bucket_owned, &key_owned).map_err(|e| e.to_string())).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("stale content-location pin cleanup failed for {bucket}/{key}: {e}"),
+                Err(e) => log::warn!("stale content-location pin cleanup blocking task failed for {bucket}/{key}: {e}"),
+            }
         }
     }
+    let t_local = std::time::Instant::now();
     let t0 = std::time::Instant::now();
     let (loc_acked, cleanup_acked) = tokio::join!(
         replicate_location_put(&state, &record, &peers),
@@ -634,6 +709,17 @@ async fn put_object_plain(
              (shard data was written, but the object may not be findable from every node)"
         ), &key));
     }
+
+    // Quorum can be met without this node: its own copy of either broadcast
+    // can fail while the others succeed. This node is the one the client
+    // reads back from first, so its copy must show the new object before
+    // the PUT succeeds. Both checks are in memory, so the usual case pays
+    // nothing. Only a failed self-delivery costs a local write.
+    ensure_local_copy_is_current(state, &record).await.map_err(|e| {
+        s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
+            "wrote the new object, but could not update this node's own copy of its records: {e}"
+        ), &key)
+    })?;
     if cleanup_acked < required_acks {
         return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
             "wrote the new object, but could not confirm the stale packed pin was cleared cluster-wide: \
@@ -643,8 +729,43 @@ async fn put_object_plain(
     }
 
     state.timing.total.record(request_start.elapsed());
-    info!("cluster PUT bucket={bucket} key={key} acked={acked}/{required_acks} loc_acked={loc_acked}/{required_acks}");
+    let t_end = std::time::Instant::now();
+    log::trace!(
+        "cluster PUT bucket={bucket} key={key} bytes={} inline={inline} shards_us={} local_cleanup_us={} replicate_us={} total_us={} acked={acked}/{required_acks} loc_acked={loc_acked}/{required_acks}",
+        body.len(),
+        t_shards.duration_since(request_start).as_micros(),
+        t_local.duration_since(t_shards).as_micros(),
+        t_end.duration_since(t_local).as_micros(),
+        t_end.duration_since(request_start).as_micros(),
+    );
     Ok(HttpResponse::Ok().finish())
+}
+
+/// Makes this node's own records match a PUT it just coordinated: the new
+/// plain record present, and no packed record left for the key (GET checks
+/// the packed store first). Writes locally only what the broadcast didn't.
+async fn ensure_local_copy_is_current(state: &ClusterState, record: &LocationRecord) -> Result<(), String> {
+    let (user_id, bucket, key) = (record.user_id.clone(), record.bucket.clone(), record.key.clone());
+    let plain_missing = state.location_store.get(&user_id, &bucket, &key).is_none_or(|r| r.version != record.version);
+    let packed_left = state.content_location_store.get(&user_id, &bucket, &key).is_some();
+    if !plain_missing && !packed_left {
+        return Ok(());
+    }
+    log::warn!("PUT {bucket}/{key}: this node's own copy missed the broadcast, writing it locally");
+    let loc = Arc::clone(&state.location_store);
+    let content = Arc::clone(&state.content_location_store);
+    let record = record.clone();
+    web::block(move || {
+        if plain_missing {
+            loc.put(record).map_err(|e| e.to_string())?;
+        }
+        if packed_left {
+            content.delete(&user_id, &bucket, &key).map_err(|e| e.to_string())?;
+        }
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {e}"))?
 }
 
 /// Fetches and EC-decodes a plain object's full bytes -- the same fetch
@@ -658,6 +779,9 @@ async fn fetch_plain_object_bytes(user_id: &str, bucket: &str, key: &str, state:
         .location_store
         .get(user_id, bucket, key)
         .ok_or_else(|| s3_err(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.", key))?;
+    if let Some(data) = inline_bytes(&record, key)? {
+        return Ok(data);
+    }
 
     let wire_key = if record.version.is_empty() {
         key.to_string()
@@ -929,7 +1053,8 @@ pub(crate) async fn cluster_abort_multipart_upload_inner(user_id: &str, bucket: 
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
-    HttpResponse::Ok().content_type("text/plain").body(state.timing.summary())
+    let body = format!("{}sync_count={}\n", state.timing.summary(), crate::storage::group_commit::sync_count());
+    HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
 /// Server-side breakdown of `store_shard` (the gRPC `ShardService::put_shard`
@@ -1116,7 +1241,10 @@ pub(crate) async fn cluster_get_object_inner(
     // those specific data shards and slice. Falls back to the original
     // full fetch+decode path (below) if any needed shard isn't
     // available, so correctness under failures is unchanged.
-    if let RangeResult::Valid(start, end) = parse_range_header(&req, total_len) {
+    let get_start = std::time::Instant::now();
+    let inline = inline_bytes(&record, &key)?;
+    let was_inline = inline.is_some();
+    if let (None, RangeResult::Valid(start, end)) = (&inline, parse_range_header(&req, total_len)) {
         let shard_len = ((record.original_len + record.k - 1) / record.k).max(1);
         let first_idx = ((start as usize) / shard_len).min(record.k - 1);
         let last_idx = ((end as usize) / shard_len).min(record.k - 1);
@@ -1159,48 +1287,52 @@ pub(crate) async fn cluster_get_object_inner(
         // fix targets.
     }
 
-    let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
-        let client = Arc::clone(&state.peer_client);
-        let bucket = bucket.clone();
-        let wire_key = wire_key.clone();
-        async move {
-            match client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await {
-                Ok(data) => Some((idx, data)),
-                Err(e) => {
-                    warn!("get_shard idx={idx} peer={peer} failed: {e}");
-                    None
+    let data = if let Some(data) = inline {
+        data
+    } else {
+        let gets = record.shard_peers.iter().cloned().enumerate().map(|(idx, peer)| {
+            let client = Arc::clone(&state.peer_client);
+            let bucket = bucket.clone();
+            let wire_key = wire_key.clone();
+            async move {
+                match client.get_shard(&peer, user_id, &bucket, &wire_key, idx).await {
+                    Ok(data) => Some((idx, data)),
+                    Err(e) => {
+                        warn!("get_shard idx={idx} peer={peer} failed: {e}");
+                        None
+                    }
                 }
             }
+        });
+
+        let results = join_all(gets).await;
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; record.shard_peers.len()];
+        for (idx, data) in results.into_iter().flatten() {
+            shards[idx] = Some(data);
         }
-    });
 
-    let results = join_all(gets).await;
-    let mut shards: Vec<Option<Vec<u8>>> = vec![None; record.shard_peers.len()];
-    for (idx, data) in results.into_iter().flatten() {
-        shards[idx] = Some(data);
-    }
+        let present = shards.iter().filter(|s| s.is_some()).count();
+        if present < record.k {
+            return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
+                "read quorum not met: {present}/{} shards available",
+                record.k
+            ), &key));
+        }
 
-    let present = shards.iter().filter(|s| s.is_some()).count();
-    if present < record.k {
-        return Err(s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &format!(
-            "read quorum not met: {present}/{} shards available",
-            record.k
-        ), &key));
-    }
-
-    // Decode with *this object's own* k/m, not the node's process-wide
-    // `state.ec` — those can disagree (a node restarted with different
-    // `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M`, or a cluster mid-migration to new
-    // parameters) and `state.ec` silently wins today, which is wrong:
-    // `record.k`/`record.m` were already being used for the quorum count
-    // above, but not for the decode that quorum count exists to gate.
-    // `ReedSolomonCoder::new` just builds a small Galois-field table, cheap
-    // enough to construct per request rather than needing a shared cache.
-    let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m)
-        .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
-    let data = decoder
-        .decode(&shards, record.original_len)
-        .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
+        // Decode with *this object's own* k/m, not the node's process-wide
+        // `state.ec` — those can disagree (a node restarted with different
+        // `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M`, or a cluster mid-migration to new
+        // parameters) and `state.ec` silently wins today, which is wrong:
+        // `record.k`/`record.m` were already being used for the quorum count
+        // above, but not for the decode that quorum count exists to gate.
+        // `ReedSolomonCoder::new` just builds a small Galois-field table, cheap
+        // enough to construct per request rather than needing a shared cache.
+        let decoder = super::ec::ReedSolomonCoder::new(record.k, record.m)
+            .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?;
+        decoder
+            .decode(&shards, record.original_len)
+            .map_err(|e| s3_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", &e.to_string(), &key))?
+    };
 
     // Verify the reconstructed object against its stored checksum before
     // ever returning it -- every object has one by default now (see
@@ -1213,8 +1345,10 @@ pub(crate) async fn cluster_get_object_inner(
     // again on read. A mismatch means the data this node just
     // reconstructed is not what was written, so it must never reach the
     // client -- fail the request instead of serving it.
+    let fetch_us = get_start.elapsed().as_micros();
     let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
     verify_object_checksum(&bucket, &key, &data, &stored_checksum)?;
+    log::trace!("cluster GET bucket={bucket} key={key} bytes={} inline={was_inline} fetch_decode_us={fetch_us} total_us={}", data.len(), get_start.elapsed().as_micros());
 
     match parse_range_header(&req, total_len) {
         RangeResult::Valid(start, end) => {
@@ -1788,6 +1922,40 @@ pub async fn cluster_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_with_inline(inline_data: Option<String>) -> LocationRecord {
+        serde_json::from_value(serde_json::json!({
+            "bucket": "b", "key": "k", "shard_peers": [], "k": 3, "m": 2,
+            "original_len": 5, "legal_hold": false, "inline_data": inline_data,
+        }))
+        .expect("minimal LocationRecord")
+    }
+
+    #[test]
+    fn inline_bytes_decodes_the_stored_object() {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hello");
+        let got = inline_bytes(&record_with_inline(Some(b64)), "k").unwrap();
+        assert_eq!(got.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn inline_bytes_is_none_for_a_sharded_object() {
+        assert_eq!(inline_bytes(&record_with_inline(None), "k").unwrap(), None);
+    }
+
+    #[test]
+    fn inline_bytes_rejects_corrupt_data_instead_of_serving_it() {
+        assert!(inline_bytes(&record_with_inline(Some("not base64!".into())), "k").is_err());
+    }
+
+    #[test]
+    fn local_cleanup_is_skipped_only_when_this_node_is_in_the_broadcast() {
+        let peers = vec!["http://n0:9710".to_string(), "http://n1:9710/".to_string()];
+        assert!(peers_include(Some("http://n0:9710"), &peers));
+        assert!(peers_include(Some("http://n1:9710"), &peers), "trailing slash on the peer entry");
+        assert!(!peers_include(Some("http://n2:9710"), &peers));
+        assert!(!peers_include(None, &peers), "unknown self address: keep the local delete");
+    }
 
     #[test]
     fn write_quorum_is_k_normally_and_k_plus_1_when_m_equals_k() {
