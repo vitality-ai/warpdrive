@@ -12,7 +12,7 @@
 //! store's own index type, so it isn't pulled in here. This type owns
 //! only the file-and-durability half of the problem.
 
-use crate::storage::group_commit::GroupCommit;
+use crate::group_commit::GroupCommit;
 use parking_lot::RwLock;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};

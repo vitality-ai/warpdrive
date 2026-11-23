@@ -5,7 +5,7 @@
 //! one node's share of cluster metadata. What they store, and how the
 //! cluster replicates it, is their business. How the bytes sit on this
 //! node's disk is the engine's. Splitting the two means another engine
-//! (RocksDB, SQLite, ...) is one `KvEngine` implementation, with no store
+//! (RocksDB, SQLite, ...) is one `Engine` implementation, with no store
 //! or replication code in it.
 //!
 //! Stores are generic over the engine, not `dyn`, so the default engine
@@ -25,13 +25,13 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use super::durable_log::DurableAppendLog;
+use crate::durable_log::DurableAppendLog;
 
 /// One node's durable key-value storage.
 ///
 /// Writes return once they're durable. Reads see every write that has
 /// returned, and may see a write that is still waiting on its sync.
-pub trait KvEngine<V>: Send + Sync {
+pub trait Engine<V>: Send + Sync {
     fn get(&self, key: &str) -> Option<V>;
     /// Durably sets `key` to `value`.
     fn put(&self, key: String, value: V) -> io::Result<()>;
@@ -93,6 +93,21 @@ impl<V: Send + Sync> Index<V> for BTreeMap<String, V> {
             .collect()
     }
     fn floor(&self, prefix: &str, key: &str, accept: impl Fn(&V) -> bool) -> Option<(&String, &V)> {
+        // No key is both at least `prefix` and at most a smaller `key`.
+        // `range` panics on that empty range, so answer it here.
+        if key < prefix {
+            return None;
+        }
+        // Keys starting with `prefix` form one run that begins at `prefix`.
+        // When `key` is past that run, every key in it is below `key`: take
+        // the last accepted one. Otherwise walk back from `key`.
+        if !key.starts_with(prefix) {
+            return self
+                .range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .filter(|(_, v)| accept(v))
+                .last();
+        }
         self.range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Included(key)))
             .rev()
             .take_while(|(k, _)| k.starts_with(prefix))
@@ -200,7 +215,7 @@ where
     }
 }
 
-impl<V, I> KvEngine<V> for BitcaskEngine<V, I>
+impl<V, I> Engine<V> for BitcaskEngine<V, I>
 where
     V: Serialize + DeserializeOwned + Clone + Send + Sync,
     I: Index<V>,
@@ -298,11 +313,31 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
 
-    type Engine = BitcaskEngine<u64>;
+    type TestEngine = BitcaskEngine<u64>;
     type HashEngine = BitcaskEngine<u64, HashMap<String, u64>>;
 
-    fn open(dir: &tempfile::TempDir) -> Engine {
-        Engine::open(dir.path().join("e.log"), "test").unwrap()
+    fn open(dir: &tempfile::TempDir) -> TestEngine {
+        TestEngine::open(dir.path().join("e.log"), "test").unwrap()
+    }
+
+    #[test]
+    fn floor_with_a_key_before_the_prefix_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        e.put("b/1".into(), 1).unwrap();
+        assert_eq!(e.floor("b/", "a", |_| true), None);
+        assert_eq!(e.floor("b/", "b/9", |_| true), Some(("b/1".to_string(), 1)));
+    }
+
+    #[test]
+    fn floor_with_a_key_past_the_prefix_finds_the_last_prefixed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = open(&dir);
+        for (k, v) in [("a/1", 1), ("a/2", 2), ("b", 3), ("c", 4)] {
+            e.put(k.into(), v).unwrap();
+        }
+        assert_eq!(e.floor("a/", "c", |_| true), Some(("a/2".to_string(), 2)));
+        assert_eq!(e.floor("a/", "c", |v| *v == 1), Some(("a/1".to_string(), 1)));
     }
 
     #[test]
@@ -332,7 +367,7 @@ mod tests {
             writeln!(f, "[\"k2\",8]").unwrap();
             writeln!(f, "[\"k1\",null]").unwrap();
         }
-        let e = Engine::open(&path, "test").unwrap();
+        let e = TestEngine::open(&path, "test").unwrap();
         assert_eq!((e.get("k1"), e.get("k2")), (None, Some(8)));
         e.put("k3".into(), 9).unwrap();
         let last = std::fs::read_to_string(&path).unwrap().lines().last().unwrap().to_string();
@@ -344,9 +379,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("e.log");
         std::fs::write(&path, "[\"k1\",7]\n[\"k2\",8").unwrap();
-        assert_eq!(Engine::open(&path, "test").unwrap().get("k1"), Some(7));
+        assert_eq!(TestEngine::open(&path, "test").unwrap().get("k1"), Some(7));
         std::fs::write(&path, "garbage\n[\"k1\",7]\n").unwrap();
-        assert!(Engine::open(&path, "test").is_err());
+        assert!(TestEngine::open(&path, "test").is_err());
     }
 
     #[test]

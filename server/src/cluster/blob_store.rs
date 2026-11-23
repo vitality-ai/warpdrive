@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use super::blob_io::{read_blob, write_blob, BlobPlacement};
 use super::bridge;
-use crate::storage::kv_engine::{BitcaskEngine, KvEngine};
+use warp_meta_store::{BitcaskEngine, Engine};
 use crate::storage::Storage;
 
 /// Each reservation covers this many more addresses than the write needs.

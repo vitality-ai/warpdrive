@@ -1,4 +1,4 @@
-//! Ordered record writes over any `KvEngine`.
+//! Ordered record writes over any `Engine`.
 //!
 //! Every location record and tombstone carries a `seq` (see `hlc`). A node
 //! applies a write only if it is newer than what it holds for the key, so
@@ -19,12 +19,12 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::hlc;
-use crate::storage::kv_engine::KvEngine;
+use crate::hlc;
+use crate::engine::Engine;
 use std::io;
 
 /// What a record must expose for ordered application.
-pub trait OrderedRecord: Clone + Serialize + DeserializeOwned + Send + Sync {
+pub trait Record: Clone + Serialize + DeserializeOwned + Send + Sync {
     fn seq(&self) -> u64;
     /// The object version this record describes. Its shards are stored
     /// under this version, so a write with a different version replaces
@@ -66,7 +66,7 @@ impl<'de, R: DeserializeOwned> Deserialize<'de> for Entry<R> {
     }
 }
 
-impl<R: OrderedRecord> Entry<R> {
+impl<R: Record> Entry<R> {
     pub fn seq(&self) -> u64 {
         match self {
             Entry::Live(r) => r.seq(),
@@ -117,12 +117,12 @@ enum Refused<R> {
 }
 
 /// Ordered records on engine `E`.
-pub struct OrderedStore<R, E> {
+pub struct WarpMetaStore<R, E> {
     engine: E,
     _record: std::marker::PhantomData<fn() -> R>,
 }
 
-impl<R: OrderedRecord, E: KvEngine<Entry<R>>> OrderedStore<R, E> {
+impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
     pub fn new(engine: E) -> Self {
         Self { engine, _record: std::marker::PhantomData }
     }
@@ -220,7 +220,7 @@ impl<R: OrderedRecord, E: KvEngine<Entry<R>>> OrderedStore<R, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::kv_engine::BitcaskEngine;
+    use crate::engine::BitcaskEngine;
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct Rec {
@@ -231,7 +231,7 @@ mod tests {
         tag: String,
     }
 
-    impl OrderedRecord for Rec {
+    impl Record for Rec {
         fn seq(&self) -> u64 {
             self.seq
         }
@@ -244,13 +244,13 @@ mod tests {
         Rec { seq, version: version.into(), tag: String::new() }
     }
 
-    type Store = OrderedStore<Rec, BitcaskEngine<Entry<Rec>>>;
+    type TestStore = WarpMetaStore<Rec, BitcaskEngine<Entry<Rec>>>;
 
-    fn open_at(path: &std::path::Path) -> Store {
-        OrderedStore::new(BitcaskEngine::open(path, "test").unwrap())
+    fn open_at(path: &std::path::Path) -> TestStore {
+        WarpMetaStore::new(BitcaskEngine::open(path, "test").unwrap())
     }
 
-    fn open() -> (tempfile::TempDir, Store) {
+    fn open() -> (tempfile::TempDir, TestStore) {
         let dir = tempfile::tempdir().unwrap();
         let s = open_at(&dir.path().join("r.log"));
         (dir, s)

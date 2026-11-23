@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use super::location_store::record_key;
-use super::ordered::{OrderedRecord, OrderedStore};
-pub use super::ordered::{Applied, Entry};
-use crate::storage::kv_engine::BitcaskEngine;
+use warp_meta_store::{Record, WarpMetaStore};
+pub use warp_meta_store::{Applied, Entry};
+use warp_meta_store::BitcaskEngine;
 
 /// One stripe's placement pin: which peers hold its `k+m` shards, the
 /// shared bin size (`capacity`, what every shard in this stripe is padded
@@ -205,7 +205,7 @@ pub trait ContentLocationStore: Send + Sync {
     fn compact(&self) -> io::Result<()>;
 }
 
-impl OrderedRecord for ContentDependentRecord {
+impl Record for ContentDependentRecord {
     fn seq(&self) -> u64 {
         self.seq
     }
@@ -214,14 +214,14 @@ impl OrderedRecord for ContentDependentRecord {
     }
 }
 
-/// `ContentLocationStore` on ordered records over a per-node `KvEngine`.
+/// `ContentLocationStore` on ordered records over a per-node `Engine`.
 pub struct BitcaskContentLocationStore<E = BitcaskEngine<Entry<ContentDependentRecord>>> {
-    log: OrderedStore<ContentDependentRecord, E>,
+    log: WarpMetaStore<ContentDependentRecord, E>,
 }
 
 impl BitcaskContentLocationStore {
     pub fn open(log_path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self { log: OrderedStore::new(BitcaskEngine::open(log_path, "content location")?) })
+        Ok(Self { log: WarpMetaStore::new(BitcaskEngine::open(log_path, "content location")?) })
     }
 
     pub fn path(&self) -> &Path {
@@ -229,14 +229,14 @@ impl BitcaskContentLocationStore {
     }
 }
 
-impl<E: crate::storage::kv_engine::KvEngine<Entry<ContentDependentRecord>>> BitcaskContentLocationStore<E> {
+impl<E: warp_meta_store::Engine<Entry<ContentDependentRecord>>> BitcaskContentLocationStore<E> {
     /// The store on any engine.
     pub fn with_engine(engine: E) -> Self {
-        Self { log: OrderedStore::new(engine) }
+        Self { log: WarpMetaStore::new(engine) }
     }
 }
 
-impl<E: crate::storage::kv_engine::KvEngine<Entry<ContentDependentRecord>>> ContentLocationStore for BitcaskContentLocationStore<E> {
+impl<E: warp_meta_store::Engine<Entry<ContentDependentRecord>>> ContentLocationStore for BitcaskContentLocationStore<E> {
     fn put(&self, record: ContentDependentRecord) -> io::Result<Applied<ContentDependentRecord>> {
         self.log.put(record_key(&record.user_id, &record.bucket, &record.key), record)
     }

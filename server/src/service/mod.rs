@@ -82,7 +82,7 @@ pub async fn put_service(key: String, mut payload: web::Payload, req: HttpReques
 
     // Write incoming FlatBuffers payload to storage and collect (offset, size).
     // `Storage::write` now does a real (group-committed) fsync -- see
-    // `storage::group_commit`'s module doc -- so this has to go through
+    // `warp_meta_store::group_commit`'s module doc -- so this has to go through
     // `web::block` the same way `s3/handlers/object.rs`'s PUT already
     // does: calling it directly here would block this actix worker's
     // whole event loop for the fsync's duration, which also starves
@@ -173,7 +173,7 @@ pub async fn append_service(key: String, mut payload: web::Payload, req: HttpReq
 
     // Write additional FlatBuffers payload chunks to storage.
     // web::block: `write_object` now does a real group-committed fsync --
-    // see `storage::group_commit`'s module doc -- so this has to go
+    // see `warp_meta_store::group_commit`'s module doc -- so this has to go
     // through `web::block` the same way `put_service` above does.
     let context_c = context.clone();
     let buf = bytes.to_vec();

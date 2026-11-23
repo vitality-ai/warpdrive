@@ -307,7 +307,7 @@ pub async fn put_object_content_dependent(
         units: units_header.to_vec(),
         stripes: stripe_records,
         version,
-        seq: super::hlc::now(),
+        seq: warp_meta_store::hlc::now(),
         has_sparse_gaps,
         sorted_unit_locations,
         etag: s3_meta.etag.clone(),

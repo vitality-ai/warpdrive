@@ -18,8 +18,9 @@ ENV DB_FILE /data/metadata.sqlite
 
 RUN mkdir /data
 
-# Copy project files
+# Copy project files. The server depends on crates/ by path (../crates/...).
 COPY server/ /server/
+COPY crates/ /crates/
 COPY scripts/docker_cluster_entrypoint.sh /server/docker_cluster_entrypoint.sh
 RUN chmod +x /server/docker_cluster_entrypoint.sh
 
