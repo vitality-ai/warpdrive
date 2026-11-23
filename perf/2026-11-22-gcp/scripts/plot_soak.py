@@ -23,6 +23,7 @@ for ph, c in (("put", COL[0]), ("get", COL[1])):
     m = {}
     for r in ps:
         if r["phase"].lower() == ph: m.setdefault((int(r["unix_s"]) - pt0) // 60, []).append(int(r["ops"]))
+    if not m: continue
     xs = sorted(m); ax.plot(xs, [sum(m[x]) / 60 for x in xs], color=c, lw=1.6, label=f"{ph.upper()} ops/s (background load)")
 ax.set_title("Background load, ops/s per minute", fontsize=10, loc="left"); ax.set_xlabel("minute", fontsize=8); ax.set_ylim(bottom=0)
 ax.grid(color="#e4e3df", lw=0.8); [ax.spines[s].set_visible(False) for s in ("top", "right")]; ax.legend(fontsize=8, frameon=False)

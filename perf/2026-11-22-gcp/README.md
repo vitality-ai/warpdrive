@@ -41,3 +41,4 @@ detached (`setsid nohup bash ~/<driver>.sh`), then pull `~/<run>/`. Plots: `scri
 | `compaction-run1` | Does the first, sweep-driven compactor keep disk near live data, and at what cost? |
 | `compaction-run2` | Fixed sweep against gc/ rows: which free path is better? |
 | `soak1` | Does #224 hold up for an hour of steady load? |
+| `soak2` | Does 1f8bb42 fix soak 1's memory growth? (gc/ rows fixed; a second leak found and fixed in 766060b) |
