@@ -78,6 +78,7 @@ impl BitcaskShardMetaStore {
 }
 
 impl<E: Engine<(u64, u64)>> BitcaskShardMetaStore<E> {
+
     /// The store on any engine.
     pub fn with_engine(engine: E) -> Self {
         Self { engine }

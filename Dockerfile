@@ -5,6 +5,8 @@ FROM rust:1.88-slim-bookworm
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    clang \
+    libclang-dev \
     libsqlite3-dev \
     sqlite3 \
     && rm -rf /var/lib/apt/lists/*

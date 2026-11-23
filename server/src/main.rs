@@ -281,7 +281,8 @@ fn install_cluster_stores(state: &web::Data<ClusterState>) {
     use warp_drive::cluster::{blob_store::ClusterBlobStore, bridge, replicated_metadata};
     bridge::install(web::Data::clone(state));
     let engine = warp_drive::cluster::meta_engine::MetaEngineKind::from_env().unwrap_or_else(|e| panic!("{e}"));
-    let meta_log = std::env::var("WARPDRIVE_META_LOG").unwrap_or_else(|_| engine.default_path().to_string());
+    let meta_log = std::env::var("WARPDRIVE_META_LOG").unwrap_or_else(|_| engine.default_path());
+    engine.refuse_other_engines_data("cluster_metadata", &meta_log).unwrap_or_else(|e| panic!("{e}"));
     let rows = Arc::new(replicated_metadata::open_rows(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the S3 metadata store: {e}")));
     replicated_metadata::install_rows(Arc::clone(&rows));
     let meta = replicated_metadata::ReplicatedMetadataStore::new(rows, Box::new(replicated_metadata::ClusterWriter));
