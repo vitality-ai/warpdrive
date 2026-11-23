@@ -8,8 +8,8 @@ objects are appended to large files, and a small record points at each one.
 
 The architecture is set by [RFC 5](../RFCs/RFC5/RFC5-one-object-service.md):
 one S3 module and one object service, with everything below them pluggable.
-A single node is a one-node cluster. The migration is in progress, see
-[Implementation status](#implementation-status).
+A single node is a one-node cluster. Space comes back through compaction, set
+by [RFC 6](../RFCs/RFC6/). See [Implementation status](#implementation-status).
 
 ## Composable design
 
@@ -17,11 +17,11 @@ A single node is a one-node cluster. The migration is in progress, see
 
 | Component | What plugs in |
 |---|---|
-| `MetadataStore` | Replicated `LocationStore` (default), SQLite (optional, single node), Raft (later) |
+| Metadata | Replicated rows in WarpMetaStore, on an engine: RocksDB (default), Bitcask, SQLite. Any ordered key-value store plugs in through `OrderedKv`. Raft later. |
 | `PlacementPolicy` | Rendezvous hash (default), content-dependent packing, WASM policies |
 | Layout / codec | RS(k,m), RS(1,0) on one node, packed stripes, column codecs |
-| Storage | Append-only bucket files, segments with space reclamation (RFC 3) |
-| Transport | gRPC (default), TCP, HTTP, `Local` on one node |
+| Storage | 64 MB segment files per bucket, freed by compaction and hole punching (RFC 6) |
+| Transport | gRPC (default), TCP or HTTP for shards. Metadata rows go over HTTP, and a node applies its own locally. |
 | Capabilities | Pushdown queries, computable units, packed range reads |
 
 ## How a request flows
@@ -30,12 +30,13 @@ A single node is a one-node cluster. The migration is in progress, see
 
 | Module | Role |
 |---|---|
-| `s3/` | SigV4 and STS auth, the S3 handlers |
+| `s3/` | SigV4 and STS auth, the S3 handlers, lifecycle rules |
 | Object service | S3 semantics: versions, ACLs, multipart, Object Lock, listing |
+| `cluster/replicated_metadata.rs` | S3 metadata as rows replicated to every node. Each object's row holds its blobs' placements, and a read takes them from there. |
 | `cluster/coordinator.rs` | Placement, erasure coding, quorum |
-| `cluster/location_store.rs` | Object records, replicated to every node |
 | `cluster/*_peer_client.rs` | Moves shards between nodes |
-| `storage/` | Append-only bucket files with batched fsync |
+| `storage/` | 64 MB segment files with batched fsync |
+| `cluster/gc.rs`, `compactor.rs` | Free dead shards: writes record what they kill, each node compacts its own disk |
 
 ### How nodes talk to each other
 
@@ -43,43 +44,53 @@ A single node is a one-node cluster. The migration is in progress, see
 
 - **Shards** go to the `k+m` nodes placement picked. A write needs `k` acks
   (`k+1` when `m == k`). A read needs any `k`.
-- **Location records** go to every node, so any node can find any object.
+- **Metadata rows** go to every node, so any node can find any object.
 - **Internal routes aren't authenticated yet** (#157). Keep them on a
   private network.
 
 ## Single node
 
-A single node runs the same engine as a cluster, with one peer and RS(1,0).
+A node started with no peers (no `WARPDRIVE_PEERS` or `WARPDRIVE_JOIN_VIA`)
+is a cluster of one with RS(1,0). It runs the same engine as a cluster:
+replicated metadata, the shard index, compaction and lifecycle.
 
 ![Single node](diagrams/07-single-node.svg)
 
 - One data shard, no parity: losing the disk loses the data.
-- `LocationStore` holds metadata by default. SQLite is an option.
-- The `Local` transport skips the network.
+- Metadata is on RocksDB by default. Bitcask and SQLite are options.
+- It sends its shards to itself over gRPC on loopback, and applies its own
+  metadata rows locally. So it needs the same three ports as any node: HTTP,
+  gRPC (+1000) and TCP (+2000).
+- It refuses to start next to data from the old single-node engine
+  (`metadata/metadata.sqlite`). There's no migration in the beta.
 
 ## Implementation status
 
+RFC 5:
+
 | Step | What | Status |
 |---|---|---|
-| T1, T2 | Inline small objects (opt-in), one less sync per PUT | Done, PR #217 |
-| 1 | Component traits around today's code | Not started |
-| 2 | Object service extracted from the single-node handlers | Not started |
-| 3 | Writable cluster `MetadataStore` on `LocationStore` | Not started |
-| 4 | One S3 module: cluster handlers removed | Not started |
-| 5 | RS(1,0) and `Local` transport, single node on the cluster engine | Not started |
+| T1, T2 | Inline small objects (opt-in), one less sync per PUT | Done, #217 |
+| 1, 2 | Component traits, the object service on `MetadataStore` | Done, #217 |
+| 3 | Writable cluster metadata: objects, buckets, multipart, versions, ACLs, Object Lock | Done, #226 (replicated rows) |
+| 4 | One S3 module for clusters | Done for `/s3`, #226. The older `cluster/s3_surface.rs` is still mounted at `/cluster/s3/...` for content-dependent placement clients. |
+| 5 | RS(1,0), single node on the cluster engine | Done, #244. A node's shards to itself go over gRPC on loopback: there's no separate `Local` transport. |
 
-Until steps 4 and 5 land, the code still has two S3 handler sets behind the
-same `/s3` URL: `s3/handlers/` with SQLite for a node without peers, and
-`cluster/s3_surface.rs` for a node with peers. The cluster set has the gaps
-listed under [Cluster engine internals](#cluster-engine-internals).
+Since then:
+
+| Change | PR |
+|---|---|
+| Compaction and space reclamation (RFC 6): segments, gc/ rows, the compactor, hole punching | #224 |
+| WarpMetaStore as its own crate, engines behind `OrderedKv`, RocksDB as the default | #227, #237 |
+| Reads carry each chunk's placement: no per-object index in memory | #238 |
+| Bucket lifecycle (object expiry, noncurrent versions, stale uploads) | #234 |
 
 ## Cluster engine internals
 
 Correctness review log: [`docs/reviews/v1.0.0-beta-code-review.md`](reviews/v1.0.0-beta-code-review.md).
 
 Every deployed node is **symmetric**: the same binary, both a storage node
-(it stores the shards it receives through the same `local_store.rs` files the
-single-node engine uses) and a coordinator that can accept a request, decide
+(it stores the shards it receives in 64 MB segment files, `local_store.rs`) and a coordinator that can accept a request, decide
 placement, and fan out to peers. There is no
 dedicated coordinator process and no leader election: consistent with how
 MinIO and SeaweedFS run in production, placement is a deterministic function
@@ -101,7 +112,7 @@ consensus. The joining node announces itself to every peer it currently
 knows about over plain HTTP, best-effort: a peer that's briefly
 unreachable during that round simply doesn't get the update, and that gap
 isn't automatically repaired later (no gossip, no retry). In practice
-(all peers reachable) every node converges on the same list; the failure
+(all peers reachable) every node converges on the same list. The failure
 mode is a split list after a missed announce, not a hang or an error.
 
 ![Cluster membership: additive only, no leader election](diagrams/01-cluster-membership.svg)
@@ -228,16 +239,14 @@ unless marked "planned"):**
 - **`ErasureCoder`** (`ec.rs`): `ReedSolomonCoder`, the `reed-solomon-erasure` crate
   encode/decode, with a second `encode_shards`/`decode_shards` path for
   pre-packed (content-dependent) stripes.
-- **`LocationStore` / `ContentLocationStore`** (Bitcask-style: append-only
-  log + in-memory index): the plain object → peer-set pin, and the
-  multi-stripe unit → (offset, stripe, peers) record content-dependent
-  placement needs, kept as two stores since the record shapes genuinely
-  differ.
-- **`cluster/s3_surface.rs`**: the cluster's S3 handlers, SigV4-authenticated.
-  Covers objects, multipart, tagging, retention and legal hold. Gaps, which
-  RFC 5 closes: LIST has no pagination and placeholder ETags, no versions
-  (#211), no ACLs, CopyObject stores an empty object (#222), and form POST is
-  stored by the single-node engine (#213).
+- **Metadata rows** (`replicated_metadata.rs`): every S3 object, version,
+  bucket and upload as a row replicated to every node, newest stamp wins.
+  An object's row holds its blobs' placements. `LocationStore` and
+  `ContentLocationStore` keep the records the `/cluster/` API and
+  content-dependent placement use.
+- **`cluster/s3_surface.rs`**: the older S3 surface at `/cluster/s3/...`,
+  kept for content-dependent placement clients (Lance, DuckDB). S3 clients use
+  `/s3`, which goes through the shared S3 module.
 - **`pushdown.rs`**: a `ColumnCodec` trait + a `/query` endpoint that filters
   a column in-place on the peer holding it, no whole-object reassembly.
 - **Membership**: additive only (SeaweedFS/MinIO-pool style). A new node

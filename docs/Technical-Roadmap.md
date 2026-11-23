@@ -49,9 +49,9 @@ Ongoing project work that still needs design input.
 | Area | Status |
 |------|--------|
 | Storage: Key/Value, Files, and Blobs | Core, in active development |
-| Composable engine: one object service with pluggable components | Proposed in RFC 5 (PR #217) |
+| Composable engine: one object service with pluggable components | Shipped (RFC 5): one S3 module and object service, metadata engines behind `OrderedKv`, a single node as a cluster of one |
 | Fault tolerance: erasure coding | Shipped in the cluster engine, RS(k,m). Open: repairing partial writes (#206), rebuilding a replaced node (#207) |
-| Space reclamation | Open: no reclamation in the cluster engine, and single-node deletes don't free space (#218) |
+| Space reclamation | Shipped (RFC 6): segments, gc/ rows, compaction and hole punching, on clusters and single nodes |
 | User access management | SigV4 admin keys, STS federation with any OIDC provider, [Vitality Console](https://github.com/vitality-ai/Vitality-console) |
 | Search | Seeking design contribution ([discussion](https://github.com/cia-labs/Storage-service/issues/35)) |
 | Availability | Health endpoints (#208), metrics (#209) |

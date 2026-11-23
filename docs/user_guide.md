@@ -21,9 +21,7 @@
 
 ## Getting Started
 
-Warpdrive is S3-compatible. Any client or library that speaks S3 works with it. The example below uses **boto3**. The URL and client code are the same whether the server runs single-node or as a [distributed cluster](#distributed-mode-default). Which engine answers is decided when the server starts, not by the client.
-
-Some S3 features work on a single node but not yet on a cluster, among them object versions, ACLs, CopyObject, form POST uploads and paginated listing. [Technical Architecture](Technical-Architecture.md#implementation-status) lists them. RFC 5 brings both engines to the same feature set.
+Warpdrive is S3-compatible. Any client or library that speaks S3 works with it. The example below uses **boto3**. The URL, the client code and the S3 features are the same whether the server is a single node or a [distributed cluster](#distributed-mode-default): a single node runs the cluster engine as a cluster of one.
 
 ```bash
 pip install boto3
@@ -78,8 +76,7 @@ Everything above is single-node mode, which still exists but is no longer the
 recommended way to run WarpDrive — see
 [`docs/setup.md`](setup.md#3-run-a-cluster) to get a local cluster running in
 one command. This section covers the distributed engine itself: a multi-node,
-erasure-coded cluster with an S3 API (see the feature gaps under
-[Getting Started](#getting-started)). Full architecture, diagrams,
+erasure-coded cluster with an S3 API. Full architecture, diagrams,
 and measured results: [Technical Architecture](Technical-Architecture.md) and
 [v1.0.0 Results](benchmarks/v1.0.0-results.md).
 
