@@ -167,6 +167,15 @@ lazy_static! {
             [],
         ).expect("Failed to create object_lock table");
 
+        // Lifecycle configuration per bucket
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bucket_lifecycle (
+                bucket        TEXT PRIMARY KEY,
+                lifecycle_xml TEXT NOT NULL
+            )",
+            [],
+        ).expect("Failed to create bucket_lifecycle table");
+
         // CORS configuration per bucket
         conn.execute(
             "CREATE TABLE IF NOT EXISTS bucket_cors (
@@ -561,6 +570,39 @@ impl MetadataStorage for SQLiteMetadataStore {
 
     fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
         SQLiteMetadataStore::get_bucket_cors(self, bucket)
+    }
+
+    fn set_bucket_lifecycle(&self, bucket: &str, xml: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock();
+        conn.execute("INSERT OR REPLACE INTO bucket_lifecycle (bucket, lifecycle_xml) VALUES (?1, ?2)", params![bucket, xml])
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>, Error> {
+        let conn = DB_CONN.lock();
+        match conn.query_row("SELECT lifecycle_xml FROM bucket_lifecycle WHERE bucket = ?1", params![bucket], |r| r.get::<_, String>(0)) {
+            Ok(x) => Ok(Some(x)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+        }
+    }
+
+    fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), Error> {
+        let conn = DB_CONN.lock();
+        conn.execute("DELETE FROM bucket_lifecycle WHERE bucket = ?1", params![bucket]).map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(())
+    }
+
+    fn list_lifecycle_buckets(&self) -> Result<Vec<(String, String, String)>, Error> {
+        let conn = DB_CONN.lock();
+        let mut stmt = conn
+            .prepare("SELECT l.bucket, b.user, l.lifecycle_xml FROM bucket_lifecycle l JOIN buckets b ON b.name = l.bucket")
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(rows.flatten().collect())
     }
 
     fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {

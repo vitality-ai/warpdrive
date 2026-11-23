@@ -3,6 +3,7 @@ pub mod metadata_service;
 pub mod user_context;
 pub mod storage_service;
 pub mod deletion_worker;
+pub mod lifecycle_worker;
 
 use actix_web::{ web, HttpResponse,Error, HttpRequest};
 use futures::StreamExt;

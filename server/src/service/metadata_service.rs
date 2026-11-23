@@ -143,6 +143,26 @@ impl MetadataService {
         }
     }
 
+    pub fn list_bucket_multipart_uploads(&self, bucket: &str) -> Result<Vec<crate::metadata::MultipartUploadRow>, Error> {
+        self.store.list_bucket_multipart_uploads(bucket)
+    }
+
+    pub fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>, Error> {
+        self.store.get_bucket_lifecycle(bucket)
+    }
+
+    pub async fn set_bucket_lifecycle_awaited(&self, bucket: &str, xml: &str) -> Result<(), Error> {
+        let (b, x) = (bucket.to_string(), xml.to_string());
+        let store = Arc::clone(&self.store);
+        web_block_keep_status(move || store.set_bucket_lifecycle(&b, &x)).await
+    }
+
+    pub async fn delete_bucket_lifecycle_awaited(&self, bucket: &str) -> Result<(), Error> {
+        let b = bucket.to_string();
+        let store = Arc::clone(&self.store);
+        web_block_keep_status(move || store.delete_bucket_lifecycle(&b)).await
+    }
+
     /// Read a fully-populated Metadata object (S3 GET / HEAD path).
     pub fn get_object_full(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         self.store.get_metadata(&self.user, bucket, key)

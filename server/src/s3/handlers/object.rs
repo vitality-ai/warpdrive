@@ -349,6 +349,10 @@ pub async fn s3_put_object_handler(
     }
     if let Some(ref m) = lock_mode { resp.insert_header(("x-amz-object-lock-mode", m.clone())); }
     if let Some(ref u) = lock_until { resp.insert_header(("x-amz-object-lock-retain-until-date", u.clone())); }
+    let put_tags = req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()).map(parse_url_tags).unwrap_or_default();
+    if let Some(h) = crate::s3::lifecycle::header_for(&db, &bucket, &key, &put_tags, size, chrono::Utc::now()) {
+        resp.insert_header(("x-amz-expiration", h));
+    }
     // Echo checksum header in response
     if let Some((ref algo, ref value)) = checksum_result {
         let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
@@ -704,6 +708,12 @@ pub async fn s3_head_object_handler(
     resp.insert_header(("Content-Type", content_type));
     resp.insert_header(("ETag", etag));
     resp.insert_header(("Accept-Ranges", "bytes"));
+    if let Some(created) = crate::s3::lifecycle::parse_time(&last_modified) {
+        let tags = db.get_object_tags(&bucket, &key).unwrap_or_default();
+        if let Some(h) = crate::s3::lifecycle::header_for(&db, &bucket, &key, &tags, object_size, created) {
+            resp.insert_header(("x-amz-expiration", h));
+        }
+    }
     if !last_modified.is_empty() {
         resp.insert_header(("Last-Modified", last_modified_for_header(&last_modified)));
     }

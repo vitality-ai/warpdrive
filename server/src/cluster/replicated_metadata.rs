@@ -60,6 +60,8 @@ pub struct BucketRow {
     pub lock_enabled: bool,
     pub lock_config: Option<(String, Option<i64>, Option<i64>)>,
     pub cors: Option<String>,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
     pub tags: Vec<(String, String)>,
     pub acl: Option<(String, String)>,
     pub public_access_block: Option<(bool, bool, bool, bool)>,
@@ -897,6 +899,29 @@ impl MetadataStorage for ReplicatedMetadataStore {
     }
     fn get_bucket_cors(&self, bucket: &str) -> Result<Option<String>, Error> {
         Ok(self.bucket(bucket).and_then(|b| b.cors))
+    }
+    fn set_bucket_lifecycle(&self, bucket: &str, xml: &str) -> Result<(), Error> {
+        self.update_bucket(bucket, |b| b.lifecycle = Some(xml.to_string()))
+    }
+    fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<String>, Error> {
+        Ok(self.bucket(bucket).and_then(|b| b.lifecycle))
+    }
+    fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), Error> {
+        if self.bucket(bucket).and_then(|b| b.lifecycle).is_none() {
+            return Ok(());
+        }
+        self.update_bucket(bucket, |b| b.lifecycle = None)
+    }
+    fn list_lifecycle_buckets(&self) -> Result<Vec<(String, String, String)>, Error> {
+        Ok(self
+            .rows
+            .list_live("bkt/", |k, r| match &r.value {
+                MetaValue::Bucket(b) => b.lifecycle.clone().map(|x| (k["bkt/".len()..].to_string(), b.owner.clone(), x)),
+                _ => None,
+            })
+            .into_iter()
+            .flatten()
+            .collect())
     }
     fn delete_bucket_cors(&self, bucket: &str) -> Result<(), Error> {
         if self.bucket(bucket).is_none() {

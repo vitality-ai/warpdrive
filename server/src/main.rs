@@ -396,6 +396,9 @@ async fn main() -> std::io::Result<()> {
     if configured_for_cluster {
         install_cluster_stores(&cluster_state);
     }
+    // Bucket lifecycle rules (expiry, noncurrent versions, stale uploads),
+    // on single nodes and clusters alike.
+    warp_drive::service::lifecycle_worker::start();
 
     let _deletion_worker_handle = start_deletion_worker();
     info!("Deletion worker started in background");
