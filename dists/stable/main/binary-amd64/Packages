@@ -2,15 +2,15 @@ Package: warpdrive
 Version: 1.0.0-beta-1
 Architecture: amd64
 Maintainer: Tejas ChandraShekarRaju <tchandrashekar@acm.org>
-Installed-Size: 16715
-Depends: libc6 (>= 2.34), libsqlite3-0 (>= 3.5.9)
+Installed-Size: 23648
+Depends: libc6 (>= 2.38), libsqlite3-0 (>= 3.5.9), libstdc++6 (>= 14)
 Priority: optional
 Section: utils
 Filename: pool/main/w/warpdrive/warpdrive_1.0.0-beta-1_amd64.deb
-Size: 4729656
-SHA256: 6cb28aa89c48b47800b1a83a2a3dddaa212ccd540fdf26f0720980651ded75be
-SHA1: d928dc14110201592e15cd03a6f738f12f9f1038
-MD5sum: bb02f8d15acc570065b5857378897790
+Size: 7000944
+SHA256: d48853d21b34f157dc55d10a552aead555bc45ce04245d957c46ce93a13e376a
+SHA1: c566d64bcd05d21ef0fb16ad3e2decac1f72b467
+MD5sum: 6906f72ac2683810d8b51b9ae61e4d17
 Description: Self-hosted S3-compatible object storage server
  Warpdrive is a self-hosted S3-compatible object storage server.
  Drop-in replacement for AWS S3, works with any S3 SDK out of the box.
