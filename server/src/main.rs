@@ -89,7 +89,7 @@ fn peer_client_from_env() -> Arc<dyn PeerClient> {
         _ => ("grpc", Arc::new(GrpcPeerClient::new())),
     };
     info!("Peer transport: {name}");
-    client
+    Arc::new(warp_drive::cluster::peer_client::LocalFirst { inner: client })
 }
 
 /// Whether this node can serve `/s3/...` (and root `/{bucket}/...`) yet.
