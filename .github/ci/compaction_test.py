@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """compaction_test.py <warp_drive binary> <run dir>: compaction frees disk on a real cluster (RFC 6).
 
-Starts the CI cluster (.github/ci/start_cluster.sh: 5 nodes, RS(3,2)) with short grace periods and 1 MB segments, then:
+Starts the CI cluster (.github/ci/start_cluster.sh: 5 nodes, RS(3,2)) with short grace periods and 1 MB segments, or
+with NODES=1 a single node started with no peer settings at all, as a user would (a one-member cluster, RS(1,0)). Then:
 
 1. Writes 300 objects (4 KB to 300 KB), overwrites half, deletes 60, deletes an old version in a versioned bucket,
    completes a multipart upload with a part uploaded twice and a part left out, and aborts another upload.
@@ -19,7 +20,7 @@ import boto3
 from botocore.config import Config
 
 BIN, RUN = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
-NODES, BASE = 5, 9710
+NODES, BASE = int(os.environ.get("NODES", "5")), 9710
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ,
            WARPDRIVE_SEGMENT_MB="1", WARPDRIVE_RECLAIM_GRACE_SECS="3", WARPDRIVE_RECLAIM_INTERVAL_SECS="999999",
@@ -36,7 +37,23 @@ def check(ok, what):
 
 
 def start():
-    subprocess.run([f"{HERE}/start_cluster.sh", BIN, RUN], env=ENV, check=True)
+    if NODES > 1:
+        subprocess.run([f"{HERE}/start_cluster.sh", BIN, RUN], env=ENV, check=True)
+        return
+    # A single node: no WARPDRIVE_PEERS, no RS settings.
+    node = f"{RUN}/node0"
+    os.makedirs(node, exist_ok=True)
+    subprocess.run(["cp", f"{HERE}/../../server/server_log.yaml", node], check=True)
+    env = {k: v for k, v in ENV.items() if k not in ("WARPDRIVE_PEERS", "WARPDRIVE_SELF_ADDR", "WARPDRIVE_RS_K", "WARPDRIVE_RS_M", "RS_K", "RS_M")}
+    env["WARPDRIVE_PORT"] = str(BASE)
+    out = open(f"{node}/node.out", "a")
+    proc = subprocess.Popen([BIN], cwd=node, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    open(f"{node}/pid", "w").write(str(proc.pid))
+    for _ in range(60):
+        if listening(BASE):
+            return
+        time.sleep(0.5)
+    raise SystemExit("the single node didn't start")
 
 
 def stop():
@@ -167,10 +184,11 @@ rows = [f"| node {i} | {b0 / 1e6:.1f} MB | {b1 / 1e6:.1f} MB | {(b0 - b1) / 1e6:
         for i, (b0, b1, g) in enumerate(zip(before, after, passes))]
 table = "\n".join(["| Node | Segments before | After | Freed | Dead shards | Segments compacted | Punched |",
                    "|---|---|---|---|---|---|---|"] + rows)
-print(f"live data {live / 1e6:.1f} MB, RS(3,2) on {NODES} nodes\n{table}", flush=True)
+layout = "RS(3,2)" if NODES > 1 else "a single node (RS(1,0))"
+print(f"live data {live / 1e6:.1f} MB, {layout} on {NODES} node(s)\n{table}", flush=True)
 if os.environ.get("GITHUB_STEP_SUMMARY"):
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-        f.write(f"## Compaction frees disk\n\nLive data {live / 1e6:.1f} MB, RS(3,2) on {NODES} nodes.\n\n{table}\n")
+        f.write(f"## Compaction frees disk: {layout}\n\nLive data {live / 1e6:.1f} MB on {NODES} node(s).\n\n{table}\n")
 
 check(all(b1 < b0 for b0, b1 in zip(before, after)), f"every node freed segment bytes ({sum(before) - sum(after)} in all)")
 check(sum(before) - sum(after) > sum(before) // 5, "at least a fifth of the segment bytes freed")
