@@ -76,7 +76,7 @@ Object service          S3 semantics: versions, ACLs, multipart, Object Lock, li
 | `PlacementPolicy` | `cluster/placement.rs`, already a trait (`place(bucket, key, peers, k, m)`) | Content-dependent placement and WASM policies implement it. |
 | Layout / codec | `ReedSolomonCoder`, `cluster/packed.rs`, `ContentLocationStore`, `column_codecs` | One trait, chosen per bucket (`BucketConfigStore`) or per request (`x-warpd-computable-units`). Adds the no-parity coder for RS(1,0). |
 | Storage | `shard_storage.rs`, `ShardMetaStore` | Behind a trait so RFC 3 (segment storage with space reclamation) can replace it. |
-| Transport | `PeerClient` trait, already pluggable (gRPC/HTTP/TCP) | Adds `Local` for N=1, so a node never sends shards to itself over the network. |
+| Transport | `PeerClient` trait, already pluggable (gRPC/HTTP/TCP) | `LocalFirst` wraps the transport, so a node never sends shards to itself over the network. |
 | Capabilities | `/cluster/{bucket}/{key}/query`, packed reads | Exposed by the object service. The fast paths call their component directly, so no generic layer sits between them and the data. |
 
 ### Single node: RS(1,0)
@@ -109,7 +109,7 @@ The techniques below each remove a part of that cost.
 | T2 | **Drop the redundant local cleanup.** | One sync in sequence on every PUT. | Implemented, on by default. Skipped only when this node's `WARPDRIVE_SELF_ADDR` is in the peer list, so the broadcast reaches it. If that one delivery fails while quorum succeeds, the coordinator writes its own copy locally before acknowledging (see *Consistency contract*). |
 | T3 | **One durable append per shard write.** Shard bytes and the shard-index entry go into one log append with one sync. | One of the two sequential syncs on every shard holder. | Next |
 | T4 | **Record rides with the shards.** Shard holders get the record in the same message as their shard, marked pending, and it goes live when write quorum is reached. Nodes that hold no shard get the record in parallel. | The second network round for sharded objects. | Next |
-| T5 | **Local shard short-circuit.** When the coordinator holds a shard itself, read or write it directly instead of over gRPC to itself. Also covers N=1 (single node as RS(1,0)). | One network hop per request on the coordinator's own shard. | Next |
+| T5 | **Local shard short-circuit.** When the coordinator holds a shard itself, read or write it directly instead of over gRPC to itself. Also covers N=1 (single node as RS(1,0)). | One network hop per request on the coordinator's own shard. | Implemented, on by default: `LocalFirst` in `cluster/peer_client.rs` |
 | T6 | **Hedged reads.** Ask for k+1 shards and decode from the first k that arrive. | Tail latency from one slow node. | Later |
 
 **Durability after acknowledgment.** A PUT is acknowledged once a write quorum has it: `k` shard holders for an erasure-coded object (`k+1` when `m == k`), and the same number of record copies for an inline one. So what an acknowledged object survives depends on how many copies actually landed, not on `m`:
@@ -194,7 +194,7 @@ Every migration step re-runs these on the same hardware as the recorded baseline
 Where performance can be lost, so the steps watch for it:
 - **Extra buffer copies.** Bodies must pass through as `Bytes` from the handler to the codec.
 - **An extra metadata hop** on reads or writes.
-- **N=1 talking to itself** over gRPC. Prevented by the `Local` transport.
+- **N=1 talking to itself** over gRPC. Prevented by `LocalFirst`.
 - Trait dispatch itself (nanoseconds) is negligible next to I/O.
 
 Where it can be gained: T1-T5 above, measured one at a time.
