@@ -1,0 +1,16 @@
+
+ Performance counter stats for process id '79275':
+
+          17734.90 msec task-clock                       #    1.772 CPUs utilized             
+             10944      context-switches                 #  617.088 /sec                      
+               233      cpu-migrations                   #   13.138 /sec                      
+              2530      syscalls:sys_enter_write         #  142.657 /sec                      
+               188      syscalls:sys_enter_pwrite64      #   10.601 /sec                      
+               957      syscalls:sys_enter_sendto        #   53.961 /sec                      
+             16475      syscalls:sys_enter_recvfrom      #  928.959 /sec                      
+               569      syscalls:sys_enter_fdatasync     #   32.084 /sec                      
+                 8      syscalls:sys_enter_fsync         #    0.451 /sec                      
+              3101      syscalls:sys_enter_futex         #  174.853 /sec                      
+
+      10.007760899 seconds time elapsed
+

@@ -1,0 +1,73 @@
+## host
+wln-0
+machine_type: n2-standard-2
+zone: us-central1-a
+cpu_platform: Intel Cascade Lake
+captured_utc: 2026-11-26T19:48:03Z
+boot_utc: 2026-11-23 08:16:11
+## cpu
+Architecture:                            x86_64
+CPU(s):                                  2
+Model name:                              Intel(R) Xeon(R) CPU @ 2.80GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      1
+Socket(s):                               1
+Flags: (avx512 present)
+L1d cache:                               32 KiB (1 instance)
+L2 cache:                                1 MiB (1 instance)
+L3 cache:                                33 MiB (1 instance)
+NUMA node(s):                            1
+governor: none
+## memory
+               total        used        free      shared  buff/cache   available
+Mem:            7939         262        1256           0        6420        7368
+## kernel and os
+6.8.0-1073-gcp
+Ubuntu 22.04.5 LTS
+## storage
+NAME    MODEL            SIZE ROTA TRAN
+sda     PersistentDisk    30G    1 
+nvme0n1 nvme_card        375G    0 nvme
+nvme0n1 scheduler: [none] mq-deadline  nr_requests: 1023 logical_block: 4096
+├─sda1   29.9G ext4     /
+├─sda14     4M          
+└─sda15   106M vfat     /boot/efi
+nvme0n1   375G ext4     /mnt/nvme
+/mnt/nvme: /dev/nvme0n1 ext4   rw,noatime
+## tunables
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+vm.swappiness = 60
+net.core.somaxconn = 4096
+net.ipv4.tcp_congestion_control = cubic
+fs.file-max = 9223372036854775807
+ulimit_nofile: 1024
+## network
+ens5: 1460
+## binaries
+2026-11-26T10:06:05 ba
+2026-11-23T08:18:31 comp_log.yaml
+2026-11-26T19:23:52 flamegraph.pl
+2026-11-26T19:23:52 netmon.sh
+2026-11-23T08:18:31 soak_sampler.sh
+2026-11-26T19:23:52 stackcollapse-perf.pl
+2026-11-26T18:56:41 wd-244
+2026-11-23T08:18:31 wd-combo
+2026-11-23T08:18:31 wd-final3
+2026-11-26T18:56:44 wd-pr
+2026-11-26T18:28:49 wd-q
+2026-11-26T18:19:17 wd-redis
+2026-11-23T08:17:57 wd-rocks
+2026-11-26T18:08:59 wd-s123
+2026-11-26T18:10:12 wd-s4
+2026-11-26T18:27:45 wd-s5
+wd-244 40c184221d1d782b
+wd-combo a0a664c90663c967
+wd-final3 557fb681c1e53fae
+wd-pr 17e58ba2667ac929
+wd-q 6528948c0b123570
+wd-redis d45cde00f28da6c4
+wd-rocks 4a36d380a567640f
+wd-s123 96e49e8d6cb6f205
+wd-s4 9c53fa6dd5841aef
+wd-s5 6528948c0b123570

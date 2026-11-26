@@ -1,0 +1,128 @@
+## host
+wlc
+machine_type: n2-standard-2
+zone: us-central1-a
+cpu_platform: Intel Cascade Lake
+captured_utc: 2026-11-26T19:47:26Z
+boot_utc: 2026-11-23 08:16:28
+## cpu
+Architecture:                            x86_64
+CPU(s):                                  2
+Model name:                              Intel(R) Xeon(R) CPU @ 2.80GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      1
+Socket(s):                               1
+Flags: (avx512 present)
+L1d cache:                               32 KiB (1 instance)
+L2 cache:                                1 MiB (1 instance)
+L3 cache:                                33 MiB (1 instance)
+NUMA node(s):                            1
+governor: none
+## memory
+               total        used        free      shared  buff/cache   available
+Mem:            7939         260        1524           0        6154        7370
+## kernel and os
+6.8.0-1073-gcp
+Ubuntu 22.04.5 LTS
+## storage
+NAME  MODEL            SIZE ROTA TRAN
+sda   PersistentDisk    30G    1 
+├─sda1   29.9G ext4     /
+├─sda14     4M          
+└─sda15   106M vfat     /boot/efi
+/mnt/nvme: not mounted
+## tunables
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+vm.swappiness = 60
+net.core.somaxconn = 4096
+net.ipv4.tcp_congestion_control = cubic
+fs.file-max = 9223372036854775807
+ulimit_nofile: 1024
+## network
+ens4: 1460
+driver: virtio_net
+version: 1.0.0
+## binaries
+2026-11-26T08:02:23 ba
+2026-11-22T10:30:33 s3_bench
+2026-11-23T07:35:40 s3b-combo
+2026-11-22T17:41:32 s3b-comp
+2026-11-22T10:30:53 sampler.sh
+2026-11-22T11:14:00 wd-226
+2026-11-26T18:52:28 wd-244
+2026-11-22T12:05:04 wd-ar
+2026-11-22T16:04:55 wd-as
+2026-11-22T22:18:43 wd-cgc
+2026-11-23T07:35:38 wd-combo
+2026-11-22T17:41:32 wd-comp
+2026-11-22T17:42:36 wd-compold
+2026-11-22T22:17:39 wd-csweep
+2026-11-23T00:25:12 wd-final
+2026-11-23T02:08:10 wd-final2
+2026-11-23T03:09:05 wd-final3
+2026-11-22T15:56:17 wd-fx
+2026-11-22T11:10:37 wd-main
+2026-11-22T10:30:33 wd-par
+2026-11-26T18:54:56 wd-pr
+2026-11-26T07:54:06 wd-redis
+2026-11-23T04:41:47 wd-rocks
+2026-11-26T17:55:49 wd-s123
+2026-11-26T18:08:45 wd-s4
+2026-11-26T18:19:03 wd-s5
+2026-11-22T17:02:28 wd-seg
+2026-11-22T17:01:24 wd-segbase
+wd-226 f1475278e5bc6632
+wd-244 40c184221d1d782b
+wd-ar 162b5251c5f8e164
+wd-as 27318ca70f80dba5
+wd-cgc c7c9060471945f37
+wd-combo a0a664c90663c967
+wd-comp ad8b271642bdc848
+wd-compold b0e8dd9186621441
+wd-csweep 499424b01d0cfd06
+wd-final fe5d5167f339148e
+wd-final2 f9235c2cb4acd47f
+wd-final3 557fb681c1e53fae
+wd-fx 58660e2ea8dd674f
+wd-main 868d75653edac3cc
+wd-par aa5ed4b615fcb372
+wd-pr 17e58ba2667ac929
+wd-redis d45cde00f28da6c4
+wd-rocks 4a36d380a567640f
+wd-s123 96e49e8d6cb6f205
+wd-s4 9c53fa6dd5841aef
+wd-s5 6528948c0b123570
+wd-seg 039d43aac3b50f6e
+wd-segbase cea80ef1f71b9ec3
+## toolchain (builds happen on wlc)
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+binary: rustc
+commit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a
+commit-date: 2026-11-09
+host: x86_64-unknown-linux-gnu
+release: 1.100.0
+LLVM version: 23.1.5
+cargo 1.100.0 (3acc79c0c 2026-11-05)
+## release profile
+## tarballs and commits
+src-226.tgz no-COMMIT-file
+src-244.tgz no-COMMIT-file
+src-ar.tgz no-COMMIT-file
+src-as.tgz b919f763e395aee1dc7710d67c4bbb8d386e8e1c
+src-cgc.tgz 99857028d2f7b0dbd81109aae44a0eb7b7c48112
+src-combo.tgz dcfa2fad6b5681390e5336adc4228ef6e0b3d139
+no-COMMIT-file
+src-comp.tgz 44a4055144cd0cb39f46f28c7317f412ba59f649
+src-compold.tgz af6926600a230b307f08f2352ac30865e7a20d38
+src-csweep.tgz beab2124db879008c7b1660332955780c0db5437
+src-final.tgz 4c2aeebbcd29ea4b29cecd739493d902ef10249a
+src-final2.tgz 1f8bb42d582706d5ade0c3fa050aa083032fe8ee
+src-final3.tgz 766060b5746dadaa0293766e28beb06bd94407fe
+src-fx.tgz 8c9094da247a1dff5eb69a16722d2801a18d8f5e
+src-main.tgz no-COMMIT-file
+src-par.tgz no-COMMIT-file
+src-pr.tgz no-COMMIT-file
+src-rocks.tgz d4cf604fb68e7a4e6f975af138124ccc91925fce
+src-seg.tgz 823f04d6fea1e0beb32605e22d57d51dd8d004d1
+src-segbase.tgz b5897db964e252837a8e9e87922552ed58d96a99
