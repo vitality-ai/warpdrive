@@ -3447,6 +3447,7 @@ dependencies = [
  "rand 0.8.8",
  "reed-solomon-erasure",
  "reqwest",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",

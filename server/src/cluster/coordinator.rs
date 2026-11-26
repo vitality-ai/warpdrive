@@ -306,8 +306,20 @@ async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() 
         let op = make();
         let label = op.label();
         let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
-        let req = (!is_self).then(|| op.request(&state.location_http, peer));
+        // A metadata row for a peer rides in that peer's next batch.
+        let batched = match &op {
+            RecordOp::Meta(m) if !is_self && super::meta_batch::enabled() => Some(m.clone()),
+            _ => None,
+        };
+        let req = (!is_self && batched.is_none()).then(|| op.request(&state.location_http, peer));
         async move {
+            if let Some(m) = batched {
+                return match super::meta_batch::send(&state.location_http, peer, m).await {
+                    super::meta_batch::RowReply::Applied => PeerReply::Applied,
+                    super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
+                    super::meta_batch::RowReply::Failed => PeerReply::Failed,
+                };
+            }
             let Some(req) = req else {
                 return apply_locally(state, op).await;
             };
