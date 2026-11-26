@@ -20,7 +20,7 @@
 use parking_lot::{Mutex, MutexGuard};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::marker::PhantomData;
@@ -138,6 +138,39 @@ where
         }
         self.set(&key, &bytes)?;
         Ok(Ok(current))
+    }
+
+    fn put_many_if<T>(&self, items: Vec<(String, V)>, check: impl Fn(usize, Option<&V>) -> Result<(), T>) -> io::Result<Vec<Result<Option<V>, T>>> {
+        // Every key's stripe, in stripe order (as `delete_many_if`), then one
+        // durable write for every accepted item.
+        let mut stripes: Vec<usize> = items.iter().map(|(k, _)| stripe_of(k)).collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let _guards: Vec<_> = stripes.iter().map(|&s| self.stripes[s].lock()).collect();
+        // A key named twice is checked against the earlier item's value:
+        // reads don't see the batch yet.
+        let mut latest: HashMap<&str, usize> = HashMap::new();
+        let mut out = Vec::with_capacity(items.len());
+        let mut accepted: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, (k, v)) in items.iter().enumerate() {
+            let current = match latest.get(k.as_str()) {
+                Some(&j) => Some(items[j].1.clone()),
+                None => self.read(k)?,
+            };
+            match check(i, current.as_ref()) {
+                Ok(()) => {
+                    accepted.push((i, encode(v)?));
+                    latest.insert(k.as_str(), i);
+                    out.push(Ok(current));
+                }
+                Err(e) => out.push(Err(e)),
+            }
+        }
+        if !accepted.is_empty() {
+            let batch: Vec<(&[u8], Option<&[u8]>)> = accepted.iter().map(|(i, b)| (items[*i].0.as_bytes(), Some(b.as_slice()))).collect();
+            self.kv.write(&batch)?;
+        }
+        Ok(out)
     }
 
     fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {

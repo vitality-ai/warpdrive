@@ -285,6 +285,86 @@ pub fn rows() -> Option<Arc<MetaRows>> {
     ROWS.get().cloned()
 }
 
+/// One row write waiting for the commit thread.
+struct CommitJob {
+    key: String,
+    op: warp_meta_store::RowOp<MetaRecord>,
+    reply: tokio::sync::oneshot::Sender<Result<Applied<MetaRecord>, String>>,
+}
+
+/// The most row writes one commit applies.
+const COMMIT_BATCH_MAX: usize = 1024;
+
+static COMMITTER: std::sync::OnceLock<std::sync::mpsc::Sender<CommitJob>> = std::sync::OnceLock::new();
+
+/// Writes one row to this node's rows (a tombstone at `seq` when `record` is
+/// `None`), durable when it returns, without blocking the caller's thread.
+///
+/// Every caller's write goes to one commit thread. It takes all the writes
+/// waiting, applies them with one `apply_many` (one engine write, one sync),
+/// and answers each. Under load a batch holds many writes, so a write costs
+/// a channel send and a wakeup instead of a blocking-pool hand-off and its
+/// own place in the engine's write queue. Each write gets the answer `put`
+/// or `delete` would give it.
+pub async fn commit_row(key: String, seq: u64, record: Option<MetaRecord>) -> Result<Applied<MetaRecord>, String> {
+    let tx = COMMITTER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<CommitJob>();
+        std::thread::Builder::new()
+            .name("wd-meta-commit".into())
+            .spawn(move || commit_loop(rx))
+            .expect("starting the metadata commit thread");
+        tx
+    });
+    let op = match record {
+        Some(r) => warp_meta_store::RowOp::Put(r),
+        None => warp_meta_store::RowOp::Delete(seq),
+    };
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tx.send(CommitJob { key, op, reply }).map_err(|_| "the metadata commit thread has stopped".to_string())?;
+    answer.await.map_err(|_| "the metadata commit thread dropped a write".to_string())?
+}
+
+fn commit_loop(rx: std::sync::mpsc::Receiver<CommitJob>) {
+    while let Ok(first) = rx.recv() {
+        let mut jobs = vec![first];
+        while jobs.len() < COMMIT_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(j) => jobs.push(j),
+                Err(_) => break,
+            }
+        }
+        let Some(rows) = rows() else {
+            for j in jobs {
+                let _ = j.reply.send(Err("this node has no S3 metadata rows (not started as a cluster node)".into()));
+            }
+            continue;
+        };
+        let mut keys = Vec::with_capacity(jobs.len());
+        let mut replies = Vec::with_capacity(jobs.len());
+        let mut ops = Vec::with_capacity(jobs.len());
+        for j in jobs {
+            keys.push(j.key.clone());
+            ops.push((j.key, j.op));
+            replies.push(j.reply);
+        }
+        match rows.apply_many(ops) {
+            Ok(results) => {
+                for k in &keys {
+                    row_written(k);
+                }
+                for (reply, r) in replies.into_iter().zip(results) {
+                    let _ = reply.send(Ok(r));
+                }
+            }
+            Err(e) => {
+                for reply in replies {
+                    let _ = reply.send(Err(e.to_string()));
+                }
+            }
+        }
+    }
+}
+
 /// Bumped after every bucket row write on this node, by any path (a local
 /// write or one replicated from a peer), so `BucketCache` entries read before
 /// it are refetched.

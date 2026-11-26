@@ -57,6 +57,13 @@ pub trait Engine<V>: Send + Sync {
         }
         Ok(removed)
     }
+    /// `put_if` for many items, durable on return. Item `i` is checked (as
+    /// `check(i, current)`) against the value the items before it left, and
+    /// the accepted ones are written together, so an engine can make the
+    /// whole batch durable with one sync. One result per item, as `put_if`.
+    fn put_many_if<T>(&self, items: Vec<(String, V)>, check: impl Fn(usize, Option<&V>) -> Result<(), T>) -> io::Result<Vec<Result<Option<V>, T>>> {
+        items.into_iter().enumerate().map(|(i, (k, v))| self.put_if(k, v, |c| check(i, c))).collect()
+    }
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
     ///

@@ -254,8 +254,23 @@ impl RecordOp {
 
 /// Applies `op` on this node, off the async thread.
 async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
-    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
     let label = op.label();
+    // A metadata row goes through the commit thread: batched with the other
+    // writes waiting, and awaited without holding a thread.
+    if let RecordOp::Meta(m) = op {
+        return match super::replicated_metadata::commit_row(m.key, m.seq, m.record).await {
+            Ok(applied) => match OpOutcome::from(applied) {
+                OpOutcome::Applied => PeerReply::Applied,
+                OpOutcome::Stale(seq) => PeerReply::Stale(seq),
+                OpOutcome::VersionMismatch => PeerReply::Failed,
+            },
+            Err(e) => {
+                warn!("{label}: applying on this node failed: {e}");
+                PeerReply::Failed
+            }
+        };
+    }
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
     // On the multi-threaded cluster runtime the write runs in place, with
     // the runtime moving this thread's other tasks elsewhere while it
     // blocks: no hand-off to the blocking pool and back. Elsewhere it goes
@@ -2285,15 +2300,9 @@ mod tests {
 }
 
 /// Receiving side of S3 metadata row replication.
-pub async fn cluster_internal_meta_row(
-    body: web::Json<MetaRowRequest>,
-    state: web::Data<ClusterState>,
-) -> Result<HttpResponse, Error> {
-    let op = RecordOp::Meta(body.into_inner());
-    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
-        .map_err(ErrorInternalServerError)?;
-    Ok(outcome_response(outcome))
+pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>) -> Result<HttpResponse, Error> {
+    // Through the commit thread, batched with this node's other row writes.
+    let m = body.into_inner();
+    let applied = super::replicated_metadata::commit_row(m.key, m.seq, m.record).await.map_err(ErrorInternalServerError)?;
+    Ok(outcome_response(applied.into()))
 }
