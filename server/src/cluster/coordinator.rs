@@ -253,7 +253,17 @@ impl RecordOp {
 async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
     let label = op.label();
-    match tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await {
+    // On the multi-threaded cluster runtime the write runs in place, with
+    // the runtime moving this thread's other tasks elsewhere while it
+    // blocks: no hand-off to the blocking pool and back. Elsewhere it goes
+    // to the blocking pool as before.
+    let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let result = if multi {
+        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref())))
+    } else {
+        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await
+    };
+    match result {
         Ok(Ok(OpOutcome::Applied)) => PeerReply::Applied,
         Ok(Ok(OpOutcome::Stale(seq))) => PeerReply::Stale(seq),
         Ok(Ok(OpOutcome::VersionMismatch)) => PeerReply::Failed,

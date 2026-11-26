@@ -47,9 +47,24 @@ pub enum Entry<R> {
 /// Parsed through `serde_json::Value`, not a serde untagged enum: an
 /// untagged enum can't read a map with numeric keys (a multipart upload's
 /// parts), so a node holding one couldn't replay its own log.
+///
+/// A binary format (the RocksDB engine's MessagePack) only ever holds the
+/// tagged form, so it is read directly, without the JSON detour.
 impl<'de, R: DeserializeOwned> Deserialize<'de> for Entry<R> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
+        if !d.is_human_readable() {
+            #[derive(Deserialize)]
+            #[serde(bound = "R: DeserializeOwned")]
+            enum Tagged<R> {
+                Live(R),
+                Tombstone { seq: u64 },
+            }
+            return Ok(match Tagged::<R>::deserialize(d)? {
+                Tagged::Live(r) => Entry::Live(r),
+                Tagged::Tombstone { seq } => Entry::Tombstone { seq },
+            });
+        }
         let v = serde_json::Value::deserialize(d)?;
         if let serde_json::Value::Object(m) = &v {
             if m.len() == 1 {

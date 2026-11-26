@@ -10,26 +10,57 @@
 //!   lookups return what the Bitcask engine returns.
 //! - Values are JSON, the encoding the Bitcask log uses.
 //! - Durability: WAL journal with `synchronous=FULL`. A write returns once
-//!   its transaction is synced, as `Engine` requires.
-//! - One connection behind a mutex. Every write is its own synced
-//!   transaction, so concurrent writers each pay a sync: there is no group
-//!   commit yet.
+//!   the transaction holding it is synced, as `Engine` requires.
+//! - Group commit: writers stage their changes into one open transaction,
+//!   and the first writer to wait commits it for everyone, so one sync
+//!   covers every write that arrived while the previous commit ran. Each
+//!   write still returns only after its own commit.
+//! - Reads go to a pool of connections, which WAL lets run alongside the
+//!   writer. They see committed data only, and a write is committed before
+//!   it returns, so a caller always reads its own writes.
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use warp_meta_store::{Engine, Entry, WarpMetaStore};
 
 /// A [`WarpMetaStore`] whose records live in SQLite.
 pub type SqliteMetaStore<R> = WarpMetaStore<R, SqliteEngine<Entry<R>>>;
 
+/// The writer connection and the batch it is filling.
+struct Writer {
+    conn: Connection,
+    /// Whether a transaction is open with staged writes.
+    open: bool,
+    /// The batch new writes join. Bumped by each commit.
+    batch: u64,
+}
+
+/// Which batches have committed.
+#[derive(Default)]
+struct Commits {
+    /// Every batch below this one has finished committing.
+    done: u64,
+    /// Whether a writer is committing now.
+    committing: bool,
+    /// Batches whose commit failed, with why. Kept until every waiter of
+    /// that batch has read it (pruned once far behind).
+    failed: HashMap<u64, String>,
+}
+
 /// [`Engine`] on a SQLite table `kv(key BLOB PRIMARY KEY, value BLOB)`.
 pub struct SqliteEngine<V> {
-    conn: Mutex<Connection>,
+    writer: Mutex<Writer>,
+    commits: Mutex<Commits>,
+    committed: Condvar,
+    readers: Vec<Mutex<Connection>>,
+    next_reader: AtomicUsize,
     _v: PhantomData<fn() -> V>,
 }
 
@@ -37,15 +68,144 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+fn connect(path: &Path) -> io::Result<Connection> {
+    let conn = Connection::open(path).map_err(io_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(io_err)?;
+    Ok(conn)
+}
+
+/// Read connections: `WARPDRIVE_SQLITE_READERS`, else twice the cores.
+fn reader_count() -> usize {
+    std::env::var("WARPDRIVE_SQLITE_READERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get() * 2))
+}
+
 impl<V> SqliteEngine<V> {
     /// Opens (creating if needed) the database at `path`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let conn = Connection::open(path).map_err(io_err)?;
+        let path = path.as_ref();
+        let conn = connect(path)?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(io_err)?;
         conn.pragma_update(None, "synchronous", "FULL").map_err(io_err)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;")
             .map_err(io_err)?;
-        Ok(Self { conn: Mutex::new(conn), _v: PhantomData })
+        let readers = (0..reader_count()).map(|_| connect(path).map(Mutex::new)).collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            writer: Mutex::new(Writer { conn, open: false, batch: 0 }),
+            commits: Mutex::new(Commits::default()),
+            committed: Condvar::new(),
+            readers,
+            next_reader: AtomicUsize::new(0),
+            _v: PhantomData,
+        })
+    }
+
+    /// A read connection: a free one if any, else the next in turn.
+    fn reader(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        let n = self.readers.len();
+        for i in 0..n {
+            if let Some(c) = self.readers[(start + i) % n].try_lock() {
+                return c;
+            }
+        }
+        self.readers[start % n].lock()
+    }
+
+    /// Runs `op` inside the open batch (opening one if needed), atomically:
+    /// a failed `op` leaves nothing behind. Returns its result and the
+    /// batch it joined. The caller must then `wait_for(batch)` before
+    /// reporting the write as done.
+    fn stage<T>(&self, op: impl FnOnce(&Connection) -> io::Result<T>) -> io::Result<(T, u64)> {
+        let mut w = self.writer.lock();
+        if !w.open {
+            w.conn.execute_batch("BEGIN IMMEDIATE").map_err(io_err)?;
+            w.open = true;
+        }
+        w.conn.execute_batch("SAVEPOINT op").map_err(io_err)?;
+        match op(&w.conn) {
+            Ok(t) => {
+                w.conn.execute_batch("RELEASE op").map_err(io_err)?;
+                Ok((t, w.batch))
+            }
+            Err(e) => {
+                let _ = w.conn.execute_batch("ROLLBACK TO op; RELEASE op");
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns once `batch` is committed (synced), committing it here if no
+    /// one else is. Errors if that commit failed.
+    fn wait_for(&self, batch: u64) -> io::Result<()> {
+        let mut c = self.commits.lock();
+        loop {
+            if c.done > batch {
+                return match c.failed.get(&batch) {
+                    Some(e) => Err(io::Error::other(format!("group commit failed: {e}"))),
+                    None => Ok(()),
+                };
+            }
+            if c.committing {
+                self.committed.wait(&mut c);
+                continue;
+            }
+            c.committing = true;
+            drop(c);
+            // Holding the writer while syncing means writes arriving now
+            // queue for the next batch, which this commit's waiters then
+            // fill together.
+            let (id, result) = {
+                let mut w = self.writer.lock();
+                let id = w.batch;
+                let result = if w.open {
+                    let r = w.conn.execute_batch("COMMIT").map_err(|e| e.to_string());
+                    if r.is_err() {
+                        let _ = w.conn.execute_batch("ROLLBACK");
+                    }
+                    r
+                } else {
+                    Ok(())
+                };
+                w.open = false;
+                w.batch += 1;
+                (id, result)
+            };
+            c = self.commits.lock();
+            if let Err(e) = result {
+                c.failed.insert(id, e);
+            }
+            c.done = id + 1;
+            let floor = c.done.saturating_sub(1024);
+            c.failed.retain(|b, _| *b >= floor);
+            c.committing = false;
+            self.committed.notify_all();
+        }
+    }
+
+    /// Stages `op` and returns once it is committed.
+    fn write<T>(&self, op: impl FnOnce(&Connection) -> io::Result<T>) -> io::Result<T> {
+        let (t, batch) = self.stage(op)?;
+        self.wait_for(batch)?;
+        Ok(t)
+    }
+
+    /// Commits whatever is staged, then runs `f` on the writer with no
+    /// transaction open.
+    fn quiesced<T>(&self, f: impl FnOnce(&Connection) -> io::Result<T>) -> io::Result<T> {
+        loop {
+            let batch = {
+                let w = self.writer.lock();
+                if !w.open {
+                    return f(&w.conn);
+                }
+                w.batch
+            };
+            self.wait_for(batch)?;
+        }
     }
 }
 
@@ -55,6 +215,29 @@ fn encode<V: Serialize>(v: &V) -> io::Result<Vec<u8>> {
 
 fn decode<V: DeserializeOwned>(b: &[u8]) -> Option<V> {
     serde_json::from_slice(b).ok()
+}
+
+fn current<V: DeserializeOwned>(conn: &Connection, key: &str) -> io::Result<Option<V>> {
+    Ok(conn
+        .prepare_cached("SELECT value FROM kv WHERE key = ?1")
+        .map_err(io_err)?
+        .query_row(params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+        .optional()
+        .map_err(io_err)?
+        .and_then(|b| decode(&b)))
+}
+
+fn upsert(conn: &Connection, key: &str, bytes: &[u8]) -> io::Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")
+        .map_err(io_err)?
+        .execute(params![key.as_bytes(), bytes])
+        .map_err(io_err)?;
+    Ok(())
+}
+
+fn remove(conn: &Connection, key: &str) -> io::Result<()> {
+    conn.prepare_cached("DELETE FROM kv WHERE key = ?1").map_err(io_err)?.execute(params![key.as_bytes()]).map_err(io_err)?;
+    Ok(())
 }
 
 /// The smallest byte string greater than every string starting with
@@ -77,7 +260,7 @@ where
     /// Rows with keys starting with `prefix` and at most `upper` when given,
     /// in key order (descending when `desc`), passed to `f` until it says stop.
     fn walk(&self, prefix: &str, upper: Option<&str>, desc: bool, mut f: impl FnMut(String, V) -> bool) {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let lo = prefix.as_bytes().to_vec();
         let hi = prefix_end(prefix.as_bytes());
         let order = if desc { "DESC" } else { "ASC" };
@@ -109,86 +292,55 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync,
 {
     fn get(&self, key: &str) -> Option<V> {
-        let conn = self.conn.lock();
-        let b: Option<Vec<u8>> = conn
-            .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten();
-        b.and_then(|b| decode(&b))
+        current(&self.reader(), key).ok().flatten()
     }
 
     fn put(&self, key: String, value: V) -> io::Result<()> {
         let bytes = encode(&value)?;
-        let conn = self.conn.lock();
-        conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)", params![key.as_bytes(), bytes]).map_err(io_err)?;
-        Ok(())
+        self.write(|c| upsert(c, &key, &bytes))
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
-        Ok(())
+        self.write(|c| remove(c, key))
     }
 
     fn put_if<T>(&self, key: String, value: V, check: impl FnOnce(Option<&V>) -> Result<(), T>) -> io::Result<Result<Option<V>, T>> {
         let bytes = encode(&value)?;
-        let mut conn = self.conn.lock();
-        // The connection lock already excludes other writers in this
-        // process. The IMMEDIATE transaction keeps the read and the write
-        // atomic against any other connection to the same file too.
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
-        let current: Option<V> = tx
-            .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
-            .optional()
-            .map_err(io_err)?
-            .and_then(|b| decode(&b));
-        if let Err(e) = check(current.as_ref()) {
-            return Ok(Err(e));
-        }
-        tx.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)", params![key.as_bytes(), bytes]).map_err(io_err)?;
-        tx.commit().map_err(io_err)?;
-        Ok(Ok(current))
+        // The check reads the batch's staged state, so writes to one key
+        // are checked in the order they are staged. A refused write still
+        // waits for the batch: what it saw counts only once committed.
+        self.write(|c| {
+            let cur: Option<V> = current(c, &key)?;
+            if let Err(e) = check(cur.as_ref()) {
+                return Ok(Err(e));
+            }
+            upsert(c, &key, &bytes)?;
+            Ok(Ok(cur))
+        })
     }
 
     fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
-        let current: Option<V> = tx
-            .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
-            .optional()
-            .map_err(io_err)?
-            .and_then(|b| decode(&b));
-        match current {
-            Some(v) if !keep(&v) => {}
-            _ => return Ok(false),
-        }
-        tx.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
-        tx.commit().map_err(io_err)?;
-        Ok(true)
+        self.write(|c| match current::<V>(c, key)? {
+            Some(v) if !keep(&v) => remove(c, key).map(|_| true),
+            _ => Ok(false),
+        })
     }
 
     fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(io_err)?;
-        let mut removed = 0;
-        for key in keys {
-            let current: Option<V> = tx
-                .query_row("SELECT value FROM kv WHERE key = ?1", params![key.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
-                .optional()
-                .map_err(io_err)?
-                .and_then(|b| decode(&b));
-            if matches!(current, Some(v) if !keep(key, &v)) {
-                tx.execute("DELETE FROM kv WHERE key = ?1", params![key.as_bytes()]).map_err(io_err)?;
-                removed += 1;
+        self.write(|c| {
+            let mut removed = 0;
+            for key in keys {
+                if matches!(current::<V>(c, key)?, Some(v) if !keep(key, &v)) {
+                    remove(c, key)?;
+                    removed += 1;
+                }
             }
-        }
-        tx.commit().map_err(io_err)?;
-        Ok(removed)
+            Ok(removed)
+        })
     }
 
     fn scan_range<T>(&self, after: Option<&str>, upto: &str, mut f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let mut out = Vec::new();
         let (lo, hi) = (after.unwrap_or("").as_bytes().to_vec(), upto.as_bytes().to_vec());
         let sql = if after.is_some() { "SELECT key, value FROM kv WHERE key > ?1 AND key <= ?2 ORDER BY key" } else { "SELECT key, value FROM kv WHERE key >= ?1 AND key <= ?2 ORDER BY key" };
@@ -238,8 +390,7 @@ where
     }
 
     fn compact(&self) -> io::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;").map_err(io_err)
+        self.quiesced(|c| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;").map_err(io_err))
     }
 }
 
@@ -321,6 +472,46 @@ mod tests {
             .collect();
         handles.into_iter().for_each(|h| h.join().unwrap());
         assert_eq!(e.get("n"), Some(400), "every increment applied exactly once");
+    }
+
+    #[test]
+    fn concurrent_writes_are_all_committed_and_readable_after_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.db");
+        {
+            let e = std::sync::Arc::new(SqliteEngine::<u64>::open(&path).unwrap());
+            let handles: Vec<_> = (0..16u64)
+                .map(|t| {
+                    let e = e.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..200u64 {
+                            let k = format!("t{t}/{i}");
+                            e.put(k.clone(), t * 1000 + i).unwrap();
+                            // A write is readable from the read pool as soon as it returns.
+                            assert_eq!(e.get(&k), Some(t * 1000 + i), "read-your-writes for {k}");
+                        }
+                    })
+                })
+                .collect();
+            handles.into_iter().for_each(|h| h.join().unwrap());
+        }
+        let e = SqliteEngine::<u64>::open(&path).unwrap();
+        assert_eq!(e.snapshot().len(), 16 * 200, "every acknowledged write survives a reopen");
+    }
+
+    #[test]
+    fn a_failed_op_leaves_nothing_in_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = SqliteEngine::<u64>::open(dir.path().join("kv.db")).unwrap();
+        e.put("a".into(), 1).unwrap();
+        let r = e.stage(|c| {
+            upsert(c, "b", b"2")?;
+            Err::<(), _>(io::Error::other("boom"))
+        });
+        assert!(r.is_err());
+        e.put("c".into(), 3).unwrap();
+        assert_eq!(e.get("b"), None, "the failed op's write was rolled back");
+        assert_eq!(e.get("c"), Some(3));
     }
 
     /// Runs the same random operations on SQLite and Bitcask and requires

@@ -74,6 +74,15 @@ impl RocksKv {
         o.set_max_write_buffer_number(2);
         o.set_compression_type(DBCompressionType::Lz4);
         o.set_max_open_files(256);
+        // Values of at least WARPDRIVE_ROCKSDB_BLOB_MIN bytes (default 2048)
+        // go to blob files, so compaction moves a pointer instead of
+        // rewriting the value. 0 turns it off.
+        let blob_min = std::env::var("WARPDRIVE_ROCKSDB_BLOB_MIN").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048);
+        if blob_min > 0 {
+            o.set_enable_blob_files(true);
+            o.set_min_blob_size(blob_min);
+            o.set_enable_blob_gc(true);
+        }
         let mut sync = WriteOptions::default();
         sync.set_sync(true);
         let db = DB::open(&o, path.as_ref()).map_err(|e| io_err(format!("{}: {e}", path.as_ref().display())))?;
