@@ -139,22 +139,58 @@ pub enum RowOp<R> {
     Delete(u64),
 }
 
+/// The parts of a stored `Entry` that ordering needs: its seq, and, for a
+/// live entry, its record's version. A write batch checks against this
+/// instead of the whole entry, so an engine that stores entries serialized
+/// can decode just these fields and skip the rest (an inline value, say).
+///
+/// That relies on every `Record` serializing its seq as a field named `seq`
+/// and its version, when not empty, as a field named `version`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub enum EntryHead {
+    Live(RecordHead),
+    Tombstone { seq: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecordHead {
+    pub seq: u64,
+    #[serde(default)]
+    pub version: String,
+}
+
+impl EntryHead {
+    pub fn of<R: Record>(e: &Entry<R>) -> Self {
+        match e {
+            Entry::Live(r) => EntryHead::Live(RecordHead { seq: r.seq(), version: r.version().to_string() }),
+            Entry::Tombstone { seq } => EntryHead::Tombstone { seq: *seq },
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        match self {
+            EntryHead::Live(r) => r.seq,
+            EntryHead::Tombstone { seq } => *seq,
+        }
+    }
+}
+
 /// When `put` writes: a newer record, or the same write sent again.
-fn put_rule<R: Record>(seq: u64, version: &str, current: Option<&Entry<R>>) -> Result<(), Refused<R>> {
+fn put_rule<R>(seq: u64, version: &str, current: Option<&EntryHead>) -> Result<(), Refused<R>> {
     match current {
         None => Ok(()),
         Some(c) if seq > c.seq() => Ok(()),
-        Some(Entry::Live(c)) if seq == c.seq() && c.version() == version => Err(Refused::Repeat),
+        Some(EntryHead::Live(c)) if seq == c.seq && c.version == version => Err(Refused::Repeat),
         Some(c) => Err(Refused::Outcome(Applied::Stale { current_seq: c.seq() })),
     }
 }
 
 /// When `delete` writes its tombstone.
-fn delete_rule<R: Record>(seq: u64, current: Option<&Entry<R>>) -> Result<(), Refused<R>> {
+fn delete_rule<R>(seq: u64, current: Option<&EntryHead>) -> Result<(), Refused<R>> {
     match current {
         None => Ok(()),
         Some(c) if seq > c.seq() => Ok(()),
-        Some(Entry::Tombstone { seq: t }) if *t == seq => Err(Refused::Repeat),
+        Some(EntryHead::Tombstone { seq: t }) if *t == seq => Err(Refused::Repeat),
         Some(c) => Err(Refused::Outcome(Applied::Stale { current_seq: c.seq() })),
     }
 }
@@ -192,13 +228,14 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
     /// A new version of the object, or the same write sent again.
     pub fn put(&self, rk: String, record: R) -> io::Result<Applied<R>> {
         let (seq, version) = (record.seq(), record.version().to_string());
-        self.write(rk, Entry::Live(record), |current| put_rule(seq, &version, current))
+        self.write(rk, Entry::Live(record), |current| put_rule(seq, &version, current.map(EntryHead::of).as_ref()))
     }
 
     /// `put` and `delete` for many rows, durable together on return: the
     /// engine can make the whole batch durable with one sync. Each op gets
     /// the answer `put` or `delete` would give it, judged against the rows
-    /// as the ops before it in the batch left them.
+    /// as the ops before it in the batch left them, except that an applied
+    /// op's `previous` is `None`: only each row's `EntryHead` is read.
     pub fn apply_many(&self, ops: Vec<(String, RowOp<R>)>) -> io::Result<Vec<Applied<R>>> {
         let rules: Vec<(u64, Option<String>)> = ops
             .iter()
@@ -218,7 +255,7 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
                 (rk, entry)
             })
             .collect();
-        let results = self.engine.put_many_if(items, |i, current| {
+        let results = self.engine.put_many_if_head(items, EntryHead::of, |i, current: Option<&EntryHead>| {
             if let Some(c) = current {
                 hlc::observe(c.seq());
             }
@@ -227,10 +264,11 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
                 (seq, None) => delete_rule(*seq, current),
             }
         })?;
+        // `previous` isn't reported: the batch reads only each row's head.
         Ok(results
             .into_iter()
             .map(|r| match r {
-                Ok(previous) => Applied::Yes { previous },
+                Ok(()) => Applied::Yes { previous: None },
                 Err(Refused::Repeat) => Applied::Yes { previous: None },
                 Err(Refused::Outcome(o)) => o,
             })
@@ -262,7 +300,7 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
 
     /// Deletes the key at `seq`, leaving a tombstone.
     pub fn delete(&self, rk: String, seq: u64) -> io::Result<Applied<R>> {
-        self.write(rk, Entry::Tombstone { seq }, |current| delete_rule(seq, current))
+        self.write(rk, Entry::Tombstone { seq }, |current| delete_rule(seq, current.map(EntryHead::of).as_ref()))
     }
 
     pub fn get(&self, rk: &str) -> Option<R> {
@@ -353,13 +391,23 @@ mod tests {
             .unwrap();
         assert_eq!(got[0], Applied::Stale { current_seq: 10 });
         assert_eq!(got[1], Applied::Yes { previous: None });
-        assert_eq!(got[2], Applied::Yes { previous: Some(Entry::Live(rec(20, "b1"))) });
+        assert_eq!(got[2], Applied::Yes { previous: None });
         assert_eq!(got[3], Applied::Stale { current_seq: 30 });
-        assert_eq!(got[4], Applied::Yes { previous: Some(Entry::Live(rec(10, "a1"))) });
+        assert_eq!(got[4], Applied::Yes { previous: None });
         assert!(got[5].is_applied() && got[6].is_applied());
         assert_eq!(s.get("b").unwrap().version, "b2");
         assert_eq!(s.entry("a"), Some(Entry::Tombstone { seq: 40 }));
         assert_eq!(s.get("c").unwrap().version, "c1");
+    }
+
+    #[test]
+    fn an_entry_head_decodes_from_a_stored_entry_without_the_rest() {
+        let live: Entry<Rec> = Entry::Live(Rec { seq: 7, version: "v".into(), tag: "x".repeat(1000) });
+        let dead: Entry<Rec> = Entry::Tombstone { seq: 9 };
+        for e in [live, dead] {
+            let bytes = rmp_serde::to_vec_named(&e).unwrap();
+            assert_eq!(rmp_serde::from_slice::<EntryHead>(&bytes).unwrap(), EntryHead::of(&e));
+        }
     }
 
     #[test]

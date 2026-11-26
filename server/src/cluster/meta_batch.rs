@@ -198,6 +198,11 @@ mod tests {
             MetaRowRequest { key: "ver/k".into(), seq: 5, record: Some(MetaRecord { seq: 5, value: MetaValue::Version(v) }) },
             MetaRowRequest { key: "acl/k".into(), seq: 6, record: None },
         ];
+        // The commit check reads only an entry's head: it must decode from
+        // a stored MetaRecord entry to the record's own seq and version.
+        let stored = warp_meta_store::Entry::Live(rows[0].record.clone().unwrap());
+        let head: warp_meta_store::EntryHead = rmp_serde::from_slice(&rmp_serde::to_vec_named(&stored).unwrap()).unwrap();
+        assert_eq!(head, warp_meta_store::EntryHead::of(&stored));
         let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&rmp_serde::to_vec_named(&rows).unwrap()).unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!((back[0].key.as_str(), back[0].seq, &back[0].record), (rows[0].key.as_str(), 5, &rows[0].record));

@@ -173,6 +173,37 @@ where
         Ok(out)
     }
 
+    fn put_many_if_head<H: DeserializeOwned, T>(&self, items: Vec<(String, V)>, head: impl Fn(&V) -> H, check: impl Fn(usize, Option<&H>) -> Result<(), T>) -> io::Result<Vec<Result<(), T>>> {
+        // As `put_many_if`, but each current value is decoded only as far as
+        // `H`: its other fields are skipped, not built.
+        let mut stripes: Vec<usize> = items.iter().map(|(k, _)| stripe_of(k)).collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let _guards: Vec<_> = stripes.iter().map(|&s| self.stripes[s].lock()).collect();
+        let mut latest: HashMap<&str, usize> = HashMap::new();
+        let mut out = Vec::with_capacity(items.len());
+        let mut accepted: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, (k, v)) in items.iter().enumerate() {
+            let current: Option<H> = match latest.get(k.as_str()) {
+                Some(&j) => Some(head(&items[j].1)),
+                None => self.kv.get(k.as_bytes())?.and_then(|b| decode::<H>(&b)),
+            };
+            match check(i, current.as_ref()) {
+                Ok(()) => {
+                    accepted.push((i, encode(v)?));
+                    latest.insert(k.as_str(), i);
+                    out.push(Ok(()));
+                }
+                Err(e) => out.push(Err(e)),
+            }
+        }
+        if !accepted.is_empty() {
+            let batch: Vec<(&[u8], Option<&[u8]>)> = accepted.iter().map(|(i, b)| (items[*i].0.as_bytes(), Some(b.as_slice()))).collect();
+            self.kv.write(&batch)?;
+        }
+        Ok(out)
+    }
+
     fn delete_if(&self, key: &str, keep: impl FnOnce(&V) -> bool) -> io::Result<bool> {
         let _g = self.lock(key);
         match self.read(key)? {
