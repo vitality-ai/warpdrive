@@ -215,10 +215,13 @@ impl RecordOp {
             RecordOp::Meta(m) => {
                 let rows = super::replicated_metadata::rows()
                     .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
-                match m.record {
-                    Some(r) => rows.put(m.key, r)?.into(),
-                    None => rows.delete(m.key, m.seq)?.into(),
-                }
+                let key = m.key.clone();
+                let out = match m.record {
+                    Some(r) => rows.put(m.key, r)?,
+                    None => rows.delete(m.key, m.seq)?,
+                };
+                super::replicated_metadata::row_written(&key);
+                out.into()
             }
         })
     }
@@ -251,9 +254,34 @@ impl RecordOp {
 
 /// Applies `op` on this node, off the async thread.
 async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
-    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
     let label = op.label();
-    match tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await {
+    // A metadata row goes through the commit thread: batched with the other
+    // writes waiting, and awaited without holding a thread.
+    if let RecordOp::Meta(m) = op {
+        return match super::replicated_metadata::commit_row(m.key, m.seq, m.record).await {
+            Ok(applied) => match OpOutcome::from(applied) {
+                OpOutcome::Applied => PeerReply::Applied,
+                OpOutcome::Stale(seq) => PeerReply::Stale(seq),
+                OpOutcome::VersionMismatch => PeerReply::Failed,
+            },
+            Err(e) => {
+                warn!("{label}: applying on this node failed: {e}");
+                PeerReply::Failed
+            }
+        };
+    }
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    // On the multi-threaded cluster runtime the write runs in place, with
+    // the runtime moving this thread's other tasks elsewhere while it
+    // blocks: no hand-off to the blocking pool and back. Elsewhere it goes
+    // to the blocking pool as before.
+    let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let result = if multi {
+        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref())))
+    } else {
+        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await
+    };
+    match result {
         Ok(Ok(OpOutcome::Applied)) => PeerReply::Applied,
         Ok(Ok(OpOutcome::Stale(seq))) => PeerReply::Stale(seq),
         Ok(Ok(OpOutcome::VersionMismatch)) => PeerReply::Failed,
@@ -278,8 +306,20 @@ async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() 
         let op = make();
         let label = op.label();
         let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
-        let req = (!is_self).then(|| op.request(&state.location_http, peer));
+        // A metadata row for a peer rides in that peer's next batch.
+        let batched = match &op {
+            RecordOp::Meta(m) if !is_self && super::meta_batch::enabled() => Some(m.clone()),
+            _ => None,
+        };
+        let req = (!is_self && batched.is_none()).then(|| op.request(&state.location_http, peer));
         async move {
+            if let Some(m) = batched {
+                return match super::meta_batch::send(&state.location_http, peer, m).await {
+                    super::meta_batch::RowReply::Applied => PeerReply::Applied,
+                    super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
+                    super::meta_batch::RowReply::Failed => PeerReply::Failed,
+                };
+            }
             let Some(req) = req else {
                 return apply_locally(state, op).await;
             };
@@ -2272,15 +2312,9 @@ mod tests {
 }
 
 /// Receiving side of S3 metadata row replication.
-pub async fn cluster_internal_meta_row(
-    body: web::Json<MetaRowRequest>,
-    state: web::Data<ClusterState>,
-) -> Result<HttpResponse, Error> {
-    let op = RecordOp::Meta(body.into_inner());
-    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
-        .map_err(ErrorInternalServerError)?;
-    Ok(outcome_response(outcome))
+pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>) -> Result<HttpResponse, Error> {
+    // Through the commit thread, batched with this node's other row writes.
+    let m = body.into_inner();
+    let applied = super::replicated_metadata::commit_row(m.key, m.seq, m.record).await.map_err(ErrorInternalServerError)?;
+    Ok(outcome_response(applied.into()))
 }

@@ -39,10 +39,11 @@ fn key_nanos(key: &str) -> Option<u64> {
     u64::from_str_radix(key.strip_prefix(PREFIX)?, 16).ok()
 }
 
-/// The blobs a gc/ row names: every dead blob, inline ones included. An inline
-/// blob has no shards to free, but its address index entry goes too.
+/// The blobs a gc/ row names: the dead blobs with shards to free. An inline
+/// blob's bytes live in its row, so it has nothing on disk to free and needs
+/// no gc/ row (writing one would also copy the old bytes into it).
 pub fn with_shards(blobs: Vec<BlobRef>) -> Vec<BlobRef> {
-    blobs
+    blobs.into_iter().filter(|b| b.placement.inline.is_none()).collect()
 }
 
 fn cursor_path() -> String {

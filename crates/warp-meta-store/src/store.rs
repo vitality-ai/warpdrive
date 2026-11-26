@@ -47,9 +47,24 @@ pub enum Entry<R> {
 /// Parsed through `serde_json::Value`, not a serde untagged enum: an
 /// untagged enum can't read a map with numeric keys (a multipart upload's
 /// parts), so a node holding one couldn't replay its own log.
+///
+/// A binary format (the RocksDB engine's MessagePack) only ever holds the
+/// tagged form, so it is read directly, without the JSON detour.
 impl<'de, R: DeserializeOwned> Deserialize<'de> for Entry<R> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
+        if !d.is_human_readable() {
+            #[derive(Deserialize)]
+            #[serde(bound = "R: DeserializeOwned")]
+            enum Tagged<R> {
+                Live(R),
+                Tombstone { seq: u64 },
+            }
+            return Ok(match Tagged::<R>::deserialize(d)? {
+                Tagged::Live(r) => Entry::Live(r),
+                Tagged::Tombstone { seq } => Entry::Tombstone { seq },
+            });
+        }
         let v = serde_json::Value::deserialize(d)?;
         if let serde_json::Value::Object(m) = &v {
             if m.len() == 1 {
@@ -116,6 +131,70 @@ enum Refused<R> {
     Outcome(Applied<R>),
 }
 
+/// One row write in an `apply_many` batch.
+#[derive(Debug, Clone)]
+pub enum RowOp<R> {
+    Put(R),
+    /// A tombstone at this `seq`.
+    Delete(u64),
+}
+
+/// The parts of a stored `Entry` that ordering needs: its seq, and, for a
+/// live entry, its record's version. A write batch checks against this
+/// instead of the whole entry, so an engine that stores entries serialized
+/// can decode just these fields and skip the rest (an inline value, say).
+///
+/// That relies on every `Record` serializing its seq as a field named `seq`
+/// and its version, when not empty, as a field named `version`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub enum EntryHead {
+    Live(RecordHead),
+    Tombstone { seq: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecordHead {
+    pub seq: u64,
+    #[serde(default)]
+    pub version: String,
+}
+
+impl EntryHead {
+    pub fn of<R: Record>(e: &Entry<R>) -> Self {
+        match e {
+            Entry::Live(r) => EntryHead::Live(RecordHead { seq: r.seq(), version: r.version().to_string() }),
+            Entry::Tombstone { seq } => EntryHead::Tombstone { seq: *seq },
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        match self {
+            EntryHead::Live(r) => r.seq,
+            EntryHead::Tombstone { seq } => *seq,
+        }
+    }
+}
+
+/// When `put` writes: a newer record, or the same write sent again.
+fn put_rule<R>(seq: u64, version: &str, current: Option<&EntryHead>) -> Result<(), Refused<R>> {
+    match current {
+        None => Ok(()),
+        Some(c) if seq > c.seq() => Ok(()),
+        Some(EntryHead::Live(c)) if seq == c.seq && c.version == version => Err(Refused::Repeat),
+        Some(c) => Err(Refused::Outcome(Applied::Stale { current_seq: c.seq() })),
+    }
+}
+
+/// When `delete` writes its tombstone.
+fn delete_rule<R>(seq: u64, current: Option<&EntryHead>) -> Result<(), Refused<R>> {
+    match current {
+        None => Ok(()),
+        Some(c) if seq > c.seq() => Ok(()),
+        Some(EntryHead::Tombstone { seq: t }) if *t == seq => Err(Refused::Repeat),
+        Some(c) => Err(Refused::Outcome(Applied::Stale { current_seq: c.seq() })),
+    }
+}
+
 /// Ordered records on engine `E`.
 pub struct WarpMetaStore<R, E> {
     engine: E,
@@ -148,14 +227,52 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
 
     /// A new version of the object, or the same write sent again.
     pub fn put(&self, rk: String, record: R) -> io::Result<Applied<R>> {
-        let seq = record.seq();
-        let version = record.version().to_string();
-        self.write(rk, Entry::Live(record), |current| match current {
-            None => Ok(()),
-            Some(c) if seq > c.seq() => Ok(()),
-            Some(Entry::Live(c)) if seq == c.seq() && c.version() == version => Err(Refused::Repeat),
-            Some(c) => Err(Refused::Outcome(Applied::Stale { current_seq: c.seq() })),
-        })
+        let (seq, version) = (record.seq(), record.version().to_string());
+        self.write(rk, Entry::Live(record), |current| put_rule(seq, &version, current.map(EntryHead::of).as_ref()))
+    }
+
+    /// `put` and `delete` for many rows, durable together on return: the
+    /// engine can make the whole batch durable with one sync. Each op gets
+    /// the answer `put` or `delete` would give it, judged against the rows
+    /// as the ops before it in the batch left them, except that an applied
+    /// op's `previous` is `None`: only each row's `EntryHead` is read.
+    pub fn apply_many(&self, ops: Vec<(String, RowOp<R>)>) -> io::Result<Vec<Applied<R>>> {
+        let rules: Vec<(u64, Option<String>)> = ops
+            .iter()
+            .map(|(_, op)| match op {
+                RowOp::Put(r) => (r.seq(), Some(r.version().to_string())),
+                RowOp::Delete(seq) => (*seq, None),
+            })
+            .collect();
+        let items: Vec<(String, Entry<R>)> = ops
+            .into_iter()
+            .map(|(rk, op)| {
+                let entry = match op {
+                    RowOp::Put(r) => Entry::Live(r),
+                    RowOp::Delete(seq) => Entry::Tombstone { seq },
+                };
+                hlc::observe(entry.seq());
+                (rk, entry)
+            })
+            .collect();
+        let results = self.engine.put_many_if_head(items, EntryHead::of, |i, current: Option<&EntryHead>| {
+            if let Some(c) = current {
+                hlc::observe(c.seq());
+            }
+            match &rules[i] {
+                (seq, Some(version)) => put_rule(*seq, version, current),
+                (seq, None) => delete_rule(*seq, current),
+            }
+        })?;
+        // `previous` isn't reported: the batch reads only each row's head.
+        Ok(results
+            .into_iter()
+            .map(|r| match r {
+                Ok(()) => Applied::Yes { previous: None },
+                Err(Refused::Repeat) => Applied::Yes { previous: None },
+                Err(Refused::Outcome(o)) => o,
+            })
+            .collect())
     }
 
     /// A metadata change (tags, retention) to the version the record names.
@@ -183,12 +300,7 @@ impl<R: Record, E: Engine<Entry<R>>> WarpMetaStore<R, E> {
 
     /// Deletes the key at `seq`, leaving a tombstone.
     pub fn delete(&self, rk: String, seq: u64) -> io::Result<Applied<R>> {
-        self.write(rk, Entry::Tombstone { seq }, |current| match current {
-            None => Ok(()),
-            Some(c) if seq > c.seq() => Ok(()),
-            Some(Entry::Tombstone { seq: t }) if *t == seq => Err(Refused::Repeat),
-            Some(c) => Err(Refused::Outcome(Applied::Stale { current_seq: c.seq() })),
-        })
+        self.write(rk, Entry::Tombstone { seq }, |current| delete_rule(seq, current.map(EntryHead::of).as_ref()))
     }
 
     pub fn get(&self, rk: &str) -> Option<R> {
@@ -259,6 +371,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open_at(&dir.path().join("r.log"));
         (dir, s)
+    }
+
+    /// `apply_many` gives each op the answer `put`/`delete` would, judged
+    /// against the batch's earlier ops, on both the default engine path
+    /// (Bitcask) and the one-write path (`KvEngine`).
+    fn check_apply_many(s: &WarpMetaStore<Rec, impl Engine<Entry<Rec>>>) {
+        s.put("a".into(), rec(10, "a1")).unwrap();
+        let got = s
+            .apply_many(vec![
+                ("a".into(), RowOp::Put(rec(5, "old"))),  // older than what's there
+                ("b".into(), RowOp::Put(rec(20, "b1"))),  // new key
+                ("b".into(), RowOp::Put(rec(30, "b2"))),  // newer than the item before it
+                ("b".into(), RowOp::Put(rec(25, "b0"))),  // older than the item before it
+                ("a".into(), RowOp::Delete(40)),          // delete after the refused put
+                ("c".into(), RowOp::Put(rec(50, "c1"))),
+                ("c".into(), RowOp::Put(rec(50, "c1"))),  // the same write twice
+            ])
+            .unwrap();
+        assert_eq!(got[0], Applied::Stale { current_seq: 10 });
+        assert_eq!(got[1], Applied::Yes { previous: None });
+        assert_eq!(got[2], Applied::Yes { previous: None });
+        assert_eq!(got[3], Applied::Stale { current_seq: 30 });
+        assert_eq!(got[4], Applied::Yes { previous: None });
+        assert!(got[5].is_applied() && got[6].is_applied());
+        assert_eq!(s.get("b").unwrap().version, "b2");
+        assert_eq!(s.entry("a"), Some(Entry::Tombstone { seq: 40 }));
+        assert_eq!(s.get("c").unwrap().version, "c1");
+    }
+
+    #[test]
+    fn an_entry_head_decodes_from_a_stored_entry_without_the_rest() {
+        let live: Entry<Rec> = Entry::Live(Rec { seq: 7, version: "v".into(), tag: "x".repeat(1000) });
+        let dead: Entry<Rec> = Entry::Tombstone { seq: 9 };
+        for e in [live, dead] {
+            let bytes = rmp_serde::to_vec_named(&e).unwrap();
+            assert_eq!(rmp_serde::from_slice::<EntryHead>(&bytes).unwrap(), EntryHead::of(&e));
+        }
+    }
+
+    #[test]
+    fn apply_many_judges_each_op_against_the_ones_before_it() {
+        let (_d, s) = open();
+        check_apply_many(&s);
+        let kv: WarpMetaStore<Rec, crate::kv::KvEngine<Entry<Rec>>> = WarpMetaStore::new(crate::kv::KvEngine::new(Box::new(crate::kv::MemKv::default())));
+        check_apply_many(&kv);
     }
 
     #[test]

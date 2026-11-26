@@ -195,6 +195,9 @@ where
     fn delete_many_if(&self, keys: &[String], keep: impl Fn(&str, &V) -> bool) -> io::Result<usize> {
         forward!(self, e => e.delete_many_if(keys, keep))
     }
+    fn put_many_if<T>(&self, items: Vec<(String, V)>, check: impl Fn(usize, Option<&V>) -> Result<(), T>) -> io::Result<Vec<Result<Option<V>, T>>> {
+        forward!(self, e => e.put_many_if(items, check))
+    }
     fn scan_range<T>(&self, after: Option<&str>, upto: &str, f: impl FnMut(&str, &V) -> Option<T>) -> Vec<T> {
         forward!(self, e => e.scan_range(after, upto, f))
     }
