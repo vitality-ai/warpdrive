@@ -239,6 +239,8 @@ fn bucket_versions_prefix(user: &str, bucket: &str) -> String {
 fn versions_prefix(user: &str, bucket: &str, key: &str) -> String {
     format!("{}{key}\0", bucket_versions_prefix(user, bucket))
 }
+/// Where a never-versioned bucket keeps a key's only version.
+const UNVERSIONED_ORDER: u64 = 0;
 fn version_key(user: &str, bucket: &str, key: &str, order: u64) -> String {
     format!("{}{order:016x}", versions_prefix(user, bucket, key))
 }
@@ -283,6 +285,43 @@ pub fn rows() -> Option<Arc<MetaRows>> {
     ROWS.get().cloned()
 }
 
+/// Bumped after every bucket row write on this node, by any path (a local
+/// write or one replicated from a peer), so `BucketCache` entries read before
+/// it are refetched.
+static BUCKET_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called after a row lands in this node's rows.
+pub fn row_written(key: &str) {
+    if key.starts_with("bkt/") {
+        BUCKET_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Bucket rows as last read, each tagged with `BUCKET_GEN` from before the
+/// read. An entry is used only while the generation is unchanged, so a bucket
+/// write anywhere makes every entry stale. Saves a lookup and a decode on
+/// every object write.
+#[derive(Default)]
+struct BucketCache(parking_lot::RwLock<std::collections::HashMap<String, (u64, Option<BucketRow>)>>);
+
+impl BucketCache {
+    fn get(&self, bucket: &str, load: impl FnOnce() -> Option<BucketRow>) -> Option<BucketRow> {
+        let gen = BUCKET_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((g, row)) = self.0.read().get(bucket) {
+            if *g == gen {
+                return row.clone();
+            }
+        }
+        let row = load();
+        let mut map = self.0.write();
+        if map.len() > 10_000 {
+            map.clear();
+        }
+        map.insert(bucket.to_string(), (gen, row.clone()));
+        row
+    }
+}
+
 /// Replicates row writes to a write quorum of the cluster.
 pub struct ClusterWriter;
 
@@ -323,6 +362,7 @@ impl RowWriter for LocalWriter {
             None => self.0.delete(key.to_string(), seq),
         }
         .map_err(|e| e.to_string())?;
+        row_written(key);
         match res {
             Applied::Yes { .. } => Ok(()),
             other => Err(format!("row write refused: {other:?}")),
@@ -363,6 +403,7 @@ pub struct ReplicatedMetadataStore {
     rows: Arc<MetaRows>,
     writer: Box<dyn RowWriter>,
     locks: KeyLocks,
+    buckets: BucketCache,
 }
 
 fn now_iso() -> String {
@@ -384,7 +425,7 @@ fn new_version_id() -> String {
 
 impl ReplicatedMetadataStore {
     pub fn new(rows: Arc<MetaRows>, writer: Box<dyn RowWriter>) -> Self {
-        Self { rows, writer, locks: KeyLocks::new() }
+        Self { rows, writer, locks: KeyLocks::new(), buckets: BucketCache::default() }
     }
 
     fn get(&self, key: &str) -> Option<MetaValue> {
@@ -404,10 +445,10 @@ impl ReplicatedMetadataStore {
     }
 
     fn bucket(&self, bucket: &str) -> Option<BucketRow> {
-        match self.get(&bucket_key(bucket)) {
+        self.buckets.get(bucket, || match self.get(&bucket_key(bucket)) {
             Some(MetaValue::Bucket(b)) => Some(b),
             _ => None,
-        }
+        })
     }
 
     /// Read-modify-write of a bucket row. `f` returns what to hand back.
@@ -432,6 +473,19 @@ impl ReplicatedMetadataStore {
             .flatten()
             .collect();
         (!versions.is_empty()).then_some(ObjectRow { versions })
+    }
+
+    /// `object` for a write in `mode`: in a never-versioned bucket the key's
+    /// only version is at `UNVERSIONED_ORDER`, so one point lookup instead of
+    /// a scan.
+    fn object_for_write(&self, mode: Versioning, user: &str, bucket: &str, key: &str) -> Option<ObjectRow> {
+        if mode != Versioning::Disabled {
+            return self.object(user, bucket, key);
+        }
+        match self.get(&version_key(user, bucket, key, UNVERSIONED_ORDER)) {
+            Some(MetaValue::Version(v)) => Some(ObjectRow { versions: vec![v] }),
+            _ => None,
+        }
     }
 
     /// The latest version of a key, found with one lookup.
@@ -476,7 +530,7 @@ impl ReplicatedMetadataStore {
         let mode = self.mode(&bucket);
         let (vid, replaced) = {
             let _g = self.locks.lock_async(&versions_prefix(&user, &bucket, &key)).await;
-            let before = self.object(&user, &bucket, &key).unwrap_or_default();
+            let before = self.object_for_write(mode, &user, &bucket, &key).unwrap_or_default();
             let mut after = before.clone();
             let uploads = self.upload_blobs_fn(&user, &bucket);
             let out = put_version(mode, &user, &bucket, &metadata, &mut after, &uploads)?;
@@ -678,10 +732,12 @@ fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadat
         _ => (String::new(), o.versions.drain(..).last()),
     };
     meta.version_id = (!vid.is_empty()).then(|| vid.clone());
-    // An unversioned overwrite takes the old version's slot: one row
-    // write, not a new row plus a tombstone.
-    let order = match (mode, &replaced) {
-        (Versioning::Disabled, Some(old)) => old.order,
+    // A never-versioned bucket keeps its one version at order 0
+    // (`UNVERSIONED_ORDER`): an overwrite is one write to the same row, found
+    // with a point lookup. If versioning is enabled later, order 0 sorts
+    // before every new version, as the oldest should.
+    let order = match mode {
+        Versioning::Disabled => UNVERSIONED_ORDER,
         _ => hlc::now(),
     };
     o.versions.push(VersionEntry { order, version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
@@ -775,7 +831,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
             }
             let known: Vec<BlobRef> = o.versions.iter().flat_map(|v| v.blobs.iter().cloned()).collect();
             let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list(), &known, &Vec::new).map_err(ErrorInternalServerError)?;
-            o.versions = vec![VersionEntry { order: hlc::now(), version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
+            o.versions = vec![VersionEntry { order: UNVERSIONED_ORDER, version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
             Ok(())
         })
     }
@@ -1463,6 +1519,36 @@ macro_rules! metadata_store_tests {
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().etag.as_deref(), Some("b"));
         assert_eq!(s.list_objects("u", "b").unwrap(), vec!["k".to_string()]);
         assert!(matches!(s.delete_object_v2("u", "b", "k").unwrap(), VersioningDeleteResult::Deleted));
+    }
+
+    /// An inline value of `size` bytes, handed off as a real small PUT does.
+    fn written_inline(size: u64) -> (u64, u64) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 50);
+        let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
+        let inline = Some(crate::cluster::blob_io::InlineBytes(vec![7; size as usize]));
+        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: size, inline };
+        super::super::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
+        (base, size)
+    }
+
+    #[test]
+    fn an_unversioned_overwrite_is_one_row_at_order_zero_and_inline_values_leave_no_gc_row() {
+        let (_d, s) = store();
+        s.create_bucket("u", "b").unwrap();
+        let s = Arc::new(s);
+        let put = |size| {
+            let m = Metadata::from_offset_size_list(vec![written_inline(size)]);
+            futures::executor::block_on(Arc::clone(&s).put_object_v2_owned("u".into(), "b".into(), "k".into(), m)).unwrap()
+        };
+        let first = put(10);
+        assert_eq!(first.0, None);
+        let (_, old) = put(20);
+        assert_eq!(old.len(), 1, "the overwrite hands back the old extent");
+        let rows: Vec<String> = s.rows.list_live(&versions_prefix("u", "b", "k"), |k, _| k.to_string());
+        assert_eq!(rows, vec![version_key("u", "b", "k", UNVERSIONED_ORDER)]);
+        assert_eq!(s.get_metadata("u", "b", "k").unwrap().size, 20);
+        let gc: Vec<String> = s.rows.list_live("gc/", |k, _| k.to_string());
+        assert!(gc.is_empty(), "an inline value has nothing on disk to free: {gc:?}");
     }
 
     #[test]
