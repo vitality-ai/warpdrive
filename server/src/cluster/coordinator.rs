@@ -1194,7 +1194,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
 
     // Same composite-ETag formula single-node's CompleteMultipartUpload
     // uses: md5 of the concatenated per-part md5 bytes, dash, part count.
-    let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
+    let final_etag = format!("\"{}-{}\"", hex::encode(crate::s3::handlers::common::md5_digest(&combined_md5_bytes)), requested.len());
     let total_size = body.len() as u64;
 
     // Checksum on by default here too, same reasoning (and same CRC32C

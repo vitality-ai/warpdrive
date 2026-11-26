@@ -4,7 +4,7 @@ use actix_web::HttpRequest;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sha2::{Sha256, Digest};
 use sha1::Sha1;
-use crc::{Crc, CRC_32_ISCSI, Algorithm};
+use crc::{Crc, Algorithm};
 
 const CRC_64_NVME_ALGO: Algorithm<u64> = Algorithm {
     width: 64,
@@ -118,10 +118,8 @@ pub fn compute_checksum(algo: &ChecksumAlgorithm, data: &[u8]) -> String {
             let crc = crc32fast::hash(data);
             B64.encode(crc.to_be_bytes())
         }
-        ChecksumAlgorithm::Crc32c => {
-            let crc = Crc::<u32>::new(&CRC_32_ISCSI);
-            B64.encode(crc.checksum(data).to_be_bytes())
-        }
+        // SSE4.2 / ARMv8 CRC instructions where the CPU has them.
+        ChecksumAlgorithm::Crc32c => B64.encode(crc32c::crc32c(data).to_be_bytes()),
         ChecksumAlgorithm::Crc64Nvme => {
             let crc = Crc::<u64>::new(&CRC_64_NVME_ALGO);
             B64.encode(crc.checksum(data).to_be_bytes())
@@ -148,3 +146,26 @@ pub fn compute_composite_checksum(algo: &ChecksumAlgorithm, part_checksums: &[St
     format!("{}-{}", hash_b64, part_checksums.len())
 }
 
+
+#[cfg(test)]
+mod hardware_hash_tests {
+    use super::*;
+
+    /// The hardware CRC32C gives the standard CRC-32C (iSCSI) values, so
+    /// checksums stored before and after the switch agree.
+    #[test]
+    fn crc32c_matches_the_standard_check_values() {
+        assert_eq!(crc32c::crc32c(b"123456789"), 0xE306_9283);
+        let table = Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let data: Vec<u8> = (0..1_000_003u32).map(|i| (i * 31 % 251) as u8).collect();
+        assert_eq!(crc32c::crc32c(&data), table.checksum(&data));
+        assert_eq!(compute_checksum(&ChecksumAlgorithm::Crc32c, &data), B64.encode(table.checksum(&data).to_be_bytes()));
+    }
+
+    #[test]
+    fn md5_digest_matches_the_standard_values() {
+        use crate::s3::handlers::common::md5_digest;
+        assert_eq!(hex::encode(md5_digest(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex::encode(md5_digest(b"The quick brown fox jumps over the lazy dog")), "9e107d9d372bb6826bd81d3542a419d6");
+    }
+}
