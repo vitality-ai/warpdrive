@@ -18,7 +18,7 @@ pub mod tcp_peer_client;
 pub mod bridge;
 pub mod blob_io;
 pub mod blob_store;
-pub mod replicated_metadata;
+pub mod rows;
 pub mod meta_batch;
 pub mod location_store;
 pub mod content_location_store;

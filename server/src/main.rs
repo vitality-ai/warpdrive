@@ -287,14 +287,15 @@ async fn s3_post_bucket_dispatch(
 /// (`WARPDRIVE_META_LOG`) and erasure-coded object bytes, with address
 /// reservations in `WARPDRIVE_BLOB_ALLOC_LOG`.
 fn install_cluster_stores(state: &web::Data<ClusterState>) {
-    use warp_drive::cluster::{blob_store::ClusterBlobStore, bridge, replicated_metadata};
+    use warp_drive::cluster::{blob_store::ClusterBlobStore, bridge, rows};
+    use warp_drive::object_layer::metadata::ReplicatedMetadataStore;
     bridge::install(web::Data::clone(state));
     let engine = warp_drive::cluster::meta_engine::MetaEngineKind::from_env().unwrap_or_else(|e| panic!("{e}"));
     let meta_log = std::env::var("WARPDRIVE_META_LOG").unwrap_or_else(|_| engine.default_path());
     engine.refuse_other_engines_data("cluster_metadata", &meta_log).unwrap_or_else(|e| panic!("{e}"));
-    let rows = Arc::new(replicated_metadata::open_rows(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the S3 metadata store: {e}")));
-    replicated_metadata::install_rows(Arc::clone(&rows));
-    let meta = replicated_metadata::ReplicatedMetadataStore::new(rows, Box::new(replicated_metadata::ClusterWriter));
+    let node_rows = Arc::new(rows::NodeRows::open(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the row store: {e}")));
+    rows::install(Arc::clone(&node_rows));
+    let meta = ReplicatedMetadataStore::new(Arc::new(rows::ClusterRows(node_rows)));
     warp_drive::service::metadata_service::set_metadata_store(Arc::new(meta));
     let alloc_log = std::env::var("WARPDRIVE_BLOB_ALLOC_LOG").unwrap_or_else(|_| "blob_alloc.log".to_string());
     let blobs = ClusterBlobStore::open(&alloc_log).unwrap_or_else(|e| panic!("failed to start the cluster object store: {e}"));

@@ -15,6 +15,8 @@ use crate::service::metadata_service::MetadataService;
 use crate::service::storage_service::StorageService;
 use crate::service::user_context::UserContext;
 use async_trait::async_trait;
+
+pub mod metadata;
 use warp_frontend::{ObjectError, ObjectResult, ObjectService, Principal};
 
 /// The object layer every front end gets.

@@ -1,9 +1,12 @@
-//! `MetadataStorage` for a cluster: S3 metadata kept as replicated rows.
+//! The object layer's metadata: buckets, object versions, uploads, ACLs and
+//! locks, kept as engine rows (`warp_engine::RowStore`).
 //!
-//! Every node holds a full copy of the rows, so reads are local. A write
-//! changes one row: it reads the row, applies the change, stamps it with a
-//! new `seq` (`hlc`) and replicates it to every node, returning once a
-//! write quorum has it (`ordered`: every node keeps the newest stamp).
+//! The engine stores and replicates each row as an opaque payload. This
+//! layer decides the keys below and what a payload holds (a `MetaValue`,
+//! MessagePack). Every node holds a full copy of the rows, so reads are
+//! local. A write changes one row: it reads the row, applies the change,
+//! stamps it with a new `seq` and has the engine replicate it, returning
+//! once a write quorum has it. Every node keeps the newest stamp.
 //!
 //! **Rows**
 //!
@@ -37,14 +40,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use warp_engine::{next_seq, Payload, Row, RowStore};
 use warp_meta_store::hlc;
-use warp_meta_store::{Applied, Entry, Record, WarpMetaStore};
 use crate::metadata::{
     BucketStats, DeleteSpecificResult, DeletionEvent, Metadata, MetadataStorage, MultipartPartRow, MultipartUploadRow,
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
-use super::blob_store::{claim, locator, BlobRef};
-use super::meta_engine::{AnyEngine, MetaEngineKind};
+use crate::cluster::blob_store::{claim, locator, BlobRef};
 
 // ---------------------------------------------------------------- rows
 
@@ -165,28 +167,65 @@ pub enum MetaValue {
     Gc(Vec<BlobRef>),
 }
 
-/// One replicated row, with its place in the row's write order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One row as this layer reads it: its `seq` and its decoded value. The
+/// engine stores the value as an opaque payload (MessagePack).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetaRecord {
     pub seq: u64,
     pub value: MetaValue,
 }
 
-impl Record for MetaRecord {
-    fn seq(&self) -> u64 {
-        self.seq
-    }
-    fn version(&self) -> &str {
-        ""
+/// A row's payload for `value`.
+pub fn encode(value: &MetaValue) -> Payload {
+    Payload(rmp_serde::to_vec_named(value).expect("metadata rows always encode"))
+}
+
+/// The value in an engine row. A row that doesn't decode is logged and
+/// read as absent.
+pub fn decode(row: &Row) -> Option<MetaRecord> {
+    match rmp_serde::from_slice::<MetaValue>(&row.payload.0) {
+        Ok(value) => Some(MetaRecord { seq: row.seq, value }),
+        Err(e) => {
+            log::error!("a metadata row ({} bytes, seq {}) doesn't decode: {e}", row.payload.0.len(), row.seq);
+            None
+        }
     }
 }
 
-/// This node's copy of the rows, on the engine picked at startup
-/// (`WARPDRIVE_META_ENGINE`, see `meta_engine`).
-pub type MetaRows = WarpMetaStore<MetaRecord, AnyEngine<Entry<MetaRecord>>>;
+/// The engine's rows, read and written as this layer's values.
+pub struct MetaRows(Arc<dyn RowStore>);
 
-pub fn open_rows(kind: MetaEngineKind, path: &str) -> std::io::Result<MetaRows> {
-    Ok(WarpMetaStore::new(AnyEngine::open(kind, path, "s3 metadata")?))
+impl MetaRows {
+    pub fn new(rows: Arc<dyn RowStore>) -> Self {
+        Self(rows)
+    }
+
+    pub fn get(&self, key: &str) -> Option<MetaRecord> {
+        self.0.get(key).as_ref().and_then(decode)
+    }
+
+    pub fn floor_live(&self, prefix: &str, key: &str) -> Option<(String, MetaRecord)> {
+        let (k, row) = self.0.floor(prefix, key)?;
+        decode(&row).map(|r| (k, r))
+    }
+
+    pub fn list_live<T>(&self, prefix: &str, mut f: impl FnMut(&str, &MetaRecord) -> T) -> Vec<T> {
+        let mut out = Vec::new();
+        self.0.scan(prefix, &mut |k, row| {
+            if let Some(r) = decode(row) {
+                out.push(f(k, &r));
+            }
+        });
+        out
+    }
+
+    fn write(&self, key: &str, seq: u64, value: Option<&MetaValue>) -> Result<(), String> {
+        self.0.write(key, seq, value.map(encode))
+    }
+
+    fn write_async(&self, key: String, seq: u64, value: Option<&MetaValue>) -> warp_engine::WriteFuture {
+        self.0.write_async(key, seq, value.map(encode))
+    }
 }
 
 /// The blobs behind a row's extents, for the row to store. A blob this node
@@ -258,195 +297,40 @@ fn version_scoped(kind: &str, bucket: &str, key: &str, version_id: &str) -> Stri
 
 // ---------------------------------------------------------------- replication
 
-/// Where a row write goes. Production replicates to a quorum of nodes;
-/// tests apply locally.
-pub trait RowWriter: Send + Sync {
-    /// Writes `record` (or a tombstone at `seq` when `None`) for `key`,
-    /// returning once it is durable on a write quorum.
-    fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String>;
-
-    /// Async form of `write`, for callers that must not block a thread on
-    /// the quorum round trip. The default runs `write` now.
-    fn write_async(&self, key: String, seq: u64, record: Option<MetaRecord>) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(std::future::ready(self.write(&key, seq, record)))
-    }
+/// Bucket rows as last read, each tagged with the generation from before
+/// the read. A watch on `bkt/` bumps the generation after every bucket row
+/// write on this node (local or replicated from a peer), so an entry is
+/// used only while no bucket row has changed since. Saves a lookup and a
+/// decode on every object write.
+struct BucketCache {
+    gen: Arc<std::sync::atomic::AtomicU64>,
+    rows: parking_lot::RwLock<std::collections::HashMap<String, (u64, Option<BucketRow>)>>,
 }
-
-static ROWS: std::sync::OnceLock<Arc<MetaRows>> = std::sync::OnceLock::new();
-
-/// Sets this node's rows, so replicated row writes from peers land in them.
-/// Called once at startup.
-pub fn install_rows(rows: Arc<MetaRows>) {
-    let _ = ROWS.set(rows);
-}
-
-/// This node's rows, once `install_rows` has run.
-pub fn rows() -> Option<Arc<MetaRows>> {
-    ROWS.get().cloned()
-}
-
-/// One row write waiting for the commit thread.
-struct CommitJob {
-    key: String,
-    op: warp_meta_store::RowOp<MetaRecord>,
-    reply: tokio::sync::oneshot::Sender<Result<Applied<MetaRecord>, String>>,
-}
-
-/// The most row writes one commit applies.
-const COMMIT_BATCH_MAX: usize = 1024;
-
-static COMMITTER: std::sync::OnceLock<std::sync::mpsc::Sender<CommitJob>> = std::sync::OnceLock::new();
-
-/// Writes one row to this node's rows (a tombstone at `seq` when `record` is
-/// `None`), durable when it returns, without blocking the caller's thread.
-///
-/// Every caller's write goes to one commit thread. It takes all the writes
-/// waiting, applies them with one `apply_many` (one engine write, one sync),
-/// and answers each. Under load a batch holds many writes, so a write costs
-/// a channel send and a wakeup instead of a blocking-pool hand-off and its
-/// own place in the engine's write queue. Each write gets the answer `put`
-/// or `delete` would give it.
-pub async fn commit_row(key: String, seq: u64, record: Option<MetaRecord>) -> Result<Applied<MetaRecord>, String> {
-    let tx = COMMITTER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<CommitJob>();
-        std::thread::Builder::new()
-            .name("wd-meta-commit".into())
-            .spawn(move || commit_loop(rx))
-            .expect("starting the metadata commit thread");
-        tx
-    });
-    let op = match record {
-        Some(r) => warp_meta_store::RowOp::Put(r),
-        None => warp_meta_store::RowOp::Delete(seq),
-    };
-    let (reply, answer) = tokio::sync::oneshot::channel();
-    tx.send(CommitJob { key, op, reply }).map_err(|_| "the metadata commit thread has stopped".to_string())?;
-    answer.await.map_err(|_| "the metadata commit thread dropped a write".to_string())?
-}
-
-fn commit_loop(rx: std::sync::mpsc::Receiver<CommitJob>) {
-    while let Ok(first) = rx.recv() {
-        let mut jobs = vec![first];
-        while jobs.len() < COMMIT_BATCH_MAX {
-            match rx.try_recv() {
-                Ok(j) => jobs.push(j),
-                Err(_) => break,
-            }
-        }
-        let Some(rows) = rows() else {
-            for j in jobs {
-                let _ = j.reply.send(Err("this node has no S3 metadata rows (not started as a cluster node)".into()));
-            }
-            continue;
-        };
-        let mut keys = Vec::with_capacity(jobs.len());
-        let mut replies = Vec::with_capacity(jobs.len());
-        let mut ops = Vec::with_capacity(jobs.len());
-        for j in jobs {
-            keys.push(j.key.clone());
-            ops.push((j.key, j.op));
-            replies.push(j.reply);
-        }
-        match rows.apply_many(ops) {
-            Ok(results) => {
-                for k in &keys {
-                    row_written(k);
-                }
-                for (reply, r) in replies.into_iter().zip(results) {
-                    let _ = reply.send(Ok(r));
-                }
-            }
-            Err(e) => {
-                for reply in replies {
-                    let _ = reply.send(Err(e.to_string()));
-                }
-            }
-        }
-    }
-}
-
-/// Bumped after every bucket row write on this node, by any path (a local
-/// write or one replicated from a peer), so `BucketCache` entries read before
-/// it are refetched.
-static BUCKET_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Called after a row lands in this node's rows.
-pub fn row_written(key: &str) {
-    if key.starts_with("bkt/") {
-        BUCKET_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Bucket rows as last read, each tagged with `BUCKET_GEN` from before the
-/// read. An entry is used only while the generation is unchanged, so a bucket
-/// write anywhere makes every entry stale. Saves a lookup and a decode on
-/// every object write.
-#[derive(Default)]
-struct BucketCache(parking_lot::RwLock<std::collections::HashMap<String, (u64, Option<BucketRow>)>>);
 
 impl BucketCache {
+    fn watching(rows: &dyn RowStore) -> Self {
+        let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let g = Arc::clone(&gen);
+        rows.watch("bkt/", Arc::new(move |_| {
+            g.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        Self { gen, rows: Default::default() }
+    }
+
     fn get(&self, bucket: &str, load: impl FnOnce() -> Option<BucketRow>) -> Option<BucketRow> {
-        let gen = BUCKET_GEN.load(std::sync::atomic::Ordering::SeqCst);
-        if let Some((g, row)) = self.0.read().get(bucket) {
+        let gen = self.gen.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((g, row)) = self.rows.read().get(bucket) {
             if *g == gen {
                 return row.clone();
             }
         }
         let row = load();
-        let mut map = self.0.write();
+        let mut map = self.rows.write();
         if map.len() > 10_000 {
             map.clear();
         }
         map.insert(bucket.to_string(), (gen, row.clone()));
         row
-    }
-}
-
-/// Replicates row writes to a write quorum of the cluster.
-pub struct ClusterWriter;
-
-impl RowWriter for ClusterWriter {
-    fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String> {
-        let state = super::bridge::state().ok_or("cluster state not installed")?;
-        let peers = state.membership.peers();
-        let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
-        let key = key.to_string();
-        let acked = super::bridge::run(move || async move { super::coordinator::replicate_meta_row(&state, &peers, &key, seq, record).await });
-        if acked < required {
-            return Err(format!("{acked}/{required} nodes stored the row"));
-        }
-        Ok(())
-    }
-
-    fn write_async(&self, key: String, seq: u64, record: Option<MetaRecord>) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async move {
-            let state = super::bridge::state().ok_or("cluster state not installed")?;
-            let peers = state.membership.peers();
-            let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
-            let acked = super::coordinator::replicate_meta_row(&state, &peers, &key, seq, record).await;
-            if acked < required {
-                return Err(format!("{acked}/{required} nodes stored the row"));
-            }
-            Ok(())
-        })
-    }
-}
-
-/// Applies row writes to this node's rows only.
-pub struct LocalWriter(pub Arc<MetaRows>);
-
-impl RowWriter for LocalWriter {
-    fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String> {
-        let res = match record {
-            Some(r) => self.0.put(key.to_string(), r),
-            None => self.0.delete(key.to_string(), seq),
-        }
-        .map_err(|e| e.to_string())?;
-        row_written(key);
-        match res {
-            Applied::Yes { .. } => Ok(()),
-            other => Err(format!("row write refused: {other:?}")),
-        }
     }
 }
 
@@ -480,8 +364,7 @@ impl KeyLocks {
 }
 
 pub struct ReplicatedMetadataStore {
-    rows: Arc<MetaRows>,
-    writer: Box<dyn RowWriter>,
+    rows: MetaRows,
     locks: KeyLocks,
     buckets: BucketCache,
 }
@@ -504,8 +387,10 @@ fn new_version_id() -> String {
 }
 
 impl ReplicatedMetadataStore {
-    pub fn new(rows: Arc<MetaRows>, writer: Box<dyn RowWriter>) -> Self {
-        Self { rows, writer, locks: KeyLocks::new(), buckets: BucketCache::default() }
+    /// The object layer's metadata over the engine's `rows`.
+    pub fn new(rows: Arc<dyn RowStore>) -> Self {
+        let buckets = BucketCache::watching(rows.as_ref());
+        Self { rows: MetaRows::new(rows), locks: KeyLocks::new(), buckets }
     }
 
     fn get(&self, key: &str) -> Option<MetaValue> {
@@ -513,15 +398,14 @@ impl ReplicatedMetadataStore {
     }
 
     fn put(&self, key: &str, value: MetaValue) -> Result<(), Error> {
-        let seq = hlc::now();
-        self.writer.write(key, seq, Some(MetaRecord { seq, value })).map_err(write_err)
+        self.rows.write(key, next_seq(), Some(&value)).map_err(write_err)
     }
 
     fn remove(&self, key: &str) -> Result<(), Error> {
         if self.rows.get(key).is_none() {
             return Ok(());
         }
-        self.writer.write(key, hlc::now(), None).map_err(write_err)
+        self.rows.write(key, next_seq(), None).map_err(write_err)
     }
 
     fn bucket(&self, bucket: &str) -> Option<BucketRow> {
@@ -593,15 +477,14 @@ impl ReplicatedMetadataStore {
     }
 
     async fn put_async(&self, key: String, value: MetaValue) -> Result<(), String> {
-        let seq = hlc::now();
-        self.writer.write_async(key, seq, Some(MetaRecord { seq, value })).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+        self.rows.write_async(key, next_seq(), Some(&value)).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
     }
 
     async fn remove_async(&self, key: String) -> Result<(), String> {
         if self.rows.get(&key).is_none() {
             return Ok(());
         }
-        self.writer.write_async(key, hlc::now(), None).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+        self.rows.write_async(key, next_seq(), None).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
     }
 
     /// The S3 PUT metadata write without blocking a thread: the same rows,
@@ -657,11 +540,11 @@ impl ReplicatedMetadataStore {
 
     /// Records `blobs` as dead (a `gc/` row), after whatever dropped them.
     async fn gc_async(&self, blobs: Vec<BlobRef>) -> Result<(), String> {
-        let blobs = super::gc::with_shards(blobs);
+        let blobs = crate::cluster::gc::with_shards(blobs);
         if blobs.is_empty() {
             return Ok(());
         }
-        self.put_async(super::gc::new_key(), MetaValue::Gc(blobs)).await
+        self.put_async(crate::cluster::gc::new_key(), MetaValue::Gc(blobs)).await
     }
 
     /// The whole S3 DeleteObject metadata write without blocking a thread:
@@ -787,11 +670,11 @@ impl ReplicatedMetadataStore {
 
     /// Records `blobs` as dead (a `gc/` row), after whatever dropped them.
     fn gc(&self, blobs: Vec<BlobRef>) -> Result<(), Error> {
-        let blobs = super::gc::with_shards(blobs);
+        let blobs = crate::cluster::gc::with_shards(blobs);
         if blobs.is_empty() {
             return Ok(());
         }
-        self.put(&super::gc::new_key(), MetaValue::Gc(blobs))
+        self.put(&crate::cluster::gc::new_key(), MetaValue::Gc(blobs))
     }
 }
 
@@ -1562,12 +1445,14 @@ macro_rules! metadata_store_tests {
     ($name:ident, $kind:expr) => {
         mod $name {
             use super::*;
+            use crate::cluster::meta_engine::MetaEngineKind;
+            use crate::cluster::rows::{LocalRows, NodeRows};
             const KIND: MetaEngineKind = $kind;
 
     fn store() -> (tempfile::TempDir, ReplicatedMetadataStore) {
         let dir = tempfile::tempdir().unwrap();
-        let rows = Arc::new(open_rows(KIND, &dir.path().join("m.log").to_string_lossy()).unwrap());
-        let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
+        let rows = Arc::new(NodeRows::open(KIND, &dir.path().join("m.log").to_string_lossy()).unwrap());
+        let s = ReplicatedMetadataStore::new(Arc::new(LocalRows(rows)));
         (dir, s)
     }
 
@@ -1578,7 +1463,7 @@ macro_rules! metadata_store_tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
         let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
         let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec!["p".into()], k: 1, m: 0, wire_key: format!("{base:x}"), len: size, inline: None };
-        super::super::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
+        crate::cluster::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
         (base, size)
     }
 
@@ -1607,7 +1492,7 @@ macro_rules! metadata_store_tests {
         let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
         let inline = Some(crate::cluster::blob_io::InlineBytes(vec![7; size as usize]));
         let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: size, inline };
-        super::super::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
+        crate::cluster::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
         (base, size)
     }
 
@@ -1812,8 +1697,8 @@ macro_rules! metadata_store_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.log").to_string_lossy().into_owned();
         {
-            let rows = Arc::new(open_rows(KIND, &path).unwrap());
-            let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
+            let rows = Arc::new(NodeRows::open(KIND, &path).unwrap());
+            let s = ReplicatedMetadataStore::new(Arc::new(LocalRows(rows)));
             s.create_bucket("u", "b").unwrap();
             s.put_object_v2("u", "b", "k", &meta(4, "e")).unwrap();
             // An upload's parts are a map keyed by part number.
@@ -1821,8 +1706,8 @@ macro_rules! metadata_store_tests {
             let ext = crate::util::serializer::serialize_offset_size(&vec![written(10)]).unwrap();
             s.upsert_multipart_part("up", 3, "e3", 10, &ext, "").unwrap();
         }
-        let rows = Arc::new(open_rows(KIND, &path).unwrap());
-        let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
+        let rows = Arc::new(NodeRows::open(KIND, &path).unwrap());
+        let s = ReplicatedMetadataStore::new(Arc::new(LocalRows(rows)));
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().size, 4);
         assert_eq!(s.list_multipart_parts("up").unwrap()[0].part_number, 3);
     }
@@ -1831,6 +1716,32 @@ macro_rules! metadata_store_tests {
 }
 
 #[cfg(test)]
-metadata_store_tests!(tests_bitcask, MetaEngineKind::Bitcask);
+metadata_store_tests!(tests_bitcask, crate::cluster::meta_engine::MetaEngineKind::Bitcask);
 #[cfg(test)]
-metadata_store_tests!(tests_sqlite, MetaEngineKind::Sqlite);
+metadata_store_tests!(tests_sqlite, crate::cluster::meta_engine::MetaEngineKind::Sqlite);
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use crate::cluster::blob_io::{BlobPlacement, InlineBytes};
+
+    #[test]
+    fn a_version_row_with_inline_bytes_round_trips_through_an_engine_row() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let placement = BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: 256, inline: Some(InlineBytes(bytes.clone())) };
+        let v = VersionEntry {
+            order: 0,
+            version_id: String::new(),
+            is_delete_marker: false,
+            meta: crate::metadata::Metadata::from_offset_size_list(vec![(7, 256)]),
+            tags: vec![("t".into(), "v".into())],
+            parts_manifest: None,
+            blobs: vec![BlobRef { user_id: "u".into(), bucket: "b".into(), base: 7, placement }],
+        };
+        let value = MetaValue::Version(v);
+        let row = Row { seq: 5, payload: encode(&value) };
+        assert!(row.payload.0.windows(bytes.len()).any(|w| w == bytes.as_slice()), "inline bytes are stored raw");
+        assert_eq!(decode(&row), Some(MetaRecord { seq: 5, value }));
+        assert_eq!(decode(&Row { seq: 1, payload: Payload(vec![0xc1]) }), None, "a payload that doesn't decode reads as absent");
+    }
+}

@@ -53,7 +53,8 @@ use warp_meta_store::Entry;
 
 use super::blob_store::blob_bucket;
 use super::coordinator::{self_addr, ClusterState};
-use super::replicated_metadata::{rows, MetaValue};
+use crate::object_layer::metadata::{decode, MetaValue};
+use super::rows::rows;
 use super::shard_storage::{parse_shard_key, shard_entries, ShardId};
 
 /// Prefix of the internal bucket S3 blob shards are stored under.
@@ -128,13 +129,13 @@ fn parse_stripe_key(s: &str) -> Option<(String, usize)> {
 fn row_references() -> HashSet<(String, String, String)> {
     let Some(rows) = rows() else { return HashSet::new() };
     let mut refs = HashSet::new();
-    let uploads = rows.list_live("upl/", |_, r| match &r.value {
-        MetaValue::Upload(u) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
+    let uploads = rows.log().list_live("upl/", |_, r| match decode(r).map(|r| r.value) {
+        Some(MetaValue::Upload(u)) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
         _ => Vec::new(),
     });
-    let blobs = uploads.into_iter().chain(rows.list_live("", |_, r| match &r.value {
-        MetaValue::Version(v) => v.blobs.clone(),
-        MetaValue::Upload(u) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
+    let blobs = uploads.into_iter().chain(rows.log().list_live("", |_, r| match decode(r).map(|r| r.value) {
+        Some(MetaValue::Version(v)) => v.blobs,
+        Some(MetaValue::Upload(u)) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
         _ => Vec::new(),
     }));
     for b in blobs.flatten() {
@@ -391,7 +392,7 @@ pub fn compact_due_logs(state: &ClusterState) -> Vec<&'static str> {
     };
     if let Some(rows) = rows() {
         use warp_meta_store::Engine;
-        run("s3 metadata", rows.engine().compaction_due(), &|| rows.engine().compact());
+        run("rows", rows.log().engine().compaction_due(), &|| rows.log().engine().compact());
     }
     run("shard index", super::shard_storage::shard_index_compaction_due(), &super::shard_storage::compact_shard_index);
     run("location", state.location_store.compaction_due(), &|| state.location_store.compact());

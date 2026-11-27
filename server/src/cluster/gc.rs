@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use warp_meta_store::hlc;
 
 use super::blob_store::{blob_bucket, BlobRef};
-use super::replicated_metadata::{rows, MetaValue};
+use crate::object_layer::metadata::{decode, MetaValue};
+use super::rows::rows;
 use super::shard_storage::{shard_key, shard_location};
 
 const PREFIX: &str = "gc/";
@@ -98,8 +99,9 @@ pub fn run() -> GcStats {
     let upto = format!("{PREFIX}{:016x}", now.saturating_sub(grace));
     let after = if cursor.is_empty() { PREFIX.to_string() } else { cursor.clone() };
     let due: Vec<(String, Vec<BlobRef>)> = rows
-        .list_live_range(Some(&after), &upto, |k, r| match &r.value {
-            MetaValue::Gc(blobs) if k.starts_with(PREFIX) => Some((k.to_string(), blobs.clone())),
+        .log()
+        .list_live_range(Some(&after), &upto, |k, r| match decode(r).map(|r| r.value) {
+            Some(MetaValue::Gc(blobs)) if k.starts_with(PREFIX) => Some((k.to_string(), blobs)),
             _ => None,
         })
         .into_iter()
@@ -136,7 +138,7 @@ pub fn run() -> GcStats {
         // milliseconds, long before it is due.
         use warp_meta_store::Engine;
         let keys: Vec<String> = due.iter().map(|(k, _)| k.clone()).collect();
-        match rows.engine().delete_many_if(&keys, |_, _| false) {
+        match rows.log().engine().delete_many_if(&keys, |_, _| false) {
             Ok(n) => stats.rows_retired = n,
             Err(e) => log::warn!("gc: dropping processed rows failed: {e}"),
         }

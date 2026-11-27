@@ -1,0 +1,289 @@
+//! The engine's rows on this node (`warp_engine::RowStore`), and how a row
+//! write reaches the cluster.
+//!
+//! A row is a key, a `seq` and an opaque payload. Nothing here reads a
+//! payload: what the rows mean belongs to the layer that writes them.
+
+use parking_lot::RwLock;
+use std::sync::Arc;
+use warp_engine::{Payload, Row, RowStore, Watcher, WriteFuture};
+use warp_meta_store::{Applied, Entry, RowOp, WarpMetaStore};
+
+use super::meta_engine::{AnyEngine, MetaEngineKind};
+
+/// The ordered row log on the metadata engine picked at startup
+/// (`WARPDRIVE_META_ENGINE`, see `meta_engine`).
+pub type RowLog = WarpMetaStore<Row, AnyEngine<Entry<Row>>>;
+
+/// This node's copy of the rows, and the watchers to tell when one is
+/// written. Every write on this node goes through here, so a watcher hears
+/// about local writes and replicated ones alike.
+pub struct NodeRows {
+    log: RowLog,
+    watchers: RwLock<Vec<(String, Watcher)>>,
+}
+
+impl NodeRows {
+    pub fn open(kind: MetaEngineKind, path: &str) -> std::io::Result<Self> {
+        Ok(Self::new(WarpMetaStore::new(AnyEngine::open(kind, path, "rows")?)))
+    }
+
+    pub fn new(log: RowLog) -> Self {
+        Self { log, watchers: RwLock::new(Vec::new()) }
+    }
+
+    /// The log, for reads, compaction and garbage collection.
+    pub fn log(&self) -> &RowLog {
+        &self.log
+    }
+
+    pub fn watch(&self, prefix: &str, on_write: Watcher) {
+        self.watchers.write().push((prefix.to_string(), on_write));
+    }
+
+    fn written(&self, key: &str) {
+        for (prefix, w) in self.watchers.read().iter() {
+            if key.starts_with(prefix.as_str()) {
+                w(key);
+            }
+        }
+    }
+
+    pub fn put(&self, key: String, row: Row) -> std::io::Result<Applied<Row>> {
+        let out = self.log.put(key.clone(), row)?;
+        self.written(&key);
+        Ok(out)
+    }
+
+    pub fn delete(&self, key: String, seq: u64) -> std::io::Result<Applied<Row>> {
+        let out = self.log.delete(key.clone(), seq)?;
+        self.written(&key);
+        Ok(out)
+    }
+
+    /// Many writes, durable together (one sync).
+    pub fn apply_many(&self, ops: Vec<(String, RowOp<Row>)>) -> std::io::Result<Vec<Applied<Row>>> {
+        let keys: Vec<String> = ops.iter().map(|(k, _)| k.clone()).collect();
+        let out = self.log.apply_many(ops)?;
+        for k in &keys {
+            self.written(k);
+        }
+        Ok(out)
+    }
+}
+
+static ROWS: std::sync::OnceLock<Arc<NodeRows>> = std::sync::OnceLock::new();
+
+/// Sets this node's rows, so replicated row writes from peers land in them.
+/// Called once at startup.
+pub fn install(rows: Arc<NodeRows>) {
+    let _ = ROWS.set(rows);
+}
+
+/// This node's rows, once `install` has run.
+pub fn rows() -> Option<Arc<NodeRows>> {
+    ROWS.get().cloned()
+}
+
+/// One row write waiting for the commit thread.
+struct CommitJob {
+    key: String,
+    op: RowOp<Row>,
+    reply: tokio::sync::oneshot::Sender<Result<Applied<Row>, String>>,
+}
+
+/// The most row writes one commit applies.
+const COMMIT_BATCH_MAX: usize = 1024;
+
+static COMMITTER: std::sync::OnceLock<std::sync::mpsc::Sender<CommitJob>> = std::sync::OnceLock::new();
+
+/// Writes one row to this node's rows (a tombstone at `seq` when `payload`
+/// is `None`), durable when it returns, without blocking the caller's
+/// thread.
+///
+/// Every caller's write goes to one commit thread. It takes all the writes
+/// waiting, applies them with one `apply_many` (one engine write, one sync),
+/// and answers each. Under load a batch holds many writes, so a write costs
+/// a channel send and a wakeup instead of a blocking-pool hand-off and its
+/// own place in the engine's write queue. Each write gets the answer `put`
+/// or `delete` would give it.
+pub async fn commit_row(key: String, seq: u64, payload: Option<Payload>) -> Result<Applied<Row>, String> {
+    let tx = COMMITTER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<CommitJob>();
+        std::thread::Builder::new()
+            .name("wd-row-commit".into())
+            .spawn(move || commit_loop(rx))
+            .expect("starting the row commit thread");
+        tx
+    });
+    let op = match payload {
+        Some(payload) => RowOp::Put(Row { seq, payload }),
+        None => RowOp::Delete(seq),
+    };
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tx.send(CommitJob { key, op, reply }).map_err(|_| "the row commit thread has stopped".to_string())?;
+    answer.await.map_err(|_| "the row commit thread dropped a write".to_string())?
+}
+
+fn commit_loop(rx: std::sync::mpsc::Receiver<CommitJob>) {
+    while let Ok(first) = rx.recv() {
+        let mut jobs = vec![first];
+        while jobs.len() < COMMIT_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(j) => jobs.push(j),
+                Err(_) => break,
+            }
+        }
+        let Some(rows) = rows() else {
+            for j in jobs {
+                let _ = j.reply.send(Err("this node has no rows (not started as a cluster node)".into()));
+            }
+            continue;
+        };
+        let (ops, replies): (Vec<(String, RowOp<Row>)>, Vec<_>) = jobs.into_iter().map(|j| ((j.key, j.op), j.reply)).unzip();
+        match rows.apply_many(ops) {
+            Ok(results) => {
+                for (reply, r) in replies.into_iter().zip(results) {
+                    let _ = reply.send(Ok(r));
+                }
+            }
+            Err(e) => {
+                for reply in replies {
+                    let _ = reply.send(Err(e.to_string()));
+                }
+            }
+        }
+    }
+}
+
+fn scan(log: &RowLog, prefix: &str, f: &mut dyn FnMut(&str, &Row)) {
+    log.list_live(prefix, |k, r| f(k, r));
+}
+
+/// The rows as the cluster sees them: reads from this node's copy, writes
+/// replicated to a write quorum.
+pub struct ClusterRows(pub Arc<NodeRows>);
+
+impl RowStore for ClusterRows {
+    fn get(&self, key: &str) -> Option<Row> {
+        self.0.log.get(key)
+    }
+
+    fn floor(&self, prefix: &str, key: &str) -> Option<(String, Row)> {
+        self.0.log.floor_live(prefix, key)
+    }
+
+    fn scan(&self, prefix: &str, f: &mut dyn FnMut(&str, &Row)) {
+        scan(&self.0.log, prefix, f)
+    }
+
+    fn write(&self, key: &str, seq: u64, payload: Option<Payload>) -> Result<(), String> {
+        let state = super::bridge::state().ok_or("cluster state not installed")?;
+        let peers = state.membership.peers();
+        let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
+        let key = key.to_string();
+        let acked = super::bridge::run(move || async move { super::coordinator::replicate_row(&state, &peers, &key, seq, payload).await });
+        if acked < required {
+            return Err(format!("{acked}/{required} nodes stored the row"));
+        }
+        Ok(())
+    }
+
+    fn write_async(&self, key: String, seq: u64, payload: Option<Payload>) -> WriteFuture {
+        Box::pin(async move {
+            let state = super::bridge::state().ok_or("cluster state not installed")?;
+            let peers = state.membership.peers();
+            let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
+            let acked = super::coordinator::replicate_row(&state, &peers, &key, seq, payload).await;
+            if acked < required {
+                return Err(format!("{acked}/{required} nodes stored the row"));
+            }
+            Ok(())
+        })
+    }
+
+    fn watch(&self, prefix: &str, on_write: Watcher) {
+        self.0.watch(prefix, on_write)
+    }
+}
+
+/// The rows on this node alone: writes apply locally. For tests.
+pub struct LocalRows(pub Arc<NodeRows>);
+
+impl RowStore for LocalRows {
+    fn get(&self, key: &str) -> Option<Row> {
+        self.0.log.get(key)
+    }
+
+    fn floor(&self, prefix: &str, key: &str) -> Option<(String, Row)> {
+        self.0.log.floor_live(prefix, key)
+    }
+
+    fn scan(&self, prefix: &str, f: &mut dyn FnMut(&str, &Row)) {
+        scan(&self.0.log, prefix, f)
+    }
+
+    fn write(&self, key: &str, seq: u64, payload: Option<Payload>) -> Result<(), String> {
+        let res = match payload {
+            Some(payload) => self.0.put(key.to_string(), Row { seq, payload }),
+            None => self.0.delete(key.to_string(), seq),
+        }
+        .map_err(|e| e.to_string())?;
+        match res {
+            Applied::Yes { .. } => Ok(()),
+            other => Err(format!("row write refused: {other:?}")),
+        }
+    }
+
+    fn write_async(&self, key: String, seq: u64, payload: Option<Payload>) -> WriteFuture {
+        Box::pin(std::future::ready(self.write(&key, seq, payload)))
+    }
+
+    fn watch(&self, prefix: &str, on_write: Watcher) {
+        self.0.watch(prefix, on_write)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn local() -> (tempfile::TempDir, LocalRows) {
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeRows::open(MetaEngineKind::Bitcask, &dir.path().join("rows.log").to_string_lossy()).unwrap();
+        (dir, LocalRows(Arc::new(node)))
+    }
+
+    #[test]
+    fn rows_are_ordered_by_seq_and_opaque() {
+        let (_d, rows) = local();
+        rows.write("a/1", 10, Some(Payload(b"ten".to_vec()))).unwrap();
+        assert!(rows.write("a/1", 9, Some(Payload(b"nine".to_vec()))).is_err(), "an older write is refused");
+        assert_eq!(rows.get("a/1").unwrap().payload.0, b"ten");
+        rows.write("a/2", 11, Some(Payload(vec![0, 255]))).unwrap();
+        rows.write("b/1", 12, Some(Payload(vec![]))).unwrap();
+        let mut seen = Vec::new();
+        rows.scan("a/", &mut |k, r| seen.push((k.to_string(), r.seq)));
+        assert_eq!(seen, vec![("a/1".to_string(), 10), ("a/2".to_string(), 11)]);
+        assert_eq!(rows.floor("a/", "a/9").unwrap().0, "a/2");
+        rows.write("a/2", 13, None).unwrap();
+        assert!(rows.get("a/2").is_none(), "a tombstone hides the row");
+        assert!(rows.write("a/2", 12, Some(Payload(vec![1]))).is_err(), "an older write can't revive it");
+    }
+
+    #[test]
+    fn watchers_hear_every_write_under_their_prefix() {
+        let (_d, rows) = local();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        rows.watch("bkt/", Arc::new(move |_| {
+            h.fetch_add(1, Ordering::SeqCst);
+        }));
+        rows.write("bkt/x", 1, Some(Payload(vec![1]))).unwrap();
+        rows.write("ver/x", 2, Some(Payload(vec![1]))).unwrap();
+        // A write arriving from a peer lands through NodeRows directly.
+        rows.0.apply_many(vec![("bkt/y".into(), RowOp::Put(Row { seq: 3, payload: Payload(vec![]) }))]).unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+}

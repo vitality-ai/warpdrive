@@ -8,7 +8,7 @@
 //! so inline bytes travel raw), with up to `MAX_IN_FLIGHT` requests out at
 //! once. While those are out, more rows queue, so batches grow with load and
 //! cost nothing extra when it's light. The peer applies a batch through its
-//! commit thread (`replicated_metadata::commit_row`), so the whole batch is
+//! commit thread (`rows::commit_row`), so the whole batch is
 //! durable with one sync there too, and answers each row as `/meta` would.
 //!
 //! `WARPDRIVE_META_BATCH=off` sends one request per row (`/meta`) instead.
@@ -71,17 +71,7 @@ pub async fn send(client: &reqwest::Client, peer: &str, req: MetaRowRequest) -> 
 }
 
 fn approx_bytes(r: &MetaRowRequest) -> usize {
-    // The key plus a generous allowance for the record; inline values
-    // dominate, and they're counted through the record's encoded size only
-    // when the batch is sent, so this just keeps batches of large values short.
-    r.key.len() + r.record.as_ref().map_or(16, |rec| 256 + inline_len(rec))
-}
-
-fn inline_len(rec: &super::replicated_metadata::MetaRecord) -> usize {
-    match &rec.value {
-        super::replicated_metadata::MetaValue::Version(v) => v.blobs.iter().map(|b| b.placement.inline.as_ref().map_or(0, |i| i.0.len())).sum(),
-        _ => 0,
-    }
+    r.key.len() + 16 + r.payload.as_ref().map_or(0, |p| p.0.len())
 }
 
 async fn peer_loop(client: reqwest::Client, peer: String, mut rx: mpsc::UnboundedReceiver<Pending>) {
@@ -157,7 +147,7 @@ pub async fn cluster_internal_meta_batch(body: web::Bytes) -> HttpResponse {
         Err(e) => return HttpResponse::BadRequest().body(format!("unreadable metadata batch: {e}")),
     };
     let answers: Vec<RowReply> = futures::future::join_all(reqs.into_iter().map(|m| async move {
-        match super::replicated_metadata::commit_row(m.key, m.seq, m.record).await {
+        match super::rows::commit_row(m.key, m.seq, m.payload).await {
             Ok(warp_meta_store::Applied::Yes { .. }) => RowReply::Applied,
             Ok(warp_meta_store::Applied::Stale { current_seq }) => RowReply::Stale(current_seq),
             Ok(warp_meta_store::Applied::VersionMismatch) => RowReply::Failed,
@@ -179,34 +169,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rows_with_inline_bytes_and_tombstones_round_trip_as_messagepack() {
-        use super::super::blob_io::{BlobPlacement, InlineBytes};
-        use super::super::blob_store::BlobRef;
-        use super::super::replicated_metadata::{MetaRecord, MetaValue, VersionEntry};
+    fn rows_and_tombstones_round_trip_as_messagepack_with_raw_payloads() {
         let bytes: Vec<u8> = (0..=255).collect();
-        let placement = BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: 256, inline: Some(InlineBytes(bytes)) };
-        let v = VersionEntry {
-            order: 0,
-            version_id: String::new(),
-            is_delete_marker: false,
-            meta: crate::metadata::Metadata::from_offset_size_list(vec![(7, 256)]),
-            tags: vec![("t".into(), "v".into())],
-            parts_manifest: None,
-            blobs: vec![BlobRef { user_id: "u".into(), bucket: "b".into(), base: 7, placement }],
-        };
         let rows = vec![
-            MetaRowRequest { key: "ver/k".into(), seq: 5, record: Some(MetaRecord { seq: 5, value: MetaValue::Version(v) }) },
-            MetaRowRequest { key: "acl/k".into(), seq: 6, record: None },
+            MetaRowRequest { key: "a/k".into(), seq: 5, payload: Some(warp_engine::Payload(bytes.clone())) },
+            MetaRowRequest { key: "b/k".into(), seq: 6, payload: None },
         ];
-        // The commit check reads only an entry's head: it must decode from
-        // a stored MetaRecord entry to the record's own seq and version.
-        let stored = warp_meta_store::Entry::Live(rows[0].record.clone().unwrap());
-        let head: warp_meta_store::EntryHead = rmp_serde::from_slice(&rmp_serde::to_vec_named(&stored).unwrap()).unwrap();
-        assert_eq!(head, warp_meta_store::EntryHead::of(&stored));
-        let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&rmp_serde::to_vec_named(&rows).unwrap()).unwrap();
-        assert_eq!(back.len(), 2);
-        assert_eq!((back[0].key.as_str(), back[0].seq, &back[0].record), (rows[0].key.as_str(), 5, &rows[0].record));
-        assert_eq!((back[1].key.as_str(), back[1].seq, back[1].record.is_none()), ("acl/k", 6, true));
+        let wire = rmp_serde::to_vec_named(&rows).unwrap();
+        assert!(wire.windows(bytes.len()).any(|w| w == bytes.as_slice()), "the payload travels raw");
+        let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!((back[0].key.as_str(), back[0].seq, &back[0].payload), ("a/k", 5, &rows[0].payload));
+        assert_eq!((back[1].key.as_str(), back[1].seq, back[1].payload.is_none()), ("b/k", 6, true));
     }
 
     #[test]

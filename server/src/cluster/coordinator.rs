@@ -171,17 +171,17 @@ pub(crate) enum RecordOp {
     PutContent(ContentDependentRecord),
     UpdateContent(ContentDependentRecord),
     DeleteContent(DeleteKeyRequest),
-    /// An S3 metadata row (`replicated_metadata`), or its tombstone when
-    /// `record` is `None`.
+    /// An engine row (`rows`), or its tombstone when `payload` is `None`.
     Meta(MetaRowRequest),
 }
 
-/// Body of `/cluster/_internal/meta`: one S3 metadata row write.
+/// Body of `/cluster/_internal/meta`: one row write. The payload is opaque
+/// here: the engine replicates rows without reading them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaRowRequest {
     pub key: String,
     pub seq: u64,
-    pub record: Option<super::replicated_metadata::MetaRecord>,
+    pub payload: Option<warp_engine::Payload>,
 }
 
 /// How a store answered one record write, without the replaced value.
@@ -213,15 +213,12 @@ impl RecordOp {
             RecordOp::UpdateContent(r) => content.update(r)?.into(),
             RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
             RecordOp::Meta(m) => {
-                let rows = super::replicated_metadata::rows()
-                    .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
-                let key = m.key.clone();
-                let out = match m.record {
-                    Some(r) => rows.put(m.key, r)?,
+                let rows = super::rows::rows().ok_or_else(|| std::io::Error::other("this node has no rows (not started as a cluster node)"))?;
+                match m.payload {
+                    Some(payload) => rows.put(m.key, warp_engine::Row { seq: m.seq, payload })?,
                     None => rows.delete(m.key, m.seq)?,
-                };
-                super::replicated_metadata::row_written(&key);
-                out.into()
+                }
+                .into()
             }
         })
     }
@@ -258,7 +255,7 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     // A metadata row goes through the commit thread: batched with the other
     // writes waiting, and awaited without holding a thread.
     if let RecordOp::Meta(m) = op {
-        return match super::replicated_metadata::commit_row(m.key, m.seq, m.record).await {
+        return match super::rows::commit_row(m.key, m.seq, m.payload).await {
             Ok(applied) => match OpOutcome::from(applied) {
                 OpOutcome::Applied => PeerReply::Applied,
                 OpOutcome::Stale(seq) => PeerReply::Stale(seq),
@@ -409,17 +406,10 @@ fn delete_req(user_id: &str, bucket: &str, key: &str, seq: u64) -> DeleteKeyRequ
     DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq }
 }
 
-/// Replicates an S3 metadata row write (a tombstone when `record` is
-/// `None`) to every peer. Returns how many stored it.
-pub(crate) async fn replicate_meta_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, record: Option<super::replicated_metadata::MetaRecord>) -> usize {
-    replicate_ordered(state, peers, seq, |seq| {
-        let record = record.clone().map(|mut r| {
-            r.seq = seq;
-            r
-        });
-        RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, record })
-    })
-    .await
+/// Replicates a row write (a tombstone when `payload` is `None`) to every
+/// peer. Returns how many stored it.
+pub(crate) async fn replicate_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, payload: Option<warp_engine::Payload>) -> usize {
+    replicate_ordered(state, peers, seq, |seq| RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, payload: payload.clone() })).await
 }
 
 /// Replicates a tombstone for `(user_id, bucket, key)` at `seq` to every
@@ -2315,6 +2305,6 @@ mod tests {
 pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>) -> Result<HttpResponse, Error> {
     // Through the commit thread, batched with this node's other row writes.
     let m = body.into_inner();
-    let applied = super::replicated_metadata::commit_row(m.key, m.seq, m.record).await.map_err(ErrorInternalServerError)?;
+    let applied = super::rows::commit_row(m.key, m.seq, m.payload).await.map_err(ErrorInternalServerError)?;
     Ok(outcome_response(applied.into()))
 }
