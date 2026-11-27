@@ -1,0 +1,9 @@
+[package]
+name = "wasm-placement"
+version = "0.1.0"
+edition = "2021"
+description = "Sandboxed user-defined placement-policy (StripePacker) prototype + aggressive safety suite"
+
+[dependencies]
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime"] }
+wat = "1"
