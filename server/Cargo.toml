@@ -64,6 +64,9 @@ rmp-serde = "1.3"
 warp-meta-store = { path = "../crates/warp-meta-store" }
 warp-meta-store-sqlite = { path = "../crates/warp-meta-store-sqlite" }
 warp-meta-store-rocksdb = { path = "../crates/warp-meta-store-rocksdb" }
+warp-engine = { path = "../crates/warp-engine" }
+warp-frontend = { path = "../crates/warp-frontend" }
+warp-frontend-redis = { path = "../crates/warp-frontend-redis" }
 jsonwebtoken = "9"
 rand = "0.8"
 

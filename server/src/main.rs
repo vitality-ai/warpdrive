@@ -102,6 +102,24 @@ enum Engine {
     NotReady,
 }
 
+/// The front ends besides S3, each in its own crate behind
+/// `warp_frontend::FrontEnd`, all over the object layer. One that's
+/// configured but can't start is logged and left off: S3 still serves.
+fn start_front_ends(one_node: bool) {
+    use warp_frontend::{FrontEnd, ObjectService};
+    let objects: Arc<dyn ObjectService> = Arc::new(warp_drive::object_layer::ObjectLayer);
+    let mut front_ends: Vec<Box<dyn FrontEnd>> = Vec::new();
+    if let Some(config) = warp_frontend_redis::RedisConfig::from_env(one_node, warp_drive::identity::ADMIN_USER_ID) {
+        front_ends.push(Box::new(warp_frontend_redis::Redis { config }));
+    }
+    for f in front_ends {
+        let name = f.name().to_string();
+        if let Err(e) = f.start(Arc::clone(&objects)) {
+            log::error!("{name} front end not started: {e}");
+        }
+    }
+}
+
 fn pick_engine(state: &ClusterState) -> Engine {
     if state.membership.peers().is_empty() {
         Engine::NotReady
@@ -424,6 +442,8 @@ async fn main() -> std::io::Result<()> {
         Err(e) => warn!("could not raise the open-file limit: {e}"),
     }
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    let one_node = !set("WARPDRIVE_PEERS") && !set("WARPDRIVE_JOIN_VIA");
     single_node_as_one_member_cluster(port);
     // Informational only -- the real per-request decision (`distributed_mode`,
     // below) is made from live membership, not this startup snapshot. A
@@ -500,6 +520,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    start_front_ends(one_node);
     // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
     // candidate, also always running regardless of which PeerClient is
     // selected for outbound calls.
