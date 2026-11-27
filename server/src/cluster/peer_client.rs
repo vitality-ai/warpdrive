@@ -79,38 +79,65 @@ pub trait PeerClient: Send + Sync {
     }
 }
 
-/// Wraps a transport so this node's own shards stay in process: a shard
-/// for this node is stored or loaded directly, as its shard server would on
-/// receiving it, instead of going over loopback to that server. Shards for
-/// other nodes go over `inner`. The metadata record already works this way
-/// (`coordinator::send_to_peers`).
-pub struct LocalFirst {
-    pub inner: std::sync::Arc<dyn PeerClient>,
+/// Where this node keeps its own shards, as its shard server stores them.
+pub trait LocalShards: Send + Sync {
+    fn store(&self, user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), String>;
+    fn load(&self, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, String>;
 }
 
-fn is_self(peer: &str) -> bool {
-    super::coordinator::self_addr().is_some_and(|me| peer.trim().trim_end_matches('/') == me)
+/// This node's shard files (`shard_storage`).
+pub struct DiskShards;
+
+impl LocalShards for DiskShards {
+    fn store(&self, user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: &[u8]) -> Result<(), String> {
+        super::shard_storage::store_shard(user_id, bucket, key, shard_idx, data).map_err(|e| e.to_string())
+    }
+    fn load(&self, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, String> {
+        super::shard_storage::load_shard(user_id, bucket, key, shard_idx).map_err(|e| e.to_string())
+    }
+}
+
+/// Wraps a transport so this node's own shards stay in process: a shard
+/// for this node (`me`) goes straight to `local`, as its shard server
+/// would store it on receiving it, instead of over loopback to that
+/// server. Shards for other nodes go over `inner`. The metadata record
+/// already works this way (`coordinator::send_to_peers`).
+pub struct LocalFirst {
+    inner: std::sync::Arc<dyn PeerClient>,
+    local: std::sync::Arc<dyn LocalShards>,
+    me: Option<String>,
+}
+
+impl LocalFirst {
+    /// `me` is this node's peer address, if it has one.
+    pub fn new(inner: std::sync::Arc<dyn PeerClient>, local: std::sync::Arc<dyn LocalShards>, me: Option<&str>) -> Self {
+        Self { inner, local, me: me.map(|m| m.trim().trim_end_matches('/').to_string()) }
+    }
+
+    fn is_me(&self, peer: &str) -> bool {
+        self.me.as_deref().is_some_and(|me| peer.trim().trim_end_matches('/') == me)
+    }
 }
 
 #[async_trait]
 impl PeerClient for LocalFirst {
     async fn put_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize, data: Vec<u8>) -> Result<(), Error> {
-        if !is_self(peer) {
+        if !self.is_me(peer) {
             return self.inner.put_shard(peer, user_id, bucket, key, shard_idx, data).await;
         }
-        let (u, b, k) = (user_id.to_string(), bucket.to_string(), key.to_string());
-        tokio::task::spawn_blocking(move || super::shard_storage::store_shard(&u, &b, &k, shard_idx, &data).map_err(|e| e.to_string()))
+        let (local, u, b, k) = (std::sync::Arc::clone(&self.local), user_id.to_string(), bucket.to_string(), key.to_string());
+        tokio::task::spawn_blocking(move || local.store(&u, &b, &k, shard_idx, &data))
             .await
             .map_err(|e| ErrorBadGateway(format!("local shard store task failed: {e}")))?
             .map_err(|e| ErrorBadGateway(format!("put_shard to {peer} (this node) failed: {e}")))
     }
 
     async fn get_shard(&self, peer: &str, user_id: &str, bucket: &str, key: &str, shard_idx: usize) -> Result<Vec<u8>, Error> {
-        if !is_self(peer) {
+        if !self.is_me(peer) {
             return self.inner.get_shard(peer, user_id, bucket, key, shard_idx).await;
         }
-        let (u, b, k) = (user_id.to_string(), bucket.to_string(), key.to_string());
-        tokio::task::spawn_blocking(move || super::shard_storage::load_shard(&u, &b, &k, shard_idx).map_err(|e| e.to_string()))
+        let (local, u, b, k) = (std::sync::Arc::clone(&self.local), user_id.to_string(), bucket.to_string(), key.to_string());
+        tokio::task::spawn_blocking(move || local.load(&u, &b, &k, shard_idx))
             .await
             .map_err(|e| ErrorBadGateway(format!("local shard load task failed: {e}")))?
             .map_err(|e| ErrorBadGateway(format!("get_shard from {peer} (this node) failed: {e}")))
@@ -235,6 +262,49 @@ impl PeerClient for HttpPeerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// Records where each shard went.
+    #[derive(Default)]
+    struct Seen(parking_lot::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl PeerClient for Seen {
+        async fn put_shard(&self, peer: &str, _u: &str, _b: &str, key: &str, _i: usize, _d: Vec<u8>) -> Result<(), Error> {
+            self.0.lock().push(format!("remote {peer} {key}"));
+            Ok(())
+        }
+        async fn get_shard(&self, peer: &str, _u: &str, _b: &str, key: &str, _i: usize) -> Result<Vec<u8>, Error> {
+            self.0.lock().push(format!("remote {peer} {key}"));
+            Ok(b"remote".to_vec())
+        }
+    }
+
+    #[derive(Default)]
+    struct Mem(parking_lot::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+    impl LocalShards for Mem {
+        fn store(&self, _u: &str, _b: &str, key: &str, idx: usize, data: &[u8]) -> Result<(), String> {
+            self.0.lock().insert(format!("{key}#{idx}"), data.to_vec());
+            Ok(())
+        }
+        fn load(&self, _u: &str, _b: &str, key: &str, idx: usize) -> Result<Vec<u8>, String> {
+            self.0.lock().get(&format!("{key}#{idx}")).cloned().ok_or_else(|| "no such shard".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn local_first_keeps_this_nodes_shards_in_process() {
+        let (remote, local) = (Arc::new(Seen::default()), Arc::new(Mem::default()));
+        let c = LocalFirst::new(remote.clone(), local.clone(), Some("http://me:1/"));
+        c.put_shard("http://me:1", "u", "b", "k", 0, b"mine".to_vec()).await.unwrap();
+        c.put_shard("http://other:1", "u", "b", "k", 1, b"theirs".to_vec()).await.unwrap();
+        assert_eq!(c.get_shard("http://me:1/", "u", "b", "k", 0).await.unwrap(), b"mine");
+        assert_eq!(local.0.lock().len(), 1, "only this node's shard is stored locally");
+        assert_eq!(*remote.0.lock(), vec!["remote http://other:1 k".to_string()]);
+        let anon = LocalFirst::new(remote.clone(), local, None);
+        assert_eq!(anon.get_shard("http://me:1", "u", "b", "k", 0).await.unwrap(), b"remote", "no address: every shard is remote");
+    }
 
     #[test]
     fn flatbuffer_round_trip() {

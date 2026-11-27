@@ -54,7 +54,6 @@ use warp_meta_store::Entry;
 use super::blob_store::blob_bucket;
 use super::coordinator::{self_addr, ClusterState};
 use crate::object_layer::metadata::{decode, MetaValue};
-use super::rows::rows;
 use super::shard_storage::{parse_shard_key, shard_entries, ShardId};
 
 /// Prefix of the internal bucket S3 blob shards are stored under.
@@ -126,8 +125,8 @@ fn parse_stripe_key(s: &str) -> Option<(String, usize)> {
 /// into a version row, writing the version row before it clears the upload.
 /// So upload rows are scanned first, then everything: a moved blob is seen
 /// in the upload row, or else its version row was already written.
-fn row_references() -> HashSet<(String, String, String)> {
-    let Some(rows) = rows() else { return HashSet::new() };
+fn row_references(state: &ClusterState) -> HashSet<(String, String, String)> {
+    let Some(rows) = state.rows.get() else { return HashSet::new() };
     let mut refs = HashSet::new();
     let uploads = rows.log().list_live("upl/", |_, r| match decode(r).map(|r| r.value) {
         Some(MetaValue::Upload(u)) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
@@ -201,7 +200,7 @@ pub struct CheckReply {
 
 /// Answers a peer's confirmation request from this node's records.
 pub fn references(state: &ClusterState, shards: &[ShardRef]) -> Vec<bool> {
-    let refs = row_references();
+    let refs = row_references(state);
     shards
         .iter()
         .map(|s| {
@@ -277,7 +276,7 @@ pub type Dead = (String, u64, u64);
 /// `sweep`, with the reclaimable shards themselves.
 pub async fn sweep_detail(state: &ClusterState) -> (SweepStats, Vec<Dead>) {
     let cfg = config();
-    let refs = row_references();
+    let refs = row_references(state);
     let now = now_nanos();
     let grace = cfg.grace.as_nanos() as u64;
     let mut stats = SweepStats::default();
@@ -390,7 +389,7 @@ pub fn compact_due_logs(state: &ClusterState) -> Vec<&'static str> {
             }
         }
     };
-    if let Some(rows) = rows() {
+    if let Some(rows) = state.rows.get() {
         use warp_meta_store::Engine;
         run("rows", rows.log().engine().compaction_due(), &|| rows.log().engine().compact());
     }
@@ -421,7 +420,7 @@ pub fn start(state: web::Data<ClusterState>) {
                 if !compacted.is_empty() {
                     log::info!("compacted record logs: {}", compacted.join(", "));
                 }
-                let gc = super::gc::run();
+                let gc = super::gc::run(&state);
                 if gc.rows > 0 || gc.compact != Default::default() {
                     log::info!("gc: {gc:?}");
                 }

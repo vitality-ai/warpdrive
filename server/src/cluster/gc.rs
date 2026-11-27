@@ -26,7 +26,6 @@ use warp_meta_store::hlc;
 
 use super::blob_store::{blob_bucket, BlobRef};
 use crate::object_layer::metadata::{decode, MetaValue};
-use super::rows::rows;
 use super::shard_storage::{shard_key, shard_location};
 
 const PREFIX: &str = "gc/";
@@ -81,7 +80,7 @@ pub struct GcStats {
 /// One pass: frees this node's shards of the blobs in `gc/` rows past the
 /// grace period, then runs the compactor. Blocks: call it off the async
 /// workers.
-pub fn run() -> GcStats {
+pub fn run(state: &super::coordinator::ClusterState) -> GcStats {
     // One pass at a time: the cursor is read, then written.
     static ONE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     let _one = ONE.lock();
@@ -90,7 +89,7 @@ pub fn run() -> GcStats {
     if !super::compactor::config().enabled {
         return stats;
     }
-    let Some(rows) = rows() else { return stats };
+    let Some(rows) = state.rows.get() else { return stats };
     let grace = super::reclaim::config().grace.as_nanos() as u64;
     let now = hlc::now();
     let cursor = load_cursor();
@@ -146,8 +145,8 @@ pub fn run() -> GcStats {
     stats
 }
 
-pub async fn cluster_internal_gc_run() -> actix_web::HttpResponse {
-    match actix_web::web::block(run).await {
+pub async fn cluster_internal_gc_run(state: actix_web::web::Data<super::coordinator::ClusterState>) -> actix_web::HttpResponse {
+    match actix_web::web::block(move || run(&state)).await {
         Ok(stats) => actix_web::HttpResponse::Ok().json(stats),
         Err(e) => actix_web::HttpResponse::InternalServerError().body(e.to_string()),
     }

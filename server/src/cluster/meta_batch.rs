@@ -8,7 +8,7 @@
 //! so inline bytes travel raw), with up to `MAX_IN_FLIGHT` requests out at
 //! once. While those are out, more rows queue, so batches grow with load and
 //! cost nothing extra when it's light. The peer applies a batch through its
-//! commit thread (`rows::commit_row`), so the whole batch is
+//! commit thread (`NodeRows::commit`), so the whole batch is
 //! durable with one sync there too, and answers each row as `/meta` would.
 //!
 //! `WARPDRIVE_META_BATCH=off` sends one request per row (`/meta`) instead.
@@ -141,13 +141,18 @@ async fn post(client: &reqwest::Client, url: &str, reqs: &[MetaRowRequest]) -> V
 
 /// `/cluster/_internal/meta_batch`: applies each row through this node's
 /// commit thread (so the batch shares a sync) and answers each.
-pub async fn cluster_internal_meta_batch(body: web::Bytes) -> HttpResponse {
+pub async fn cluster_internal_meta_batch(body: web::Bytes, state: web::Data<super::coordinator::ClusterState>) -> HttpResponse {
+    let Some(rows) = state.rows.get().cloned() else {
+        return HttpResponse::ServiceUnavailable().body("this node has no rows (not started as a cluster node)");
+    };
     let reqs: Vec<MetaRowRequest> = match rmp_serde::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return HttpResponse::BadRequest().body(format!("unreadable metadata batch: {e}")),
     };
-    let answers: Vec<RowReply> = futures::future::join_all(reqs.into_iter().map(|m| async move {
-        match super::rows::commit_row(m.key, m.seq, m.payload).await {
+    let answers: Vec<RowReply> = futures::future::join_all(reqs.into_iter().map(|m| {
+        let rows = Arc::clone(&rows);
+        async move {
+        match rows.commit(m.key, m.seq, m.payload).await {
             Ok(warp_meta_store::Applied::Yes { .. }) => RowReply::Applied,
             Ok(warp_meta_store::Applied::Stale { current_seq }) => RowReply::Stale(current_seq),
             Ok(warp_meta_store::Applied::VersionMismatch) => RowReply::Failed,
@@ -155,6 +160,7 @@ pub async fn cluster_internal_meta_batch(body: web::Bytes) -> HttpResponse {
                 log::warn!("metadata batch row: applying on this node failed: {e}");
                 RowReply::Failed
             }
+        }
         }
     }))
     .await;

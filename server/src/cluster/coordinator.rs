@@ -71,6 +71,8 @@ pub struct ClusterState {
     /// single-node storage, which a client could write to and then lose
     /// once the join completes and routing switches to the cluster).
     pub configured_for_cluster: bool,
+    /// This node's rows (`rows`), set once when the node starts its stores.
+    pub rows: std::sync::OnceLock<Arc<super::rows::NodeRows>>,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
     // both the part bytes and the upload "header" (status, content-type,
     // user-metadata) are ordinary objects through the existing
@@ -204,7 +206,7 @@ impl<R> From<Applied<R>> for OpOutcome {
 impl RecordOp {
     /// Applies the write to this node's stores. Blocking: it waits for the
     /// write to be durable.
-    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore) -> std::io::Result<OpOutcome> {
+    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore, rows: Option<&super::rows::NodeRows>) -> std::io::Result<OpOutcome> {
         Ok(match self {
             RecordOp::PutLocation(r) => loc.put(r)?.into(),
             RecordOp::UpdateLocation(r) => loc.update(r)?.into(),
@@ -213,7 +215,7 @@ impl RecordOp {
             RecordOp::UpdateContent(r) => content.update(r)?.into(),
             RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
             RecordOp::Meta(m) => {
-                let rows = super::rows::rows().ok_or_else(|| std::io::Error::other("this node has no rows (not started as a cluster node)"))?;
+                let rows = rows.ok_or_else(|| std::io::Error::other("this node has no rows (not started as a cluster node)"))?;
                 match m.payload {
                     Some(payload) => rows.put(m.key, warp_engine::Row { seq: m.seq, payload })?,
                     None => rows.delete(m.key, m.seq)?,
@@ -255,7 +257,11 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     // A metadata row goes through the commit thread: batched with the other
     // writes waiting, and awaited without holding a thread.
     if let RecordOp::Meta(m) = op {
-        return match super::rows::commit_row(m.key, m.seq, m.payload).await {
+        let Some(rows) = state.rows.get() else {
+            warn!("{label}: this node has no rows (not started as a cluster node)");
+            return PeerReply::Failed;
+        };
+        return match rows.commit(m.key, m.seq, m.payload).await {
             Ok(applied) => match OpOutcome::from(applied) {
                 OpOutcome::Applied => PeerReply::Applied,
                 OpOutcome::Stale(seq) => PeerReply::Stale(seq),
@@ -274,9 +280,9 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     // to the blocking pool as before.
     let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
     let result = if multi {
-        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref())))
+        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref(), None)))
     } else {
-        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await
+        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref(), None)).await
     };
     match result {
         Ok(Ok(OpOutcome::Applied)) => PeerReply::Applied,
@@ -2012,7 +2018,7 @@ pub async fn cluster_internal_put_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::PutContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2028,7 +2034,7 @@ pub async fn cluster_internal_update_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::UpdateContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2047,7 +2053,7 @@ pub async fn cluster_internal_put_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::PutLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2064,7 +2070,7 @@ pub async fn cluster_internal_update_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::UpdateLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2107,7 +2113,7 @@ pub async fn cluster_internal_delete_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::DeleteLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2124,7 +2130,7 @@ pub async fn cluster_internal_delete_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::DeleteContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2302,9 +2308,10 @@ mod tests {
 }
 
 /// Receiving side of S3 metadata row replication.
-pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>) -> Result<HttpResponse, Error> {
+pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>, state: web::Data<ClusterState>) -> Result<HttpResponse, Error> {
     // Through the commit thread, batched with this node's other row writes.
     let m = body.into_inner();
-    let applied = super::rows::commit_row(m.key, m.seq, m.payload).await.map_err(ErrorInternalServerError)?;
+    let rows = state.rows.get().ok_or_else(|| ErrorInternalServerError("this node has no rows (not started as a cluster node)"))?;
+    let applied = rows.commit(m.key, m.seq, m.payload).await.map_err(ErrorInternalServerError)?;
     Ok(outcome_response(applied.into()))
 }

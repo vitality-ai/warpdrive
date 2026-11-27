@@ -21,6 +21,8 @@ pub type RowLog = WarpMetaStore<Row, AnyEngine<Entry<Row>>>;
 pub struct NodeRows {
     log: RowLog,
     watchers: RwLock<Vec<(String, Watcher)>>,
+    /// The commit thread, started on the first `commit`.
+    committer: std::sync::OnceLock<std::sync::mpsc::Sender<CommitJob>>,
 }
 
 impl NodeRows {
@@ -29,7 +31,7 @@ impl NodeRows {
     }
 
     pub fn new(log: RowLog) -> Self {
-        Self { log, watchers: RwLock::new(Vec::new()) }
+        Self { log, watchers: RwLock::new(Vec::new()), committer: std::sync::OnceLock::new() }
     }
 
     /// The log, for reads, compaction and garbage collection.
@@ -72,21 +74,8 @@ impl NodeRows {
     }
 }
 
-static ROWS: std::sync::OnceLock<Arc<NodeRows>> = std::sync::OnceLock::new();
-
-/// Sets this node's rows, so replicated row writes from peers land in them.
-/// Called once at startup.
-pub fn install(rows: Arc<NodeRows>) {
-    let _ = ROWS.set(rows);
-}
-
-/// This node's rows, once `install` has run.
-pub fn rows() -> Option<Arc<NodeRows>> {
-    ROWS.get().cloned()
-}
-
 /// One row write waiting for the commit thread.
-struct CommitJob {
+pub struct CommitJob {
     key: String,
     op: RowOp<Row>,
     reply: tokio::sync::oneshot::Sender<Result<Applied<Row>, String>>,
@@ -95,37 +84,40 @@ struct CommitJob {
 /// The most row writes one commit applies.
 const COMMIT_BATCH_MAX: usize = 1024;
 
-static COMMITTER: std::sync::OnceLock<std::sync::mpsc::Sender<CommitJob>> = std::sync::OnceLock::new();
-
-/// Writes one row to this node's rows (a tombstone at `seq` when `payload`
-/// is `None`), durable when it returns, without blocking the caller's
-/// thread.
-///
-/// Every caller's write goes to one commit thread. It takes all the writes
-/// waiting, applies them with one `apply_many` (one engine write, one sync),
-/// and answers each. Under load a batch holds many writes, so a write costs
-/// a channel send and a wakeup instead of a blocking-pool hand-off and its
-/// own place in the engine's write queue. Each write gets the answer `put`
-/// or `delete` would give it.
-pub async fn commit_row(key: String, seq: u64, payload: Option<Payload>) -> Result<Applied<Row>, String> {
-    let tx = COMMITTER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<CommitJob>();
-        std::thread::Builder::new()
-            .name("wd-row-commit".into())
-            .spawn(move || commit_loop(rx))
-            .expect("starting the row commit thread");
-        tx
-    });
-    let op = match payload {
-        Some(payload) => RowOp::Put(Row { seq, payload }),
-        None => RowOp::Delete(seq),
-    };
-    let (reply, answer) = tokio::sync::oneshot::channel();
-    tx.send(CommitJob { key, op, reply }).map_err(|_| "the row commit thread has stopped".to_string())?;
-    answer.await.map_err(|_| "the row commit thread dropped a write".to_string())?
+impl NodeRows {
+    /// Writes one row to this node's rows (a tombstone at `seq` when
+    /// `payload` is `None`), durable when it returns, without blocking the
+    /// caller's thread.
+    ///
+    /// Every caller's write goes to one commit thread. It takes all the
+    /// writes waiting, applies them with one `apply_many` (one engine write,
+    /// one sync), and answers each. Under load a batch holds many writes, so
+    /// a write costs a channel send and a wakeup instead of a blocking-pool
+    /// hand-off and its own place in the engine's write queue. Each write
+    /// gets the answer `put` or `delete` would give it.
+    pub async fn commit(self: &Arc<Self>, key: String, seq: u64, payload: Option<Payload>) -> Result<Applied<Row>, String> {
+        let tx = self.committer.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<CommitJob>();
+            // The thread holds the rows only weakly, so dropping the rows
+            // (a test's store) ends it.
+            let rows = Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("wd-row-commit".into())
+                .spawn(move || commit_loop(rows, rx))
+                .expect("starting the row commit thread");
+            tx
+        });
+        let op = match payload {
+            Some(payload) => RowOp::Put(Row { seq, payload }),
+            None => RowOp::Delete(seq),
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        tx.send(CommitJob { key, op, reply }).map_err(|_| "the row commit thread has stopped".to_string())?;
+        answer.await.map_err(|_| "the row commit thread dropped a write".to_string())?
+    }
 }
 
-fn commit_loop(rx: std::sync::mpsc::Receiver<CommitJob>) {
+fn commit_loop(rows: std::sync::Weak<NodeRows>, rx: std::sync::mpsc::Receiver<CommitJob>) {
     while let Ok(first) = rx.recv() {
         let mut jobs = vec![first];
         while jobs.len() < COMMIT_BATCH_MAX {
@@ -134,13 +126,13 @@ fn commit_loop(rx: std::sync::mpsc::Receiver<CommitJob>) {
                 Err(_) => break,
             }
         }
-        let Some(rows) = rows() else {
-            for j in jobs {
-                let _ = j.reply.send(Err("this node has no rows (not started as a cluster node)".into()));
-            }
-            continue;
-        };
         let (ops, replies): (Vec<(String, RowOp<Row>)>, Vec<_>) = jobs.into_iter().map(|j| ((j.key, j.op), j.reply)).unzip();
+        let Some(rows) = rows.upgrade() else {
+            for reply in replies {
+                let _ = reply.send(Err("this node's rows are closed".into()));
+            }
+            return;
+        };
         match rows.apply_many(ops) {
             Ok(results) => {
                 for (reply, r) in replies.into_iter().zip(results) {
@@ -270,6 +262,27 @@ mod tests {
         rows.write("a/2", 13, None).unwrap();
         assert!(rows.get("a/2").is_none(), "a tombstone hides the row");
         assert!(rows.write("a/2", 12, Some(Payload(vec![1]))).is_err(), "an older write can't revive it");
+    }
+
+    #[tokio::test]
+    async fn commits_from_many_writers_are_ordered_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.log").to_string_lossy().into_owned();
+        {
+            let node = Arc::new(NodeRows::open(MetaEngineKind::Bitcask, &path).unwrap());
+            let writes = (0..200u64).map(|i| {
+                let node = Arc::clone(&node);
+                async move { node.commit(format!("k/{}", i % 10), 1000 + i, Some(Payload(i.to_be_bytes().to_vec()))).await }
+            });
+            let results = futures::future::join_all(writes).await;
+            assert!(results.iter().all(|r| r.is_ok()));
+            assert!(matches!(node.commit("k/0".into(), 1, Some(Payload(vec![]))).await.unwrap(), Applied::Stale { .. }), "an older seq is stale");
+            node.commit("k/1".into(), 5000, None).await.unwrap();
+        }
+        let node = NodeRows::open(MetaEngineKind::Bitcask, &path).unwrap();
+        // Each key holds its newest write, after a reopen.
+        assert_eq!(node.log().get("k/0").unwrap().seq, 1190);
+        assert!(node.log().get("k/1").is_none(), "the tombstone survived");
     }
 
     #[test]
