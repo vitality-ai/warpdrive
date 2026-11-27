@@ -25,12 +25,28 @@ use serde::{Deserialize, Serialize};
 use warp_meta_store::hlc;
 
 use super::blob_store::{blob_bucket, BlobRef};
-use crate::object_layer::metadata::{decode, MetaValue};
 use super::shard_storage::{shard_key, shard_location};
 
 const PREFIX: &str = "gc/";
 
 /// A new `gc/` row key: ordered by time.
+/// A release row's payload: the blobs to free once the grace period has
+/// passed. The engine owns these rows. A layer above writes one (at
+/// `new_key()`) after the rows that stopped referencing the blobs.
+pub fn release_payload(blobs: &[BlobRef]) -> warp_engine::Payload {
+    warp_engine::Payload(rmp_serde::to_vec_named(blobs).expect("blob references always encode"))
+}
+
+fn released(row: &warp_engine::Row) -> Option<Vec<BlobRef>> {
+    match rmp_serde::from_slice(&row.payload.0) {
+        Ok(blobs) => Some(blobs),
+        Err(e) => {
+            log::error!("gc: a release row (seq {}) doesn't decode: {e}", row.seq);
+            None
+        }
+    }
+}
+
 pub fn new_key() -> String {
     format!("{PREFIX}{:016x}", hlc::now())
 }
@@ -99,10 +115,7 @@ pub fn run(state: &super::coordinator::ClusterState) -> GcStats {
     let after = if cursor.is_empty() { PREFIX.to_string() } else { cursor.clone() };
     let due: Vec<(String, Vec<BlobRef>)> = rows
         .log()
-        .list_live_range(Some(&after), &upto, |k, r| match decode(r).map(|r| r.value) {
-            Some(MetaValue::Gc(blobs)) if k.starts_with(PREFIX) => Some((k.to_string(), blobs)),
-            _ => None,
-        })
+        .list_live_range(Some(&after), &upto, |k, r| if k.starts_with(PREFIX) { released(r).map(|blobs| (k.to_string(), blobs)) } else { None })
         .into_iter()
         .flatten()
         .collect();

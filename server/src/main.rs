@@ -297,6 +297,7 @@ fn install_cluster_stores(state: &web::Data<ClusterState>) {
     engine.refuse_other_engines_data("cluster_metadata", &meta_log).unwrap_or_else(|e| panic!("{e}"));
     let node_rows = Arc::new(rows::NodeRows::open(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the row store: {e}")));
     let _ = state.rows.set(Arc::clone(&node_rows));
+    let _ = state.blob_references.set(Arc::new(warp_drive::object_layer::metadata::MetadataBlobRefs));
     let meta = ReplicatedMetadataStore::new(Arc::new(rows::ClusterRows(node_rows)));
     warp_drive::service::metadata_service::set_metadata_store(Arc::new(meta));
     let alloc_log = std::env::var("WARPDRIVE_BLOB_ALLOC_LOG").unwrap_or_else(|_| "blob_alloc.log".to_string());
@@ -383,6 +384,7 @@ fn build_cluster_state() -> web::Data<ClusterState> {
                 .build()
                 .expect("building the row transport's HTTP client"),
         ),
+        blob_references: Default::default(),
         rows: Default::default(),
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
             || std::env::var("WARPDRIVE_JOIN_VIA").is_ok(),

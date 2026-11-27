@@ -160,11 +160,6 @@ pub enum MetaValue {
     Upload(UploadRow),
     Acl { owner: String, grants: String },
     Lock(LockRow),
-    /// Blobs a write just stopped referencing (RFC 6 step 6). Written after
-    /// the rows that dropped them, so a crash in between leaks space and
-    /// never frees a referenced blob. Each node frees its own shards of
-    /// them once the grace period has passed (`gc.rs`).
-    Gc(Vec<BlobRef>),
 }
 
 /// One row as this layer reads it: its `seq` and its decoded value. The
@@ -225,6 +220,55 @@ impl MetaRows {
 
     fn write_async(&self, key: String, seq: u64, value: Option<&MetaValue>) -> warp_engine::WriteFuture {
         self.0.write_async(key, seq, value.map(encode))
+    }
+}
+
+impl ReplicatedMetadataStore {
+    /// Hands blobs a write just stopped referencing to the engine to free
+    /// (RFC 6 step 6): a release row, written after the rows that dropped
+    /// them, so a crash in between leaks space and never frees a referenced
+    /// blob. Each node frees its own shards of them once the grace period
+    /// has passed (`gc.rs`).
+    fn release(&self, blobs: Vec<BlobRef>) -> Result<(), Error> {
+        self.rows.0.write(&crate::cluster::gc::new_key(), next_seq(), Some(crate::cluster::gc::release_payload(&blobs))).map_err(write_err)
+    }
+
+    async fn release_async(&self, blobs: Vec<BlobRef>) -> Result<(), String> {
+        let payload = crate::cluster::gc::release_payload(&blobs);
+        self.rows.0.write_async(crate::cluster::gc::new_key(), next_seq(), Some(payload)).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+    }
+}
+
+/// The blobs this layer's rows reference, for the engine's audit.
+pub struct MetadataBlobRefs;
+
+impl crate::cluster::reclaim::BlobReferences for MetadataBlobRefs {
+    /// A reference moves in one case: CompleteMultipartUpload moves part
+    /// blobs from the upload row into a version row, writing the version
+    /// row before it clears the upload. So upload rows are scanned first,
+    /// then versions: a moved blob is seen in the upload row, or else its
+    /// version row was already written.
+    fn referenced(&self, rows: &crate::cluster::rows::NodeRows) -> Vec<BlobRef> {
+        let parts = |u: UploadRow| -> Vec<BlobRef> { u.parts.into_values().flat_map(|p| p.blobs).collect() };
+        let mut out: Vec<BlobRef> = rows
+            .log()
+            .list_live("upl/", |_, r| match decode(r).map(|r| r.value) {
+                Some(MetaValue::Upload(u)) => parts(u),
+                _ => Vec::new(),
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        out.extend(
+            rows.log()
+                .list_live("ver/", |_, r| match decode(r).map(|r| r.value) {
+                    Some(MetaValue::Version(v)) => v.blobs,
+                    _ => Vec::new(),
+                })
+                .into_iter()
+                .flatten(),
+        );
+        out
     }
 }
 
@@ -544,7 +588,7 @@ impl ReplicatedMetadataStore {
         if blobs.is_empty() {
             return Ok(());
         }
-        self.put_async(crate::cluster::gc::new_key(), MetaValue::Gc(blobs)).await
+        self.release_async(blobs).await
     }
 
     /// The whole S3 DeleteObject metadata write without blocking a thread:
@@ -674,7 +718,7 @@ impl ReplicatedMetadataStore {
         if blobs.is_empty() {
             return Ok(());
         }
-        self.put(&crate::cluster::gc::new_key(), MetaValue::Gc(blobs))
+        self.release(blobs)
     }
 }
 

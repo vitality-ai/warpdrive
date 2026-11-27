@@ -74,6 +74,9 @@ pub struct ClusterState {
     /// How row writes reach other nodes (`meta_batch`: batched, or one
     /// request per row).
     pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
+    /// Which blobs the rows reference, from the layer that writes them. Set
+    /// with `rows`. The audit (`reclaim`) frees shards no row needs.
+    pub blob_references: std::sync::OnceLock<Arc<dyn super::reclaim::BlobReferences>>,
     /// This node's rows (`rows`), set once when the node starts its stores.
     pub rows: std::sync::OnceLock<Arc<super::rows::NodeRows>>,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
