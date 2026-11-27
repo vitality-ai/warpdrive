@@ -40,6 +40,14 @@ jobs:
       working-directory: crates/warp-meta-store-sqlite
       run: cargo test
 
+    - name: Run engine crate tests
+      working-directory: crates/warp-engine
+      run: cargo test
+
+    - name: Run front-end crate tests
+      working-directory: crates/warp-frontend-redis
+      run: cargo test
+
     - name: Lint with Clippy (Errors Only)
       working-directory: server
       run: |

@@ -41,7 +41,9 @@ log4rs = "1.3.0"
 log-mdc = "0.1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1.0", features = ["full"] }
-md5 = "0.7.0"
+md-5 = "0.10"
+crc32c = "0.6"
+zstd = "0.13"
 hex = "0.4.3"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -51,7 +53,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 dotenvy = "0.15"
 hmac = "0.12"
 base64 = "0.22"
-reed-solomon-erasure = "6.0"
+reed-solomon-erasure = { version = "6.0", features = ["simd-accel"] }
 async-trait = "0.1"
 tonic = "0.11"
 prost = "0.12"
@@ -59,9 +61,13 @@ flate2 = "1.0"
 percent-encoding = "2"
 actix-multipart = "0.6"
 parking_lot = "0.12"
+rmp-serde = "1.3"
 warp-meta-store = { path = "../crates/warp-meta-store" }
 warp-meta-store-sqlite = { path = "../crates/warp-meta-store-sqlite" }
 warp-meta-store-rocksdb = { path = "../crates/warp-meta-store-rocksdb" }
+warp-engine = { path = "../crates/warp-engine" }
+warp-frontend = { path = "../crates/warp-frontend" }
+warp-frontend-redis = { path = "../crates/warp-frontend-redis" }
 jsonwebtoken = "9"
 rand = "0.8"
 
@@ -75,6 +81,11 @@ bundled-sqlite = ["rusqlite/bundled"]
 [build-dependencies]
 tonic-build = "0.11"
 protoc-bin-vendored = "3"
+
+# Assembly MD5 where it exists (x86_64): the ETag is a full pass over every
+# PUT body.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+md-5 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 actix-web = "4.11.0"

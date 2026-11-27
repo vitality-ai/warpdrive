@@ -23,4 +23,4 @@ pub mod store;
 
 pub use engine::{BitcaskEngine, Engine};
 pub use kv::{assert_behaves_like_bitcask, KvEngine, MemKv, OrderedKv};
-pub use store::{Applied, Entry, Record, WarpMetaStore};
+pub use store::{Applied, Entry, EntryHead, Record, RecordHead, RowOp, WarpMetaStore};

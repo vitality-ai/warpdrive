@@ -7,3 +7,7 @@ pub mod api;
 pub mod service;
 pub mod s3;
 pub mod cluster;
+pub mod digest;
+pub mod identity;
+pub mod phase_timing;
+pub mod object_layer;

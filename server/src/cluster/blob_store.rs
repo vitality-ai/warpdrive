@@ -106,26 +106,66 @@ pub struct BlobRef {
 /// PUT never wrote a row goes after `HANDOFF_TTL` (the audit sweep frees its
 /// shards). So it holds writes in flight, not every object: reads take the
 /// placement from the row they read (`Locator`), not from this node's memory.
-type Handoff = HashMap<(String, String, u64), (BlobPlacement, std::time::Instant)>;
+///
+/// A blob whose shards travel with its row (`WARPDRIVE_BLOB_WITH_ROW`, on by
+/// default) waits here with its shards, unsent. Those entries go after
+/// `UNSENT_TTL`, so a PUT that fails before its row can't hold shard bytes
+/// for long. Its row then finds no placement and fails, never a row
+/// without shards.
+type Handoff = HashMap<(String, String, u64), (BlobPlacement, std::time::Instant, Option<Vec<warp_engine::Attachment>>)>;
 
 static HANDOFF: std::sync::LazyLock<parking_lot::Mutex<Handoff>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
+/// Shards of claimed blobs, by wire key, for the row write that claimed
+/// them to take (`take_shards`) moments later.
+static CLAIMED: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, (Vec<warp_engine::Attachment>, std::time::Instant)>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
 const HANDOFF_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const UNSENT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn expired(at: &std::time::Instant, unsent: bool) -> bool {
+    at.elapsed() >= if unsent { UNSENT_TTL } else { HANDOFF_TTL }
+}
 
 /// Records a blob just written, for its row to claim.
 pub fn hand_off(b: BlobRef) {
-    let mut h = HANDOFF.lock();
-    // Now and then, drop entries no row claimed.
-    if h.len() % 4096 == 4095 {
-        h.retain(|_, (_, at)| at.elapsed() < HANDOFF_TTL);
-    }
-    h.insert((b.user_id, b.bucket, b.base), (b.placement, std::time::Instant::now()));
+    hand_off_with(b, None)
 }
 
-/// The blob this node wrote at `base`, if no row has claimed it yet.
+/// Records a blob whose shards go with its row, unsent.
+pub fn hand_off_with(b: BlobRef, shards: Option<Vec<warp_engine::Attachment>>) {
+    let mut h = HANDOFF.lock();
+    // Now and then, drop entries no row claimed.
+    if h.len() % 256 == 255 {
+        h.retain(|_, (_, at, s)| !expired(at, s.is_some()));
+    }
+    h.insert((b.user_id, b.bucket, b.base), (b.placement, std::time::Instant::now(), shards));
+}
+
+/// The blob this node wrote at `base`, if no row has claimed it yet. Its
+/// unsent shards wait for the row write (`take_shards`).
 pub fn claim(user_id: &str, bucket: &str, base: u64) -> Option<BlobRef> {
-    let (placement, _) = HANDOFF.lock().remove(&(user_id.to_string(), bucket.to_string(), base))?;
+    let (placement, at, shards) = HANDOFF.lock().remove(&(user_id.to_string(), bucket.to_string(), base))?;
+    if expired(&at, shards.is_some()) {
+        return None;
+    }
+    if let Some(shards) = shards {
+        let mut c = CLAIMED.lock();
+        if c.len() % 256 == 255 {
+            c.retain(|_, (_, at)| at.elapsed() < UNSENT_TTL);
+        }
+        c.insert(placement.wire_key.clone(), (shards, std::time::Instant::now()));
+    }
     Some(BlobRef { user_id: user_id.to_string(), bucket: bucket.to_string(), base, placement })
+}
+
+/// The unsent shards of a claimed blob, for the row that points at it.
+pub fn take_shards(b: &BlobRef) -> Option<Vec<warp_engine::Attachment>> {
+    if b.placement.wire_key.is_empty() {
+        return None;
+    }
+    CLAIMED.lock().remove(&b.placement.wire_key).map(|(s, _)| s)
 }
 
 /// Blobs waiting to be claimed, for tests and metrics.
@@ -318,6 +358,24 @@ impl Storage for ClusterBlobStore {
             return Some(Box::pin(std::future::ready(Err("cluster state not installed".to_string()))));
         };
         let (user, bucket) = (user_id.to_string(), bucket.to_string());
+        if state.blob_with_row {
+            // Placed and encoded now. The shards go out with the row.
+            let (ib, key) = (blob_bucket(&bucket), blob_key(base));
+            let prepared = match super::blob_io::prepare_blob(&state, &ib, &key, &data) {
+                Ok(p) => p,
+                Err(e) => return Some(Box::pin(std::future::ready(Err(e.to_string())))),
+            };
+            let shards = (!prepared.shards.is_empty()).then(|| {
+                let space = super::coordinator::shard_space(&user, &ib);
+                prepared
+                    .shards
+                    .into_iter()
+                    .map(|(peer, index, data)| warp_engine::Attachment { peer, space: space.clone(), key: prepared.placement.wire_key.clone(), index, data: warp_engine::Payload(data) })
+                    .collect()
+            });
+            hand_off_with(BlobRef { user_id: user, bucket, base, placement: prepared.placement }, shards);
+            return Some(Box::pin(std::future::ready(Ok((base, len)))));
+        }
         Some(Box::pin(async move {
             let placement = write_blob(&state, &user, &blob_bucket(&bucket), &blob_key(base), &data).await.map_err(|e| e.to_string())?;
             hand_off(BlobRef { user_id: user, bucket, base, placement });
@@ -373,7 +431,7 @@ mod tests {
 
     #[test]
     fn a_row_claims_its_blob_once() {
-        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, inline: None };
+        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, zstd_len: None, inline: None };
         hand_off(BlobRef { user_id: "u-claim".into(), bucket: "b-claim".into(), base: 100, placement: p.clone() });
         assert!(claim("u-claim", "other", 100).is_none(), "another bucket's address is another blob");
         assert_eq!(claim("u-claim", "b-claim", 100).map(|b| b.placement), Some(p));
@@ -381,8 +439,21 @@ mod tests {
     }
 
     #[test]
+    fn unsent_shards_wait_for_the_row_that_claims_their_blob() {
+        let p = BlobPlacement { shard_peers: vec!["a".into(), "b".into()], k: 1, m: 1, wire_key: "w-unsent".into(), len: 10, zstd_len: None, inline: None };
+        let shard = |peer: &str, index| warp_engine::Attachment { peer: peer.into(), space: "s".into(), key: "w-unsent".into(), index, data: warp_engine::Payload(vec![index as u8; 4]) };
+        let b = BlobRef { user_id: "u-unsent".into(), bucket: "b-unsent".into(), base: 7, placement: p };
+        assert!(take_shards(&b).is_none(), "nothing before the blob is claimed");
+        hand_off_with(b.clone(), Some(vec![shard("a", 0), shard("b", 1)]));
+        let claimed = claim("u-unsent", "b-unsent", 7).unwrap();
+        assert_eq!(claimed, b);
+        assert_eq!(take_shards(&claimed).map(|s| s.len()), Some(2), "the row takes both shards");
+        assert!(take_shards(&claimed).is_none(), "and only once");
+    }
+
+    #[test]
     fn a_read_needs_the_chunks_locator_and_stays_inside_its_blob() {
-        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, inline: None };
+        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, zstd_len: None, inline: None };
         let loc = locator(&BlobRef { user_id: "u".into(), bucket: "b".into(), base: 100, placement: p });
         assert!(located(None, "b", 100).is_err());
         assert_eq!(located(Some(&loc), "b", 105).map(|(base, _)| base), Ok(100));

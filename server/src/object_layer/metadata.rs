@@ -1,9 +1,12 @@
-//! `MetadataStorage` for a cluster: S3 metadata kept as replicated rows.
+//! The object layer's metadata: buckets, object versions, uploads, ACLs and
+//! locks, kept as engine rows (`warp_engine::RowStore`).
 //!
-//! Every node holds a full copy of the rows, so reads are local. A write
-//! changes one row: it reads the row, applies the change, stamps it with a
-//! new `seq` (`hlc`) and replicates it to every node, returning once a
-//! write quorum has it (`ordered`: every node keeps the newest stamp).
+//! The engine stores and replicates each row as an opaque payload. This
+//! layer decides the keys below and what a payload holds (a `MetaValue`,
+//! MessagePack). Every node holds a full copy of the rows, so reads are
+//! local. A write changes one row: it reads the row, applies the change,
+//! stamps it with a new `seq` and has the engine replicate it, returning
+//! once a write quorum has it. Every node keeps the newest stamp.
 //!
 //! **Rows**
 //!
@@ -37,14 +40,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use warp_engine::{next_seq, Payload, Row, RowStore};
 use warp_meta_store::hlc;
-use warp_meta_store::{Applied, Entry, Record, WarpMetaStore};
 use crate::metadata::{
     BucketStats, DeleteSpecificResult, DeletionEvent, Metadata, MetadataStorage, MultipartPartRow, MultipartUploadRow,
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
-use super::blob_store::{claim, locator, BlobRef};
-use super::meta_engine::{AnyEngine, MetaEngineKind};
+use crate::cluster::blob_store::{claim, locator, take_shards, BlobRef};
 
 // ---------------------------------------------------------------- rows
 
@@ -158,35 +160,126 @@ pub enum MetaValue {
     Upload(UploadRow),
     Acl { owner: String, grants: String },
     Lock(LockRow),
-    /// Blobs a write just stopped referencing (RFC 6 step 6). Written after
-    /// the rows that dropped them, so a crash in between leaks space and
-    /// never frees a referenced blob. Each node frees its own shards of
-    /// them once the grace period has passed (`gc.rs`).
-    Gc(Vec<BlobRef>),
 }
 
-/// One replicated row, with its place in the row's write order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One row as this layer reads it: its `seq` and its decoded value. The
+/// engine stores the value as an opaque payload (MessagePack).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetaRecord {
     pub seq: u64,
     pub value: MetaValue,
 }
 
-impl Record for MetaRecord {
-    fn seq(&self) -> u64 {
-        self.seq
-    }
-    fn version(&self) -> &str {
-        ""
+/// A row's payload for `value`.
+pub fn encode(value: &MetaValue) -> Payload {
+    Payload(rmp_serde::to_vec_named(value).expect("metadata rows always encode"))
+}
+
+/// The value in an engine row. A row that doesn't decode is logged and
+/// read as absent.
+pub fn decode(row: &Row) -> Option<MetaRecord> {
+    match rmp_serde::from_slice::<MetaValue>(&row.payload.0) {
+        Ok(value) => Some(MetaRecord { seq: row.seq, value }),
+        Err(e) => {
+            log::error!("a metadata row ({} bytes, seq {}) doesn't decode: {e}", row.payload.0.len(), row.seq);
+            None
+        }
     }
 }
 
-/// This node's copy of the rows, on the engine picked at startup
-/// (`WARPDRIVE_META_ENGINE`, see `meta_engine`).
-pub type MetaRows = WarpMetaStore<MetaRecord, AnyEngine<Entry<MetaRecord>>>;
+/// The engine's rows, read and written as this layer's values.
+pub struct MetaRows(Arc<dyn RowStore>);
 
-pub fn open_rows(kind: MetaEngineKind, path: &str) -> std::io::Result<MetaRows> {
-    Ok(WarpMetaStore::new(AnyEngine::open(kind, path, "s3 metadata")?))
+impl MetaRows {
+    pub fn new(rows: Arc<dyn RowStore>) -> Self {
+        Self(rows)
+    }
+
+    pub fn get(&self, key: &str) -> Option<MetaRecord> {
+        self.0.get(key).as_ref().and_then(decode)
+    }
+
+    pub fn floor_live(&self, prefix: &str, key: &str) -> Option<(String, MetaRecord)> {
+        let (k, row) = self.0.floor(prefix, key)?;
+        decode(&row).map(|r| (k, r))
+    }
+
+    pub fn list_live<T>(&self, prefix: &str, mut f: impl FnMut(&str, &MetaRecord) -> T) -> Vec<T> {
+        let mut out = Vec::new();
+        self.0.scan(prefix, &mut |k, row| {
+            if let Some(r) = decode(row) {
+                out.push(f(k, &r));
+            }
+        });
+        out
+    }
+
+    fn write(&self, key: &str, seq: u64, value: Option<&MetaValue>) -> Result<(), String> {
+        self.0.write_with_blocking(key, seq, value.map(encode), unsent_shards(value))
+    }
+
+    fn write_async(&self, key: String, seq: u64, value: Option<&MetaValue>) -> warp_engine::WriteFuture {
+        self.0.write_with(key, seq, value.map(encode), unsent_shards(value))
+    }
+}
+
+/// The shards of blobs this row points at that haven't been sent yet: they
+/// go with the row, so the row and its shards are durable together.
+fn unsent_shards(value: Option<&MetaValue>) -> Vec<warp_engine::Attachment> {
+    match value {
+        Some(MetaValue::Version(v)) => v.blobs.iter().filter_map(take_shards).flatten().collect(),
+        Some(MetaValue::Upload(u)) => u.parts.values().flat_map(|p| p.blobs.iter()).filter_map(take_shards).flatten().collect(),
+        _ => Vec::new(),
+    }
+}
+
+impl ReplicatedMetadataStore {
+    /// Hands blobs a write just stopped referencing to the engine to free
+    /// (RFC 6 step 6): a release row, written after the rows that dropped
+    /// them, so a crash in between leaks space and never frees a referenced
+    /// blob. Each node frees its own shards of them once the grace period
+    /// has passed (`gc.rs`).
+    fn release(&self, blobs: Vec<BlobRef>) -> Result<(), Error> {
+        self.rows.0.write(&crate::cluster::gc::new_key(), next_seq(), Some(crate::cluster::gc::release_payload(&blobs))).map_err(write_err)
+    }
+
+    async fn release_async(&self, blobs: Vec<BlobRef>) -> Result<(), String> {
+        let payload = crate::cluster::gc::release_payload(&blobs);
+        self.rows.0.write_async(crate::cluster::gc::new_key(), next_seq(), Some(payload)).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+    }
+}
+
+/// The blobs this layer's rows reference, for the engine's audit.
+pub struct MetadataBlobRefs;
+
+impl crate::cluster::reclaim::BlobReferences for MetadataBlobRefs {
+    /// A reference moves in one case: CompleteMultipartUpload moves part
+    /// blobs from the upload row into a version row, writing the version
+    /// row before it clears the upload. So upload rows are scanned first,
+    /// then versions: a moved blob is seen in the upload row, or else its
+    /// version row was already written.
+    fn referenced(&self, rows: &crate::cluster::rows::NodeRows) -> Vec<BlobRef> {
+        let parts = |u: UploadRow| -> Vec<BlobRef> { u.parts.into_values().flat_map(|p| p.blobs).collect() };
+        let mut out: Vec<BlobRef> = rows
+            .log()
+            .list_live("upl/", |_, r| match decode(r).map(|r| r.value) {
+                Some(MetaValue::Upload(u)) => parts(u),
+                _ => Vec::new(),
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        out.extend(
+            rows.log()
+                .list_live("ver/", |_, r| match decode(r).map(|r| r.value) {
+                    Some(MetaValue::Version(v)) => v.blobs,
+                    _ => Vec::new(),
+                })
+                .into_iter()
+                .flatten(),
+        );
+        out
+    }
 }
 
 /// The blobs behind a row's extents, for the row to store. A blob this node
@@ -239,6 +332,8 @@ fn bucket_versions_prefix(user: &str, bucket: &str) -> String {
 fn versions_prefix(user: &str, bucket: &str, key: &str) -> String {
     format!("{}{key}\0", bucket_versions_prefix(user, bucket))
 }
+/// Where a never-versioned bucket keeps a key's only version.
+const UNVERSIONED_ORDER: u64 = 0;
 fn version_key(user: &str, bucket: &str, key: &str, order: u64) -> String {
     format!("{}{order:016x}", versions_prefix(user, bucket, key))
 }
@@ -256,77 +351,40 @@ fn version_scoped(kind: &str, bucket: &str, key: &str, version_id: &str) -> Stri
 
 // ---------------------------------------------------------------- replication
 
-/// Where a row write goes. Production replicates to a quorum of nodes;
-/// tests apply locally.
-pub trait RowWriter: Send + Sync {
-    /// Writes `record` (or a tombstone at `seq` when `None`) for `key`,
-    /// returning once it is durable on a write quorum.
-    fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String>;
-
-    /// Async form of `write`, for callers that must not block a thread on
-    /// the quorum round trip. The default runs `write` now.
-    fn write_async(&self, key: String, seq: u64, record: Option<MetaRecord>) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(std::future::ready(self.write(&key, seq, record)))
-    }
+/// Bucket rows as last read, each tagged with the generation from before
+/// the read. A watch on `bkt/` bumps the generation after every bucket row
+/// write on this node (local or replicated from a peer), so an entry is
+/// used only while no bucket row has changed since. Saves a lookup and a
+/// decode on every object write.
+struct BucketCache {
+    gen: Arc<std::sync::atomic::AtomicU64>,
+    rows: parking_lot::RwLock<std::collections::HashMap<String, (u64, Option<BucketRow>)>>,
 }
 
-static ROWS: std::sync::OnceLock<Arc<MetaRows>> = std::sync::OnceLock::new();
-
-/// Sets this node's rows, so replicated row writes from peers land in them.
-/// Called once at startup.
-pub fn install_rows(rows: Arc<MetaRows>) {
-    let _ = ROWS.set(rows);
-}
-
-/// This node's rows, once `install_rows` has run.
-pub fn rows() -> Option<Arc<MetaRows>> {
-    ROWS.get().cloned()
-}
-
-/// Replicates row writes to a write quorum of the cluster.
-pub struct ClusterWriter;
-
-impl RowWriter for ClusterWriter {
-    fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String> {
-        let state = super::bridge::state().ok_or("cluster state not installed")?;
-        let peers = state.membership.peers();
-        let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
-        let key = key.to_string();
-        let acked = super::bridge::run(move || async move { super::coordinator::replicate_meta_row(&state, &peers, &key, seq, record).await });
-        if acked < required {
-            return Err(format!("{acked}/{required} nodes stored the row"));
-        }
-        Ok(())
+impl BucketCache {
+    fn watching(rows: &dyn RowStore) -> Self {
+        let gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let g = Arc::clone(&gen);
+        rows.watch("bkt/", Arc::new(move |_| {
+            g.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        Self { gen, rows: Default::default() }
     }
 
-    fn write_async(&self, key: String, seq: u64, record: Option<MetaRecord>) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async move {
-            let state = super::bridge::state().ok_or("cluster state not installed")?;
-            let peers = state.membership.peers();
-            let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
-            let acked = super::coordinator::replicate_meta_row(&state, &peers, &key, seq, record).await;
-            if acked < required {
-                return Err(format!("{acked}/{required} nodes stored the row"));
+    fn get(&self, bucket: &str, load: impl FnOnce() -> Option<BucketRow>) -> Option<BucketRow> {
+        let gen = self.gen.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((g, row)) = self.rows.read().get(bucket) {
+            if *g == gen {
+                return row.clone();
             }
-            Ok(())
-        })
-    }
-}
-
-/// Applies row writes to this node's rows only.
-pub struct LocalWriter(pub Arc<MetaRows>);
-
-impl RowWriter for LocalWriter {
-    fn write(&self, key: &str, seq: u64, record: Option<MetaRecord>) -> Result<(), String> {
-        let res = match record {
-            Some(r) => self.0.put(key.to_string(), r),
-            None => self.0.delete(key.to_string(), seq),
         }
-        .map_err(|e| e.to_string())?;
-        match res {
-            Applied::Yes { .. } => Ok(()),
-            other => Err(format!("row write refused: {other:?}")),
+        let row = load();
+        let mut map = self.rows.write();
+        if map.len() > 10_000 {
+            map.clear();
         }
+        map.insert(bucket.to_string(), (gen, row.clone()));
+        row
     }
 }
 
@@ -360,9 +418,9 @@ impl KeyLocks {
 }
 
 pub struct ReplicatedMetadataStore {
-    rows: Arc<MetaRows>,
-    writer: Box<dyn RowWriter>,
+    rows: MetaRows,
     locks: KeyLocks,
+    buckets: BucketCache,
 }
 
 fn now_iso() -> String {
@@ -383,8 +441,10 @@ fn new_version_id() -> String {
 }
 
 impl ReplicatedMetadataStore {
-    pub fn new(rows: Arc<MetaRows>, writer: Box<dyn RowWriter>) -> Self {
-        Self { rows, writer, locks: KeyLocks::new() }
+    /// The object layer's metadata over the engine's `rows`.
+    pub fn new(rows: Arc<dyn RowStore>) -> Self {
+        let buckets = BucketCache::watching(rows.as_ref());
+        Self { rows: MetaRows::new(rows), locks: KeyLocks::new(), buckets }
     }
 
     fn get(&self, key: &str) -> Option<MetaValue> {
@@ -392,22 +452,21 @@ impl ReplicatedMetadataStore {
     }
 
     fn put(&self, key: &str, value: MetaValue) -> Result<(), Error> {
-        let seq = hlc::now();
-        self.writer.write(key, seq, Some(MetaRecord { seq, value })).map_err(write_err)
+        self.rows.write(key, next_seq(), Some(&value)).map_err(write_err)
     }
 
     fn remove(&self, key: &str) -> Result<(), Error> {
         if self.rows.get(key).is_none() {
             return Ok(());
         }
-        self.writer.write(key, hlc::now(), None).map_err(write_err)
+        self.rows.write(key, next_seq(), None).map_err(write_err)
     }
 
     fn bucket(&self, bucket: &str) -> Option<BucketRow> {
-        match self.get(&bucket_key(bucket)) {
+        self.buckets.get(bucket, || match self.get(&bucket_key(bucket)) {
             Some(MetaValue::Bucket(b)) => Some(b),
             _ => None,
-        }
+        })
     }
 
     /// Read-modify-write of a bucket row. `f` returns what to hand back.
@@ -432,6 +491,19 @@ impl ReplicatedMetadataStore {
             .flatten()
             .collect();
         (!versions.is_empty()).then_some(ObjectRow { versions })
+    }
+
+    /// `object` for a write in `mode`: in a never-versioned bucket the key's
+    /// only version is at `UNVERSIONED_ORDER`, so one point lookup instead of
+    /// a scan.
+    fn object_for_write(&self, mode: Versioning, user: &str, bucket: &str, key: &str) -> Option<ObjectRow> {
+        if mode != Versioning::Disabled {
+            return self.object(user, bucket, key);
+        }
+        match self.get(&version_key(user, bucket, key, UNVERSIONED_ORDER)) {
+            Some(MetaValue::Version(v)) => Some(ObjectRow { versions: vec![v] }),
+            _ => None,
+        }
     }
 
     /// The latest version of a key, found with one lookup.
@@ -459,15 +531,14 @@ impl ReplicatedMetadataStore {
     }
 
     async fn put_async(&self, key: String, value: MetaValue) -> Result<(), String> {
-        let seq = hlc::now();
-        self.writer.write_async(key, seq, Some(MetaRecord { seq, value })).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+        self.rows.write_async(key, next_seq(), Some(&value)).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
     }
 
     async fn remove_async(&self, key: String) -> Result<(), String> {
         if self.rows.get(&key).is_none() {
             return Ok(());
         }
-        self.writer.write_async(key, hlc::now(), None).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
+        self.rows.write_async(key, next_seq(), None).await.map_err(|e| format!("metadata write did not reach quorum: {e}"))
     }
 
     /// The S3 PUT metadata write without blocking a thread: the same rows,
@@ -476,7 +547,7 @@ impl ReplicatedMetadataStore {
         let mode = self.mode(&bucket);
         let (vid, replaced) = {
             let _g = self.locks.lock_async(&versions_prefix(&user, &bucket, &key)).await;
-            let before = self.object(&user, &bucket, &key).unwrap_or_default();
+            let before = self.object_for_write(mode, &user, &bucket, &key).unwrap_or_default();
             let mut after = before.clone();
             let uploads = self.upload_blobs_fn(&user, &bucket);
             let out = put_version(mode, &user, &bucket, &metadata, &mut after, &uploads)?;
@@ -523,11 +594,11 @@ impl ReplicatedMetadataStore {
 
     /// Records `blobs` as dead (a `gc/` row), after whatever dropped them.
     async fn gc_async(&self, blobs: Vec<BlobRef>) -> Result<(), String> {
-        let blobs = super::gc::with_shards(blobs);
+        let blobs = crate::cluster::gc::with_shards(blobs);
         if blobs.is_empty() {
             return Ok(());
         }
-        self.put_async(super::gc::new_key(), MetaValue::Gc(blobs)).await
+        self.release_async(blobs).await
     }
 
     /// The whole S3 DeleteObject metadata write without blocking a thread:
@@ -653,11 +724,11 @@ impl ReplicatedMetadataStore {
 
     /// Records `blobs` as dead (a `gc/` row), after whatever dropped them.
     fn gc(&self, blobs: Vec<BlobRef>) -> Result<(), Error> {
-        let blobs = super::gc::with_shards(blobs);
+        let blobs = crate::cluster::gc::with_shards(blobs);
         if blobs.is_empty() {
             return Ok(());
         }
-        self.put(&super::gc::new_key(), MetaValue::Gc(blobs))
+        self.release(blobs)
     }
 }
 
@@ -678,10 +749,12 @@ fn put_version(mode: Versioning, user_id: &str, bucket: &str, metadata: &Metadat
         _ => (String::new(), o.versions.drain(..).last()),
     };
     meta.version_id = (!vid.is_empty()).then(|| vid.clone());
-    // An unversioned overwrite takes the old version's slot: one row
-    // write, not a new row plus a tombstone.
-    let order = match (mode, &replaced) {
-        (Versioning::Disabled, Some(old)) => old.order,
+    // A never-versioned bucket keeps its one version at order 0
+    // (`UNVERSIONED_ORDER`): an overwrite is one write to the same row, found
+    // with a point lookup. If versioning is enabled later, order 0 sorts
+    // before every new version, as the oldest should.
+    let order = match mode {
+        Versioning::Disabled => UNVERSIONED_ORDER,
         _ => hlc::now(),
     };
     o.versions.push(VersionEntry { order, version_id: vid.clone(), is_delete_marker: false, meta, tags: Vec::new(), parts_manifest: None, blobs });
@@ -775,7 +848,7 @@ impl MetadataStorage for ReplicatedMetadataStore {
             }
             let known: Vec<BlobRef> = o.versions.iter().flat_map(|v| v.blobs.iter().cloned()).collect();
             let blobs = blobs_for(user_id, bucket, &metadata.to_offset_size_list(), &known, &Vec::new).map_err(ErrorInternalServerError)?;
-            o.versions = vec![VersionEntry { order: hlc::now(), version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
+            o.versions = vec![VersionEntry { order: UNVERSIONED_ORDER, version_id: String::new(), is_delete_marker: false, meta: metadata.clone(), tags: Vec::new(), parts_manifest: None, blobs }];
             Ok(())
         })
     }
@@ -1426,12 +1499,14 @@ macro_rules! metadata_store_tests {
     ($name:ident, $kind:expr) => {
         mod $name {
             use super::*;
+            use crate::cluster::meta_engine::MetaEngineKind;
+            use crate::cluster::rows::{LocalRows, NodeRows};
             const KIND: MetaEngineKind = $kind;
 
     fn store() -> (tempfile::TempDir, ReplicatedMetadataStore) {
         let dir = tempfile::tempdir().unwrap();
-        let rows = Arc::new(open_rows(KIND, &dir.path().join("m.log").to_string_lossy()).unwrap());
-        let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
+        let rows = Arc::new(NodeRows::open(KIND, &dir.path().join("m.log").to_string_lossy()).unwrap());
+        let s = ReplicatedMetadataStore::new(Arc::new(LocalRows(rows)));
         (dir, s)
     }
 
@@ -1441,8 +1516,8 @@ macro_rules! metadata_store_tests {
     fn written(size: u64) -> (u64, u64) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
         let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
-        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec!["p".into()], k: 1, m: 0, wire_key: format!("{base:x}"), len: size, inline: None };
-        super::super::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
+        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec!["p".into()], k: 1, m: 0, wire_key: format!("{base:x}"), len: size, zstd_len: None, inline: None };
+        crate::cluster::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
         (base, size)
     }
 
@@ -1463,6 +1538,36 @@ macro_rules! metadata_store_tests {
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().etag.as_deref(), Some("b"));
         assert_eq!(s.list_objects("u", "b").unwrap(), vec!["k".to_string()]);
         assert!(matches!(s.delete_object_v2("u", "b", "k").unwrap(), VersioningDeleteResult::Deleted));
+    }
+
+    /// An inline value of `size` bytes, handed off as a real small PUT does.
+    fn written_inline(size: u64) -> (u64, u64) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 50);
+        let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
+        let inline = Some(crate::cluster::blob_io::InlineBytes(vec![7; size as usize]));
+        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: size, zstd_len: None, inline };
+        crate::cluster::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
+        (base, size)
+    }
+
+    #[test]
+    fn an_unversioned_overwrite_is_one_row_at_order_zero_and_inline_values_leave_no_gc_row() {
+        let (_d, s) = store();
+        s.create_bucket("u", "b").unwrap();
+        let s = Arc::new(s);
+        let put = |size| {
+            let m = Metadata::from_offset_size_list(vec![written_inline(size)]);
+            futures::executor::block_on(Arc::clone(&s).put_object_v2_owned("u".into(), "b".into(), "k".into(), m)).unwrap()
+        };
+        let first = put(10);
+        assert_eq!(first.0, None);
+        let (_, old) = put(20);
+        assert_eq!(old.len(), 1, "the overwrite hands back the old extent");
+        let rows: Vec<String> = s.rows.list_live(&versions_prefix("u", "b", "k"), |k, _| k.to_string());
+        assert_eq!(rows, vec![version_key("u", "b", "k", UNVERSIONED_ORDER)]);
+        assert_eq!(s.get_metadata("u", "b", "k").unwrap().size, 20);
+        let gc: Vec<String> = s.rows.list_live("gc/", |k, _| k.to_string());
+        assert!(gc.is_empty(), "an inline value has nothing on disk to free: {gc:?}");
     }
 
     #[test]
@@ -1646,8 +1751,8 @@ macro_rules! metadata_store_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.log").to_string_lossy().into_owned();
         {
-            let rows = Arc::new(open_rows(KIND, &path).unwrap());
-            let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
+            let rows = Arc::new(NodeRows::open(KIND, &path).unwrap());
+            let s = ReplicatedMetadataStore::new(Arc::new(LocalRows(rows)));
             s.create_bucket("u", "b").unwrap();
             s.put_object_v2("u", "b", "k", &meta(4, "e")).unwrap();
             // An upload's parts are a map keyed by part number.
@@ -1655,8 +1760,8 @@ macro_rules! metadata_store_tests {
             let ext = crate::util::serializer::serialize_offset_size(&vec![written(10)]).unwrap();
             s.upsert_multipart_part("up", 3, "e3", 10, &ext, "").unwrap();
         }
-        let rows = Arc::new(open_rows(KIND, &path).unwrap());
-        let s = ReplicatedMetadataStore::new(Arc::clone(&rows), Box::new(LocalWriter(rows)));
+        let rows = Arc::new(NodeRows::open(KIND, &path).unwrap());
+        let s = ReplicatedMetadataStore::new(Arc::new(LocalRows(rows)));
         assert_eq!(s.get_metadata("u", "b", "k").unwrap().size, 4);
         assert_eq!(s.list_multipart_parts("up").unwrap()[0].part_number, 3);
     }
@@ -1665,6 +1770,32 @@ macro_rules! metadata_store_tests {
 }
 
 #[cfg(test)]
-metadata_store_tests!(tests_bitcask, MetaEngineKind::Bitcask);
+metadata_store_tests!(tests_bitcask, crate::cluster::meta_engine::MetaEngineKind::Bitcask);
 #[cfg(test)]
-metadata_store_tests!(tests_sqlite, MetaEngineKind::Sqlite);
+metadata_store_tests!(tests_sqlite, crate::cluster::meta_engine::MetaEngineKind::Sqlite);
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use crate::cluster::blob_io::{BlobPlacement, InlineBytes};
+
+    #[test]
+    fn a_version_row_with_inline_bytes_round_trips_through_an_engine_row() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let placement = BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: 256, zstd_len: None, inline: Some(InlineBytes(bytes.clone())) };
+        let v = VersionEntry {
+            order: 0,
+            version_id: String::new(),
+            is_delete_marker: false,
+            meta: crate::metadata::Metadata::from_offset_size_list(vec![(7, 256)]),
+            tags: vec![("t".into(), "v".into())],
+            parts_manifest: None,
+            blobs: vec![BlobRef { user_id: "u".into(), bucket: "b".into(), base: 7, placement }],
+        };
+        let value = MetaValue::Version(v);
+        let row = Row { seq: 5, payload: encode(&value) };
+        assert!(row.payload.0.windows(bytes.len()).any(|w| w == bytes.as_slice()), "inline bytes are stored raw");
+        assert_eq!(decode(&row), Some(MetaRecord { seq: 5, value }));
+        assert_eq!(decode(&Row { seq: 1, payload: Payload(vec![0xc1]) }), None, "a payload that doesn't decode reads as absent");
+    }
+}

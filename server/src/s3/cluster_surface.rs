@@ -31,15 +31,15 @@ use std::sync::Arc;
 
 use crate::s3::handlers::common::s3_err;
 
-use super::coordinator::{
+use crate::cluster::coordinator::{
     cluster_abort_multipart_upload_inner, cluster_complete_multipart_upload_inner,
     cluster_create_multipart_upload_inner, cluster_delete_object_inner, cluster_delete_object_tagging_inner,
     cluster_get_object_inner, cluster_get_object_legal_hold, cluster_get_object_retention, cluster_get_object_tagging,
     cluster_list_parts_inner, cluster_put_object_inner, cluster_put_object_legal_hold_inner,
     cluster_put_object_retention_inner, cluster_put_object_tagging_inner, cluster_upload_part_inner, ClusterState,
 };
-use super::location_store::ObjectS3Metadata;
-use super::metadata_store::ClusterMetadataStore;
+use crate::cluster::location_store::ObjectS3Metadata;
+use crate::cluster::metadata_store::ClusterMetadataStore;
 use crate::s3::auth::authenticate_s3_request;
 use crate::s3::handlers::checksum::{compute_checksum, parse_checksum_headers, verify_checksum, ChecksumAlgorithm};
 use crate::s3::handlers::common::{
@@ -115,7 +115,7 @@ pub async fn cluster_s3_head_object(
     state: web::Data<ClusterState>,
 ) -> Result<HttpResponse, Error> {
     let (bucket, key) = path.into_inner();
-    let user_id = super::location_store::UNAUTHENTICATED_USER;
+    let user_id = crate::cluster::location_store::UNAUTHENTICATED_USER;
 
     let (size, etag) = if let Some(record) = state.content_location_store.get(user_id, &bucket, &key) {
         (record.original_len as u64, record.etag)

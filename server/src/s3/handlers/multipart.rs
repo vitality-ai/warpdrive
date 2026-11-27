@@ -195,7 +195,7 @@ pub async fn s3_upload_part_handler(
         .map_err(actix_web::error::ErrorInternalServerError)?];
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
 
-    let etag = format!("\"{}\"", hex::encode(md5::compute(&body).0));
+    let etag = format!("\"{}\"", hex::encode(crate::s3::handlers::common::md5_digest(&body)));
 
     // Parse and verify per-part checksum
     let part_checksum_algo = req.headers().get("x-amz-sdk-checksum-algorithm")
@@ -359,7 +359,7 @@ pub async fn s3_upload_part_copy_handler(
     }
 
     let extents_blob = crate::util::serializer::serialize_offset_size(&offset_size_list)?;
-    let etag = format!("\"{}\"", hex::encode(md5::compute(&part_bytes).0));
+    let etag = format!("\"{}\"", hex::encode(crate::s3::handlers::common::md5_digest(&part_bytes)));
     db.upsert_multipart_part_awaited(&upload_id, part_number_i32, &etag, part_size, &extents_blob, "").await?;
 
     let last_modified = last_modified_now();
@@ -519,7 +519,7 @@ pub async fn s3_complete_multipart_upload_handler(
         }
     }
     let multipart_etag = format!("\"{}-{}\"",
-        hex::encode(md5::compute(&combined_md5_bytes).0),
+        hex::encode(crate::s3::handlers::common::md5_digest(&combined_md5_bytes)),
         total_parts);
 
     let content_type = upload_row.content_type.or_else(|| Some("binary/octet-stream".to_string()));

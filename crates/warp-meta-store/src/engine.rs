@@ -57,6 +57,21 @@ pub trait Engine<V>: Send + Sync {
         }
         Ok(removed)
     }
+    /// `put_if` for many items, durable on return. Item `i` is checked (as
+    /// `check(i, current)`) against the value the items before it left, and
+    /// the accepted ones are written together, so an engine can make the
+    /// whole batch durable with one sync. One result per item, as `put_if`.
+    fn put_many_if<T>(&self, items: Vec<(String, V)>, check: impl Fn(usize, Option<&V>) -> Result<(), T>) -> io::Result<Vec<Result<Option<V>, T>>> {
+        items.into_iter().enumerate().map(|(i, (k, v))| self.put_if(k, v, |c| check(i, c))).collect()
+    }
+    /// `put_many_if` where `check` sees only a head `H` of the current value
+    /// (`head(&v)`), and no replaced values come back. An engine that stores
+    /// values serialized can decode `H` straight from the stored bytes and
+    /// skip the rest of the value.
+    fn put_many_if_head<H: DeserializeOwned, T>(&self, items: Vec<(String, V)>, head: impl Fn(&V) -> H, check: impl Fn(usize, Option<&H>) -> Result<(), T>) -> io::Result<Vec<Result<(), T>>> {
+        let out = self.put_many_if(items, |i, current| check(i, current.map(&head).as_ref()))?;
+        Ok(out.into_iter().map(|r| r.map(|_| ())).collect())
+    }
     /// `f` applied to every entry whose key starts with `prefix`, in key
     /// order, keeping the `Some` results.
     ///

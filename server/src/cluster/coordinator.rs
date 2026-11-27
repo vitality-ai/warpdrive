@@ -71,6 +71,22 @@ pub struct ClusterState {
     /// single-node storage, which a client could write to and then lose
     /// once the join completes and routing switches to the cluster).
     pub configured_for_cluster: bool,
+    /// Whether blob bytes are compressed before they're stored and moved
+    /// (`blob_io::Compression`, `WARPDRIVE_BLOB_COMPRESSION`).
+    pub compression: super::blob_io::Compression,
+    /// How row writes reach other nodes (`meta_batch`: batched, or one
+    /// request per row).
+    pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
+    /// When a row write returns (`RowAck`, `WARPDRIVE_ROW_ACK`).
+    pub row_ack: RowAck,
+    /// A PUT's blob shards travel with its row, one round instead of two
+    /// (on unless `WARPDRIVE_BLOB_WITH_ROW=off`).
+    pub blob_with_row: bool,
+    /// Which blobs the rows reference, from the layer that writes them. Set
+    /// with `rows`. The audit (`reclaim`) frees shards no row needs.
+    pub blob_references: std::sync::OnceLock<Arc<dyn super::reclaim::BlobReferences>>,
+    /// This node's rows (`rows`), set once when the node starts its stores.
+    pub rows: std::sync::OnceLock<Arc<super::rows::NodeRows>>,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
     // both the part bytes and the upload "header" (status, content-type,
     // user-metadata) are ordinary objects through the existing
@@ -148,7 +164,30 @@ fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderVal
         .collect()
 }
 
+/// When a row write returns to its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowAck {
+    /// Once every peer has answered (the default). Every reachable node then
+    /// holds the row, so a read on any node sees it.
+    All,
+    /// Once a write quorum including this node has applied it. Just as
+    /// durable, and this node reads its own writes, but another node can
+    /// see the row a little later.
+    Quorum,
+}
+
+impl RowAck {
+    /// `WARPDRIVE_ROW_ACK=quorum`, else `All`. Read once at startup.
+    pub fn from_env() -> Self {
+        match std::env::var("WARPDRIVE_ROW_ACK") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("quorum") => RowAck::Quorum,
+            _ => RowAck::All,
+        }
+    }
+}
+
 /// How one peer answered a record write.
+#[derive(Clone, Copy, Debug)]
 enum PeerReply {
     Applied,
     /// The peer has a newer write for the key (409, `current_seq`).
@@ -171,17 +210,50 @@ pub(crate) enum RecordOp {
     PutContent(ContentDependentRecord),
     UpdateContent(ContentDependentRecord),
     DeleteContent(DeleteKeyRequest),
-    /// An S3 metadata row (`replicated_metadata`), or its tombstone when
-    /// `record` is `None`.
+    /// An engine row (`rows`), or its tombstone when `payload` is `None`.
     Meta(MetaRowRequest),
 }
 
-/// Body of `/cluster/_internal/meta`: one S3 metadata row write.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Body of `/cluster/_internal/meta`: one row write. The payload is opaque
+/// here: the engine replicates rows without reading them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetaRowRequest {
     pub key: String,
     pub seq: u64,
-    pub record: Option<super::replicated_metadata::MetaRecord>,
+    pub payload: Option<warp_engine::Payload>,
+    /// The shard this peer stores before it acknowledges the row, when the
+    /// row's blob travels with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<warp_engine::Attachment>,
+    /// Every peer's shard, on the sending node only: `send_to_peer` puts
+    /// each peer's own one in `shard`.
+    #[serde(skip)]
+    pub shards: Option<Arc<Vec<warp_engine::Attachment>>>,
+}
+
+/// A shard's `space` on the wire: its user and bucket, length-prefixed so
+/// neither needs escaping.
+pub(crate) fn shard_space(user_id: &str, bucket: &str) -> String {
+    format!("{}:{user_id}:{bucket}", user_id.len())
+}
+
+pub(crate) fn split_space(space: &str) -> Option<(&str, &str)> {
+    let (len, rest) = space.split_once(':')?;
+    let len: usize = len.parse().ok()?;
+    let user = rest.get(..len)?;
+    let bucket = rest.get(len..)?.strip_prefix(':')?;
+    Some((user, bucket))
+}
+
+/// Stores a shard that came with a row on this node, before the row.
+pub(crate) async fn store_attached(shard: Option<warp_engine::Attachment>) -> Result<(), String> {
+    let Some(a) = shard else { return Ok(()) };
+    tokio::task::spawn_blocking(move || {
+        let (user, bucket) = split_space(&a.space).ok_or_else(|| format!("unreadable shard space {:?}", a.space))?;
+        super::shard_storage::store_shard(user, bucket, &a.key, a.index, &a.data.0).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("shard store task failed: {e}"))?
 }
 
 /// How a store answered one record write, without the replaced value.
@@ -204,7 +276,7 @@ impl<R> From<Applied<R>> for OpOutcome {
 impl RecordOp {
     /// Applies the write to this node's stores. Blocking: it waits for the
     /// write to be durable.
-    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore) -> std::io::Result<OpOutcome> {
+    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore, rows: Option<&super::rows::NodeRows>) -> std::io::Result<OpOutcome> {
         Ok(match self {
             RecordOp::PutLocation(r) => loc.put(r)?.into(),
             RecordOp::UpdateLocation(r) => loc.update(r)?.into(),
@@ -213,12 +285,16 @@ impl RecordOp {
             RecordOp::UpdateContent(r) => content.update(r)?.into(),
             RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
             RecordOp::Meta(m) => {
-                let rows = super::replicated_metadata::rows()
-                    .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
-                match m.record {
-                    Some(r) => rows.put(m.key, r)?.into(),
-                    None => rows.delete(m.key, m.seq)?.into(),
+                let rows = rows.ok_or_else(|| std::io::Error::other("this node has no rows (not started as a cluster node)"))?;
+                if let Some(a) = m.shard {
+                    let (user, bucket) = split_space(&a.space).ok_or_else(|| std::io::Error::other("unreadable shard space"))?;
+                    super::shard_storage::store_shard(user, bucket, &a.key, a.index, &a.data.0).map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
+                match m.payload {
+                    Some(payload) => rows.put(m.key, warp_engine::Row { seq: m.seq, payload })?,
+                    None => rows.delete(m.key, m.seq)?,
+                }
+                .into()
             }
         })
     }
@@ -251,9 +327,42 @@ impl RecordOp {
 
 /// Applies `op` on this node, off the async thread.
 async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
-    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
     let label = op.label();
-    match tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await {
+    // A metadata row goes through the commit thread: batched with the other
+    // writes waiting, and awaited without holding a thread.
+    if let RecordOp::Meta(m) = op {
+        let Some(rows) = state.rows.get() else {
+            warn!("{label}: this node has no rows (not started as a cluster node)");
+            return PeerReply::Failed;
+        };
+        if let Err(e) = store_attached(m.shard).await {
+            warn!("{label}: storing its shard on this node failed: {e}");
+            return PeerReply::Failed;
+        }
+        return match rows.commit(m.key, m.seq, m.payload).await {
+            Ok(applied) => match OpOutcome::from(applied) {
+                OpOutcome::Applied => PeerReply::Applied,
+                OpOutcome::Stale(seq) => PeerReply::Stale(seq),
+                OpOutcome::VersionMismatch => PeerReply::Failed,
+            },
+            Err(e) => {
+                warn!("{label}: applying on this node failed: {e}");
+                PeerReply::Failed
+            }
+        };
+    }
+    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
+    // On the multi-threaded cluster runtime the write runs in place, with
+    // the runtime moving this thread's other tasks elsewhere while it
+    // blocks: no hand-off to the blocking pool and back. Elsewhere it goes
+    // to the blocking pool as before.
+    let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let result = if multi {
+        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref(), None)))
+    } else {
+        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref(), None)).await
+    };
+    match result {
         Ok(Ok(OpOutcome::Applied)) => PeerReply::Applied,
         Ok(Ok(OpOutcome::Stale(seq))) => PeerReply::Stale(seq),
         Ok(Ok(OpOutcome::VersionMismatch)) => PeerReply::Failed,
@@ -268,42 +377,123 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     }
 }
 
-/// Sends one write per peer and collects each peer's answer. This node's
-/// own copy is applied directly, not over HTTP: a request to itself would
-/// need a free HTTP worker on this node, and with every worker busy waiting
-/// on replication, there might be none.
-async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() -> RecordOp + Sync)) -> Vec<PeerReply> {
-    let me = self_addr();
-    let requests = peers.iter().map(|peer| {
-        let op = make();
-        let label = op.label();
-        let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
-        let req = (!is_self).then(|| op.request(&state.location_http, peer));
-        async move {
-            let Some(req) = req else {
-                return apply_locally(state, op).await;
-            };
-            match req.send().await {
-                Ok(r) if r.status().is_success() => PeerReply::Applied,
-                Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<StaleReply>().await {
-                    Ok(s) => PeerReply::Stale(s.current_seq),
-                    Err(e) => {
-                        warn!("{label} replication to {peer}: unreadable 409 body: {e}");
-                        PeerReply::Failed
-                    }
-                },
-                Ok(r) => {
-                    warn!("{label} replication to {peer} returned {}", r.status());
-                    PeerReply::Failed
-                }
-                Err(e) => {
-                    warn!("{label} replication to {peer} failed: {e}");
-                    PeerReply::Failed
-                }
-            }
+/// One peer's answer to one write. This node's own copy is applied
+/// directly, not over HTTP: a request to itself would need a free HTTP
+/// worker on this node, and with every worker busy waiting on replication,
+/// there might be none. A row for another peer goes through the row
+/// transport.
+async fn send_to_peer(state: &ClusterState, peer: &str, mut op: RecordOp) -> PeerReply {
+    let label = op.label();
+    if let RecordOp::Meta(m) = &mut op {
+        if let Some(all) = m.shards.take() {
+            let p = peer.trim().trim_end_matches('/');
+            m.shard = all.iter().find(|a| a.peer.trim().trim_end_matches('/') == p).cloned();
         }
-    });
-    join_all(requests).await
+    }
+    let is_self = self_addr().is_some_and(|m| peer.trim().trim_end_matches('/') == m);
+    if is_self {
+        return apply_locally(state, op).await;
+    }
+    if let RecordOp::Meta(m) = op {
+        return match state.row_transport.send(peer, m).await {
+            super::meta_batch::RowReply::Applied => PeerReply::Applied,
+            super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
+            super::meta_batch::RowReply::Failed => PeerReply::Failed,
+        };
+    }
+    match op.request(&state.location_http, peer).send().await {
+        Ok(r) if r.status().is_success() => PeerReply::Applied,
+        Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<StaleReply>().await {
+            Ok(s) => PeerReply::Stale(s.current_seq),
+            Err(e) => {
+                warn!("{label} replication to {peer}: unreadable 409 body: {e}");
+                PeerReply::Failed
+            }
+        },
+        Ok(r) => {
+            warn!("{label} replication to {peer} returned {}", r.status());
+            PeerReply::Failed
+        }
+        Err(e) => {
+            warn!("{label} replication to {peer} failed: {e}");
+            PeerReply::Failed
+        }
+    }
+}
+
+/// Sends one write to every peer and returns the answers it waited for.
+///
+/// With `RowAck::Quorum`, a row write returns as soon as a write quorum
+/// including this node has applied it, with no peer saying it holds
+/// something newer. The other peers' answers arrive in
+/// the background. That's safe for ordering when any two quorums overlap
+/// (2 x quorum > peers): a newer write that already finished is on a
+/// quorum, so an older one can't collect a quorum of applies without
+/// meeting a peer that answers `Stale`, and then this waits for every peer
+/// and restamps as before. Without that overlap, or for other records, it
+/// waits for every peer.
+async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() -> RecordOp + Sync)) -> Vec<PeerReply> {
+    let is_row = matches!(make(), RecordOp::Meta(_));
+    let required = required_write_acks(state.ec.k(), state.ec.m());
+    let quorum_ok = is_row && state.row_ack == RowAck::Quorum && 2 * required > peers.len();
+    let owned = super::bridge::state().filter(|_| quorum_ok);
+    let me = self_addr();
+    let is_me = move |p: &str| me.is_some_and(|m| p.trim().trim_end_matches('/') == m);
+    let need_me = peers.iter().any(|p| is_me(p));
+    let Some(owned) = owned else {
+        let timed = join_all(peers.iter().map(|peer| {
+            let op = make();
+            async move {
+                let started = std::time::Instant::now();
+                let r = send_to_peer(state, peer, op).await;
+                (peer.clone(), r, started.elapsed())
+            }
+        }))
+        .await;
+        if is_row {
+            record_row_round(state, &timed, required);
+        }
+        return timed.into_iter().map(|(_, r, _)| r).collect();
+    };
+    let mut pending: futures::stream::FuturesUnordered<_> = peers
+        .iter()
+        .map(|peer| {
+            let (st, peer, op) = (owned.clone(), peer.clone(), make());
+            super::bridge::spawn(async move {
+                let started = std::time::Instant::now();
+                let r = send_to_peer(&st, &peer, op).await;
+                (peer, r, started.elapsed())
+            })
+        })
+        .collect();
+    use futures::StreamExt;
+    let mut done: Vec<(String, PeerReply, std::time::Duration)> = Vec::with_capacity(peers.len());
+    let mut stale = false;
+    while let Some(joined) = pending.next().await {
+        let (peer, r, d) = joined.unwrap_or_else(|e| (String::new(), { warn!("row write task failed: {e}"); PeerReply::Failed }, std::time::Duration::ZERO));
+        stale |= matches!(r, PeerReply::Stale(_));
+        done.push((peer, r, d));
+        let applied = done.iter().filter(|(_, r, _)| matches!(r, PeerReply::Applied)).count();
+        let mine = !need_me || done.iter().any(|(p, r, _)| is_me(p) && matches!(r, PeerReply::Applied));
+        if applied >= required && mine && !stale && !pending.is_empty() {
+            let replies: Vec<PeerReply> = done.iter().map(|(_, r, _)| r.clone()).collect();
+            // The rest finish on their own. Timing waits for them.
+            super::bridge::spawn(async move {
+                while let Some(Ok(t)) = pending.next().await {
+                    done.push(t);
+                }
+                record_row_round(&owned, &done, required);
+            });
+            return replies;
+        }
+    }
+    record_row_round(state, &done, required);
+    done.into_iter().map(|(_, r, _)| r).collect()
+}
+
+fn record_row_round(state: &ClusterState, timed: &[(String, PeerReply, std::time::Duration)], required: usize) {
+    let replies: Vec<(&str, bool, std::time::Duration)> = timed.iter().map(|(p, r, d)| (p.as_str(), matches!(r, PeerReply::Applied), *d)).collect();
+    state.timing.row.record(&replies, required);
 }
 
 /// Rounds of restamp-and-resend before an ordered write gives up.
@@ -369,15 +559,17 @@ fn delete_req(user_id: &str, bucket: &str, key: &str, seq: u64) -> DeleteKeyRequ
     DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq }
 }
 
-/// Replicates an S3 metadata row write (a tombstone when `record` is
-/// `None`) to every peer. Returns how many stored it.
-pub(crate) async fn replicate_meta_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, record: Option<super::replicated_metadata::MetaRecord>) -> usize {
+/// Replicates a row write (a tombstone when `payload` is `None`) to every
+/// peer. Returns how many stored it.
+pub(crate) async fn replicate_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, payload: Option<warp_engine::Payload>) -> usize {
+    replicate_row_with(state, peers, key, seq, payload, None).await
+}
+
+/// `replicate_row`, each peer also storing its shard from `shards` before
+/// it acknowledges.
+pub(crate) async fn replicate_row_with(state: &ClusterState, peers: &[String], key: &str, seq: u64, payload: Option<warp_engine::Payload>, shards: Option<Arc<Vec<warp_engine::Attachment>>>) -> usize {
     replicate_ordered(state, peers, seq, |seq| {
-        let record = record.clone().map(|mut r| {
-            r.seq = seq;
-            r
-        });
-        RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, record })
+        RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, payload: payload.clone(), shard: None, shards: shards.clone() })
     })
     .await
 }
@@ -1154,7 +1346,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
 
     // Same composite-ETag formula single-node's CompleteMultipartUpload
     // uses: md5 of the concatenated per-part md5 bytes, dash, part count.
-    let final_etag = format!("\"{}-{}\"", hex::encode(md5::compute(&combined_md5_bytes).0), requested.len());
+    let final_etag = format!("\"{}-{}\"", hex::encode(crate::digest::md5_digest(&combined_md5_bytes)), requested.len());
     let total_size = body.len() as u64;
 
     // Checksum on by default here too, same reasoning (and same CRC32C
@@ -1166,7 +1358,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
         content_type: meta_record.content_type.clone(),
-        last_modified: Some(super::s3_surface::now_http_date()),
+        last_modified: Some(crate::s3::cluster_surface::now_http_date()),
         user_metadata: meta_record.user_metadata.clone(),
         checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
         checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
@@ -1218,7 +1410,11 @@ async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, b
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
-    let body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    let mut body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    body.push_str(&crate::phase_timing::S3_PUT.summary());
+    if let Some(v) = state.compression.view() {
+        body.push_str(&format!("compression={v}\n"));
+    }
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
@@ -1314,7 +1510,7 @@ pub(crate) async fn cluster_get_object_inner(
         // now also surfaced on the actual GET response.
         let etag = record.etag.clone();
         let content_type = record.content_type.clone();
-        let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+        let last_modified = record.last_modified.clone().unwrap_or_else(crate::s3::cluster_surface::now_http_date);
         let user_metadata = record.user_metadata.clone();
         let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
         let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
@@ -1381,7 +1577,7 @@ pub(crate) async fn cluster_get_object_inner(
     let total_len = record.original_len as u64;
     let etag = record.etag.clone();
     let content_type = record.content_type.clone();
-    let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+    let last_modified = record.last_modified.clone().unwrap_or_else(crate::s3::cluster_surface::now_http_date);
     let user_metadata = record.user_metadata.clone();
     let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
 
@@ -1982,7 +2178,7 @@ pub async fn cluster_internal_put_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::PutContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -1998,7 +2194,7 @@ pub async fn cluster_internal_update_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::UpdateContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2017,7 +2213,7 @@ pub async fn cluster_internal_put_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::PutLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2034,7 +2230,7 @@ pub async fn cluster_internal_update_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::UpdateLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2077,7 +2273,7 @@ pub async fn cluster_internal_delete_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::DeleteLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2094,7 +2290,7 @@ pub async fn cluster_internal_delete_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::DeleteContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2127,6 +2323,15 @@ pub async fn cluster_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shard_space_splits_back_into_user_and_bucket() {
+        for (u, b) in [("u", "b"), ("a:b", "c"), ("", "x"), ("user", "with:colons:too")] {
+            assert_eq!(split_space(&shard_space(u, b)), Some((u, b)));
+        }
+        assert_eq!(split_space("5:ab"), None);
+        assert_eq!(split_space("x:u:b"), None);
+    }
 
     fn record_with_inline(inline_data: Option<String>) -> LocationRecord {
         serde_json::from_value(serde_json::json!({
@@ -2272,15 +2477,11 @@ mod tests {
 }
 
 /// Receiving side of S3 metadata row replication.
-pub async fn cluster_internal_meta_row(
-    body: web::Json<MetaRowRequest>,
-    state: web::Data<ClusterState>,
-) -> Result<HttpResponse, Error> {
-    let op = RecordOp::Meta(body.into_inner());
-    let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
-        .map_err(ErrorInternalServerError)?;
-    Ok(outcome_response(outcome))
+pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>, state: web::Data<ClusterState>) -> Result<HttpResponse, Error> {
+    // Through the commit thread, batched with this node's other row writes.
+    let m = body.into_inner();
+    let rows = state.rows.get().ok_or_else(|| ErrorInternalServerError("this node has no rows (not started as a cluster node)"))?;
+    store_attached(m.shard).await.map_err(ErrorInternalServerError)?;
+    let applied = rows.commit(m.key, m.seq, m.payload).await.map_err(ErrorInternalServerError)?;
+    Ok(outcome_response(applied.into()))
 }

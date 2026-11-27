@@ -773,6 +773,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1895,10 +1904,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
-name = "md5"
-version = "0.7.0"
+name = "md-5"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+ "md5-asm",
+]
+
+[[package]]
+name = "md5-asm"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d19b8ee7fc7d812058d3b708c7f719efd0713d53854648e4223c6fcae709e2df"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "memchr"
@@ -2479,6 +2502,8 @@ version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7263373d500d4d4f505d43a2a662d475a894aa94503a1ee28e9188b5f3960d4f"
 dependencies = [
+ "cc",
+ "libc",
  "libm",
  "lru",
  "parking_lot 0.11.2",
@@ -2574,6 +2599,25 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
 ]
 
 [[package]]
@@ -3363,11 +3407,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "warp-meta-store",
+]
+
+[[package]]
+name = "warp-frontend"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+]
+
+[[package]]
+name = "warp-frontend-redis"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "tokio",
+ "warp-frontend",
+]
+
+[[package]]
 name = "warp-meta-store"
 version = "0.1.0"
 dependencies = [
  "log",
  "parking_lot 0.12.5",
+ "rmp-serde",
  "serde",
  "serde_json",
 ]
@@ -3404,6 +3474,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc",
+ "crc32c",
  "crc32fast",
  "criterion",
  "dotenvy",
@@ -3419,7 +3490,7 @@ dependencies = [
  "log",
  "log-mdc",
  "log4rs",
- "md5",
+ "md-5",
  "parking_lot 0.12.5",
  "percent-encoding",
  "prost",
@@ -3427,6 +3498,7 @@ dependencies = [
  "rand 0.8.8",
  "reed-solomon-erasure",
  "reqwest",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3436,9 +3508,13 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
+ "warp-engine",
+ "warp-frontend",
+ "warp-frontend-redis",
  "warp-meta-store",
  "warp-meta-store-rocksdb",
  "warp-meta-store-sqlite",
+ "zstd",
 ]
 
 [[package]]

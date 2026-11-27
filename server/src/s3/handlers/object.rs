@@ -31,6 +31,7 @@ pub async fn s3_put_object_handler(
     mut payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    let put_started = std::time::Instant::now();
     if let Ok(query) = web::Query::<HashMap<String, String>>::from_query(req.query_string()) {
         if req.headers().contains_key("x-amz-copy-source")
             && query.contains_key("partNumber")
@@ -173,7 +174,13 @@ pub async fn s3_put_object_handler(
 
     let store = crate::storage::object_store();
     let mut offset_size_list: Vec<(u64, u64)> = Vec::new();
-    let mut body_buf: Vec<u8> = Vec::new();
+    // Sized from the request up front, so the body isn't copied again each
+    // time the buffer grows. Capped: the header is the client's word.
+    let expected = ["x-amz-decoded-content-length", "content-length"]
+        .iter()
+        .find_map(|h| req.headers().get(*h).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or(0);
+    let mut body_buf: Vec<u8> = Vec::with_capacity(expected.min(256 << 20));
 
     while let Some(chunk_result) = payload.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -185,20 +192,36 @@ pub async fn s3_put_object_handler(
         body_buf.extend_from_slice(&chunk);
     }
 
+    let body_read = std::time::Instant::now();
+    crate::phase_timing::S3_PUT.body.record(body_read - put_started);
     // One write for the whole body, not one per network chunk. The body is
     // already buffered for the ETag, so this costs no extra memory, and on
     // a cluster each write is a full erasure-coded round with its own
     // replicated record: a 1 MB body used to take 20 or more of them.
-    if !body_buf.is_empty() {
+    // The hashes the PUT needs (MD5 for the ETag and Content-MD5, and CRC32C
+    // unless the client sent its own checksum) run on the blocking pool while
+    // the store encodes and sends its copy of the body, instead of after.
+    let want_default_crc = parse_checksum_headers(&req).is_none();
+    let shared = Arc::new(body_buf);
+    let hashing = {
+        let b = Arc::clone(&shared);
+        web::block(move || {
+            let md5 = crate::s3::handlers::common::md5_digest(&b);
+            let crc = want_default_crc.then(|| compute_checksum(&ChecksumAlgorithm::Crc32c, &b));
+            (md5, crc)
+        })
+    };
+    if !shared.is_empty() {
+        let body_buf = &shared;
         let ctx = context.clone();
         let store_c = Arc::clone(&store);
-        let buf = body_buf.clone();
+        let buf = body_buf.to_vec();
         // A store that writes over the network (the cluster) is awaited
         // here. One that writes to local disk goes to the blocking pool.
         let written = match store_c.write_async(&ctx.user_id, &ctx.bucket, buf) {
             Some(fut) => fut.await,
             None => {
-                let buf = body_buf.clone();
+                let buf = body_buf.to_vec();
                 web::block(move || store_c.write(&ctx.user_id, &ctx.bucket, &buf).map_err(|e| e.to_string()))
                     .await
                     .map_err(|e| {
@@ -213,9 +236,16 @@ pub async fn s3_put_object_handler(
         })?;
         offset_size_list.push(pair);
     }
+    crate::phase_timing::S3_PUT.blob.record(body_read.elapsed());
+    let (body_md5, default_crc) = hashing.await.map_err(|e| {
+        error!("PutObject: hashing task failed bucket={} key={}: {:?}", bucket, key, e);
+        actix_web::error::ErrorInternalServerError("hashing task failed")
+    })?;
+    // The hashing task has finished, so this is the only reference: no copy.
+    let body_buf = Arc::try_unwrap(shared).unwrap_or_else(|a| (*a).clone());
 
     let size = body_buf.len() as u64;
-    let etag = md5_etag(&body_buf);
+    let etag = format!("\"{}\"", hex::encode(body_md5));
     let last_modified = last_modified_now();
 
     if let Some(raw) = req.headers().get("content-md5").and_then(|v| v.to_str().ok()) {
@@ -228,7 +258,6 @@ pub async fn s3_put_object_handler(
         use base64::Engine as _;
         match base64::engine::general_purpose::STANDARD.decode(raw) {
             Ok(decoded) if decoded.len() == 16 => {
-                let body_md5 = md5::compute(&body_buf).0;
                 if decoded.as_slice() != &body_md5 {
                     return Ok(s3_error(StatusCode::BAD_REQUEST, "BadDigest",
                                        "The Content-MD5 you specified did not match what we received.",
@@ -266,7 +295,7 @@ pub async fn s3_put_object_handler(
     // given instead of being overridden by a second, redundant one.
     let checksum_result = match checksum_result {
         Some(r) => Some(r),
-        None => Some((ChecksumAlgorithm::Crc32c, compute_checksum(&ChecksumAlgorithm::Crc32c, &body_buf))),
+        None => Some((ChecksumAlgorithm::Crc32c, default_crc.unwrap_or_else(|| compute_checksum(&ChecksumAlgorithm::Crc32c, &body_buf)))),
     };
 
     let mut metadata = Metadata::from_offset_size_list(offset_size_list);
@@ -284,7 +313,9 @@ pub async fn s3_put_object_handler(
         // For simple (non-multipart) objects, checksum_type is not set (leave None)
     }
 
+    let meta_started = std::time::Instant::now();
     let (version_id, old_extents) = db.put_object_full_async(&bucket, &key, metadata).await?;
+    crate::phase_timing::S3_PUT.meta.record(meta_started.elapsed());
     if !old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &old_extents).ok();
     }
@@ -358,6 +389,7 @@ pub async fn s3_put_object_handler(
         let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
         resp.insert_header((header_name, value.clone()));
     }
+    crate::phase_timing::S3_PUT.total.record(put_started.elapsed());
     Ok(resp.insert_header(("Content-Length", "0")).body(""))
 }
 

@@ -30,7 +30,7 @@ use warp_drive::cluster::coordinator::{
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
-use warp_drive::cluster::s3_surface::{
+use warp_drive::s3::cluster_surface::{
     cluster_s3_delete_object_authenticated, cluster_s3_delete_objects_authenticated,
     cluster_s3_get_object_authenticated,
     cluster_s3_head_object, cluster_s3_head_object_authenticated,
@@ -89,33 +89,45 @@ fn peer_client_from_env() -> Arc<dyn PeerClient> {
         _ => ("grpc", Arc::new(GrpcPeerClient::new())),
     };
     info!("Peer transport: {name}");
-    client
+
+    use warp_drive::cluster::peer_client::{DiskShards, LocalFirst};
+    let me = std::env::var("WARPDRIVE_SELF_ADDR").ok().filter(|a| !a.trim().is_empty());
+    Arc::new(LocalFirst::new(client, Arc::new(DiskShards), me.as_deref()))
 }
 
-/// Which engine should answer `/s3/...` (and root `/{bucket}/...`) for
-/// this request. Three states, not two: a node can be configured for a
-/// cluster (`WARPDRIVE_PEERS` or `WARPDRIVE_JOIN_VIA` given at startup --
-/// `ClusterState::configured_for_cluster`) and still have no peers yet,
-/// either because a dynamic join (`WARPDRIVE_JOIN_VIA`/`WARPDRIVE_SELF_ADDR`)
-/// hasn't completed, or because it failed outright and never will.
-/// Silently falling back to single-node storage in that window would let
-/// a client write successfully, then lose that write the moment the join
-/// does complete and routing switches to the cluster -- so a
-/// configured-but-not-ready node must reject the request instead, not
-/// quietly serve it from the wrong engine.
+/// Whether this node can serve `/s3/...` (and root `/{bucket}/...`) yet.
+/// Every node runs the cluster engine (a single node is a one-member
+/// cluster), but a node joining through `WARPDRIVE_JOIN_VIA` has no peers
+/// until the join completes, or ever if it fails. It rejects requests
+/// meanwhile, so no write lands somewhere it would later be lost.
 enum Engine {
-    SingleNode,
-    Distributed,
+    Ready,
     NotReady,
 }
 
+/// The front ends besides S3, each in its own crate behind
+/// `warp_frontend::FrontEnd`, all over the object layer. One that's
+/// configured but can't start is logged and left off: S3 still serves.
+fn start_front_ends(one_node: bool) {
+    use warp_frontend::{FrontEnd, ObjectService};
+    let objects: Arc<dyn ObjectService> = Arc::new(warp_drive::object_layer::ObjectLayer);
+    let mut front_ends: Vec<Box<dyn FrontEnd>> = Vec::new();
+    if let Some(config) = warp_frontend_redis::RedisConfig::from_env(one_node, warp_drive::identity::ADMIN_USER_ID) {
+        front_ends.push(Box::new(warp_frontend_redis::Redis { config }));
+    }
+    for f in front_ends {
+        let name = f.name().to_string();
+        if let Err(e) = f.start(Arc::clone(&objects)) {
+            log::error!("{name} front end not started: {e}");
+        }
+    }
+}
+
 fn pick_engine(state: &ClusterState) -> Engine {
-    if !state.membership.peers().is_empty() {
-        Engine::Distributed
-    } else if state.configured_for_cluster {
+    if state.membership.peers().is_empty() {
         Engine::NotReady
     } else {
-        Engine::SingleNode
+        Engine::Ready
     }
 }
 
@@ -182,7 +194,7 @@ async fn s3_put_object_dispatch(
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::NotReady => Err(not_ready_error()),
-        Engine::Distributed | Engine::SingleNode => s3_put_object_handler(path, payload, req).await,
+        Engine::Ready => s3_put_object_handler(path, payload, req).await,
     }
 }
 
@@ -193,7 +205,7 @@ async fn s3_get_object_dispatch(
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::NotReady => Err(not_ready_error()),
-        Engine::Distributed | Engine::SingleNode => s3_get_object_handler(path, req).await,
+        Engine::Ready => s3_get_object_handler(path, req).await,
     }
 }
 
@@ -204,7 +216,7 @@ async fn s3_delete_object_dispatch(
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::NotReady => Err(not_ready_error()),
-        Engine::Distributed | Engine::SingleNode => s3_delete_object_handler(path, req).await,
+        Engine::Ready => s3_delete_object_handler(path, req).await,
     }
 }
 
@@ -215,7 +227,7 @@ async fn s3_head_object_dispatch(
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::NotReady => Err(not_ready_error()),
-        Engine::Distributed | Engine::SingleNode => s3_head_object_handler(path, req).await,
+        Engine::Ready => s3_head_object_handler(path, req).await,
     }
 }
 
@@ -235,7 +247,7 @@ async fn s3_list_objects_dispatch(
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::NotReady => Err(not_ready_error()),
-        Engine::Distributed | Engine::SingleNode => s3_list_objects_handler(path, query, req).await,
+        Engine::Ready => s3_list_objects_handler(path, query, req).await,
     }
 }
 
@@ -248,7 +260,7 @@ async fn s3_multipart_dispatch(
 ) -> Result<HttpResponse, Error> {
     match pick_engine(&cluster_state) {
         Engine::NotReady => Err(not_ready_error()),
-        Engine::Distributed | Engine::SingleNode => s3_multipart_router(path, query, payload, req).await,
+        Engine::Ready => s3_multipart_router(path, query, payload, req).await,
     }
 }
 
@@ -278,14 +290,16 @@ async fn s3_post_bucket_dispatch(
 /// (`WARPDRIVE_META_LOG`) and erasure-coded object bytes, with address
 /// reservations in `WARPDRIVE_BLOB_ALLOC_LOG`.
 fn install_cluster_stores(state: &web::Data<ClusterState>) {
-    use warp_drive::cluster::{blob_store::ClusterBlobStore, bridge, replicated_metadata};
+    use warp_drive::cluster::{blob_store::ClusterBlobStore, bridge, rows};
+    use warp_drive::object_layer::metadata::ReplicatedMetadataStore;
     bridge::install(web::Data::clone(state));
     let engine = warp_drive::cluster::meta_engine::MetaEngineKind::from_env().unwrap_or_else(|e| panic!("{e}"));
     let meta_log = std::env::var("WARPDRIVE_META_LOG").unwrap_or_else(|_| engine.default_path());
     engine.refuse_other_engines_data("cluster_metadata", &meta_log).unwrap_or_else(|e| panic!("{e}"));
-    let rows = Arc::new(replicated_metadata::open_rows(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the S3 metadata store: {e}")));
-    replicated_metadata::install_rows(Arc::clone(&rows));
-    let meta = replicated_metadata::ReplicatedMetadataStore::new(rows, Box::new(replicated_metadata::ClusterWriter));
+    let node_rows = Arc::new(rows::NodeRows::open(engine, &meta_log).unwrap_or_else(|e| panic!("failed to open the row store: {e}")));
+    let _ = state.rows.set(Arc::clone(&node_rows));
+    let _ = state.blob_references.set(Arc::new(warp_drive::object_layer::metadata::MetadataBlobRefs));
+    let meta = ReplicatedMetadataStore::new(Arc::new(rows::ClusterRows(node_rows)));
     warp_drive::service::metadata_service::set_metadata_store(Arc::new(meta));
     let alloc_log = std::env::var("WARPDRIVE_BLOB_ALLOC_LOG").unwrap_or_else(|_| "blob_alloc.log".to_string());
     let blobs = ClusterBlobStore::open(&alloc_log).unwrap_or_else(|e| panic!("failed to start the cluster object store: {e}"));
@@ -363,6 +377,37 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
             m
         },
+        compression: {
+            let c = warp_drive::cluster::blob_io::Compression::from_env();
+            if let Some(how) = c.describe() {
+                info!("Blob bytes are compressed {how}");
+            }
+            c
+        },
+        // Rows to other nodes: batched unless WARPDRIVE_META_BATCH=off.
+        row_transport: warp_drive::cluster::meta_batch::from_env(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .build()
+                .expect("building the row transport's HTTP client"),
+        ),
+        row_ack: {
+            let a = warp_drive::cluster::coordinator::RowAck::from_env();
+            if a == warp_drive::cluster::coordinator::RowAck::Quorum {
+                info!("Row writes return once a write quorum including this node has them (WARPDRIVE_ROW_ACK=quorum)");
+            }
+            a
+        },
+        blob_with_row: {
+            let on = !std::env::var("WARPDRIVE_BLOB_WITH_ROW").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+            if !on {
+                info!("A PUT writes its shards, then its row (WARPDRIVE_BLOB_WITH_ROW=off)");
+            }
+            on
+        },
+        blob_references: Default::default(),
+        rows: Default::default(),
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
             || std::env::var("WARPDRIVE_JOIN_VIA").is_ok(),
     };
@@ -380,6 +425,48 @@ fn build_cluster_state() -> web::Data<ClusterState> {
     web::Data::new(state)
 }
 
+/// A node started with no peers (neither `WARPDRIVE_PEERS` nor
+/// `WARPDRIVE_JOIN_VIA`) is a one-member cluster: its own address is its only
+/// peer and its layout defaults to RS(1,0). It then runs exactly the cluster's
+/// code (replicated metadata, the shard index, gc/ rows and compaction,
+/// lifecycle), so there is one engine, not a separate single-node one. Set
+/// `WARPDRIVE_RS_K`/`WARPDRIVE_RS_M` to choose another layout, and
+/// `WARPDRIVE_SELF_ADDR` if other processes reach the node by another name.
+/// Called before any thread starts.
+fn single_node_as_one_member_cluster(port: u16) {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    if set("WARPDRIVE_PEERS") || set("WARPDRIVE_JOIN_VIA") {
+        return;
+    }
+    let me = std::env::var("WARPDRIVE_SELF_ADDR").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+    std::env::set_var("WARPDRIVE_SELF_ADDR", &me);
+    std::env::set_var("WARPDRIVE_PEERS", &me);
+    if !set("WARPDRIVE_RS_K") && !set("WARPDRIVE_RS_M") {
+        std::env::set_var("WARPDRIVE_RS_K", "1");
+        std::env::set_var("WARPDRIVE_RS_M", "0");
+    }
+    info!("No peers configured: a one-member cluster at {me}, RS({},{})", std::env::var("WARPDRIVE_RS_K").unwrap_or_default(), std::env::var("WARPDRIVE_RS_M").unwrap_or_default());
+    refuse_old_single_node_data();
+}
+
+/// Refuses to start a single node next to data written by the old
+/// single-node engine (a SQLite database, `DB_FILE` or
+/// `metadata/metadata.sqlite`), when this node has no cluster metadata yet:
+/// it would otherwise come up empty beside the old objects. The cluster
+/// engine never creates that file. There's no migration (beta).
+fn refuse_old_single_node_data() {
+    let old = std::env::var("DB_FILE").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "metadata/metadata.sqlite".to_string());
+    let kind = warp_drive::cluster::meta_engine::MetaEngineKind::from_env().unwrap_or(warp_drive::cluster::meta_engine::MetaEngineKind::Rocksdb);
+    let new = std::env::var("WARPDRIVE_META_LOG").unwrap_or_else(|_| kind.default_path());
+    if std::path::Path::new(&old).exists() && !std::path::Path::new(&new).exists() {
+        panic!(
+            "{old} holds data from the old single-node engine. A single node now runs the cluster engine (a one-member \
+             cluster, RS(1,0)) and there is no migration in the beta: move {old} and the storage directory away to start \
+             empty, or keep running the previous release to read that data."
+        );
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
@@ -391,6 +478,9 @@ async fn main() -> std::io::Result<()> {
         Err(e) => warn!("could not raise the open-file limit: {e}"),
     }
     let port: u16 = std::env::var("WARPDRIVE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9710);
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    let one_node = !set("WARPDRIVE_PEERS") && !set("WARPDRIVE_JOIN_VIA");
+    single_node_as_one_member_cluster(port);
     // Informational only -- the real per-request decision (`distributed_mode`,
     // below) is made from live membership, not this startup snapshot. A
     // join-only node (WARPDRIVE_JOIN_VIA set, no WARPDRIVE_PEERS) starts
@@ -466,6 +556,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    start_front_ends(one_node);
     // Raw-TCP+FlatBuffers shard server, on port+2000 — the third transport
     // candidate, also always running regardless of which PeerClient is
     // selected for outbound calls.
@@ -505,6 +596,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_internal/location", web::post().to(cluster_internal_put_location))
             .route("/cluster/_internal/content_location", web::post().to(cluster_internal_put_content_location))
             .route("/cluster/_internal/meta", web::post().to(cluster_internal_meta_row))
+            .route("/cluster/_internal/meta_batch", web::post().to(warp_drive::cluster::meta_batch::cluster_internal_meta_batch))
             .route("/cluster/_internal/reclaim/check", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_check))
             .route("/cluster/_internal/reclaim/report", web::post().to(warp_drive::cluster::reclaim::cluster_internal_reclaim_report))
             .route("/cluster/_internal/gc/run", web::post().to(warp_drive::cluster::gc::cluster_internal_gc_run))
@@ -520,7 +612,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
             .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
             .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
-            // Minimal S3-protocol surface (s3_surface.rs) — a distinct "s3/" prefix
+            // Minimal S3-protocol surface (s3/cluster_surface.rs) — a distinct "s3/" prefix
             // so it never collides with the generic {bucket}/{key:.*} routes
             // below. Phase 3: PUT/GET/DELETE/HEAD here now go through
             // authenticate_s3_request (same SigV4 verification single-node
