@@ -16,6 +16,7 @@ pub mod peer_client;
 pub mod grpc_peer_client;
 pub mod tcp_peer_client;
 pub mod bridge;
+pub mod adaptive;
 pub mod blob_io;
 pub mod blob_store;
 pub mod rows;

@@ -89,6 +89,7 @@ fn peer_client_from_env() -> Arc<dyn PeerClient> {
         _ => ("grpc", Arc::new(GrpcPeerClient::new())),
     };
     info!("Peer transport: {name}");
+
     use warp_drive::cluster::peer_client::{DiskShards, LocalFirst};
     let me = std::env::var("WARPDRIVE_SELF_ADDR").ok().filter(|a| !a.trim().is_empty());
     Arc::new(LocalFirst::new(client, Arc::new(DiskShards), me.as_deref()))
@@ -375,6 +376,13 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             let mut m: std::collections::HashMap<String, Arc<dyn ColumnCodec>> = std::collections::HashMap::new();
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
             m
+        },
+        compression: {
+            let c = warp_drive::cluster::blob_io::Compression::from_env();
+            if let Some(how) = c.describe() {
+                info!("Blob bytes are compressed {how}");
+            }
+            c
         },
         // Rows to other nodes: batched unless WARPDRIVE_META_BATCH=off.
         row_transport: warp_drive::cluster::meta_batch::from_env(

@@ -220,7 +220,7 @@ async fn main() {
     let duration = Duration::from_secs(args[5].parse().unwrap());
     let payload_bytes: usize = args[6].parse().unwrap();
     let host = url.trim_start_matches("http://").trim_start_matches("https://").to_string();
-    let payload = Arc::new(vec![0xCDu8; payload_bytes]);
+    let payload = Arc::new(make_payload(&std::env::var("S3B_DATA").unwrap_or_default(), payload_bytes));
 
     // Create the bucket (ignore "already exists").
     {
@@ -254,4 +254,45 @@ fn stamp(unix_secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z")
+}
+
+/// The bytes every PUT sends. `S3B_DATA`: unset or `const` for one repeated
+/// byte (compresses over a thousand times, unlike real data), `random` for
+/// bytes that don't compress, `text` for JSON-lines records that zstd
+/// compresses about 3 to 5 times, like logs or exported tables.
+fn make_payload(kind: &str, n: usize) -> Vec<u8> {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    match kind {
+        "random" => (0..n).map(|_| next() as u8).collect(),
+        "text" => {
+            const WORDS: [&str; 16] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa"];
+            let mut out = Vec::with_capacity(n + 128);
+            let mut i = 0u64;
+            while out.len() < n {
+                let r = next();
+                out.extend_from_slice(
+                    format!(
+                        "{{\"id\":{i},\"user\":\"u{}\",\"event\":\"{}\",\"tag\":\"{}\",\"amount\":{}.{:02},\"ts\":{}}}\n",
+                        r % 5000,
+                        WORDS[(r >> 16) as usize % 16],
+                        WORDS[(r >> 24) as usize % 16],
+                        (r >> 32) % 10000,
+                        (r >> 48) % 100,
+                        1_700_000_000_000 + i * 37
+                    )
+                    .as_bytes(),
+                );
+                i += 1;
+            }
+            out.truncate(n);
+            out
+        }
+        _ => vec![0xCDu8; n],
+    }
 }

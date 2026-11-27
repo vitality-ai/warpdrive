@@ -71,6 +71,9 @@ pub struct ClusterState {
     /// single-node storage, which a client could write to and then lose
     /// once the join completes and routing switches to the cluster).
     pub configured_for_cluster: bool,
+    /// Whether blob bytes are compressed before they're stored and moved
+    /// (`blob_io::Compression`, `WARPDRIVE_BLOB_COMPRESSION`).
+    pub compression: super::blob_io::Compression,
     /// How row writes reach other nodes (`meta_batch`: batched, or one
     /// request per row).
     pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
@@ -1260,7 +1263,10 @@ async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, b
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
-    let body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    let mut body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    if let Some(v) = state.compression.view() {
+        body.push_str(&format!("compression={v}\n"));
+    }
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 

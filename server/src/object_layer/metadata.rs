@@ -1506,7 +1506,7 @@ macro_rules! metadata_store_tests {
     fn written(size: u64) -> (u64, u64) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
         let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
-        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec!["p".into()], k: 1, m: 0, wire_key: format!("{base:x}"), len: size, inline: None };
+        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec!["p".into()], k: 1, m: 0, wire_key: format!("{base:x}"), len: size, zstd_len: None, inline: None };
         crate::cluster::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
         (base, size)
     }
@@ -1535,7 +1535,7 @@ macro_rules! metadata_store_tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 50);
         let base = NEXT.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
         let inline = Some(crate::cluster::blob_io::InlineBytes(vec![7; size as usize]));
-        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: size, inline };
+        let placement = crate::cluster::blob_io::BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: size, zstd_len: None, inline };
         crate::cluster::blob_store::hand_off(BlobRef { user_id: "u".into(), bucket: "b".into(), base, placement });
         (base, size)
     }
@@ -1772,7 +1772,7 @@ mod payload_tests {
     #[test]
     fn a_version_row_with_inline_bytes_round_trips_through_an_engine_row() {
         let bytes: Vec<u8> = (0..=255).collect();
-        let placement = BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: 256, inline: Some(InlineBytes(bytes.clone())) };
+        let placement = BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: 256, zstd_len: None, inline: Some(InlineBytes(bytes.clone())) };
         let v = VersionEntry {
             order: 0,
             version_id: String::new(),

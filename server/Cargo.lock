@@ -3514,6 +3514,7 @@ dependencies = [
  "warp-meta-store",
  "warp-meta-store-rocksdb",
  "warp-meta-store-sqlite",
+ "zstd",
 ]
 
 [[package]]
