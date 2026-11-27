@@ -30,7 +30,7 @@ use warp_drive::cluster::coordinator::{
     cluster_timing_stats, cluster_shard_server_timing, cluster_grpc_client_timing, ClusterState,
 };
 use warp_drive::cluster::pushdown::{cluster_pushdown_query, cluster_internal_pushdown_filter, ColumnCodec, ZlibF64Codec};
-use warp_drive::cluster::s3_surface::{
+use warp_drive::s3::cluster_surface::{
     cluster_s3_delete_object_authenticated, cluster_s3_delete_objects_authenticated,
     cluster_s3_get_object_authenticated,
     cluster_s3_head_object, cluster_s3_head_object_authenticated,
@@ -590,7 +590,7 @@ async fn main() -> std::io::Result<()> {
             .route("/cluster/_admin/bucket_config/{bucket}", web::put().to(cluster_put_bucket_config))
             .route("/cluster/{bucket}/{key:.*}/retention", web::put().to(cluster_put_retention))
             .route("/cluster/{bucket}/{key:.*}/query", web::post().to(cluster_pushdown_query))
-            // Minimal S3-protocol surface (s3_surface.rs) — a distinct "s3/" prefix
+            // Minimal S3-protocol surface (s3/cluster_surface.rs) — a distinct "s3/" prefix
             // so it never collides with the generic {bucket}/{key:.*} routes
             // below. Phase 3: PUT/GET/DELETE/HEAD here now go through
             // authenticate_s3_request (same SigV4 verification single-node

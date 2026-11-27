@@ -1208,7 +1208,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
         content_type: meta_record.content_type.clone(),
-        last_modified: Some(super::s3_surface::now_http_date()),
+        last_modified: Some(crate::s3::cluster_surface::now_http_date()),
         user_metadata: meta_record.user_metadata.clone(),
         checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
         checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
@@ -1356,7 +1356,7 @@ pub(crate) async fn cluster_get_object_inner(
         // now also surfaced on the actual GET response.
         let etag = record.etag.clone();
         let content_type = record.content_type.clone();
-        let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+        let last_modified = record.last_modified.clone().unwrap_or_else(crate::s3::cluster_surface::now_http_date);
         let user_metadata = record.user_metadata.clone();
         let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
         let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
@@ -1423,7 +1423,7 @@ pub(crate) async fn cluster_get_object_inner(
     let total_len = record.original_len as u64;
     let etag = record.etag.clone();
     let content_type = record.content_type.clone();
-    let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+    let last_modified = record.last_modified.clone().unwrap_or_else(crate::s3::cluster_surface::now_http_date);
     let user_metadata = record.user_metadata.clone();
     let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
 
