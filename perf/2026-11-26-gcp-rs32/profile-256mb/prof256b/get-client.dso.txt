@@ -1,0 +1,4 @@
+    82.56%  [kernel.kallsyms]
+    13.17%  libc.so.6        
+     3.91%  s3b-combo        
+     0.36%  libm.so.6        

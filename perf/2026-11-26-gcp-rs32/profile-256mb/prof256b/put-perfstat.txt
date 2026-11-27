@@ -1,0 +1,16 @@
+
+ Performance counter stats for process id '106697':
+
+           8739.46 msec task-clock                       #    0.874 CPUs utilized             
+             10576      context-switches                 #    1.210 K/sec                     
+                29      cpu-migrations                   #    3.318 /sec                      
+                86      syscalls:sys_enter_write         #    9.840 /sec                      
+                 4      syscalls:sys_enter_pwrite64      #    0.458 /sec                      
+                10      syscalls:sys_enter_sendto        #    1.144 /sec                      
+             18179      syscalls:sys_enter_recvfrom      #    2.080 K/sec                     
+                11      syscalls:sys_enter_fdatasync     #    1.259 /sec                      
+                 4      syscalls:sys_enter_fsync         #    0.458 /sec                      
+                45      syscalls:sys_enter_futex         #    5.149 /sec                      
+
+      10.004266095 seconds time elapsed
+

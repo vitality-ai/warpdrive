@@ -1,0 +1,16 @@
+
+ Performance counter stats for process id '105059':
+
+          16709.47 msec task-clock                       #    1.669 CPUs utilized             
+              4163      context-switches                 #  249.140 /sec                      
+                20      cpu-migrations                   #    1.197 /sec                      
+              1040      syscalls:sys_enter_write         #   62.240 /sec                      
+                 0      syscalls:sys_enter_pwrite64      #    0.000 /sec                      
+               405      syscalls:sys_enter_sendto        #   24.238 /sec                      
+            293228      syscalls:sys_enter_recvfrom      #   17.549 K/sec                     
+                 0      syscalls:sys_enter_fdatasync     #    0.000 /sec                      
+                 0      syscalls:sys_enter_fsync         #    0.000 /sec                      
+             21017      syscalls:sys_enter_futex         #    1.258 K/sec                     
+
+      10.009595483 seconds time elapsed
+

@@ -1,0 +1,3 @@
+    69.13%  [kernel.kallsyms]
+    28.81%  libc.so.6        
+     2.06%  wd-pr            

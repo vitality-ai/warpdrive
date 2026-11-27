@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""plot_sweep.py <run dir>: PUT and GET MB/s per object size, #244 head against the PR, from summary.csv."""
+"""plot_sweep.py <run dir> [base label] [pr label]: PUT and GET MB/s per object size, from summary.csv."""
 import csv, sys
 import matplotlib.pyplot as plt
 import numpy as np
 
 run = sys.argv[1]
+base_label = sys.argv[2] if len(sys.argv) > 2 else "#244 head (df476de)"
+pr_label = sys.argv[3] if len(sys.argv) > 3 else "this PR"
 rows = list(csv.DictReader(open(f"{run}/summary.csv")))
 sizes = sorted({int(r["size"]) for r in rows})
 label = {4096: "4 KB", 65536: "64 KB", 1048576: "1 MB", 8388608: "8 MB", 67108864: "64 MB", 268435456: "256 MB"}
@@ -19,8 +21,8 @@ fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), dpi=150)
 x = np.arange(len(sizes)); w = 0.38
 for ax, phase in zip(axes, ["put", "get"]):
     b = [mbps("base", phase, s) for s in sizes]; p = [mbps("pr", phase, s) for s in sizes]
-    ax.bar(x - w / 2, b, w - 0.03, color="#9E9E9E", label="#244 head (df476de)", zorder=3)
-    ax.bar(x + w / 2, p, w - 0.03, color="#0072B2", label="this PR", zorder=3)
+    ax.bar(x - w / 2, b, w - 0.03, color="#9E9E9E", label=base_label, zorder=3)
+    ax.bar(x + w / 2, p, w - 0.03, color="#0072B2", label=pr_label, zorder=3)
     for i in range(len(sizes)):
         ax.text(x[i] + w / 2, p[i] * 1.08, f"{(p[i] / b[i] - 1) * 100:+.0f}%", ha="center", fontsize=8, color="#333")
     ax.set_yscale("log"); ax.set_xticks(x, [label[s] for s in sizes])
