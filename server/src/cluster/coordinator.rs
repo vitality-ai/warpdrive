@@ -79,6 +79,9 @@ pub struct ClusterState {
     pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
     /// When a row write returns (`RowAck`, `WARPDRIVE_ROW_ACK`).
     pub row_ack: RowAck,
+    /// A PUT's blob shards travel with its row, one round instead of two
+    /// (on unless `WARPDRIVE_BLOB_WITH_ROW=off`).
+    pub blob_with_row: bool,
     /// Which blobs the rows reference, from the layer that writes them. Set
     /// with `rows`. The audit (`reclaim`) frees shards no row needs.
     pub blob_references: std::sync::OnceLock<Arc<dyn super::reclaim::BlobReferences>>,
@@ -213,11 +216,44 @@ pub(crate) enum RecordOp {
 
 /// Body of `/cluster/_internal/meta`: one row write. The payload is opaque
 /// here: the engine replicates rows without reading them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetaRowRequest {
     pub key: String,
     pub seq: u64,
     pub payload: Option<warp_engine::Payload>,
+    /// The shard this peer stores before it acknowledges the row, when the
+    /// row's blob travels with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<warp_engine::Attachment>,
+    /// Every peer's shard, on the sending node only: `send_to_peer` puts
+    /// each peer's own one in `shard`.
+    #[serde(skip)]
+    pub shards: Option<Arc<Vec<warp_engine::Attachment>>>,
+}
+
+/// A shard's `space` on the wire: its user and bucket, length-prefixed so
+/// neither needs escaping.
+pub(crate) fn shard_space(user_id: &str, bucket: &str) -> String {
+    format!("{}:{user_id}:{bucket}", user_id.len())
+}
+
+pub(crate) fn split_space(space: &str) -> Option<(&str, &str)> {
+    let (len, rest) = space.split_once(':')?;
+    let len: usize = len.parse().ok()?;
+    let user = rest.get(..len)?;
+    let bucket = rest.get(len..)?.strip_prefix(':')?;
+    Some((user, bucket))
+}
+
+/// Stores a shard that came with a row on this node, before the row.
+pub(crate) async fn store_attached(shard: Option<warp_engine::Attachment>) -> Result<(), String> {
+    let Some(a) = shard else { return Ok(()) };
+    tokio::task::spawn_blocking(move || {
+        let (user, bucket) = split_space(&a.space).ok_or_else(|| format!("unreadable shard space {:?}", a.space))?;
+        super::shard_storage::store_shard(user, bucket, &a.key, a.index, &a.data.0).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("shard store task failed: {e}"))?
 }
 
 /// How a store answered one record write, without the replaced value.
@@ -250,6 +286,10 @@ impl RecordOp {
             RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
             RecordOp::Meta(m) => {
                 let rows = rows.ok_or_else(|| std::io::Error::other("this node has no rows (not started as a cluster node)"))?;
+                if let Some(a) = m.shard {
+                    let (user, bucket) = split_space(&a.space).ok_or_else(|| std::io::Error::other("unreadable shard space"))?;
+                    super::shard_storage::store_shard(user, bucket, &a.key, a.index, &a.data.0).map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
                 match m.payload {
                     Some(payload) => rows.put(m.key, warp_engine::Row { seq: m.seq, payload })?,
                     None => rows.delete(m.key, m.seq)?,
@@ -295,6 +335,10 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
             warn!("{label}: this node has no rows (not started as a cluster node)");
             return PeerReply::Failed;
         };
+        if let Err(e) = store_attached(m.shard).await {
+            warn!("{label}: storing its shard on this node failed: {e}");
+            return PeerReply::Failed;
+        }
         return match rows.commit(m.key, m.seq, m.payload).await {
             Ok(applied) => match OpOutcome::from(applied) {
                 OpOutcome::Applied => PeerReply::Applied,
@@ -338,8 +382,14 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
 /// worker on this node, and with every worker busy waiting on replication,
 /// there might be none. A row for another peer goes through the row
 /// transport.
-async fn send_to_peer(state: &ClusterState, peer: &str, op: RecordOp) -> PeerReply {
+async fn send_to_peer(state: &ClusterState, peer: &str, mut op: RecordOp) -> PeerReply {
     let label = op.label();
+    if let RecordOp::Meta(m) = &mut op {
+        if let Some(all) = m.shards.take() {
+            let p = peer.trim().trim_end_matches('/');
+            m.shard = all.iter().find(|a| a.peer.trim().trim_end_matches('/') == p).cloned();
+        }
+    }
     let is_self = self_addr().is_some_and(|m| peer.trim().trim_end_matches('/') == m);
     if is_self {
         return apply_locally(state, op).await;
@@ -512,7 +562,16 @@ fn delete_req(user_id: &str, bucket: &str, key: &str, seq: u64) -> DeleteKeyRequ
 /// Replicates a row write (a tombstone when `payload` is `None`) to every
 /// peer. Returns how many stored it.
 pub(crate) async fn replicate_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, payload: Option<warp_engine::Payload>) -> usize {
-    replicate_ordered(state, peers, seq, |seq| RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, payload: payload.clone() })).await
+    replicate_row_with(state, peers, key, seq, payload, None).await
+}
+
+/// `replicate_row`, each peer also storing its shard from `shards` before
+/// it acknowledges.
+pub(crate) async fn replicate_row_with(state: &ClusterState, peers: &[String], key: &str, seq: u64, payload: Option<warp_engine::Payload>, shards: Option<Arc<Vec<warp_engine::Attachment>>>) -> usize {
+    replicate_ordered(state, peers, seq, |seq| {
+        RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, payload: payload.clone(), shard: None, shards: shards.clone() })
+    })
+    .await
 }
 
 /// Replicates a tombstone for `(user_id, bucket, key)` at `seq` to every
@@ -2265,6 +2324,15 @@ pub async fn cluster_join(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_shard_space_splits_back_into_user_and_bucket() {
+        for (u, b) in [("u", "b"), ("a:b", "c"), ("", "x"), ("user", "with:colons:too")] {
+            assert_eq!(split_space(&shard_space(u, b)), Some((u, b)));
+        }
+        assert_eq!(split_space("5:ab"), None);
+        assert_eq!(split_space("x:u:b"), None);
+    }
+
     fn record_with_inline(inline_data: Option<String>) -> LocationRecord {
         serde_json::from_value(serde_json::json!({
             "bucket": "b", "key": "k", "shard_peers": [], "k": 3, "m": 2,
@@ -2413,6 +2481,7 @@ pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>, state: w
     // Through the commit thread, batched with this node's other row writes.
     let m = body.into_inner();
     let rows = state.rows.get().ok_or_else(|| ErrorInternalServerError("this node has no rows (not started as a cluster node)"))?;
+    store_attached(m.shard).await.map_err(ErrorInternalServerError)?;
     let applied = rows.commit(m.key, m.seq, m.payload).await.map_err(ErrorInternalServerError)?;
     Ok(outcome_response(applied.into()))
 }

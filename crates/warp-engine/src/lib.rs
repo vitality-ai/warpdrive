@@ -11,6 +11,10 @@
 //!   Layers above can [watch](RowStore::watch) a key prefix to hear about
 //!   every write that lands on this node, local or replicated.
 //! - **Blobs**: bytes erasure-coded across nodes (coming in this crate next).
+//!   A row write can carry the shards of the blob it points to
+//!   ([`RowStore::write_with`]): each node gets its shard in the same message
+//!   as the row and acknowledges both together, so a write is one round
+//!   trip, and a row that reached a quorum always has its shards behind it.
 //!
 //! What it's judged on: bytes moved and syncs per operation, and the
 //! ordering and durability above. The object layer builds buckets,
@@ -87,6 +91,18 @@ impl warp_meta_store::Record for Row {
 /// A row write's future. `Send`, so callers can await it from any runtime.
 pub type WriteFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
 
+/// A shard that travels with a row write ([`RowStore::write_with`]): `data`
+/// is stored on `peer` as shard `index` of the blob at `key` in `space`
+/// before that peer acknowledges the row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub peer: String,
+    pub space: String,
+    pub key: String,
+    pub index: usize,
+    pub data: Payload,
+}
+
 /// Called with a row's key after a write to it lands on this node.
 pub type Watcher = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -110,6 +126,25 @@ pub trait RowStore: Send + Sync {
 
     /// `write` without blocking the caller's thread on the quorum round trip.
     fn write_async(&self, key: String, seq: u64, payload: Option<Payload>) -> WriteFuture;
+
+    /// `write_async`, with shards that must be durable on their peers too.
+    /// Returns once a write quorum holds the row and a write quorum of the
+    /// shard holders holds its shard. A store that can't carry shards
+    /// refuses the write rather than drop them.
+    fn write_with(&self, key: String, seq: u64, payload: Option<Payload>, shards: Vec<Attachment>) -> WriteFuture {
+        if shards.is_empty() {
+            return self.write_async(key, seq, payload);
+        }
+        Box::pin(std::future::ready(Err("this row store can't carry shards".to_string())))
+    }
+
+    /// `write_with`, blocking the caller's thread.
+    fn write_with_blocking(&self, key: &str, seq: u64, payload: Option<Payload>, shards: Vec<Attachment>) -> Result<(), String> {
+        if shards.is_empty() {
+            return self.write(key, seq, payload);
+        }
+        Err("this row store can't carry shards".to_string())
+    }
 
     /// Calls `on_write` after every write that lands on this node for a key
     /// starting with `prefix`: this node's own writes and those replicated
@@ -136,6 +171,22 @@ mod tests {
         let mp = rmp_serde::to_vec_named(&row).unwrap();
         assert!(mp.windows(4).any(|w| w == [0, 1, 2, 255]), "raw bytes in MessagePack");
         assert_eq!(rmp_serde::from_slice::<Row>(&mp).unwrap(), row);
+    }
+
+    #[test]
+    fn a_store_that_cant_carry_shards_refuses_them() {
+        struct Plain;
+        impl RowStore for Plain {
+            fn get(&self, _: &str) -> Option<Row> { None }
+            fn floor(&self, _: &str, _: &str) -> Option<(String, Row)> { None }
+            fn scan(&self, _: &str, _: &mut dyn FnMut(&str, &Row)) {}
+            fn write(&self, _: &str, _: u64, _: Option<Payload>) -> Result<(), String> { Ok(()) }
+            fn write_async(&self, _: String, _: u64, _: Option<Payload>) -> WriteFuture { Box::pin(std::future::ready(Ok(()))) }
+            fn watch(&self, _: &str, _: Watcher) {}
+        }
+        let shard = Attachment { peer: "p".into(), space: "s".into(), key: "k".into(), index: 0, data: Payload(vec![1]) };
+        assert!(Plain.write_with_blocking("k", 1, None, Vec::new()).is_ok(), "no shards: a plain write");
+        assert!(Plain.write_with_blocking("k", 1, None, vec![shard]).is_err(), "shards are never dropped");
     }
 
     #[test]

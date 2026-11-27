@@ -399,6 +399,13 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             }
             a
         },
+        blob_with_row: {
+            let on = !std::env::var("WARPDRIVE_BLOB_WITH_ROW").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+            if !on {
+                info!("A PUT writes its shards, then its row (WARPDRIVE_BLOB_WITH_ROW=off)");
+            }
+            on
+        },
         blob_references: Default::default(),
         rows: Default::default(),
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)

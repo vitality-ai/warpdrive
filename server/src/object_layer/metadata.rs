@@ -46,7 +46,7 @@ use crate::metadata::{
     BucketStats, DeleteSpecificResult, DeletionEvent, Metadata, MetadataStorage, MultipartPartRow, MultipartUploadRow,
     ObjectId, ObjectLockRow, VersionRow, VersioningDeleteResult,
 };
-use crate::cluster::blob_store::{claim, locator, BlobRef};
+use crate::cluster::blob_store::{claim, locator, take_shards, BlobRef};
 
 // ---------------------------------------------------------------- rows
 
@@ -215,11 +215,21 @@ impl MetaRows {
     }
 
     fn write(&self, key: &str, seq: u64, value: Option<&MetaValue>) -> Result<(), String> {
-        self.0.write(key, seq, value.map(encode))
+        self.0.write_with_blocking(key, seq, value.map(encode), unsent_shards(value))
     }
 
     fn write_async(&self, key: String, seq: u64, value: Option<&MetaValue>) -> warp_engine::WriteFuture {
-        self.0.write_async(key, seq, value.map(encode))
+        self.0.write_with(key, seq, value.map(encode), unsent_shards(value))
+    }
+}
+
+/// The shards of blobs this row points at that haven't been sent yet: they
+/// go with the row, so the row and its shards are durable together.
+fn unsent_shards(value: Option<&MetaValue>) -> Vec<warp_engine::Attachment> {
+    match value {
+        Some(MetaValue::Version(v)) => v.blobs.iter().filter_map(take_shards).flatten().collect(),
+        Some(MetaValue::Upload(u)) => u.parts.values().flat_map(|p| p.blobs.iter()).filter_map(take_shards).flatten().collect(),
+        _ => Vec::new(),
     }
 }
 

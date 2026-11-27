@@ -121,7 +121,7 @@ impl RowTransport for Batched {
 }
 
 fn approx_bytes(r: &MetaRowRequest) -> usize {
-    r.key.len() + 16 + r.payload.as_ref().map_or(0, |p| p.0.len())
+    r.key.len() + 16 + r.payload.as_ref().map_or(0, |p| p.0.len()) + r.shard.as_ref().map_or(0, |a| a.data.0.len() + a.key.len() + a.space.len())
 }
 
 async fn peer_loop(client: reqwest::Client, peer: String, mut rx: mpsc::UnboundedReceiver<Pending>) {
@@ -202,6 +202,10 @@ pub async fn cluster_internal_meta_batch(body: web::Bytes, state: web::Data<supe
     let answers: Vec<RowReply> = futures::future::join_all(reqs.into_iter().map(|m| {
         let rows = Arc::clone(&rows);
         async move {
+        if let Err(e) = super::coordinator::store_attached(m.shard).await {
+            log::warn!("metadata batch row: storing its shard on this node failed: {e}");
+            return RowReply::Failed;
+        }
         match rows.commit(m.key, m.seq, m.payload).await {
             Ok(warp_meta_store::Applied::Yes { .. }) => RowReply::Applied,
             Ok(warp_meta_store::Applied::Stale { current_seq }) => RowReply::Stale(current_seq),
@@ -228,14 +232,30 @@ mod tests {
     fn rows_and_tombstones_round_trip_as_messagepack_with_raw_payloads() {
         let bytes: Vec<u8> = (0..=255).collect();
         let rows = vec![
-            MetaRowRequest { key: "a/k".into(), seq: 5, payload: Some(warp_engine::Payload(bytes.clone())) },
-            MetaRowRequest { key: "b/k".into(), seq: 6, payload: None },
+            MetaRowRequest { key: "a/k".into(), seq: 5, payload: Some(warp_engine::Payload(bytes.clone())), ..Default::default() },
+            MetaRowRequest { key: "b/k".into(), seq: 6, payload: None, ..Default::default() },
         ];
         let wire = rmp_serde::to_vec_named(&rows).unwrap();
         assert!(wire.windows(bytes.len()).any(|w| w == bytes.as_slice()), "the payload travels raw");
         let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&wire).unwrap();
         assert_eq!((back[0].key.as_str(), back[0].seq, &back[0].payload), ("a/k", 5, &rows[0].payload));
         assert_eq!((back[1].key.as_str(), back[1].seq, back[1].payload.is_none()), ("b/k", 6, true));
+    }
+
+    #[test]
+    fn a_row_carries_its_shard_raw_and_never_the_other_peers_shards() {
+        let data: Vec<u8> = (0..=255).rev().collect();
+        let a = warp_engine::Attachment { peer: "p1".into(), space: "1:u:b".into(), key: "w".into(), index: 2, data: warp_engine::Payload(data.clone()) };
+        let other = warp_engine::Attachment { index: 3, ..a.clone() };
+        let row = MetaRowRequest { key: "k".into(), seq: 9, payload: None, shard: Some(a.clone()), shards: Some(std::sync::Arc::new(vec![a.clone(), other])) };
+        let wire = rmp_serde::to_vec_named(&vec![row]).unwrap();
+        assert!(wire.windows(data.len()).any(|w| w == data.as_slice()), "the shard travels raw");
+        let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(back[0].shard.as_ref(), Some(&a));
+        assert!(back[0].shards.is_none(), "every peer's shards stay on the sender");
+        // A row without a shard reads as before.
+        let plain = rmp_serde::to_vec_named(&MetaRowRequest { key: "k".into(), seq: 1, ..Default::default() }).unwrap();
+        assert!(rmp_serde::from_slice::<MetaRowRequest>(&plain).unwrap().shard.is_none());
     }
 
     #[test]

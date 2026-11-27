@@ -6,7 +6,7 @@
 
 use parking_lot::RwLock;
 use std::sync::Arc;
-use warp_engine::{Payload, Row, RowStore, Watcher, WriteFuture};
+use warp_engine::{Attachment, Payload, Row, RowStore, Watcher, WriteFuture};
 use warp_meta_store::{Applied, Entry, RowOp, WarpMetaStore};
 
 use super::meta_engine::{AnyEngine, MetaEngineKind};
@@ -192,6 +192,49 @@ impl RowStore for ClusterRows {
             }
             Ok(())
         })
+    }
+
+    /// One round when every peer holds a shard: each gets its shard in the
+    /// row's message and acknowledges both, so a quorum of acks is a quorum
+    /// of rows and of shards. Otherwise (more nodes than shards) the shards
+    /// go first, to a quorum of their holders, then the row.
+    fn write_with(&self, key: String, seq: u64, payload: Option<Payload>, shards: Vec<Attachment>) -> WriteFuture {
+        if shards.is_empty() {
+            return self.write_async(key, seq, payload);
+        }
+        Box::pin(async move {
+            let state = super::bridge::state().ok_or("cluster state not installed")?;
+            let peers = state.membership.peers();
+            let required = super::coordinator::required_write_acks(state.ec.k(), state.ec.m());
+            let norm = |p: &str| p.trim().trim_end_matches('/').to_string();
+            let holders: std::collections::HashSet<String> = shards.iter().map(|a| norm(&a.peer)).collect();
+            let one_round = holders.len() == shards.len() && peers.iter().all(|p| holders.contains(&norm(p)));
+            if !one_round {
+                let puts = shards.into_iter().map(|a| {
+                    let client = std::sync::Arc::clone(&state.peer_client);
+                    async move {
+                        let (user, bucket) = super::coordinator::split_space(&a.space).ok_or("unreadable shard space")?;
+                        client.put_shard(&a.peer, user, bucket, &a.key, a.index, a.data.0).await.map_err(|e| e.to_string())
+                    }
+                });
+                let stored = futures::future::join_all(puts).await.into_iter().filter(|r| r.is_ok()).count();
+                if stored < required {
+                    return Err(format!("{stored}/{required} nodes stored a shard"));
+                }
+                let acked = super::coordinator::replicate_row(&state, &peers, &key, seq, payload).await;
+                return if acked < required { Err(format!("{acked}/{required} nodes stored the row")) } else { Ok(()) };
+            }
+            let acked = super::coordinator::replicate_row_with(&state, &peers, &key, seq, payload, Some(std::sync::Arc::new(shards))).await;
+            if acked < required {
+                return Err(format!("{acked}/{required} nodes stored the row and its shard"));
+            }
+            Ok(())
+        })
+    }
+
+    fn write_with_blocking(&self, key: &str, seq: u64, payload: Option<Payload>, shards: Vec<Attachment>) -> Result<(), String> {
+        let fut = self.write_with(key.to_string(), seq, payload, shards);
+        super::bridge::run(move || fut)
     }
 
     fn watch(&self, prefix: &str, on_write: Watcher) {

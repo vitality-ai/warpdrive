@@ -201,10 +201,26 @@ fn unpack(p: &BlobPlacement, stored: Vec<u8>) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// A blob ready to write: where its shards go, and the shards, each with
+/// its peer and index. An inline blob has no shards.
+pub struct PreparedBlob {
+    pub placement: BlobPlacement,
+    pub shards: Vec<(String, usize, Vec<u8>)>,
+}
+
 /// Encodes `body` and writes its shards under `key` in `bucket`, returning
 /// once a write quorum holds them. Small bodies are returned inline
 /// instead, with no shard round.
 pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: &str, body: &[u8]) -> Result<BlobPlacement, Error> {
+    let prepared = prepare_blob(state, bucket, key, body)?;
+    if !prepared.shards.is_empty() {
+        send_shards(state, user_id, bucket, &prepared.placement, prepared.shards).await?;
+    }
+    Ok(prepared.placement)
+}
+
+/// Compresses, places and encodes `body` without sending anything.
+pub fn prepare_blob(state: &ClusterState, bucket: &str, key: &str, body: &[u8]) -> Result<PreparedBlob, Error> {
     let (k, m) = (state.ec.k(), state.ec.m());
     let raw_len = body.len() as u64;
     let max_inline = super::coordinator::inline_max_bytes();
@@ -213,7 +229,7 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
     let wire_factor = if max_inline > 0 && body.len() <= max_inline { state.membership.peers().len().max(1) as f64 } else { (k + m) as f64 / k as f64 };
     let (stored, zstd_len) = state.compression.apply(body, wire_factor);
     if max_inline > 0 && body.len() <= max_inline {
-        return Ok(BlobPlacement {
+        let placement = BlobPlacement {
             shard_peers: Vec::new(),
             k,
             m,
@@ -221,7 +237,8 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
             len: body.len() as u64,
             zstd_len,
             inline: Some(InlineBytes(stored.into_owned())),
-        });
+        };
+        return Ok(PreparedBlob { placement, shards: Vec::new() });
     }
     let body: &[u8] = &stored;
 
@@ -243,15 +260,21 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
     // A fresh version per write (#151): a retried or racing write never
     // lands on shards another placement still points at.
     let wire_key = versioned_key(key, &new_version_id());
+    let shards: Vec<(String, usize, Vec<u8>)> = chosen.iter().cloned().zip(encoded.shards).enumerate().map(|(idx, (peer, shard))| (peer, idx, shard)).collect();
+    Ok(PreparedBlob { placement: BlobPlacement { shard_peers: chosen, k, m, wire_key, len: raw_len, zstd_len, inline: None }, shards })
+}
+
+/// Writes a prepared blob's shards, returning once a write quorum holds
+/// them.
+pub async fn send_shards(state: &ClusterState, user_id: &str, bucket: &str, placement: &BlobPlacement, shards: Vec<(String, usize, Vec<u8>)>) -> Result<(), Error> {
+    let (k, m, wire_key) = (placement.k, placement.m, placement.wire_key.clone());
     // Each shard write is its own task, so the PUT can return once a write
     // quorum holds its shard while the others finish in the background.
     // They're never cancelled: every extra shard is redundancy.
-    let mut puts: futures::stream::FuturesUnordered<_> = chosen
-        .iter()
-        .cloned()
-        .zip(encoded.shards)
-        .enumerate()
-        .map(|(idx, (peer, shard))| {
+    let count = shards.len();
+    let mut puts: futures::stream::FuturesUnordered<_> = shards
+        .into_iter()
+        .map(|(peer, idx, shard)| {
             let client = Arc::clone(&state.peer_client);
             let (bucket, wire_key, user) = (bucket.to_string(), wire_key.clone(), user_id.to_string());
             super::bridge::spawn(async move {
@@ -265,7 +288,7 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
         })
         .collect();
     let required = required_write_acks(k, m);
-    let mut done: Vec<(String, bool, std::time::Duration)> = Vec::with_capacity(chosen.len());
+    let mut done: Vec<(String, bool, std::time::Duration)> = Vec::with_capacity(count);
     use futures::StreamExt;
     while let Some(joined) = puts.next().await {
         done.push(joined.unwrap_or_else(|e| (format!("task failed: {e}"), false, std::time::Duration::ZERO)));
@@ -292,7 +315,7 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
     if acked < required {
         return Err(ErrorInternalServerError(format!("write quorum not met: {acked}/{required} nodes stored a shard (RS({k},{m}))")));
     }
-    Ok(BlobPlacement { shard_peers: chosen, k, m, wire_key, len: raw_len, zstd_len, inline: None })
+    Ok(())
 }
 
 /// Reads a blob back: inline bytes, or any `k` shards decoded.
