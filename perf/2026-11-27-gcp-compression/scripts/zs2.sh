@@ -12,6 +12,8 @@ SCP="scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLe
 AK=AKIAIOSFODNN7EXAMPLE; SK=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY; PEERS=$(printf "http://%s:9710," "${IPS[@]}"); PEERS=${PEERS%,}
 BASE="WARPDRIVE_META_ENGINE=rocksdb WARPDRIVE_ROCKSDB_CACHE_MB=1024 WARPDRIVE_SEGMENT_MB=64 WARPDRIVE_RECLAIM_GRACE_SECS=120 WARPDRIVE_RECLAIM_CONFIRM_SECS=60 WARPDRIVE_COMPACT_SEAL_SECS=120"
 DUR=${DUR:-60}; SPECS=${SPECS:-"65536:64 1048576:32 8388608:16"}; DATAS=${DATAS:-"text random"}
+# Stop whatever an earlier run left running, so the new binary can be copied over it.
+for ip in "${IPS[@]}"; do $NSSH $ip "for b in wd-244 wd-pr wd-prb wd-fe wd-z wd-redis ba; do pkill -x \$b; done; sleep 3"; done
 for ip in "${IPS[@]}"; do $SCP ~/bins/wd-z ~/netmon.sh $ip:bins/ || { log "ABORT scp $ip"; exit 1; }; done
 ready() { for k in $(seq 1 300); do ok=0; for ip in "${IPS[@]}"; do curl -s -m 2 -o /dev/null -w '%{http_code}' http://$ip:9710/ | grep -q '^[234]' && ok=$((ok+1)); done; [ $ok = 5 ] && return 0; sleep 1; done; return 1; }
 fresh() {  # fresh <extra env>
