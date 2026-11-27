@@ -375,6 +375,14 @@ fn build_cluster_state() -> web::Data<ClusterState> {
             m.insert("zlib_f64".to_string(), Arc::new(ZlibF64Codec));
             m
         },
+        // Rows to other nodes: batched unless WARPDRIVE_META_BATCH=off.
+        row_transport: warp_drive::cluster::meta_batch::from_env(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .build()
+                .expect("building the row transport's HTTP client"),
+        ),
         rows: Default::default(),
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)
             || std::env::var("WARPDRIVE_JOIN_VIA").is_ok(),

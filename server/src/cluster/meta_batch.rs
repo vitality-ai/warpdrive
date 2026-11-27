@@ -16,7 +16,7 @@
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use super::coordinator::MetaRowRequest;
@@ -38,9 +38,52 @@ pub enum RowReply {
     Failed,
 }
 
-pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| !std::env::var("WARPDRIVE_META_BATCH").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")));
-    *ON
+/// How a row write reaches another node. Chosen once at startup
+/// ([`from_env`]) and kept in `ClusterState`.
+#[async_trait::async_trait]
+pub trait RowTransport: Send + Sync {
+    async fn send(&self, peer: &str, req: MetaRowRequest) -> RowReply;
+}
+
+/// Batched (the default), or one request per row with
+/// `WARPDRIVE_META_BATCH=off`.
+pub fn from_env(client: reqwest::Client) -> std::sync::Arc<dyn RowTransport> {
+    if std::env::var("WARPDRIVE_META_BATCH").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
+        log::info!("Row writes go to peers one request per row (WARPDRIVE_META_BATCH=off)");
+        std::sync::Arc::new(PerRow { client })
+    } else {
+        std::sync::Arc::new(Batched { client, queues: Default::default() })
+    }
+}
+
+/// One HTTP request per row (`/cluster/_internal/meta`).
+pub struct PerRow {
+    client: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl RowTransport for PerRow {
+    async fn send(&self, peer: &str, req: MetaRowRequest) -> RowReply {
+        let url = format!("{}/cluster/_internal/meta", peer.trim_end_matches('/'));
+        match self.client.post(url).json(&req).send().await {
+            Ok(r) if r.status().is_success() => RowReply::Applied,
+            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<super::coordinator::StaleReply>().await {
+                Ok(s) => RowReply::Stale(s.current_seq),
+                Err(e) => {
+                    log::warn!("row write to {peer}: unreadable 409 body: {e}");
+                    RowReply::Failed
+                }
+            },
+            Ok(r) => {
+                log::warn!("row write to {peer} returned {}", r.status());
+                RowReply::Failed
+            }
+            Err(e) => {
+                log::warn!("row write to {peer} failed: {e}");
+                RowReply::Failed
+            }
+        }
+    }
 }
 
 struct Pending {
@@ -48,26 +91,33 @@ struct Pending {
     reply: oneshot::Sender<RowReply>,
 }
 
-static QUEUES: LazyLock<parking_lot::Mutex<HashMap<String, mpsc::UnboundedSender<Pending>>>> = LazyLock::new(Default::default);
+/// Rows to a peer ride in that peer's next batch: one queue and sender
+/// task per peer.
+pub struct Batched {
+    client: reqwest::Client,
+    queues: parking_lot::Mutex<HashMap<String, mpsc::UnboundedSender<Pending>>>,
+}
 
-/// Sends `req` to `peer` in its next batch and returns the peer's answer.
-pub async fn send(client: &reqwest::Client, peer: &str, req: MetaRowRequest) -> RowReply {
-    let (reply, answer) = oneshot::channel();
-    let tx = {
-        let mut queues = QUEUES.lock();
-        queues
-            .entry(peer.to_string())
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::unbounded_channel();
-                super::bridge::spawn(peer_loop(client.clone(), peer.to_string(), rx));
-                tx
-            })
-            .clone()
-    };
-    if tx.send(Pending { req, reply }).is_err() {
-        return RowReply::Failed;
+#[async_trait::async_trait]
+impl RowTransport for Batched {
+    async fn send(&self, peer: &str, req: MetaRowRequest) -> RowReply {
+        let (reply, answer) = oneshot::channel();
+        let tx = {
+            let mut queues = self.queues.lock();
+            queues
+                .entry(peer.to_string())
+                .or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    super::bridge::spawn(peer_loop(self.client.clone(), peer.to_string(), rx));
+                    tx
+                })
+                .clone()
+        };
+        if tx.send(Pending { req, reply }).is_err() {
+            return RowReply::Failed;
+        }
+        answer.await.unwrap_or(RowReply::Failed)
     }
-    answer.await.unwrap_or(RowReply::Failed)
 }
 
 fn approx_bytes(r: &MetaRowRequest) -> usize {

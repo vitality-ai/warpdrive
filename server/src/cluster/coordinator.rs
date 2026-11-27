@@ -71,6 +71,9 @@ pub struct ClusterState {
     /// single-node storage, which a client could write to and then lose
     /// once the join completes and routing switches to the cluster).
     pub configured_for_cluster: bool,
+    /// How row writes reach other nodes (`meta_batch`: batched, or one
+    /// request per row).
+    pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
     /// This node's rows (`rows`), set once when the node starts its stores.
     pub rows: std::sync::OnceLock<Arc<super::rows::NodeRows>>,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
@@ -309,15 +312,15 @@ async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() 
         let op = make();
         let label = op.label();
         let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
-        // A metadata row for a peer rides in that peer's next batch.
-        let batched = match &op {
-            RecordOp::Meta(m) if !is_self && super::meta_batch::enabled() => Some(m.clone()),
+        // A row for a peer goes through the row transport.
+        let row = match &op {
+            RecordOp::Meta(m) if !is_self => Some(m.clone()),
             _ => None,
         };
-        let req = (!is_self && batched.is_none()).then(|| op.request(&state.location_http, peer));
+        let req = (!is_self && row.is_none()).then(|| op.request(&state.location_http, peer));
         async move {
-            if let Some(m) = batched {
-                return match super::meta_batch::send(&state.location_http, peer, m).await {
+            if let Some(m) = row {
+                return match state.row_transport.send(peer, m).await {
                     super::meta_batch::RowReply::Applied => PeerReply::Applied,
                     super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
                     super::meta_batch::RowReply::Failed => PeerReply::Failed,
