@@ -457,6 +457,7 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async move {
         info!("Starting gRPC shard server on {grpc_addr}");
         if let Err(e) = tonic::transport::Server::builder()
+            .tcp_nodelay(true)
             .add_service(make_grpc_shard_server())
             .serve_with_incoming(grpc_incoming)
             .await
