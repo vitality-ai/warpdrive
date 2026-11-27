@@ -77,6 +77,8 @@ pub struct ClusterState {
     /// How row writes reach other nodes (`meta_batch`: batched, or one
     /// request per row).
     pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
+    /// When a row write returns (`RowAck`, `WARPDRIVE_ROW_ACK`).
+    pub row_ack: RowAck,
     /// Which blobs the rows reference, from the layer that writes them. Set
     /// with `rows`. The audit (`reclaim`) frees shards no row needs.
     pub blob_references: std::sync::OnceLock<Arc<dyn super::reclaim::BlobReferences>>,
@@ -159,7 +161,30 @@ fn parse_computable_units_header(header_val: &actix_web::http::header::HeaderVal
         .collect()
 }
 
+/// When a row write returns to its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowAck {
+    /// Once every peer has answered (the default). Every reachable node then
+    /// holds the row, so a read on any node sees it.
+    All,
+    /// Once a write quorum including this node has applied it. Just as
+    /// durable, and this node reads its own writes, but another node can
+    /// see the row a little later.
+    Quorum,
+}
+
+impl RowAck {
+    /// `WARPDRIVE_ROW_ACK=quorum`, else `All`. Read once at startup.
+    pub fn from_env() -> Self {
+        match std::env::var("WARPDRIVE_ROW_ACK") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("quorum") => RowAck::Quorum,
+            _ => RowAck::All,
+        }
+    }
+}
+
 /// How one peer answered a record write.
+#[derive(Clone, Copy, Debug)]
 enum PeerReply {
     Applied,
     /// The peer has a newer write for the key (409, `current_seq`).
@@ -308,65 +333,117 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     }
 }
 
-/// Sends one write per peer and collects each peer's answer. This node's
-/// own copy is applied directly, not over HTTP: a request to itself would
-/// need a free HTTP worker on this node, and with every worker busy waiting
-/// on replication, there might be none.
-async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() -> RecordOp + Sync)) -> Vec<PeerReply> {
-    let me = self_addr();
-    let is_row = matches!(make(), RecordOp::Meta(_));
-    let requests = peers.iter().map(|peer| {
-        let op = make();
-        let label = op.label();
-        let started = std::time::Instant::now();
-        let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
-        // A row for a peer goes through the row transport.
-        let row = match &op {
-            RecordOp::Meta(m) if !is_self => Some(m.clone()),
-            _ => None,
-        };
-        let req = (!is_self && row.is_none()).then(|| op.request(&state.location_http, peer));
-        let reply = async move {
-            if let Some(m) = row {
-                return match state.row_transport.send(peer, m).await {
-                    super::meta_batch::RowReply::Applied => PeerReply::Applied,
-                    super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
-                    super::meta_batch::RowReply::Failed => PeerReply::Failed,
-                };
-            }
-            let Some(req) = req else {
-                return apply_locally(state, op).await;
-            };
-            match req.send().await {
-                Ok(r) if r.status().is_success() => PeerReply::Applied,
-                Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<StaleReply>().await {
-                    Ok(s) => PeerReply::Stale(s.current_seq),
-                    Err(e) => {
-                        warn!("{label} replication to {peer}: unreadable 409 body: {e}");
-                        PeerReply::Failed
-                    }
-                },
-                Ok(r) => {
-                    warn!("{label} replication to {peer} returned {}", r.status());
-                    PeerReply::Failed
-                }
-                Err(e) => {
-                    warn!("{label} replication to {peer} failed: {e}");
-                    PeerReply::Failed
-                }
-            }
-        };
-        async move {
-            let r = reply.await;
-            (peer.as_str(), r, started.elapsed())
-        }
-    });
-    let timed = join_all(requests).await;
-    if is_row {
-        let replies: Vec<(&str, bool, std::time::Duration)> = timed.iter().map(|(p, r, d)| (*p, matches!(r, PeerReply::Applied), *d)).collect();
-        state.timing.row.record(&replies, required_write_acks(state.ec.k(), state.ec.m()));
+/// One peer's answer to one write. This node's own copy is applied
+/// directly, not over HTTP: a request to itself would need a free HTTP
+/// worker on this node, and with every worker busy waiting on replication,
+/// there might be none. A row for another peer goes through the row
+/// transport.
+async fn send_to_peer(state: &ClusterState, peer: &str, op: RecordOp) -> PeerReply {
+    let label = op.label();
+    let is_self = self_addr().is_some_and(|m| peer.trim().trim_end_matches('/') == m);
+    if is_self {
+        return apply_locally(state, op).await;
     }
-    timed.into_iter().map(|(_, r, _)| r).collect()
+    if let RecordOp::Meta(m) = op {
+        return match state.row_transport.send(peer, m).await {
+            super::meta_batch::RowReply::Applied => PeerReply::Applied,
+            super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
+            super::meta_batch::RowReply::Failed => PeerReply::Failed,
+        };
+    }
+    match op.request(&state.location_http, peer).send().await {
+        Ok(r) if r.status().is_success() => PeerReply::Applied,
+        Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<StaleReply>().await {
+            Ok(s) => PeerReply::Stale(s.current_seq),
+            Err(e) => {
+                warn!("{label} replication to {peer}: unreadable 409 body: {e}");
+                PeerReply::Failed
+            }
+        },
+        Ok(r) => {
+            warn!("{label} replication to {peer} returned {}", r.status());
+            PeerReply::Failed
+        }
+        Err(e) => {
+            warn!("{label} replication to {peer} failed: {e}");
+            PeerReply::Failed
+        }
+    }
+}
+
+/// Sends one write to every peer and returns the answers it waited for.
+///
+/// With `RowAck::Quorum`, a row write returns as soon as a write quorum
+/// including this node has applied it, with no peer saying it holds
+/// something newer. The other peers' answers arrive in
+/// the background. That's safe for ordering when any two quorums overlap
+/// (2 x quorum > peers): a newer write that already finished is on a
+/// quorum, so an older one can't collect a quorum of applies without
+/// meeting a peer that answers `Stale`, and then this waits for every peer
+/// and restamps as before. Without that overlap, or for other records, it
+/// waits for every peer.
+async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() -> RecordOp + Sync)) -> Vec<PeerReply> {
+    let is_row = matches!(make(), RecordOp::Meta(_));
+    let required = required_write_acks(state.ec.k(), state.ec.m());
+    let quorum_ok = is_row && state.row_ack == RowAck::Quorum && 2 * required > peers.len();
+    let owned = super::bridge::state().filter(|_| quorum_ok);
+    let me = self_addr();
+    let is_me = move |p: &str| me.is_some_and(|m| p.trim().trim_end_matches('/') == m);
+    let need_me = peers.iter().any(|p| is_me(p));
+    let Some(owned) = owned else {
+        let timed = join_all(peers.iter().map(|peer| {
+            let op = make();
+            async move {
+                let started = std::time::Instant::now();
+                let r = send_to_peer(state, peer, op).await;
+                (peer.clone(), r, started.elapsed())
+            }
+        }))
+        .await;
+        if is_row {
+            record_row_round(state, &timed, required);
+        }
+        return timed.into_iter().map(|(_, r, _)| r).collect();
+    };
+    let mut pending: futures::stream::FuturesUnordered<_> = peers
+        .iter()
+        .map(|peer| {
+            let (st, peer, op) = (owned.clone(), peer.clone(), make());
+            super::bridge::spawn(async move {
+                let started = std::time::Instant::now();
+                let r = send_to_peer(&st, &peer, op).await;
+                (peer, r, started.elapsed())
+            })
+        })
+        .collect();
+    use futures::StreamExt;
+    let mut done: Vec<(String, PeerReply, std::time::Duration)> = Vec::with_capacity(peers.len());
+    let mut stale = false;
+    while let Some(joined) = pending.next().await {
+        let (peer, r, d) = joined.unwrap_or_else(|e| (String::new(), { warn!("row write task failed: {e}"); PeerReply::Failed }, std::time::Duration::ZERO));
+        stale |= matches!(r, PeerReply::Stale(_));
+        done.push((peer, r, d));
+        let applied = done.iter().filter(|(_, r, _)| matches!(r, PeerReply::Applied)).count();
+        let mine = !need_me || done.iter().any(|(p, r, _)| is_me(p) && matches!(r, PeerReply::Applied));
+        if applied >= required && mine && !stale && !pending.is_empty() {
+            let replies: Vec<PeerReply> = done.iter().map(|(_, r, _)| r.clone()).collect();
+            // The rest finish on their own. Timing waits for them.
+            super::bridge::spawn(async move {
+                while let Some(Ok(t)) = pending.next().await {
+                    done.push(t);
+                }
+                record_row_round(&owned, &done, required);
+            });
+            return replies;
+        }
+    }
+    record_row_round(state, &done, required);
+    done.into_iter().map(|(_, r, _)| r).collect()
+}
+
+fn record_row_round(state: &ClusterState, timed: &[(String, PeerReply, std::time::Duration)], required: usize) {
+    let replies: Vec<(&str, bool, std::time::Duration)> = timed.iter().map(|(p, r, d)| (p.as_str(), matches!(r, PeerReply::Applied), *d)).collect();
+    state.timing.row.record(&replies, required);
 }
 
 /// Rounds of restamp-and-resend before an ordered write gives up.

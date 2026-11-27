@@ -392,6 +392,13 @@ fn build_cluster_state() -> web::Data<ClusterState> {
                 .build()
                 .expect("building the row transport's HTTP client"),
         ),
+        row_ack: {
+            let a = warp_drive::cluster::coordinator::RowAck::from_env();
+            if a == warp_drive::cluster::coordinator::RowAck::Quorum {
+                info!("Row writes return once a write quorum including this node has them (WARPDRIVE_ROW_ACK=quorum)");
+            }
+            a
+        },
         blob_references: Default::default(),
         rows: Default::default(),
         configured_for_cluster: std::env::var("WARPDRIVE_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false)

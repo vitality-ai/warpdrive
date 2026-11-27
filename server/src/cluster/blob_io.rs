@@ -243,23 +243,52 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
     // A fresh version per write (#151): a retried or racing write never
     // lands on shards another placement still points at.
     let wire_key = versioned_key(key, &new_version_id());
-    let puts = chosen.iter().cloned().zip(encoded.shards).enumerate().map(|(idx, (peer, shard))| {
-        let client = Arc::clone(&state.peer_client);
-        let (bucket, wire_key, user) = (bucket.to_string(), wire_key.clone(), user_id.to_string());
-        async move {
-            let started = std::time::Instant::now();
-            let res = client.put_shard(&peer, &user, &bucket, &wire_key, idx, shard).await;
-            if let Err(e) = &res {
-                log::warn!("put_shard idx={idx} peer={peer} failed: {e}");
-            }
-            (peer, res.is_ok(), started.elapsed())
-        }
-    });
-    let timed = join_all(puts).await;
+    // Each shard write is its own task, so the PUT can return once a write
+    // quorum holds its shard while the others finish in the background.
+    // They're never cancelled: every extra shard is redundancy.
+    let mut puts: futures::stream::FuturesUnordered<_> = chosen
+        .iter()
+        .cloned()
+        .zip(encoded.shards)
+        .enumerate()
+        .map(|(idx, (peer, shard))| {
+            let client = Arc::clone(&state.peer_client);
+            let (bucket, wire_key, user) = (bucket.to_string(), wire_key.clone(), user_id.to_string());
+            super::bridge::spawn(async move {
+                let started = std::time::Instant::now();
+                let res = client.put_shard(&peer, &user, &bucket, &wire_key, idx, shard).await;
+                if let Err(e) = &res {
+                    log::warn!("put_shard idx={idx} peer={peer} failed: {e}");
+                }
+                (peer, res.is_ok(), started.elapsed())
+            })
+        })
+        .collect();
     let required = required_write_acks(k, m);
-    let replies: Vec<(&str, bool, std::time::Duration)> = timed.iter().map(|(p, ok, d)| (p.as_str(), *ok, *d)).collect();
-    state.timing.shard.record(&replies, required);
-    let acked = timed.iter().filter(|(_, ok, _)| *ok).count();
+    let mut done: Vec<(String, bool, std::time::Duration)> = Vec::with_capacity(chosen.len());
+    use futures::StreamExt;
+    while let Some(joined) = puts.next().await {
+        done.push(joined.unwrap_or_else(|e| (format!("task failed: {e}"), false, std::time::Duration::ZERO)));
+        if done.iter().filter(|d| d.1).count() >= required {
+            break;
+        }
+    }
+    let acked = done.iter().filter(|d| d.1).count();
+    let timing = Arc::clone(&state.timing);
+    let record = move |done: Vec<(String, bool, std::time::Duration)>| {
+        let replies: Vec<(&str, bool, std::time::Duration)> = done.iter().map(|(p, ok, d)| (p.as_str(), *ok, *d)).collect();
+        timing.shard.record(&replies, required);
+    };
+    if puts.is_empty() {
+        record(done);
+    } else {
+        super::bridge::spawn(async move {
+            while let Some(Ok(t)) = puts.next().await {
+                done.push(t);
+            }
+            record(done);
+        });
+    }
     if acked < required {
         return Err(ErrorInternalServerError(format!("write quorum not met: {acked}/{required} nodes stored a shard (RS({k},{m}))")));
     }
