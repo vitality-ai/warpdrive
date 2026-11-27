@@ -16,9 +16,10 @@ pub mod peer_client;
 pub mod grpc_peer_client;
 pub mod tcp_peer_client;
 pub mod bridge;
+pub mod adaptive;
 pub mod blob_io;
 pub mod blob_store;
-pub mod replicated_metadata;
+pub mod rows;
 pub mod meta_batch;
 pub mod location_store;
 pub mod content_location_store;
@@ -27,7 +28,6 @@ pub mod bucket_config;
 pub mod coordinator;
 pub mod packed;
 pub mod pushdown;
-pub mod s3_surface;
 
 pub mod shard_proto {
     tonic::include_proto!("warpdrive.cluster");

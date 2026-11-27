@@ -71,6 +71,17 @@ pub struct ClusterState {
     /// single-node storage, which a client could write to and then lose
     /// once the join completes and routing switches to the cluster).
     pub configured_for_cluster: bool,
+    /// Whether blob bytes are compressed before they're stored and moved
+    /// (`blob_io::Compression`, `WARPDRIVE_BLOB_COMPRESSION`).
+    pub compression: super::blob_io::Compression,
+    /// How row writes reach other nodes (`meta_batch`: batched, or one
+    /// request per row).
+    pub row_transport: Arc<dyn super::meta_batch::RowTransport>,
+    /// Which blobs the rows reference, from the layer that writes them. Set
+    /// with `rows`. The audit (`reclaim`) frees shards no row needs.
+    pub blob_references: std::sync::OnceLock<Arc<dyn super::reclaim::BlobReferences>>,
+    /// This node's rows (`rows`), set once when the node starts its stores.
+    pub rows: std::sync::OnceLock<Arc<super::rows::NodeRows>>,
     // Phase 4 multipart upload bookkeeping deliberately has no field here:
     // both the part bytes and the upload "header" (status, content-type,
     // user-metadata) are ordinary objects through the existing
@@ -171,17 +182,17 @@ pub(crate) enum RecordOp {
     PutContent(ContentDependentRecord),
     UpdateContent(ContentDependentRecord),
     DeleteContent(DeleteKeyRequest),
-    /// An S3 metadata row (`replicated_metadata`), or its tombstone when
-    /// `record` is `None`.
+    /// An engine row (`rows`), or its tombstone when `payload` is `None`.
     Meta(MetaRowRequest),
 }
 
-/// Body of `/cluster/_internal/meta`: one S3 metadata row write.
+/// Body of `/cluster/_internal/meta`: one row write. The payload is opaque
+/// here: the engine replicates rows without reading them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaRowRequest {
     pub key: String,
     pub seq: u64,
-    pub record: Option<super::replicated_metadata::MetaRecord>,
+    pub payload: Option<warp_engine::Payload>,
 }
 
 /// How a store answered one record write, without the replaced value.
@@ -204,7 +215,7 @@ impl<R> From<Applied<R>> for OpOutcome {
 impl RecordOp {
     /// Applies the write to this node's stores. Blocking: it waits for the
     /// write to be durable.
-    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore) -> std::io::Result<OpOutcome> {
+    pub(crate) fn apply(self, loc: &dyn LocationStore, content: &dyn ContentLocationStore, rows: Option<&super::rows::NodeRows>) -> std::io::Result<OpOutcome> {
         Ok(match self {
             RecordOp::PutLocation(r) => loc.put(r)?.into(),
             RecordOp::UpdateLocation(r) => loc.update(r)?.into(),
@@ -213,15 +224,12 @@ impl RecordOp {
             RecordOp::UpdateContent(r) => content.update(r)?.into(),
             RecordOp::DeleteContent(d) => content.delete(&d.user_id, &d.bucket, &d.key, d.seq)?.into(),
             RecordOp::Meta(m) => {
-                let rows = super::replicated_metadata::rows()
-                    .ok_or_else(|| std::io::Error::other("this node has no S3 metadata rows (not started as a cluster node)"))?;
-                let key = m.key.clone();
-                let out = match m.record {
-                    Some(r) => rows.put(m.key, r)?,
+                let rows = rows.ok_or_else(|| std::io::Error::other("this node has no rows (not started as a cluster node)"))?;
+                match m.payload {
+                    Some(payload) => rows.put(m.key, warp_engine::Row { seq: m.seq, payload })?,
                     None => rows.delete(m.key, m.seq)?,
-                };
-                super::replicated_metadata::row_written(&key);
-                out.into()
+                }
+                .into()
             }
         })
     }
@@ -258,7 +266,11 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     // A metadata row goes through the commit thread: batched with the other
     // writes waiting, and awaited without holding a thread.
     if let RecordOp::Meta(m) = op {
-        return match super::replicated_metadata::commit_row(m.key, m.seq, m.record).await {
+        let Some(rows) = state.rows.get() else {
+            warn!("{label}: this node has no rows (not started as a cluster node)");
+            return PeerReply::Failed;
+        };
+        return match rows.commit(m.key, m.seq, m.payload).await {
             Ok(applied) => match OpOutcome::from(applied) {
                 OpOutcome::Applied => PeerReply::Applied,
                 OpOutcome::Stale(seq) => PeerReply::Stale(seq),
@@ -277,9 +289,9 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
     // to the blocking pool as before.
     let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
     let result = if multi {
-        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref())))
+        Ok(tokio::task::block_in_place(move || op.apply(loc.as_ref(), content.as_ref(), None)))
     } else {
-        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref())).await
+        tokio::task::spawn_blocking(move || op.apply(loc.as_ref(), content.as_ref(), None)).await
     };
     match result {
         Ok(Ok(OpOutcome::Applied)) => PeerReply::Applied,
@@ -306,15 +318,15 @@ async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() 
         let op = make();
         let label = op.label();
         let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
-        // A metadata row for a peer rides in that peer's next batch.
-        let batched = match &op {
-            RecordOp::Meta(m) if !is_self && super::meta_batch::enabled() => Some(m.clone()),
+        // A row for a peer goes through the row transport.
+        let row = match &op {
+            RecordOp::Meta(m) if !is_self => Some(m.clone()),
             _ => None,
         };
-        let req = (!is_self && batched.is_none()).then(|| op.request(&state.location_http, peer));
+        let req = (!is_self && row.is_none()).then(|| op.request(&state.location_http, peer));
         async move {
-            if let Some(m) = batched {
-                return match super::meta_batch::send(&state.location_http, peer, m).await {
+            if let Some(m) = row {
+                return match state.row_transport.send(peer, m).await {
                     super::meta_batch::RowReply::Applied => PeerReply::Applied,
                     super::meta_batch::RowReply::Stale(seq) => PeerReply::Stale(seq),
                     super::meta_batch::RowReply::Failed => PeerReply::Failed,
@@ -409,17 +421,10 @@ fn delete_req(user_id: &str, bucket: &str, key: &str, seq: u64) -> DeleteKeyRequ
     DeleteKeyRequest { user_id: user_id.to_string(), bucket: bucket.to_string(), key: key.to_string(), seq }
 }
 
-/// Replicates an S3 metadata row write (a tombstone when `record` is
-/// `None`) to every peer. Returns how many stored it.
-pub(crate) async fn replicate_meta_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, record: Option<super::replicated_metadata::MetaRecord>) -> usize {
-    replicate_ordered(state, peers, seq, |seq| {
-        let record = record.clone().map(|mut r| {
-            r.seq = seq;
-            r
-        });
-        RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, record })
-    })
-    .await
+/// Replicates a row write (a tombstone when `payload` is `None`) to every
+/// peer. Returns how many stored it.
+pub(crate) async fn replicate_row(state: &ClusterState, peers: &[String], key: &str, seq: u64, payload: Option<warp_engine::Payload>) -> usize {
+    replicate_ordered(state, peers, seq, |seq| RecordOp::Meta(MetaRowRequest { key: key.to_string(), seq, payload: payload.clone() })).await
 }
 
 /// Replicates a tombstone for `(user_id, bucket, key)` at `seq` to every
@@ -1194,7 +1199,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
 
     // Same composite-ETag formula single-node's CompleteMultipartUpload
     // uses: md5 of the concatenated per-part md5 bytes, dash, part count.
-    let final_etag = format!("\"{}-{}\"", hex::encode(crate::s3::handlers::common::md5_digest(&combined_md5_bytes)), requested.len());
+    let final_etag = format!("\"{}-{}\"", hex::encode(crate::digest::md5_digest(&combined_md5_bytes)), requested.len());
     let total_size = body.len() as u64;
 
     // Checksum on by default here too, same reasoning (and same CRC32C
@@ -1206,7 +1211,7 @@ pub(crate) async fn cluster_complete_multipart_upload_inner(
     let s3_meta = ObjectS3Metadata {
         etag: Some(final_etag.clone()),
         content_type: meta_record.content_type.clone(),
-        last_modified: Some(super::s3_surface::now_http_date()),
+        last_modified: Some(crate::s3::cluster_surface::now_http_date()),
         user_metadata: meta_record.user_metadata.clone(),
         checksum_algorithm: Some(ChecksumAlgorithm::Crc32c.as_str().to_string()),
         checksum_value: Some(crate::s3::handlers::checksum::compute_checksum(&ChecksumAlgorithm::Crc32c, &body)),
@@ -1258,7 +1263,10 @@ async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, b
 /// answer "where are we slow if we're not saturating anywhere" — see
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
-    let body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    let mut body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    if let Some(v) = state.compression.view() {
+        body.push_str(&format!("compression={v}\n"));
+    }
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
@@ -1354,7 +1362,7 @@ pub(crate) async fn cluster_get_object_inner(
         // now also surfaced on the actual GET response.
         let etag = record.etag.clone();
         let content_type = record.content_type.clone();
-        let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+        let last_modified = record.last_modified.clone().unwrap_or_else(crate::s3::cluster_surface::now_http_date);
         let user_metadata = record.user_metadata.clone();
         let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
         let stored_checksum = record.checksum_algorithm.clone().zip(record.checksum_value.clone());
@@ -1421,7 +1429,7 @@ pub(crate) async fn cluster_get_object_inner(
     let total_len = record.original_len as u64;
     let etag = record.etag.clone();
     let content_type = record.content_type.clone();
-    let last_modified = record.last_modified.clone().unwrap_or_else(super::s3_surface::now_http_date);
+    let last_modified = record.last_modified.clone().unwrap_or_else(crate::s3::cluster_surface::now_http_date);
     let user_metadata = record.user_metadata.clone();
     let checksum_header = checksum_response_header(req, &record.checksum_algorithm, &record.checksum_value);
 
@@ -2022,7 +2030,7 @@ pub async fn cluster_internal_put_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::PutContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2038,7 +2046,7 @@ pub async fn cluster_internal_update_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::UpdateContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2057,7 +2065,7 @@ pub async fn cluster_internal_put_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::PutLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2074,7 +2082,7 @@ pub async fn cluster_internal_update_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::UpdateLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2117,7 +2125,7 @@ pub async fn cluster_internal_delete_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::DeleteLocation(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2134,7 +2142,7 @@ pub async fn cluster_internal_delete_content_location(
     // otherwise block this worker's event loop.
     let op = RecordOp::DeleteContent(body.into_inner());
     let (loc, content) = (Arc::clone(&state.location_store), Arc::clone(&state.content_location_store));
-    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref()).map_err(|e| e.to_string()))
+    let outcome = web::block(move || op.apply(loc.as_ref(), content.as_ref(), None).map_err(|e| e.to_string()))
         .await
         .map_err(|e| ErrorInternalServerError(format!("blocking task failed: {e}")))?
         .map_err(ErrorInternalServerError)?;
@@ -2312,9 +2320,10 @@ mod tests {
 }
 
 /// Receiving side of S3 metadata row replication.
-pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>) -> Result<HttpResponse, Error> {
+pub async fn cluster_internal_meta_row(body: web::Json<MetaRowRequest>, state: web::Data<ClusterState>) -> Result<HttpResponse, Error> {
     // Through the commit thread, batched with this node's other row writes.
     let m = body.into_inner();
-    let applied = super::replicated_metadata::commit_row(m.key, m.seq, m.record).await.map_err(ErrorInternalServerError)?;
+    let rows = state.rows.get().ok_or_else(|| ErrorInternalServerError("this node has no rows (not started as a cluster node)"))?;
+    let applied = rows.commit(m.key, m.seq, m.payload).await.map_err(ErrorInternalServerError)?;
     Ok(outcome_response(applied.into()))
 }

@@ -1,0 +1,9 @@
+[package]
+name = "warp-frontend"
+version = "0.1.0"
+edition = "2021"
+description = "The interface between WarpDrive's object service and the protocols in front of it (S3, Redis, ...)"
+publish = false
+
+[dependencies]
+async-trait = "0.1"

@@ -3407,6 +3407,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "warp-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "warp-meta-store",
+]
+
+[[package]]
+name = "warp-frontend"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+]
+
+[[package]]
+name = "warp-frontend-redis"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "tokio",
+ "warp-frontend",
+]
+
+[[package]]
 name = "warp-meta-store"
 version = "0.1.0"
 dependencies = [
@@ -3483,9 +3508,13 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
+ "warp-engine",
+ "warp-frontend",
+ "warp-frontend-redis",
  "warp-meta-store",
  "warp-meta-store-rocksdb",
  "warp-meta-store-sqlite",
+ "zstd",
 ]
 
 [[package]]

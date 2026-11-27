@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn a_row_claims_its_blob_once() {
-        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, inline: None };
+        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, zstd_len: None, inline: None };
         hand_off(BlobRef { user_id: "u-claim".into(), bucket: "b-claim".into(), base: 100, placement: p.clone() });
         assert!(claim("u-claim", "other", 100).is_none(), "another bucket's address is another blob");
         assert_eq!(claim("u-claim", "b-claim", 100).map(|b| b.placement), Some(p));
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_read_needs_the_chunks_locator_and_stays_inside_its_blob() {
-        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, inline: None };
+        let p = BlobPlacement { shard_peers: vec!["a".into()], k: 1, m: 0, wire_key: "x".into(), len: 10, zstd_len: None, inline: None };
         let loc = locator(&BlobRef { user_id: "u".into(), bucket: "b".into(), base: 100, placement: p });
         assert!(located(None, "b", 100).is_err());
         assert_eq!(located(Some(&loc), "b", 105).map(|(base, _)| base), Ok(100));

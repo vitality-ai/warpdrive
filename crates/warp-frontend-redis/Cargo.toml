@@ -1,0 +1,15 @@
+[package]
+name = "warp-frontend-redis"
+version = "0.1.0"
+edition = "2021"
+description = "A Redis-protocol (RESP2) front end for WarpDrive's object service"
+publish = false
+
+[dependencies]
+warp-frontend = { path = "../warp-frontend" }
+tokio = { version = "1.0", features = ["rt", "net", "io-util", "macros"] }
+log = "0.4.22"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1.0", features = ["rt", "net", "io-util", "macros", "time"] }

@@ -13,7 +13,7 @@ pub(crate) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 pub(super) const S3_GET_STREAM_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Empty body that reports a custom Content-Length for HEAD responses.
-/// `pub(crate)`: reused by the cluster API's minimal S3 surface (`cluster/s3_surface.rs`)
+/// `pub(crate)`: reused by the cluster API's minimal S3 surface (`s3/cluster_surface.rs`)
 /// for the same reason the S3 API needed it — actix recomputes
 /// Content-Length from the actual (empty) body on a plain `.finish()`,
 /// silently overriding any manually inserted header.
@@ -236,11 +236,7 @@ pub(super) fn range_slices(chunks: &[(u64, u64)], range_start: u64, range_end: u
     out
 }
 
-/// Returns the current timestamp as the canonical last_modified string stored in metadata
-/// and emitted in S3 XML bodies. Format: ISO 8601 (`2026-07-01T12:00:00.000Z`).
-pub(crate) fn last_modified_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string()
-}
+pub(crate) use crate::digest::last_modified_now;
 
 /// Converts a stored last_modified value to the RFC 2616 format required by HTTP headers.
 pub(super) fn last_modified_for_header(s: &str) -> String {
@@ -249,16 +245,7 @@ pub(super) fn last_modified_for_header(s: &str) -> String {
         .unwrap_or_else(|_| s.to_string())
 }
 
-/// MD5 of `data` (assembly on x86_64, see Cargo.toml).
-pub(crate) fn md5_digest(data: &[u8]) -> [u8; 16] {
-    use md5::Digest as _;
-    md5::Md5::digest(data).into()
-}
-
-/// Compute MD5 ETag (double-quoted) from accumulated bytes.
-pub(crate) fn md5_etag(data: &[u8]) -> String {
-    format!("\"{}\"", hex::encode(md5_digest(data)))
-}
+pub(crate) use crate::digest::{md5_digest, md5_etag};
 
 /// Strip surrounding double quotes from an ETag for comparison.
 #[inline]

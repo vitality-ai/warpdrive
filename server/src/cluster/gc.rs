@@ -25,12 +25,28 @@ use serde::{Deserialize, Serialize};
 use warp_meta_store::hlc;
 
 use super::blob_store::{blob_bucket, BlobRef};
-use super::replicated_metadata::{rows, MetaValue};
 use super::shard_storage::{shard_key, shard_location};
 
 const PREFIX: &str = "gc/";
 
 /// A new `gc/` row key: ordered by time.
+/// A release row's payload: the blobs to free once the grace period has
+/// passed. The engine owns these rows. A layer above writes one (at
+/// `new_key()`) after the rows that stopped referencing the blobs.
+pub fn release_payload(blobs: &[BlobRef]) -> warp_engine::Payload {
+    warp_engine::Payload(rmp_serde::to_vec_named(blobs).expect("blob references always encode"))
+}
+
+fn released(row: &warp_engine::Row) -> Option<Vec<BlobRef>> {
+    match rmp_serde::from_slice(&row.payload.0) {
+        Ok(blobs) => Some(blobs),
+        Err(e) => {
+            log::error!("gc: a release row (seq {}) doesn't decode: {e}", row.seq);
+            None
+        }
+    }
+}
+
 pub fn new_key() -> String {
     format!("{PREFIX}{:016x}", hlc::now())
 }
@@ -80,7 +96,7 @@ pub struct GcStats {
 /// One pass: frees this node's shards of the blobs in `gc/` rows past the
 /// grace period, then runs the compactor. Blocks: call it off the async
 /// workers.
-pub fn run() -> GcStats {
+pub fn run(state: &super::coordinator::ClusterState) -> GcStats {
     // One pass at a time: the cursor is read, then written.
     static ONE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     let _one = ONE.lock();
@@ -89,7 +105,7 @@ pub fn run() -> GcStats {
     if !super::compactor::config().enabled {
         return stats;
     }
-    let Some(rows) = rows() else { return stats };
+    let Some(rows) = state.rows.get() else { return stats };
     let grace = super::reclaim::config().grace.as_nanos() as u64;
     let now = hlc::now();
     let cursor = load_cursor();
@@ -98,10 +114,8 @@ pub fn run() -> GcStats {
     let upto = format!("{PREFIX}{:016x}", now.saturating_sub(grace));
     let after = if cursor.is_empty() { PREFIX.to_string() } else { cursor.clone() };
     let due: Vec<(String, Vec<BlobRef>)> = rows
-        .list_live_range(Some(&after), &upto, |k, r| match &r.value {
-            MetaValue::Gc(blobs) if k.starts_with(PREFIX) => Some((k.to_string(), blobs.clone())),
-            _ => None,
-        })
+        .log()
+        .list_live_range(Some(&after), &upto, |k, r| if k.starts_with(PREFIX) { released(r).map(|blobs| (k.to_string(), blobs)) } else { None })
         .into_iter()
         .flatten()
         .collect();
@@ -136,7 +150,7 @@ pub fn run() -> GcStats {
         // milliseconds, long before it is due.
         use warp_meta_store::Engine;
         let keys: Vec<String> = due.iter().map(|(k, _)| k.clone()).collect();
-        match rows.engine().delete_many_if(&keys, |_, _| false) {
+        match rows.log().engine().delete_many_if(&keys, |_, _| false) {
             Ok(n) => stats.rows_retired = n,
             Err(e) => log::warn!("gc: dropping processed rows failed: {e}"),
         }
@@ -144,8 +158,8 @@ pub fn run() -> GcStats {
     stats
 }
 
-pub async fn cluster_internal_gc_run() -> actix_web::HttpResponse {
-    match actix_web::web::block(run).await {
+pub async fn cluster_internal_gc_run(state: actix_web::web::Data<super::coordinator::ClusterState>) -> actix_web::HttpResponse {
+    match actix_web::web::block(move || run(&state)).await {
         Ok(stats) => actix_web::HttpResponse::Ok().json(stats),
         Err(e) => actix_web::HttpResponse::InternalServerError().body(e.to_string()),
     }

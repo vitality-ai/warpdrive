@@ -4,3 +4,4 @@ pub mod middleware;
 pub mod handlers;
 pub mod sts;
 pub mod lifecycle;
+pub mod cluster_surface;

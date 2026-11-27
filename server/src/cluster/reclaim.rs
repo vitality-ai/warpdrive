@@ -53,7 +53,6 @@ use warp_meta_store::Entry;
 
 use super::blob_store::blob_bucket;
 use super::coordinator::{self_addr, ClusterState};
-use super::replicated_metadata::{rows, MetaValue};
 use super::shard_storage::{parse_shard_key, shard_entries, ShardId};
 
 /// Prefix of the internal bucket S3 blob shards are stored under.
@@ -117,27 +116,20 @@ fn parse_stripe_key(s: &str) -> Option<(String, usize)> {
     Some((key.to_string(), idx))
 }
 
-/// Every `(user, shard bucket, wire_key)` a live S3 row references.
-/// Every blob a live record references.
-///
-/// The scan isn't a snapshot (`Engine::scan_prefix`), and a reference moves
-/// in one case: CompleteMultipartUpload moves part blobs from the upload row
-/// into a version row, writing the version row before it clears the upload.
-/// So upload rows are scanned first, then everything: a moved blob is seen
-/// in the upload row, or else its version row was already written.
-fn row_references() -> HashSet<(String, String, String)> {
-    let Some(rows) = rows() else { return HashSet::new() };
+/// Which blobs the rows reference. The layer that writes the rows knows
+/// what they mean, so it answers. The audit frees shards no row needs.
+pub trait BlobReferences: Send + Sync {
+    /// Every blob a live row references. The scan isn't a snapshot, so an
+    /// implementation whose rows move references orders its scan so that a
+    /// moving reference is always seen.
+    fn referenced(&self, rows: &super::rows::NodeRows) -> Vec<super::blob_store::BlobRef>;
+}
+
+/// Every `(user, shard bucket, wire_key)` a live row references.
+fn row_references(state: &ClusterState) -> HashSet<(String, String, String)> {
+    let (Some(rows), Some(refs_of)) = (state.rows.get(), state.blob_references.get()) else { return HashSet::new() };
     let mut refs = HashSet::new();
-    let uploads = rows.list_live("upl/", |_, r| match &r.value {
-        MetaValue::Upload(u) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
-        _ => Vec::new(),
-    });
-    let blobs = uploads.into_iter().chain(rows.list_live("", |_, r| match &r.value {
-        MetaValue::Version(v) => v.blobs.clone(),
-        MetaValue::Upload(u) => u.parts.values().flat_map(|p| p.blobs.clone()).collect(),
-        _ => Vec::new(),
-    }));
-    for b in blobs.flatten() {
+    for b in refs_of.referenced(rows) {
         if b.placement.inline.is_none() && !b.placement.wire_key.is_empty() {
             refs.insert((b.user_id.clone(), blob_bucket(&b.bucket), b.placement.wire_key.clone()));
         }
@@ -200,7 +192,7 @@ pub struct CheckReply {
 
 /// Answers a peer's confirmation request from this node's records.
 pub fn references(state: &ClusterState, shards: &[ShardRef]) -> Vec<bool> {
-    let refs = row_references();
+    let refs = row_references(state);
     shards
         .iter()
         .map(|s| {
@@ -276,7 +268,7 @@ pub type Dead = (String, u64, u64);
 /// `sweep`, with the reclaimable shards themselves.
 pub async fn sweep_detail(state: &ClusterState) -> (SweepStats, Vec<Dead>) {
     let cfg = config();
-    let refs = row_references();
+    let refs = row_references(state);
     let now = now_nanos();
     let grace = cfg.grace.as_nanos() as u64;
     let mut stats = SweepStats::default();
@@ -389,9 +381,9 @@ pub fn compact_due_logs(state: &ClusterState) -> Vec<&'static str> {
             }
         }
     };
-    if let Some(rows) = rows() {
+    if let Some(rows) = state.rows.get() {
         use warp_meta_store::Engine;
-        run("s3 metadata", rows.engine().compaction_due(), &|| rows.engine().compact());
+        run("rows", rows.log().engine().compaction_due(), &|| rows.log().engine().compact());
     }
     run("shard index", super::shard_storage::shard_index_compaction_due(), &super::shard_storage::compact_shard_index);
     run("location", state.location_store.compaction_due(), &|| state.location_store.compact());
@@ -420,7 +412,7 @@ pub fn start(state: web::Data<ClusterState>) {
                 if !compacted.is_empty() {
                     log::info!("compacted record logs: {}", compacted.join(", "));
                 }
-                let gc = super::gc::run();
+                let gc = super::gc::run(&state);
                 if gc.rows > 0 || gc.compact != Default::default() {
                     log::info!("gc: {gc:?}");
                 }

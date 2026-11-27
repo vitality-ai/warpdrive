@@ -8,7 +8,7 @@
 //! so inline bytes travel raw), with up to `MAX_IN_FLIGHT` requests out at
 //! once. While those are out, more rows queue, so batches grow with load and
 //! cost nothing extra when it's light. The peer applies a batch through its
-//! commit thread (`replicated_metadata::commit_row`), so the whole batch is
+//! commit thread (`NodeRows::commit`), so the whole batch is
 //! durable with one sync there too, and answers each row as `/meta` would.
 //!
 //! `WARPDRIVE_META_BATCH=off` sends one request per row (`/meta`) instead.
@@ -16,7 +16,7 @@
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use super::coordinator::MetaRowRequest;
@@ -38,9 +38,52 @@ pub enum RowReply {
     Failed,
 }
 
-pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| !std::env::var("WARPDRIVE_META_BATCH").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")));
-    *ON
+/// How a row write reaches another node. Chosen once at startup
+/// ([`from_env`]) and kept in `ClusterState`.
+#[async_trait::async_trait]
+pub trait RowTransport: Send + Sync {
+    async fn send(&self, peer: &str, req: MetaRowRequest) -> RowReply;
+}
+
+/// Batched (the default), or one request per row with
+/// `WARPDRIVE_META_BATCH=off`.
+pub fn from_env(client: reqwest::Client) -> std::sync::Arc<dyn RowTransport> {
+    if std::env::var("WARPDRIVE_META_BATCH").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
+        log::info!("Row writes go to peers one request per row (WARPDRIVE_META_BATCH=off)");
+        std::sync::Arc::new(PerRow { client })
+    } else {
+        std::sync::Arc::new(Batched { client, queues: Default::default() })
+    }
+}
+
+/// One HTTP request per row (`/cluster/_internal/meta`).
+pub struct PerRow {
+    client: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl RowTransport for PerRow {
+    async fn send(&self, peer: &str, req: MetaRowRequest) -> RowReply {
+        let url = format!("{}/cluster/_internal/meta", peer.trim_end_matches('/'));
+        match self.client.post(url).json(&req).send().await {
+            Ok(r) if r.status().is_success() => RowReply::Applied,
+            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => match r.json::<super::coordinator::StaleReply>().await {
+                Ok(s) => RowReply::Stale(s.current_seq),
+                Err(e) => {
+                    log::warn!("row write to {peer}: unreadable 409 body: {e}");
+                    RowReply::Failed
+                }
+            },
+            Ok(r) => {
+                log::warn!("row write to {peer} returned {}", r.status());
+                RowReply::Failed
+            }
+            Err(e) => {
+                log::warn!("row write to {peer} failed: {e}");
+                RowReply::Failed
+            }
+        }
+    }
 }
 
 struct Pending {
@@ -48,40 +91,37 @@ struct Pending {
     reply: oneshot::Sender<RowReply>,
 }
 
-static QUEUES: LazyLock<parking_lot::Mutex<HashMap<String, mpsc::UnboundedSender<Pending>>>> = LazyLock::new(Default::default);
+/// Rows to a peer ride in that peer's next batch: one queue and sender
+/// task per peer.
+pub struct Batched {
+    client: reqwest::Client,
+    queues: parking_lot::Mutex<HashMap<String, mpsc::UnboundedSender<Pending>>>,
+}
 
-/// Sends `req` to `peer` in its next batch and returns the peer's answer.
-pub async fn send(client: &reqwest::Client, peer: &str, req: MetaRowRequest) -> RowReply {
-    let (reply, answer) = oneshot::channel();
-    let tx = {
-        let mut queues = QUEUES.lock();
-        queues
-            .entry(peer.to_string())
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::unbounded_channel();
-                super::bridge::spawn(peer_loop(client.clone(), peer.to_string(), rx));
-                tx
-            })
-            .clone()
-    };
-    if tx.send(Pending { req, reply }).is_err() {
-        return RowReply::Failed;
+#[async_trait::async_trait]
+impl RowTransport for Batched {
+    async fn send(&self, peer: &str, req: MetaRowRequest) -> RowReply {
+        let (reply, answer) = oneshot::channel();
+        let tx = {
+            let mut queues = self.queues.lock();
+            queues
+                .entry(peer.to_string())
+                .or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    super::bridge::spawn(peer_loop(self.client.clone(), peer.to_string(), rx));
+                    tx
+                })
+                .clone()
+        };
+        if tx.send(Pending { req, reply }).is_err() {
+            return RowReply::Failed;
+        }
+        answer.await.unwrap_or(RowReply::Failed)
     }
-    answer.await.unwrap_or(RowReply::Failed)
 }
 
 fn approx_bytes(r: &MetaRowRequest) -> usize {
-    // The key plus a generous allowance for the record; inline values
-    // dominate, and they're counted through the record's encoded size only
-    // when the batch is sent, so this just keeps batches of large values short.
-    r.key.len() + r.record.as_ref().map_or(16, |rec| 256 + inline_len(rec))
-}
-
-fn inline_len(rec: &super::replicated_metadata::MetaRecord) -> usize {
-    match &rec.value {
-        super::replicated_metadata::MetaValue::Version(v) => v.blobs.iter().map(|b| b.placement.inline.as_ref().map_or(0, |i| i.0.len())).sum(),
-        _ => 0,
-    }
+    r.key.len() + 16 + r.payload.as_ref().map_or(0, |p| p.0.len())
 }
 
 async fn peer_loop(client: reqwest::Client, peer: String, mut rx: mpsc::UnboundedReceiver<Pending>) {
@@ -151,13 +191,18 @@ async fn post(client: &reqwest::Client, url: &str, reqs: &[MetaRowRequest]) -> V
 
 /// `/cluster/_internal/meta_batch`: applies each row through this node's
 /// commit thread (so the batch shares a sync) and answers each.
-pub async fn cluster_internal_meta_batch(body: web::Bytes) -> HttpResponse {
+pub async fn cluster_internal_meta_batch(body: web::Bytes, state: web::Data<super::coordinator::ClusterState>) -> HttpResponse {
+    let Some(rows) = state.rows.get().cloned() else {
+        return HttpResponse::ServiceUnavailable().body("this node has no rows (not started as a cluster node)");
+    };
     let reqs: Vec<MetaRowRequest> = match rmp_serde::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return HttpResponse::BadRequest().body(format!("unreadable metadata batch: {e}")),
     };
-    let answers: Vec<RowReply> = futures::future::join_all(reqs.into_iter().map(|m| async move {
-        match super::replicated_metadata::commit_row(m.key, m.seq, m.record).await {
+    let answers: Vec<RowReply> = futures::future::join_all(reqs.into_iter().map(|m| {
+        let rows = Arc::clone(&rows);
+        async move {
+        match rows.commit(m.key, m.seq, m.payload).await {
             Ok(warp_meta_store::Applied::Yes { .. }) => RowReply::Applied,
             Ok(warp_meta_store::Applied::Stale { current_seq }) => RowReply::Stale(current_seq),
             Ok(warp_meta_store::Applied::VersionMismatch) => RowReply::Failed,
@@ -165,6 +210,7 @@ pub async fn cluster_internal_meta_batch(body: web::Bytes) -> HttpResponse {
                 log::warn!("metadata batch row: applying on this node failed: {e}");
                 RowReply::Failed
             }
+        }
         }
     }))
     .await;
@@ -179,34 +225,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rows_with_inline_bytes_and_tombstones_round_trip_as_messagepack() {
-        use super::super::blob_io::{BlobPlacement, InlineBytes};
-        use super::super::blob_store::BlobRef;
-        use super::super::replicated_metadata::{MetaRecord, MetaValue, VersionEntry};
+    fn rows_and_tombstones_round_trip_as_messagepack_with_raw_payloads() {
         let bytes: Vec<u8> = (0..=255).collect();
-        let placement = BlobPlacement { shard_peers: vec![], k: 1, m: 0, wire_key: String::new(), len: 256, inline: Some(InlineBytes(bytes)) };
-        let v = VersionEntry {
-            order: 0,
-            version_id: String::new(),
-            is_delete_marker: false,
-            meta: crate::metadata::Metadata::from_offset_size_list(vec![(7, 256)]),
-            tags: vec![("t".into(), "v".into())],
-            parts_manifest: None,
-            blobs: vec![BlobRef { user_id: "u".into(), bucket: "b".into(), base: 7, placement }],
-        };
         let rows = vec![
-            MetaRowRequest { key: "ver/k".into(), seq: 5, record: Some(MetaRecord { seq: 5, value: MetaValue::Version(v) }) },
-            MetaRowRequest { key: "acl/k".into(), seq: 6, record: None },
+            MetaRowRequest { key: "a/k".into(), seq: 5, payload: Some(warp_engine::Payload(bytes.clone())) },
+            MetaRowRequest { key: "b/k".into(), seq: 6, payload: None },
         ];
-        // The commit check reads only an entry's head: it must decode from
-        // a stored MetaRecord entry to the record's own seq and version.
-        let stored = warp_meta_store::Entry::Live(rows[0].record.clone().unwrap());
-        let head: warp_meta_store::EntryHead = rmp_serde::from_slice(&rmp_serde::to_vec_named(&stored).unwrap()).unwrap();
-        assert_eq!(head, warp_meta_store::EntryHead::of(&stored));
-        let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&rmp_serde::to_vec_named(&rows).unwrap()).unwrap();
-        assert_eq!(back.len(), 2);
-        assert_eq!((back[0].key.as_str(), back[0].seq, &back[0].record), (rows[0].key.as_str(), 5, &rows[0].record));
-        assert_eq!((back[1].key.as_str(), back[1].seq, back[1].record.is_none()), ("acl/k", 6, true));
+        let wire = rmp_serde::to_vec_named(&rows).unwrap();
+        assert!(wire.windows(bytes.len()).any(|w| w == bytes.as_slice()), "the payload travels raw");
+        let back: Vec<MetaRowRequest> = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!((back[0].key.as_str(), back[0].seq, &back[0].payload), ("a/k", 5, &rows[0].payload));
+        assert_eq!((back[1].key.as_str(), back[1].seq, back[1].payload.is_none()), ("b/k", 6, true));
     }
 
     #[test]
