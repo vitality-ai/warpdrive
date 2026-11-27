@@ -6,40 +6,9 @@
 //! a compute bottleneck. Atomic counters, not per-request logging, so
 //! collecting this data doesn't itself perturb the measurement.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-#[derive(Default)]
-pub struct Phase {
-    total_ns: AtomicU64,
-    count: AtomicU64,
-    max_ns: AtomicU64,
-}
-
-impl Phase {
-    pub fn record(&self, d: Duration) {
-        let ns = d.as_nanos() as u64;
-        self.total_ns.fetch_add(ns, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.max_ns.fetch_max(ns, Ordering::Relaxed);
-    }
-
-    pub fn avg_ms(&self) -> f64 {
-        let count = self.count.load(Ordering::Relaxed);
-        if count == 0 {
-            return 0.0;
-        }
-        (self.total_ns.load(Ordering::Relaxed) as f64 / count as f64) / 1_000_000.0
-    }
-
-    pub fn max_ms(&self) -> f64 {
-        self.max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    }
-
-    pub fn count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
-    }
-}
+pub use crate::phase_timing::Phase;
 
 #[derive(Default)]
 pub struct TimingStats {
@@ -47,6 +16,53 @@ pub struct TimingStats {
     pub shard_fanout: Phase,
     pub location_replicate: Phase,
     pub total: Phase,
+    /// Row writes and blob shard writes, each a round to every peer.
+    pub row: Round,
+    pub shard: Round,
+}
+
+/// One kind of write round to the peers: how long until a write quorum had
+/// answered, how long until the last peer had, and each peer's own time.
+#[derive(Default)]
+pub struct Round {
+    pub quorum: Phase,
+    pub all: Phase,
+    peers: parking_lot::Mutex<std::collections::BTreeMap<String, std::sync::Arc<Phase>>>,
+}
+
+impl Round {
+    /// Records one round from each peer's `(peer, ok, time)`. `required`
+    /// successes make the quorum.
+    pub fn record(&self, replies: &[(&str, bool, Duration)], required: usize) {
+        let mut ok: Vec<Duration> = replies.iter().filter(|r| r.1).map(|r| r.2).collect();
+        ok.sort();
+        if required > 0 && ok.len() >= required {
+            self.quorum.record(ok[required - 1]);
+        }
+        if let Some(last) = replies.iter().map(|r| r.2).max() {
+            self.all.record(last);
+        }
+        let mut peers = self.peers.lock();
+        for (peer, _, d) in replies {
+            match peers.get(*peer) {
+                Some(p) => p.record(*d),
+                None => peers.entry(peer.to_string()).or_default().record(*d),
+            }
+        }
+    }
+
+    fn summary(&self, name: &str) -> String {
+        let mut s = format!(
+            "{name}_n={} {name}_quorum_avg_ms={:.3} {name}_all_avg_ms={:.3}\n",
+            self.all.count(),
+            self.quorum.avg_ms(),
+            self.all.avg_ms()
+        );
+        for (peer, p) in self.peers.lock().iter() {
+            s.push_str(&format!("{name}_peer {peer} avg_ms={:.3} max_ms={:.3}\n", p.avg_ms(), p.max_ms()));
+        }
+        s
+    }
 }
 
 impl TimingStats {
@@ -66,6 +82,7 @@ impl TimingStats {
             self.location_replicate.max_ms(),
             self.total.avg_ms(),
             self.total.max_ms(),
-        )
+        ) + &self.row.summary("row")
+            + &self.shard.summary("shard")
     }
 }

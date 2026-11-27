@@ -314,9 +314,11 @@ async fn apply_locally(state: &ClusterState, op: RecordOp) -> PeerReply {
 /// on replication, there might be none.
 async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() -> RecordOp + Sync)) -> Vec<PeerReply> {
     let me = self_addr();
+    let is_row = matches!(make(), RecordOp::Meta(_));
     let requests = peers.iter().map(|peer| {
         let op = make();
         let label = op.label();
+        let started = std::time::Instant::now();
         let is_self = me.is_some_and(|m| peer.trim().trim_end_matches('/') == m);
         // A row for a peer goes through the row transport.
         let row = match &op {
@@ -324,7 +326,7 @@ async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() 
             _ => None,
         };
         let req = (!is_self && row.is_none()).then(|| op.request(&state.location_http, peer));
-        async move {
+        let reply = async move {
             if let Some(m) = row {
                 return match state.row_transport.send(peer, m).await {
                     super::meta_batch::RowReply::Applied => PeerReply::Applied,
@@ -353,9 +355,18 @@ async fn send_to_peers(state: &ClusterState, peers: &[String], make: &(dyn Fn() 
                     PeerReply::Failed
                 }
             }
+        };
+        async move {
+            let r = reply.await;
+            (peer.as_str(), r, started.elapsed())
         }
     });
-    join_all(requests).await
+    let timed = join_all(requests).await;
+    if is_row {
+        let replies: Vec<(&str, bool, std::time::Duration)> = timed.iter().map(|(p, r, d)| (*p, matches!(r, PeerReply::Applied), *d)).collect();
+        state.timing.row.record(&replies, required_write_acks(state.ec.k(), state.ec.m()));
+    }
+    timed.into_iter().map(|(_, r, _)| r).collect()
 }
 
 /// Rounds of restamp-and-resend before an ordered write gives up.
@@ -1264,6 +1275,7 @@ async fn delete_upload_records(state: &web::Data<ClusterState>, user_id: &str, b
 /// docs/Distributed-Engine-Plan.md).
 pub async fn cluster_timing_stats(state: web::Data<ClusterState>) -> HttpResponse {
     let mut body = format!("{}sync_count={}\n", state.timing.summary(), warp_meta_store::group_commit::sync_count());
+    body.push_str(&crate::phase_timing::S3_PUT.summary());
     if let Some(v) = state.compression.view() {
         body.push_str(&format!("compression={v}\n"));
     }

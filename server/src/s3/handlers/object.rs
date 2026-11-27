@@ -31,6 +31,7 @@ pub async fn s3_put_object_handler(
     mut payload: web::Payload,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
+    let put_started = std::time::Instant::now();
     if let Ok(query) = web::Query::<HashMap<String, String>>::from_query(req.query_string()) {
         if req.headers().contains_key("x-amz-copy-source")
             && query.contains_key("partNumber")
@@ -191,6 +192,8 @@ pub async fn s3_put_object_handler(
         body_buf.extend_from_slice(&chunk);
     }
 
+    let body_read = std::time::Instant::now();
+    crate::phase_timing::S3_PUT.body.record(body_read - put_started);
     // One write for the whole body, not one per network chunk. The body is
     // already buffered for the ETag, so this costs no extra memory, and on
     // a cluster each write is a full erasure-coded round with its own
@@ -233,6 +236,7 @@ pub async fn s3_put_object_handler(
         })?;
         offset_size_list.push(pair);
     }
+    crate::phase_timing::S3_PUT.blob.record(body_read.elapsed());
     let (body_md5, default_crc) = hashing.await.map_err(|e| {
         error!("PutObject: hashing task failed bucket={} key={}: {:?}", bucket, key, e);
         actix_web::error::ErrorInternalServerError("hashing task failed")
@@ -309,7 +313,9 @@ pub async fn s3_put_object_handler(
         // For simple (non-multipart) objects, checksum_type is not set (leave None)
     }
 
+    let meta_started = std::time::Instant::now();
     let (version_id, old_extents) = db.put_object_full_async(&bucket, &key, metadata).await?;
+    crate::phase_timing::S3_PUT.meta.record(meta_started.elapsed());
     if !old_extents.is_empty() {
         db.queue_deletion(&bucket, &key, &old_extents).ok();
     }
@@ -383,6 +389,7 @@ pub async fn s3_put_object_handler(
         let header_name = format!("x-amz-checksum-{}", algo.header_suffix());
         resp.insert_header((header_name, value.clone()));
     }
+    crate::phase_timing::S3_PUT.total.record(put_started.elapsed());
     Ok(resp.insert_header(("Content-Length", "0")).body(""))
 }
 

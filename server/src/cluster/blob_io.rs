@@ -247,15 +247,19 @@ pub async fn write_blob(state: &ClusterState, user_id: &str, bucket: &str, key: 
         let client = Arc::clone(&state.peer_client);
         let (bucket, wire_key, user) = (bucket.to_string(), wire_key.clone(), user_id.to_string());
         async move {
+            let started = std::time::Instant::now();
             let res = client.put_shard(&peer, &user, &bucket, &wire_key, idx, shard).await;
             if let Err(e) = &res {
                 log::warn!("put_shard idx={idx} peer={peer} failed: {e}");
             }
-            res.is_ok()
+            (peer, res.is_ok(), started.elapsed())
         }
     });
-    let acked = join_all(puts).await.into_iter().filter(|ok| *ok).count();
+    let timed = join_all(puts).await;
     let required = required_write_acks(k, m);
+    let replies: Vec<(&str, bool, std::time::Duration)> = timed.iter().map(|(p, ok, d)| (p.as_str(), *ok, *d)).collect();
+    state.timing.shard.record(&replies, required);
+    let acked = timed.iter().filter(|(_, ok, _)| *ok).count();
     if acked < required {
         return Err(ErrorInternalServerError(format!("write quorum not met: {acked}/{required} nodes stored a shard (RS({k},{m}))")));
     }
