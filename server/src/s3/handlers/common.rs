@@ -249,9 +249,15 @@ pub(super) fn last_modified_for_header(s: &str) -> String {
         .unwrap_or_else(|_| s.to_string())
 }
 
+/// MD5 of `data` (assembly on x86_64, see Cargo.toml).
+pub(crate) fn md5_digest(data: &[u8]) -> [u8; 16] {
+    use md5::Digest as _;
+    md5::Md5::digest(data).into()
+}
+
 /// Compute MD5 ETag (double-quoted) from accumulated bytes.
 pub(crate) fn md5_etag(data: &[u8]) -> String {
-    format!("\"{}\"", hex::encode(md5::compute(data).0))
+    format!("\"{}\"", hex::encode(md5_digest(data)))
 }
 
 /// Strip surrounding double quotes from an ETag for comparison.
