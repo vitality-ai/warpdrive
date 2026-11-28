@@ -1,0 +1,1 @@
+compression={"compress_mb_per_s":656.1883017518699,"compressed":0,"cpu_busy":0.98,"disk_free":0.9445742273513781,"disk_weight":0.0529339024421637,"link_mb_per_s":1250.0,"net_busy":0.11321283483773387,"ratio":1.000152587890625,"raw":75609,"reads_per_write":1.6663624700763138}
