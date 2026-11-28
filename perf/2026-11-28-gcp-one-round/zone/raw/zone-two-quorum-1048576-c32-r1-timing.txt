@@ -1,0 +1,19 @@
+n=0
+encode_avg_ms=0.000 encode_max_ms=0.000
+shard_fanout_avg_ms=0.000 shard_fanout_max_ms=0.000
+location_replicate_avg_ms=0.000 location_replicate_max_ms=0.000
+total_avg_ms=0.000 total_max_ms=0.000
+row_n=3540 row_quorum_avg_ms=1.529 row_all_avg_ms=2.769
+row_peer http://10.128.0.47:9710 avg_ms=2.168 max_ms=50.109
+row_peer http://10.128.0.48:9710 avg_ms=1.740 max_ms=49.569
+row_peer http://10.128.0.50:9710 avg_ms=1.202 max_ms=18.880
+row_peer http://10.128.0.51:9710 avg_ms=1.736 max_ms=50.109
+row_peer http://10.128.0.52:9710 avg_ms=1.411 max_ms=34.117
+shard_n=3539 shard_quorum_avg_ms=4.583 shard_all_avg_ms=6.754
+shard_peer http://10.128.0.47:9710 avg_ms=5.560 max_ms=83.965
+shard_peer http://10.128.0.48:9710 avg_ms=4.737 max_ms=88.022
+shard_peer http://10.128.0.50:9710 avg_ms=4.333 max_ms=46.119
+shard_peer http://10.128.0.51:9710 avg_ms=4.709 max_ms=82.328
+shard_peer http://10.128.0.52:9710 avg_ms=4.547 max_ms=94.497
+sync_count=3520
+s3_put_n=3539 body_avg_ms=2.949 blob_avg_ms=7.797 meta_avg_ms=3.838 total_avg_ms=14.731

@@ -1,0 +1,5 @@
+http://10.128.0.50:9710 acked=3498 acked_wrong=0 [] failed=1134 failed_visible=0
+http://10.128.0.48:9710 acked=3498 acked_wrong=0 [] failed=1134 failed_visible=0
+http://10.128.0.47:9710 acked=3498 acked_wrong=69 [('w12-90', 'ERR An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist'), ('w6-89', 'ERR An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist')] failed=1134 failed_visible=0
+http://10.128.0.51:9710 acked=3498 acked_wrong=134 [('w1-96', 'ERR An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist'), ('w9-99', 'ERR An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist')] failed=1134 failed_visible=0
+http://10.128.0.52:9710 acked=3498 acked_wrong=227 [('w7-166', 'ERR An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist'), ('w0-165', 'ERR An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist')] failed=1134 failed_visible=0

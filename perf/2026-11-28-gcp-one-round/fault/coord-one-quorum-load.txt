@@ -1,0 +1,1 @@
+acked=3577 failed=1202 reads_ok=2166 reads_wrong=0 [] reads_error=619
